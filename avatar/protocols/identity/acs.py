@@ -232,7 +232,7 @@ def default_input(profile):
     public = public_profile(profile)
     owner = public.get('name') or '该用户'
     modes = ['text/plain', 'application/json', 'text/markdown']
-    return AcsInput(name=f'{owner}的分身', template_owner=owner,
+    return AcsInput(name=public.get('avatar_name') or f'{owner}的分身', template_owner=owner,
                     description=generated_description(profile),
                     provider=AcsProviderInput(organization=public.get('organization') or '', name=public.get('name') or ''),
                     skills=[AcsSkillInput(id='personal-profile.introduction.qa', name='个人介绍问答',
@@ -248,9 +248,7 @@ def resolve_input(stored, profile):
     content = AcsInput.model_validate(stored)
     owner = content.template_owner or defaults.template_owner
     prefix = owner + '能够'
-    name = content.name
-    if not name or name == owner + '的分身':
-        name = defaults.name
+    name = content.name or defaults.name
     description = content.description
     if not description or description in (
         f'作为{owner}的分身，能根据{owner}的资料和语言习惯回答问题。',
