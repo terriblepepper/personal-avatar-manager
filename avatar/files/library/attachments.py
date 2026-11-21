@@ -32,8 +32,11 @@ TYPES = {'.avanim': ANIMATION_MIME, '.txt': 'text/plain', '.md': 'text/markdown'
          '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',**MEDIA}
 
 
+ARTIFACT_SUFFIXES = ('.html', '.htm', '.avanim')
+
+
 def chat_file_limit(filename):
-    return MAX_SOURCE_BYTES if (filename or '').lower().endswith('.avanim') else MAX_FILE
+    return MAX_SOURCE_BYTES if (filename or '').lower().endswith(ARTIFACT_SUFFIXES) else MAX_FILE
 
 
 class OfficeDirectory:
@@ -103,8 +106,8 @@ class AttachmentService:
             raise HTTPException(415, '支持文本、图片、音频、视频、CSV/TSV/XLSX、PDF、Word 和 PPT；旧 XLS 请先另存为 XLSX/CSV')
         if not data:
             raise HTTPException(422, '不能上传空文件')
-        if extension == '.avanim' and len(data) > MAX_SOURCE_BYTES:
-            raise HTTPException(413, '动画源码不能超过 100 MiB')
+        if extension in ARTIFACT_SUFFIXES and len(data) > MAX_SOURCE_BYTES:
+            raise HTTPException(413, 'HTML 或动画文件不能超过 100 MiB')
         if max_size is not None and len(data) > max_size:
             raise HTTPException(413, '文件超过上传大小限制')
         if extension in ('.zip','.docx','.pptx','.xlsx'):

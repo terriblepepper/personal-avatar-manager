@@ -180,7 +180,7 @@ async function promote(value:FilePromotion) {
   <button v-if="uploadController" type="button" class="button small" @click="uploadController.abort()">取消上传</button>
   <input ref="uploadInput" hidden type="file" multiple accept=".png,.jpg,.jpeg,.webp,.gif,.bmp,.txt,.md,.mmd,.avanim,.html,.htm,.csv,.tsv,.xlsx,.json,.log,.pdf,.docx,.pptx,.mp3,.wav,.m4a,.ogg,.flac,.webm,.mp4,.mov" :disabled="busy||working||!conversationId" @change="upload">
 </div>
-<p class="sub">{{ temporary?'发送选中的原件副本，最多五份。':'引用持续用于后续提问，最多同时五份。其他会话临时文件需先转存为资料；索引与检索使用模型额度。' }} 本会话普通原件合计最多 50 MiB，账户会话原件合计最多 100 MiB。</p>
+<p class="sub">{{ temporary?'发送选中的原件副本，最多五份。':'引用持续用于后续提问，最多同时五份。其他会话临时文件需先转存为资料；索引与检索使用模型额度。' }} HTML 与动画单件最多 100 MiB，其他会话原件合计最多 50 MiB，账户会话原件合计最多 100 MiB。</p>
 <p v-if="status" class="sub" role="status">{{ status }}</p>
 <article v-for="file in page" :key="file.id" class="chat-file compact-chat-file"><label><input v-if="!temporary" type="checkbox" :checked="included(file)" :disabled="busy||working" @change="toggle(file,$event)"><MaterialTypeIcon :filename="file.filename"/> {{ file.filename }}</label><div class="actions"><el-button @click="preview=file">{{ /\.(mmd|avanim)$/i.test(file.filename) ? '预览与下载' : '预览' }}</el-button>
     <el-button v-if="temporary" :disabled="busy||working" @click="toggleAttachment(file)">{{ included(file) ? '移除附件' : '添加为附件' }}</el-button>

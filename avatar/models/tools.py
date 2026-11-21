@@ -1,6 +1,29 @@
 """模型原生工具调用协议适配；只解析调用计划，不在网络适配层执行工具。"""
 import json
+import re
 from fastapi import HTTPException
+
+
+# Large HTML occupies one string. Bound the surrounding JSON structure before building Python containers.
+_JSON_TOKEN = r'"(?:[^"\\]++|\\.)*+"|[]["{},:]'
+_STRUCTURE = (re.compile(_JSON_TOKEN,re.DOTALL),re.compile(_JSON_TOKEN.encode(),re.DOTALL))
+
+
+def load_model_json(value):
+    if len(value) > 2*1024*1024:
+        scanner = _STRUCTURE[0] if isinstance(value,str) else _STRUCTURE[1]
+        depth = 0
+        for count, token in enumerate(scanner.finditer(value),1):
+            first = value[token.start():token.start()+1]
+            if first in ('[','{',b'[',b'{'):
+                depth += 1
+            elif first in (']','}',b']',b'}'):
+                depth -= 1
+            elif first in ('"',b'"') and token.end()-token.start()==1:
+                raise ValueError('Unterminated model JSON string')
+            if count > 65536 or depth > 128:
+                raise ValueError('Model JSON structure too large')
+    return json.loads(value)
 
 
 def configure_tools(fmt, body, tools, *, required=True, batch=False):
@@ -51,15 +74,19 @@ def parse_tools(fmt, data, tools, *, required=True, batch=False):
             args = call.get('arguments', {})
             if isinstance(args,str):
                 issue = '工具参数不是有效 JSON'
-                args = json.loads(args)
+                args = load_model_json(args)
             if not isinstance(args,dict):
                 issue = '工具参数必须是对象'
                 raise ValueError()
             parsed.append({'name':name,'arguments':args})
         return parsed
     except (ValueError, TypeError, KeyError, IndexError, AttributeError):
-        error = HTTPException(502,'模型未返回有效的工具调用：'+issue+'。本次未执行工具。')
-        error.invalid_tool_call = True
-        error.tool_issue = issue
-        error.tool_count = count
-        raise error from None
+        raise invalid_tool_call(issue,count) from None
+
+
+def invalid_tool_call(issue,count):
+    error = HTTPException(502,'模型未返回有效的工具调用：'+issue+'。本次未执行工具。')
+    error.invalid_tool_call = True
+    error.tool_issue = issue
+    error.tool_count = count
+    return error

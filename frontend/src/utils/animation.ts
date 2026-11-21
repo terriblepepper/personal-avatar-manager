@@ -1,7 +1,7 @@
 export const MAX_ANIMATION_BYTES = 100 * 1024 * 1024
 export function animationUploadError(files: readonly File[]): string {
-  const file = files.find(item => item.size > MAX_ANIMATION_BYTES && /\.avanim$/i.test(item.name))
-  return file ? `动画包「${file.name}」超过 100 MiB` : ''
+  const file = files.find(item => item.size > MAX_ANIMATION_BYTES && /\.(?:avanim|html?)$/i.test(item.name))
+  return file ? `文件「${file.name}」超过 100 MiB` : ''
 }
 const edgeKinds = new Set(['device', 'browser', 'router', 'server', 'cloud', 'database', 'network', 'agent'])
 const nodeKinds = new Set([...edgeKinds, 'person', 'document', 'queue', 'decision', 'shield'])

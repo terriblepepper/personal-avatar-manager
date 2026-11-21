@@ -6,9 +6,8 @@ import time
 import uuid
 from contextlib import ExitStack
 from fastapi import HTTPException
-from avatar.files.parsing.animation import is_animation_file
 from avatar.core.db import now
-from avatar.files.conversation.resources import check_chat_quota, original_hashes
+from avatar.files.conversation.resources import check_chat_quota, ordinary_chat_bytes, original_hashes
 from avatar.files.library.attachments import MAX_FILE
 
 
@@ -79,7 +78,7 @@ class PeerResources:
                             if stored!=(digest,md5):
                                 raise HTTPException(409,'接收方已有副本校验失败，未重复引用')
                     else:
-                        check_chat_quota(db,uid,destination,1,row['size'],0 if is_animation_file(row) else row['size'])
+                        check_chat_quota(db,uid,destination,1,row['size'],ordinary_chat_bytes(row))
                         identifier=str(uuid.uuid4());self.files.directory.mkdir(parents=True,exist_ok=True,mode=0o700)
                         for suffix, source_path in (('.blob',original),('.jpg',preview_path)):
                             if suffix=='.jpg' and not source_path.is_file():continue

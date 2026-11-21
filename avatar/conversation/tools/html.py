@@ -59,6 +59,8 @@ def html_repair_prompt(mode, animation_required):
 
 
 def create_html(args, outputs, available, *, animation_required=False, expected_mode=None):
+    if isinstance(args,dict) and isinstance(args.get('html'),str) and len(args['html']) > MAX_SOURCE_BYTES:
+        raise HTTPException(413, 'HTML 文件不能超过 100 MiB')
     try:
         artifact = HtmlArtifact.model_validate(args)
     except ValidationError as error:
@@ -84,9 +86,9 @@ def create_html(args, outputs, available, *, animation_required=False, expected_
         raise HTTPException(422, 'HTML 必须为有效文本')
     if not source.lstrip().startswith('<') or '>' not in source:
         raise HTTPException(422, '请提交包含 HTML 标记的完整页面')
-    if artifact.mode == 'html' and (len(artifact.html) > 262144 or len(data) > 1024 * 1024):
-        raise HTTPException(422, '通用页面最多 262144 字符、1 MiB')
-    validate_output(artifact.filename, data, html_mode=artifact.mode)
+    if len(data) > MAX_SOURCE_BYTES:
+        raise HTTPException(413, 'HTML 文件不能超过 100 MiB')
+    validate_output(artifact.filename, data)
     for item in outputs:
         if item['filename'] == artifact.filename:
             if item.get('data') == data and item.get('html_mode', 'html') == artifact.mode:
