@@ -55,6 +55,8 @@ def create_app(settings=None, provider=None, run_worker=True, model_client=None)
     system_aip = SystemAipRuntime(settings, resources.database)
     system_registration = SystemRegistrationRuntime(settings, system_aip)
     avatar_registration = AvatarOntologyRegistrationRuntime(settings)
+    from avatar.runtime.platform_certificate import PlatformCertificate
+    platform_certificate = PlatformCertificate(resources.database, settings)
     entity_lifecycle = EntityLifecycleService(resources.database, settings)
     personal_aip = PersonalAipRuntime(settings, resources.chat)
     dialogues = AgentDialogues(resources.database, resources.chat)
@@ -95,6 +97,7 @@ def create_app(settings=None, provider=None, run_worker=True, model_client=None)
                 try:rag_resources.enforcement=await asyncio.to_thread(ServiceLimits().apply,rag_resources.policy,rag_resources.sampler())
                 except Exception:rag_resources.enforcement={'mode':'unavailable','error':'系统硬限制未确认，仅使用应用预算；请管理员检查'}
             if run_worker:
+                tasks.append(asyncio.create_task(platform_certificate.run(), name='platform-certificate-maintenance'))
                 tasks.append(asyncio.create_task(rag_resources.run(),name='avatar-resource-budget'))
 
                 tasks.append(
@@ -183,6 +186,7 @@ def create_app(settings=None, provider=None, run_worker=True, model_client=None)
     app.state.runtime = runtime
     app.state.rag_resources=rag_resources
     app.state.system_aip = system_aip
+    app.state.platform_certificate = platform_certificate
     app.state.system_registration = system_registration
     app.state.avatar_registration = avatar_registration
     app.state.entity_lifecycle, app.state.personal_aip = entity_lifecycle, personal_aip

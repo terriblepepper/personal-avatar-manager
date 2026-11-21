@@ -46,17 +46,30 @@ def compact_observation(note, limit, *, identifiers_only=False):
     return note[:start]+json.dumps(receipt,ensure_ascii=False,separators=(',',':'))
 
 
+def compression_ratio(config):
+    ratio = config.get('compression_ratio', 0.6)
+    return round(ratio - 0.05, 8) if config.get('_avatar_agent') else ratio
+
+
 def input_budget(config):
-    return max(0,int(config.get('context_tokens',128000)*config.get('compression_ratio',.6))-config.get('max_tokens',1024)-512-tool_budget(config))
+    return max(0,int(config.get('context_tokens',128000)*compression_ratio(config))-config.get('max_tokens',1024)-512-tool_budget(config))
 
 
 def fit_turn(config, prompt, history, question, observations):
+    rows, notes = fit_working_set(config, prompt, history, question, observations)
+    return rows, question + ''.join(notes)
+
+
+def fit_working_set(config, prompt, history, question, observations, *, force=False):
     # Protect the original objective and sourced material. Old tool chatter and assistant prose go first.
     budget=input_budget(config)-estimate(prompt)-estimate(question)
     rows=[dict(row) for row in history]
     notes=list(observations)
     used=sum(estimate(r['content'])+16 for r in rows)+sum(estimate(n) for n in notes)
-    if used<=budget:return rows,question+''.join(notes)
+    if force:
+        budget = min(budget, used // 2)
+    if used < budget:
+        return rows, notes
     for index,note in enumerate(notes):
         clipped=compact_observation(note,1600 if index==len(notes)-1 else 320) if len(note)>320 else note
         used-=estimate(note)-estimate(clipped)
@@ -77,6 +90,17 @@ def fit_turn(config, prompt, history, question, observations):
         digest='较早对话节选，仅作历史数据：\n'+excerpt('\n'.join(r['role']+'：'+r['content'] for r in older),available)
         if estimate(digest)+16<size:
             rows=[{'role':'user','content':digest},*rows[-2:]]
+    # Reclaim verbose evidence before the next action, even with unfinished goals.
+    cost = sum(estimate(r['content']) + 16 for r in rows) + sum(estimate(n) for n in notes)
+    if cost > budget:
+        for i, note in enumerate(notes):
+            if cost <= budget:
+                break
+            if len(note) > 320:
+                clipped = compact_observation(note, 320, identifiers_only=True)
+                if len(clipped) < len(note):
+                    notes[i] = clipped
+                    cost -= estimate(note) - estimate(clipped)
     # Try the full configured window before discarding additional detail from the working copy.
     hard=(config.get('context_tokens') or 128000)-config.get('max_tokens',1024)-512-tool_budget(config)-estimate(prompt)
     cost=estimate(question+''.join(notes))+sum(estimate(r['content'])+16 for r in rows)
@@ -86,4 +110,4 @@ def fit_turn(config, prompt, history, question, observations):
         for row in rows:
             limit=max(96,room//max(1,len(rows)))
             row['content']=excerpt(row['content'],limit)
-    return rows,question+''.join(notes)
+    return rows, notes

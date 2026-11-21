@@ -94,6 +94,10 @@ async def maintain_entity(settings, user_id, expected_aic, action):
     config = read_atr_config(paths.registration, settings.registry_username, settings.registry_password)
     if config.mode not in ('entity','integrated'):
         raise RegistrationFailure('仅允许维护个人正式实体')
+    return await maintain_registered(config, expected_aic, action)
+
+
+async def maintain_registered(config, expected_aic, action, *, expected_certificate=None):
     with wit_candidate_config(config) as input_config:
         registry = EntityRegistry(input_config) if config.mode=='entity' else RegistryClient(input_config,transport=RegistryReadyTransport(input_config))
         component = registration_component(input_config, registry=registry)
@@ -121,11 +125,18 @@ async def maintain_entity(settings, user_id, expected_aic, action):
                 return None
             if action != 'renew':
                 raise RegistrationFailure('未知个人证书维护操作')
+            previous = identity_json(config.paths.state_dir / 'atr-state.json')['active']
+            if expected_certificate and previous.get('client') != expected_certificate:
+                raise RegistrationFailure('证书已变化，请重新读取当前代次')
             await certificates.renew(CertificateRenewRequest(aic=expected_aic, usages=('client', 'server')))
             ontology_aic = component.final_acs.get('entityMeta',{}).get('ontologyAic','')
         material, generation, _ = await registration_component(input_config).read_active_snapshot()
         if material.aic != expected_aic:
             raise RegistrationFailure('续期后的证书身份不一致，拒绝发布')
         projection=certificate_projection(material,generation,ontology_aic)
+        active = identity_json(config.paths.state_dir / 'atr-state.json')['active']
+        if (projection['id'] != active.get('client') or not active.get('server') or
+                any(active.get(usage) == previous.get(usage) for usage in ('client','server'))):
+            raise RegistrationFailure('未读回新一代客户端和服务端证书')
         if config.mode=='integrated':projection.update(mode='acps-direct');projection.pop('ontology_aic',None)
         return projection

@@ -5,6 +5,7 @@ import logging
 import time
 import uuid
 import httpx
+from datetime import datetime
 from fastapi import HTTPException
 from wit.acps.identity.acs import AcsContractError
 from avatar.core.db import now, dump, event
@@ -84,6 +85,31 @@ class EntityLifecycleService:
             event(db, user_id, admin['username'], '提交个人身份维护任务', action, actor_id=admin['id'])
             return dict(db.execute('SELECT * FROM avatar_identity_jobs WHERE id=?', (identifier,)).fetchone())
 
+    def schedule_renewals(self):
+        if not self.settings.entity_aip_enabled:
+            return
+        timestamp = now()
+        with self.database.connect(write=True) as db:
+            due = db.execute("""SELECT a.user_id,a.aic,json_extract(a.certificate,'$.id') AS fingerprint
+                FROM avatar_records a JOIN users u ON u.id=a.user_id
+                WHERE a.identity_status='active' AND u.account_status='active' AND a.aic NOT LIKE 'DEMO-%'
+                AND julianday(json_extract(a.certificate,'$.expires_at')) <= julianday(?, '+1 day')
+                AND NOT EXISTS (SELECT 1 FROM avatar_identity_jobs j WHERE j.user_id=a.user_id
+                    AND (j.status IN ('queued','waiting','running') OR (j.action='renew' AND j.status='failed'
+                         AND j.expected_aic=a.aic AND j.updated_at>=a.updated_at)))
+                AND NOT EXISTS (SELECT 1 FROM provision_jobs j JOIN profile_submissions s ON s.id=j.submission_id
+                    WHERE s.user_id=a.user_id AND j.status IN ('queued','waiting','running'))""",(timestamp,)).fetchall()
+            for row in due:
+                if not row['fingerprint']:
+                    continue
+                job_id = str(uuid.uuid5(uuid.NAMESPACE_URL, 'avatar-renew:'+row['aic']+':'+row['fingerprint']))
+                inserted = db.execute("""INSERT INTO avatar_identity_jobs
+                    (id,user_id,actor,action,expected_aic,status,created_at,updated_at,remote_aic)
+                    VALUES(?,?,'system','renew',?,'queued',?,?,?) ON CONFLICT DO NOTHING""",
+                    (job_id,row['user_id'],row['aic'],timestamp,timestamp,row['aic']))
+                if inserted.rowcount:
+                    event(db,row['user_id'],'system','证书到期自动续签已排队',job_id)
+
     def refresh(self, admin, identifier):
         with self.database.connect(write=True) as db:
             job=db.execute('SELECT * FROM avatar_identity_jobs WHERE id=?',(identifier,)).fetchone()
@@ -107,6 +133,11 @@ class EntityLifecycleService:
         try:
             if not row or row['aic'] != job['expected_aic']:
                 raise RegistrationFailure('账户分身身份已经变化，请刷新核对')
+            if job['action'] == 'renew' and job['actor'] == 'system' and uuid.UUID(job['id']).version == 5:
+                fingerprint = json.loads(row['certificate']).get('id','')
+                expected = str(uuid.uuid5(uuid.NAMESPACE_URL, 'avatar-renew:'+row['aic']+':'+fingerprint))
+                if job['id'] != expected or row['identity_status'] != 'active':
+                    raise RegistrationFailure('排队后身份或证书已变化，跳过旧续签任务')
             cleanup = job['action'] == 'unregister' and row['identity_status'] == 'retired'
             if not cleanup:
                 async with asyncio.timeout(self.settings.system_atr_call_timeout):
@@ -160,6 +191,10 @@ class EntityLifecycleService:
                            (new, dump(result['certificate']), dump(document), now(), job['user_id']))
                 remap_identity(db,job['user_id'],old,new)
             elif job['action'] == 'renew':
+                previous = json.loads(before['certificate'])
+                if (result.get('id') == previous.get('id') or not result.get('expires_at') or
+                        previous.get('expires_at') and datetime.fromisoformat(result['expires_at']) <= datetime.fromisoformat(previous['expires_at'])):
+                    raise RegistrationFailure('续签未读回有效期更长的新证书')
                 db.execute('UPDATE avatar_records SET certificate=?,updated_at=? WHERE user_id=?', (dump(result), now(), job['user_id']))
             else:
                 certificate = json.loads(row['certificate'])
@@ -186,8 +221,12 @@ class EntityLifecycleService:
         with self.database.connect(write=True) as db:
             db.execute("UPDATE avatar_identity_jobs SET status='queued' WHERE status='running' AND action!='renew'")
             db.execute("UPDATE avatar_identity_jobs SET status='failed',error='续期被中断，请先使用 wit status 核对证书代次，再决定是否重试' WHERE status='running' AND action='renew'")
+        next_scan = 0.0
         while True:
             try:
+                if time.monotonic() >= next_scan:
+                    next_scan = time.monotonic() + 60
+                    await asyncio.to_thread(self.schedule_renewals)
                 if not await self.once():
                     await asyncio.sleep(1)
             except asyncio.CancelledError:

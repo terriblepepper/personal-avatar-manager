@@ -5,7 +5,7 @@ import json
 from contextlib import ExitStack
 from avatar.core.tokens import estimate
 from avatar.models.limits import check_context, tool_budget
-from avatar.conversation.working_context import fit_turn
+from avatar.conversation.working_context import compression_ratio, fit_turn
 import time
 import uuid
 from dataclasses import dataclass
@@ -159,7 +159,7 @@ class ConversationMemory:
         from avatar.models.limits import limits
         window = config.get('context_tokens') or (limits(config.get('provider'), config.get('model')) or {}).get('context_tokens', 128000)
         used = tool_budget(config) + estimate(system) + estimate(summary) + estimate(message) + sum(estimate(r['content']) + 16 for r in rows) + config.get('max_tokens',1024) + 512
-        return used >= window * config.get('compression_ratio', 0.6)
+        return used >= round(window * compression_ratio(config))
 
     # 职责：共用普通聊天与分身协商的摘要生成和有效性校验。
     # 输入：context 为目标模型上下文，summary/rows 为不可信历史数据。

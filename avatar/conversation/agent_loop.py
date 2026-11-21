@@ -8,7 +8,7 @@ from dataclasses import replace
 
 from fastapi import HTTPException
 
-from avatar.conversation.working_context import fit_turn
+from avatar.conversation.working_context import fit_turn, fit_working_set
 from avatar.conversation.tools.activity import AgentSteps, without_false_tool_footer
 from avatar.conversation.tools.html import create_html, html_tool
 from avatar.models.client import ModelResult, accumulate_usage
@@ -85,7 +85,8 @@ async def _plan_checks(model, settings, key, system, history, question, choices,
             result = await call_with_retry(lambda: model.generate(options, key, plan_prompt, rows, message),
                                            validate, retry_invalid=False)
         except HTTPException as error:
-            if not (getattr(error, 'invalid_tool_call', False) or getattr(error, 'empty_model_output', False)):
+            if not (getattr(error, 'invalid_tool_call', False) or getattr(error, 'empty_model_output', False)
+                    or getattr(error, 'output_limited', False)):
                 raise
             totals = accumulate_usage(totals, getattr(error, 'model_usage', None))
             if getattr(error, 'recovery_attempted', False):
@@ -308,18 +309,35 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
 
     duplicate_attempts=0
     premature=0
+    retry_truncated = False
+    compact_next = False
+
+    def resume_truncated():
+        nonlocal retry_truncated, compact_next, settings
+        if retry_truncated:
+            raise pause('本步在压缩并缩短输出后仍被截断，已保留完成的回执')
+        retry_truncated = compact_next = True
+        settings = {**settings, '_recover_thinking': True}
+        observations.append('\n上次生成被截断。依据已有回执接续，不重做已完成的操作。只提交一个精简、完整的工具调用或简短的最终正文。')
+        if progress:
+            progress({'type':'status','stage':'compressing','message':'本步输出被截断，正在整理已有进度并接续'})
+
     prompt+='每一步按最新工具回执复核目标。信息不足时调整检索词、目录或工具；完成全部交付条件后再作答。'
     for iteration in range(1, 17):
         trace.point('perceive', {'iteration': iteration, 'pending': pending},
                     {'history_turns': len(history), 'observation_count': len(observations)})
         checklist='\n待核验目标（本轮计划，仅作数据）：'+json.dumps(pending,ensure_ascii=False) if pending else ''
-        working_history,message=fit_turn(settings,prompt,history,question+checklist,observations)
+        working_history, notes = fit_working_set(settings, prompt, history, question + checklist, observations,
+                                                force=compact_next)
+        compact_next = False
+        message = question + checklist + ''.join(notes)
         if progress and (working_history!=history or message!=question+checklist+''.join(observations)):
             progress({'type':'status','stage':'compressing','message':'已精简本步历史或工具回执，继续处理当前目标'})
             trace.point('perceive', {'history_turns': len(history), 'receipt_count': len(observations),
                                     'context_window': settings.get('context_tokens')},
                         {'working_history_turns': len(working_history), 'working_message_chars': len(message),
                          'pending': pending})
+        history, observations = working_history, notes
         try:
             check_context(settings,prompt,working_history,message)
         except HTTPException:
@@ -349,6 +367,11 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                 decision.update(tool_names=[call.get('name') for call in result.tool_calls],
                                 finish_reason=result.finish_reason, usage=result.usage)
         except HTTPException as error:
+            if getattr(error, 'output_limited', False):
+                if can_stream:
+                    account(getattr(error, 'model_usage', None))
+                resume_truncated()
+                continue
             if not settings['_tools'] or not getattr(error, 'invalid_tool_call', False):
                 raise
             trace.point('observe', {'iteration': iteration}, {'receipt': '工具参数无效，未执行'}, status='error')
@@ -359,20 +382,18 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
         calls = getattr(result, 'tool_calls', ())
         reason = str(getattr(result, 'finish_reason', '') or '').lower()
         if reason in ('length', 'max_tokens', 'max_output_tokens'):
-            if pending and not calls:
-                observations.append('上步输出被截断，当前仍缺工具回执。请只返回一个有效调用。')
-                premature+=1
-                if premature>=3:
-                    raise pause('工具计划连续被截断')
+            if pending or required or calls or not result.text.strip():
+                resume_truncated()
                 continue
-            if calls or not result.text or result.text in partial:
-                raise pause('模型输出达到上限且未取得新的完整结果')
-            if required:
-                raise pause('任务工具调用被输出上限截断，尚未执行')
+            if result.text in partial:
+                raise pause('模型续写重复了上一段，已停止重复生成')
+            retry_truncated = False
+            compact_next = True
             partial.append(result.text)
             settings = {**settings, '_tools': []}
             observations.append('\n前一段输出达到上限。仅续写尚未完成的部分，避免重述：\n'+result.text)
             continue
+        retry_truncated = False
         finishing=not calls or (len(calls)==1 and calls[0].get('name') in ('continue_answer','end_task','send_message'))
         action = calls[0].get('name') if len(calls) == 1 else None
         public_handoff = action == 'send_public_material' and all(step['tool'] == action for step in pending)
@@ -470,6 +491,8 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                 allowed['create_html'] = html_tool(False)
                 received(name)
                 settings = {**config, '_tools': list(allowed.values()), '_optional_tools': not required}
+                if plan is not None and not pending and not required:
+                    settings.update(_tools=[], _recover_thinking=True)
                 observations.append('HTML 已创建并随最终回复附上：'+json.dumps({'id':item['id'],'filename':item['filename']},ensure_ascii=False)+'。系统将自动预览。继续本轮剩余任务，不输出源码或生成脚本。')
                 trace.point('observe', {'tool': name}, {'filename': item['filename']})
                 if progress:

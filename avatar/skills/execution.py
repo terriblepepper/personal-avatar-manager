@@ -11,7 +11,7 @@ from avatar.core.db import dump, now
 from avatar.core.execution import AgentSteps
 from avatar.core.execution import check_execution
 from avatar.models.limits import check_context
-from avatar.conversation.working_context import excerpt, fit_turn, input_budget
+from avatar.conversation.working_context import excerpt, fit_turn, fit_working_set, input_budget
 from avatar.skills.sandbox import LocalPythonSandbox
 
 
@@ -126,6 +126,11 @@ class SkillExecution:
                 try:
                     response=await model_client.generate(auxiliary,key,prompt,[],payload)
                     usage=response.usage
+                    if str(response.finish_reason or '').lower() in ('length','max_tokens','max_output_tokens'):
+                        error=HTTPException(502,'本步沙箱计划被截断，未执行')
+                        error.output_limited=True
+                        error.model_usage=usage
+                        raise error
                     action=json.loads(response.text.strip().removeprefix('```json').removeprefix('```').removesuffix('```'))
                     if not isinstance(action,dict) or action.get('action') not in (('run','python','finish') if allow_code else ('run','finish')):
                         raise ValueError('规划 action 无效')
@@ -148,7 +153,19 @@ class SkillExecution:
                     progress({'type': 'status', 'stage': 'tool_selection', 'message': '正在选择技能或沙箱操作'})
                 trace.point('perceive', {'tool': 'python', 'input_ids': list(inputs)}, {'previous_receipts': len(results)})
                 with trace.step('reason', {'tool': 'python', 'step': state.get('count',0)+1}) as decision:
-                    action = await call_with_retry(choose) if agent else await choose()
+                    try:
+                        action = await call_with_retry(choose) if agent else await choose()
+                    except HTTPException as error:
+                        if not agent or not getattr(error,'output_limited',False):
+                            raise
+                        prompt += '上一步计划被截断且未执行。依据已验证回执，只返回下一项必要操作的简短完整 JSON。'
+                        recent = request.pop('recent_history')
+                        request['recent_history'], _ = fit_working_set(auxiliary,prompt,recent,dump(request),[],force=True)
+                        payload = dump(request)
+                        if progress:
+                            progress({'type':'status','stage':'compressing','message':'已整理沙箱回执，正在接续未执行的规划'})
+                        check_context(auxiliary,prompt,[],payload)
+                        action = await choose()
                     decision.update(action=action['action'], input_ids=action.get('input_ids', []))
             except HTTPException as exc:
                 if getattr(exc,'output_limited',False):

@@ -119,6 +119,8 @@ def parse_response(fmt, data, *, config=None, request_id=None, api_key=''):
     reported_total = tokens(usage.get("total_tokens", usage.get("totalTokenCount")))
     total = reported_total if reported_total is not None else incoming+outgoing if incoming is not None and outgoing is not None else None
     model_usage = {"input_tokens": incoming, "output_tokens": outgoing, "total_tokens": total}
+    reason=((data.get('choices') or [{}])[0].get('finish_reason') if fmt=='openai' else
+            data.get('stop_reason') if fmt=='anthropic' else (data.get('candidates') or [{}])[0].get('finishReason'))
     calls=()
     # Distinguish a missing action after private reasoning from a malformed proposed action.
     if config and config.get('_tools'):
@@ -127,6 +129,9 @@ def parse_response(fmt, data, *, config=None, request_id=None, api_key=''):
             calls=tuple(parse_tools(fmt,data,config['_tools'],required=bool(text and str(text).strip()) and not config.get('_optional_tools')))
         except HTTPException as error:
             error.model_usage=model_usage
+            if str(reason or '').lower() in ('length','max_tokens','max_output_tokens'):
+                error.output_limited = True
+                error.invalid_tool_call = False
             raise
     if not calls and (not isinstance(text, str) or not text.strip()):
         from avatar.models.diagnostics import empty_response
@@ -155,8 +160,6 @@ def parse_response(fmt, data, *, config=None, request_id=None, api_key=''):
                     error.model_usage=model_usage
                     raise
             raise empty_response(fmt,reason=reason,thinking=thinking and not action,refusal=refusal,usage=usage,request_id=request_id,config=config)
-    reason=((data.get('choices') or [{}])[0].get('finish_reason') if fmt=='openai' else
-            data.get('stop_reason') if fmt=='anthropic' else (data.get('candidates') or [{}])[0].get('finishReason'))
     # 分身可能在下一次完整响应续写，保留两段交界处的空格、换行与代码缩进。
     visible = (text or '') if (config or {}).get('_avatar_agent') else (text or '').strip()
     return ModelResult(visible, model_usage, calls, reason)
