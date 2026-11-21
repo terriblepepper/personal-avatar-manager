@@ -339,7 +339,7 @@ class ChatRequest(BaseModel):
     conversation_id: str | None = Field(default=None, max_length=80)
     attachment_ids: list[str] = Field(default_factory=list,max_length=5)
     agent_pause_id: str | None = Field(default=None, min_length=1, max_length=80)
-    agent_control: Literal['continue','end'] | None = None
+    agent_control: Literal['continue','retry','end'] | None = None
 
     @model_validator(mode='after')
     def validate_agent_control(self):

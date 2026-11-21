@@ -254,6 +254,7 @@ class MaterialReading:
                             decision['fallback'] = '结构化读取决定'
                     decision['tool_names'] = ['read_material' if request else 'finish_reading']
             except HTTPException as error:
+                if getattr(error,'stream_exhausted',False): raise
                 if getattr(error,'delivery_unknown',False) and agent:
                     reason = '读取规划响应中断，本步尚未取得原文。'
                 elif getattr(error,'invalid_tool_call',False) or getattr(error,'output_limited',False):
@@ -298,6 +299,7 @@ class MaterialReading:
                             {'complete': reading.get('complete'), 'error': reading.get('error')})
                 trace.point('check', {'file_id': request.file_id}, {'decision': '由模型核对读取结果'})
             except HTTPException as error:
+                if getattr(error,'stream_exhausted',False): raise
                 if agent and getattr(error,'delivery_unknown',False):
                     readings.append({'file_id':request.file_id,'error':'本次原件读取未返回正文，未确认读取成功。'})
                     if progress:progress({'type':'status','stage':'material_error','message':'本次原件读取未完成'})

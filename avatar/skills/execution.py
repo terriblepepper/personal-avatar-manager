@@ -168,6 +168,11 @@ class SkillExecution:
                         action = await choose()
                     decision.update(action=action['action'], input_ids=action.get('input_ids', []))
             except HTTPException as exc:
+                if agent and getattr(exc,'stream_exhausted',False):
+                    stopped=pause(exc.detail)
+                    stopped.stream_retryable=True
+                    stopped.answer_route=config.get('_answer_route')
+                    raise stopped from None
                 if getattr(exc,'output_limited',False):
                     notices.append('脚本规划达到本步输出上限。本步未执行，请依据已取得的资料继续，并说明仍需脚本的部分。')
                     background['script_planning_notice']=notices[-1]

@@ -120,7 +120,7 @@ class GenerationStore:
             for event in snapshot.get('tool_events',[]):
                 if event.get('status')=='running':event['status']='interrupted'
         if state=='awaiting_input':
-            snapshot.update(status=result['status'],agent_pause_id=result['agent_pause_id'],stage=state,reply=result.get('reply',''))
+            snapshot.update(status=result['status'],agent_pause_id=result['agent_pause_id'],stream_retryable=result.get('stream_retryable',False),stage=state,reply=result.get('reply',''))
         db.execute('UPDATE chat_generation_jobs SET state=?,snapshot=?,updated_at=? WHERE task_id=?',(state,canonical(snapshot),time.time(),row['task_id']))
         if row['conversation_id']:
             db.execute('INSERT OR REPLACE INTO chat_pending VALUES(?,?,?,?)',(row['conversation_id'],user_id,canonical({**snapshot,'request_id':request_id}),time.time()))

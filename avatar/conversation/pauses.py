@@ -24,6 +24,8 @@ def checked(db, user_id, request):
     if request.agent_control:
         if not task or task['snapshot']['agent_pause_id'] != request.agent_pause_id:
             raise HTTPException(409,'原暂停状态已改变，请刷新会话')
+        if request.agent_control=='retry' and not task['snapshot'].get('stream_retryable'):
+            raise HTTPException(409,'该任务需要补充信息才能继续')
     elif task:
         raise HTTPException(409,'分身正在等待补充信息或结束任务，请刷新会话')
     return task
@@ -60,13 +62,16 @@ def continue_task(chat, user, request, parent, task):
         receipts=numeric_receipts(db,user['id'],parent['id'],task)
         artifacts = available_outputs(chat,db,user['id'],parent['id'],task['outputs'])
     if not target or not session:raise HTTPException(409,'原分身或会话已变更，请结束任务后重新提问')
-    message = task['objective']+'\n\n用户补充：'+request.message
+    message = task['objective'] if request.agent_control=='retry' else task['objective']+'\n\n用户补充：'+request.message
     if len(message)>16000:raise HTTPException(422,'本任务累计输入已达上限，请结束后重新提问')
-    work = request.model_copy(update={'message':message})
+    files = task.get('attachment_ids',[]) if request.agent_control=='retry' else request.attachment_ids
+    work = request.model_copy(update={'message':message,'attachment_ids':files})
     overview, context = chat.context(user,work,target,private_access=True)
     overview['_parent_id']=parent['id']
     overview['_target']={'aic':target['aic'],'name':overview['agent']['profile'].get('avatar_name','我的分身')}
     cfg,key,system,history=context
+    if request.agent_control=='retry' and task.get('answer_route'):
+        cfg={**cfg,'_answer_route':task['answer_route']}
     if task['snapshot'].get('reply'):
         prefix,raw=system.split('\n',1)
         background=json.loads(raw)
@@ -91,7 +96,7 @@ def update_waiters(db, user_id, parent_id, pause_id, state, result):
     if not pause_id:return
     # Earlier request URLs also follow the task after another browser submits a decision.
     if state=='awaiting_input':
-        changes={'status':result['status'],'reply':result['reply'],'agent_pause_id':result['agent_pause_id'],'result':result}
+        changes={'status':result['status'],'reply':result['reply'],'agent_pause_id':result['agent_pause_id'],'stream_retryable':result.get('stream_retryable',False),'result':result}
     else:
         changes={'state':state,'stage':state,'done':state=='succeeded','status':result['reply'] if state=='cancelled' else '回答完成',
                  'reply':result['reply'],'result':result,'usage':result.get('usage'),'agent_pause_id':None}
@@ -117,6 +122,7 @@ def pause(chat, user, request, work, parent, session, overview, error, previous)
     job=current_generation.get()
     result={'state':'awaiting_input','done':False,'reply':error.question or '','status':str(error),'usage':error.usage,
             'agent_pause_id':pause_id,'conversation_id':parent['id'],'message':request.message,'stage':'awaiting_input'}
+    result['stream_retryable'] = bool(getattr(error,'stream_retryable',False))
     if job:result.update(request_id=job['request_id'],task_id=job['task_id'])
     owner=overview['agent']
     with ExitStack() as resources, chat.service.database.connect(write=True) as db:
@@ -131,7 +137,8 @@ def pause(chat, user, request, work, parent, session, overview, error, previous)
         if files:resources.enter_context(chat.chat_files.storing_outputs(db,user['id'],parent['id'],None,files))
         outputs=list(dict.fromkeys([*(previous['outputs'] if previous else []),*(item['id'] for item in files)]))
         document={'aic':owner['aic'],'owner':owner['user_id'],'session_id':session['id'],
-                  'checkpoint':error.checkpoint,'objective':work.message,'snapshot':result,'outputs':outputs}
+                  'retry_dispatch':getattr(error,'retry_dispatch',False),'answer_route':getattr(error,'answer_route',None),
+                  'checkpoint':error.checkpoint,'objective':work.message,'attachment_ids':work.attachment_ids,'snapshot':result,'outputs':outputs}
         db.execute('INSERT OR REPLACE INTO chat_agent_pauses(conversation_id,pause_id,document) VALUES(?,?,?)',
                    (parent['id'],pause_id,dump(document)))
         db.execute('UPDATE chat_conversations SET updated_at=? WHERE id=?',(now(),parent['id']))

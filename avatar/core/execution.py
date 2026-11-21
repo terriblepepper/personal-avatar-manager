@@ -127,7 +127,8 @@ def model_failure(error):
     issue = getattr(error,'tool_issue',None)
     if not issue:
         if getattr(error,'delivery_unknown',False):
-            issue = '上游请求已发出，响应未确认，未自动重发'
+            issue = ('模型断流，5 次自动重试已用尽' if getattr(error,'stream_exhausted',False) else
+                     getattr(error,'timeout_reason',None) or '上游请求已发出，响应未确认，未自动重发')
         elif getattr(error,'request_not_sent',False):
             issue = '连接失败，请求未发出'
         elif getattr(error,'output_limited',False):

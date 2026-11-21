@@ -503,6 +503,7 @@ class AvatarChat:
     async def stream(self, user, request):
         lock = self.locks.setdefault(request.conversation_id or user['id'], asyncio.Lock())
         acquired = None
+        overview = context = session = prepared = None
         failure_stage='lookup'
         try:
             if lock.locked():
@@ -532,7 +533,9 @@ class AvatarChat:
                     overview,context,session,request=pauses.continue_task(self,user,request,parent,held)
                     local_reply=None
                     config = context[0]
-                    if (self.dialogues and overview.get('_private_context') and overview['agent'].get('identity_status')=='active'
+                    if request.agent_control=='retry' and held.get('retry_dispatch'):
+                        overview,context,session,local_reply=await self.dispatch(user,request,parent)
+                    elif (not config.get('_answer_route') and self.dialogues and overview.get('_private_context') and overview['agent'].get('identity_status')=='active'
                             and not session.get('parent_id') and not config.get('_agent_saved_files')
                             and not config.get('_agent_checkpoint',{}).get('sandbox_attempted')):
                         steps = AgentSteps(ToolActivity(route_records, route_events.append).emit)
@@ -591,6 +594,7 @@ class AvatarChat:
                     from avatar.core.execution import check_execution_async
                     events = asyncio.Queue()
                     async def answer_with_events():
+                        nonlocal prepared
                         try:
                             prepared = await self.prepare(user, request, overview, context, session, events.put_nowait)
                             await check_execution_async()
@@ -607,6 +611,7 @@ class AvatarChat:
                         while (event := await events.get()) is not None:
                             if event['type'] == 'status':
                                 failure_stage = event['stage']
+                                if event.get('reset_reply'): text.clear()
                             elif event['type'] == 'contact_draft':
                                 overview['_contact_draft']=event['document']
                                 continue
@@ -649,6 +654,23 @@ class AvatarChat:
             else:
                 yield {'type':'awaiting_input',**result}
         except HTTPException as exc:
+            if getattr(exc,'stream_exhausted',False):
+                retry_dispatch = overview is None
+                if retry_dispatch:
+                    overview=await asyncio.to_thread(self.service.overview,user['id'])
+                if overview.get('agent'):
+                    pause_context=prepared or context
+                    paused=AgentNeedsInput.from_context(exc.detail,pause_context[0] if pause_context else {})
+                    paused.stream_retryable=True
+                    paused.retry_dispatch=retry_dispatch or bool(held and held.get('retry_dispatch') and prepared is None)
+                    paused.answer_route=pause_context[0].get('_answer_route') if pause_context else None
+                    try:
+                        result=await run_blocking(pauses.pause,self,user,original,request,parent,session or parent,overview,paused,held)
+                    except HTTPException as error:
+                        yield {'type':'error','code':error.status_code,'message':error.detail}
+                    else:
+                        yield {'type':'awaiting_input',**result}
+                    return
             logging.getLogger(__name__).warning('Chat request failed: stage=%s code=%s detail=%s',failure_stage,exc.status_code,exc.detail)
             yield {'type':'error','code':exc.status_code,'message':exc.detail}
         except Exception as exc:

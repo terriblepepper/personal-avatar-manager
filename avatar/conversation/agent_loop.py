@@ -27,13 +27,19 @@ def _directory_allowed(system):
         return False
 
 
-async def _stream_final(source, emit, validate):
+async def _stream_final(source, emit, validate, progress=None):
     # Expose the first delta immediately, then validate and emit batches instead of querying SQL per token.
     chunks, pending = [], []
     final = None
     next_emit = 0
     async with aclosing(source):
         async for event in source:
+            if event.get('reset_reply'):
+                chunks.clear()
+                pending.clear()
+                next_emit = 0
+                if progress: progress(event)
+                continue
             if event['type'] == 'delta':
                 pending.append(event['text'])
                 if time.monotonic() < next_emit:
@@ -279,7 +285,11 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
     # Keep verified goals separate from the model's proposed actions.
     pending = []
     plan = []
-    if route_mode=='html' and not domain and 'create_html' in allowed:
+    saved_html = [item for item in config.get('_agent_saved_files',()) if item.get('html_mode') in ('2d','3d','html')]
+    if route_mode=='html' and not domain and not html_needed and any(not expected_mode or item['html_mode']==expected_mode for item in saved_html):
+        settings = {**settings,'_tools':[]}
+        prompt += '已有本任务的 HTML 原件，直接交付，勿重复制作。'
+    elif route_mode=='html' and not domain and 'create_html' in allowed:
         plan = [{'tool':'create_html','goal':'生成本轮 HTML 作品'}]
         pending = [dict(plan[0],goal_no=1)]
         settings = {**settings,'_tools':[allowed['create_html']],'_optional_tools':False}
@@ -373,10 +383,12 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
         structured = (planned_lookup is None and invalid == 1 and lookup_tool in ('find_material','find_animation','find_public_material')
                       and any(t['name']==lookup_tool for t in settings['_tools']))
         step_settings = {**settings,'_call_purpose':'goal_decision','_batch_tools':True} if settings['_tools'] else settings
+        if lookup_tool == 'create_html' and any(t['name']=='create_html' for t in settings['_tools']):
+            step_settings = {**step_settings,'_call_purpose':'html_generation'}
         step_prompt = prompt
         repairing_html = html_repair is not None and not queued_call
         if repairing_html:
-            step_settings = {**settings,'_tools':[],'_recover_thinking':True,'_call_purpose':'goal_decision'}
+            step_settings = {**settings,'_tools':[],'_recover_thinking':True,'_call_purpose':'html_generation'}
             step_prompt += '\n修复已选择的 create_html，仅返回其参数 JSON，不包裹工具名。'+html_repair
         elif structured:
             step_settings = {**settings,'_tools':[],'_recover_thinking':True,'_call_purpose':'goal_decision'}
@@ -423,7 +435,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                 elif can_stream:
                     validate()
                     source = rag.chat.model_client.stream(settings, key, prompt, working_history, message)
-                    result = await _stream_final(source, on_delta, validate)
+                    result = await _stream_final(source, on_delta, validate, progress)
                     streamed = True
                     account(result.usage)
                 else:
@@ -452,7 +464,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                                 finish_reason=result.finish_reason, usage=result.usage)
         except HTTPException as error:
             diagnostic = model_failure(error)
-            next_action = '结束本次请求'
+            next_action = '暂停，等待重试或结束' if getattr(error,'stream_exhausted',False) else '结束本次请求'
             if not diagnostic['delivery_unknown']:
                 if getattr(error,'output_limited',False) and not retry_truncated:
                     next_action = '压缩并接续'
@@ -466,6 +478,11 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                         run_id,iteration,current.get('goal_no'),lookup_tool,mode,error.status_code,diagnostic['reason'],
                         diagnostic['tool_count'],len(pending),diagnostic['delivery_unknown'],
                         round(1000*(time.monotonic()-started)),next_action)
+            if getattr(error,'stream_exhausted',False):
+                paused = AgentNeedsInput.from_context(error.detail,config,usage)
+                paused.stream_retryable = True
+                paused.answer_route = route
+                raise paused from None
             if getattr(error,'delivery_unknown',False):
                 raise
             if getattr(error, 'output_limited', False):

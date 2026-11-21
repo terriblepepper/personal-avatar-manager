@@ -79,6 +79,7 @@ class GenerationRunner:
                     first_delta = kind == 'delta' and not snapshot['reply'] and bool(event['text'])
                     if kind == 'delta': snapshot['reply'] += event['text']
                     elif kind == 'status':
+                        if event.get('reset_reply'): snapshot['reply']=''
                         snapshot.update(status=event['message'], stage=event.get('stage', 'generating'))
                         if event.get('target'): snapshot['target'] = event['target']
                     elif kind == 'usage': snapshot['usage'] = event['usage']

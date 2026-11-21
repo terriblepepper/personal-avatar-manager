@@ -94,7 +94,14 @@ class MaterialRag(MaterialReading,FileRag):
                     nonlocal delivered
                     delivered += len(text)
                     write({'type':'delta','text':text})
-                result = await self.answer(context, state['message'], progress=progress, on_delta=emit)
+                def report(event):
+                    nonlocal delivered
+                    if event.get('reset_reply'):
+                        delivered = 0
+                        write(event)
+                    elif progress:
+                        progress(event)
+                result = await self.answer(context, state['message'], progress=report, on_delta=emit)
                 self.validate(context)
                 if progress:
                     progress({'type': 'status', 'stage': 'result_ready',
@@ -285,6 +292,7 @@ class MaterialRag(MaterialReading,FileRag):
                     output.update(query=requested_query,
                                   decision='finish_reading' if requested_query is None else 'inspect_originals' if not requested_query else 'search_materials')
             except HTTPException as error:
+                if getattr(error,'stream_exhausted',False): raise
                 if not (config.get('_avatar_agent') and (recoverable(error) or getattr(error,'output_limited',False)
                                                          or getattr(error,'delivery_unknown',False))):
                     raise
@@ -306,7 +314,7 @@ class MaterialRag(MaterialReading,FileRag):
                 try:
                     plan=await call_with_retry(plan_query,lambda:self.validate(planning_context))
                 except HTTPException as error:
-                    if not (recoverable(error) or getattr(error,'delivery_unknown',False)):raise
+                    if getattr(error,'stream_exhausted',False) or not (recoverable(error) or getattr(error,'delivery_unknown',False)):raise
                     plan=FileQuery(query=state['query'])
             else:plan=await plan_query()
             return {'plan':plan.model_dump()}
