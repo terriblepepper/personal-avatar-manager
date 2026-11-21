@@ -10,7 +10,7 @@ from fastapi import HTTPException
 from wit.acps.identity.acs import AcsContractError
 from avatar.core.db import now, dump, event
 from avatar.protocols.registration.entity import EntityRegistrationRunner, staged_entity_metadata
-from avatar.protocols.registration.maintenance import maintain_entity, remove_retired_identity
+from avatar.protocols.registration.maintenance import RENEWAL_SCAN_SECONDS, maintain_entity, remove_retired_identity
 from avatar.protocols.registration.base import RegistrationPending, RegistrationFailure
 from avatar.protocols.identity.errors import identity_error_detail
 
@@ -225,7 +225,7 @@ class EntityLifecycleService:
         while True:
             try:
                 if time.monotonic() >= next_scan:
-                    next_scan = time.monotonic() + 60
+                    next_scan = time.monotonic() + RENEWAL_SCAN_SECONDS
                     await asyncio.to_thread(self.schedule_renewals)
                 if not await self.once():
                     await asyncio.sleep(1)

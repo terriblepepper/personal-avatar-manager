@@ -34,7 +34,7 @@ async function reg(manual=false){
   }catch(e){if(!disposed)registrationError.value=e instanceof Error?e.message:'注册状态读取失败'}finally{checking.value=false}
 }
 async function certificate(renew=false){
-  if(!session.user?.is_root || certBusy.value)return
+  if(certBusy.value)return
   certBusy.value=true
   try{
     if(renew && cert.value?.certificate){
@@ -74,12 +74,22 @@ async function save(resource:boolean){
     if(!disposed)ElMessage.success('配置已保存')
   }catch(e){if(!disposed)notifyError(e)}finally{busy.value=false}
 }
-onMounted(()=>{void loadSettings();void loadResources(true);if(session.user?.is_root){void reg();void certificate();timer=setInterval(()=>{if(!document.hidden){void reg();if(['queued','running'].includes(cert.value?.renewal?.state||''))void certificate()}},5000)}})
+onMounted(()=>{
+  void loadSettings()
+  void loadResources(true)
+  void certificate()
+  if(session.user?.is_root)void reg()
+  timer=setInterval(()=>{
+    if(document.hidden)return
+    if(session.user?.is_root)void reg()
+    if(['queued','running'].includes(cert.value?.renewal?.state||''))void certificate()
+  },5000)
+})
 onBeforeUnmount(()=>{disposed=true;clearInterval(timer)})
 </script>
 <template>
   <section v-if="session.user?.is_root" class="card"><div class="cardhead"><h2>管理系统与个人实体注册</h2><button class="button small" :disabled="checking" @click="reg(true)">立即检查</button></div>
-    <p class="sub">审核与证书每小时自动检查一次。管理系统提供协议端点，个人分身独立维护身份与证书。</p>
+    <p class="sub">注册审核每小时检查一次，正式证书每 30 分钟检查一次。管理系统提供协议端点，个人分身独立维护身份与证书。</p>
     <p v-if="registrationError" class="notice error" role="alert">{{ registrationError }}</p>
     <div v-if="registration" role="status">
       <template v-for="(item,i) in [registration,registration.avatar_ontology]" :key="i"><section v-if="item">
@@ -114,18 +124,16 @@ onBeforeUnmount(()=>{disposed=true;clearInterval(timer)})
     <dt>身份框架</dt><dd>{{ Object.entries(environment.framework_versions || {}).map(([name,v])=>name+' '+(v || '版本信息不可用')).join(' / ') || '未提供' }}</dd>
     <dt>操作手册</dt><dd>{{ environment.manual_path || '当前部署未提供' }}</dd>
   </dl>
-    <template v-if="session.user?.is_root">
-      <div class="cardhead"><h3>平台证书</h3><div>
-        <button class="button small" :disabled="certBusy" @click="certificate()">刷新状态</button>
-        <button class="button small" :disabled="certBusy || !cert?.certificate || ['queued','running'].includes(cert?.renewal?.state||'')" @click="certificate(true)">立即续签</button>
-      </div></div>
-      <p v-if="certError" class="notice error" role="alert">{{ certError }}</p>
-      <dl v-if="cert?.certificate" class="kv">
-        <dt>系统 AIC</dt><dd>{{ cert.certificate.aic }}</dd><dt>签发者</dt><dd>{{ cert.certificate.issuer }}</dd>
-        <dt>客户端指纹</dt><dd>{{ cert.certificate.id }}</dd><dt>证书代次</dt><dd>{{ cert.certificate.generation }}</dd>
-        <dt>最早到期时间</dt><dd>{{ date(cert.certificate.expires_at) }}</dd>
-      </dl><p v-else-if="cert" class="sub">暂无可核验的平台证书。</p>
-      <p v-if="cert?.renewal?.state" class="sub" role="status">{{ certStates[cert.renewal.state] }} · {{ date(cert.renewal.updated_at || '') }}</p>
-    </template>
+    <div class="cardhead"><h3>平台证书</h3><div>
+      <button class="button small" :disabled="certBusy" @click="certificate()">刷新状态</button>
+      <button class="button small" :disabled="certBusy || !cert?.certificate || ['queued','running'].includes(cert?.renewal?.state||'')" @click="certificate(true)">立即续签</button>
+    </div></div>
+    <p v-if="certError" class="notice error" role="alert">{{ certError }}</p>
+    <dl v-if="cert?.certificate" class="kv">
+      <dt>系统 AIC</dt><dd>{{ cert.certificate.aic }}</dd><dt>签发者</dt><dd>{{ cert.certificate.issuer }}</dd>
+      <dt>客户端指纹</dt><dd>{{ cert.certificate.id }}</dd><dt>证书代次</dt><dd>{{ cert.certificate.generation }}</dd>
+      <dt>最早到期时间</dt><dd>{{ date(cert.certificate.expires_at) }}</dd>
+    </dl><p v-else-if="cert" class="sub">暂无可核验的平台证书。</p>
+    <p v-if="cert?.renewal?.state" class="sub" role="status">{{ certStates[cert.renewal.state] }} · {{ date(cert.renewal.updated_at || '') }}</p>
   </section>
 </template>

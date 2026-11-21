@@ -16,6 +16,9 @@ from avatar.protocols.identity.system import create_identity_json
 from avatar.protocols.identity.document import identity_json, wit_candidate_config
 
 
+RENEWAL_SCAN_SECONDS = 30 * 60
+
+
 def remove_retired_identity(data_dir, user_id):
     """旧身份已远端注销；缺失目录表示上次清理已完成。"""
     try:

@@ -2,6 +2,7 @@
 import json
 from fastapi import APIRouter, Request, HTTPException, Depends
 from avatar.accounts.auth import current_user
+from avatar.api.routes import admin
 from avatar.protocols.identity.system import build_system_acs, system_identity_paths
 from avatar.protocols.identity.ontology import avatar_ontology_paths, build_avatar_ontology_acs, validate_avatar_ontology
 
@@ -75,19 +76,13 @@ async def refresh_system_registration(request: Request, user=Depends(current_use
     return system_registration_status(request, user)
 
 
-def certificate_admin(user=Depends(current_user)):
-    if not user.get('is_root') or user.get('access_scope', 'full') != 'full':
-        raise HTTPException(403, '仅根管理员可管理平台证书')
-    return user
-
-
 @router.get('/api/admin/system/certificate')
-def platform_certificate(request: Request, user=Depends(certificate_admin)):
+def platform_certificate(request: Request, user=Depends(admin)):
     return request.app.state.platform_certificate.status()
 
 
 @router.post('/api/admin/system/certificate/{fingerprint}/renew', status_code=202)
-async def renew_platform_certificate(fingerprint: str, request: Request, user=Depends(certificate_admin)):
+async def renew_platform_certificate(fingerprint: str, request: Request, user=Depends(admin)):
     await request.app.state.platform_certificate.request(fingerprint, user['username'])
     return {'status':'accepted'}
 
