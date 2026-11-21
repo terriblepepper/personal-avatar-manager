@@ -12,7 +12,7 @@ from avatar.core.execution import AgentSteps
 from avatar.core.execution import check_execution
 from avatar.models.limits import check_context
 from avatar.conversation.working_context import excerpt, fit_turn, fit_working_set, input_budget
-from avatar.skills.sandbox import LocalPythonSandbox
+from avatar.skills.sandbox import LocalPythonSandbox, SandboxUnavailable
 
 
 # 职责：记录单次请求图的规划和执行结果；不跨账户或会话保存运行状态。
@@ -225,6 +225,7 @@ class SkillExecution:
                 progress({'type': 'tool', 'id': activity_id, 'group': 'sandbox', 'name': record['name'],
                           'status': 'running', 'input': visible_input,
                           'steps': [{'time': now(), 'message': '正在准备并执行 Python 脚本'}]})
+            unavailable = False
             try:
                 resources={};size=0
                 if generated:
@@ -261,6 +262,7 @@ class SkillExecution:
                         inputs[item['id']]={'path':'inputs/'+item['id']+'/'+item['filename'],'read':lambda data=item['data']:data}
                 if revision!=self.skills.collection_date(user_id):raise HTTPException(409,'执行期间技能设置已改变，结果不再使用')
             except (RuntimeError,ValueError,OSError) as exc:
+                unavailable = isinstance(exc, SandboxUnavailable)
                 record.update(status='error',error=str(exc)[:2000])
             # 二进制输出只保留在服务端，模型只接收下载元信息与有界文字；stdout/stderr 展平为纯文本，避免二次 JSON 编码干扰回答模型。
             for key in ('stdout','stderr'):
@@ -269,6 +271,8 @@ class SkillExecution:
             if record.get('status')=='error':notices.append('技能脚本未成功，请展开执行过程查看错误详情。')
             if progress:progress({'type':'tool','id':activity_id,'name':record['name'],'status':'error' if record.get('status')=='error' else 'completed',
                                   'output':{key:record[key] for key in ('stdout','stderr','error','outputs','status') if key in record}})
+            if unavailable:
+                raise HTTPException(503,record['error'])
             results.append(record)
             # Keep status, errors and actual download receipts; shorten older process output first.
             budget=min(result_budget,max(256,input_budget(config)-estimate(context[2])-estimate(message))) if agent else result_budget

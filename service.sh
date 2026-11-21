@@ -4,16 +4,36 @@ set -euo pipefail
 cd -- "$(dirname -- "$(readlink -f -- "$0")")"
 umask 077
 action="${1:---help}"
-[[ $# -le 1 ]] || { echo '用法：./service.sh start|stop|install'; exit 2; }
+[[ $# -le 1 ]] || { echo '用法：./service.sh start|stop|install|check-sandbox'; exit 2; }
 case "$action" in
-  -h|--help) echo '用法：./service.sh start|stop|install'; exit 0 ;;
-  start|stop|install) ;;
-  *) echo '用法：./service.sh start|stop|install' >&2; exit 2 ;;
+  -h|--help) echo '用法：./service.sh start|stop|install|check-sandbox'; exit 0 ;;
+  start|stop|install|check-sandbox) ;;
+  *) echo '用法：./service.sh start|stop|install|check-sandbox' >&2; exit 2 ;;
 esac
-if [[ "$action" == start && -f .env ]]; then set -a; source .env; set +a; fi
+if [[ ( "$action" == start || "$action" == check-sandbox ) && -f .env ]]; then set -a; source .env; set +a; fi
 service=personal-avatar.service
 service_file="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$service"
+check_sandbox() {
+  [[ -x .venv/bin/python ]] || { echo '沙箱检查失败：当前虚拟环境缺少 Python。' >&2; return 1; }
+  .venv/bin/python - <<'PYTHON'
+import asyncio
+import sys
+from avatar.skills.sandbox import LocalPythonSandbox
+
+try:
+    result = asyncio.run(LocalPythonSandbox().execute('runtime-check', {
+        'check.py': b'import numpy as np\nprint(int(np.arange(4).sum()))'
+    }, 'check.py', [], timeout=30))
+    if result['status'] != 'success' or result['stdout'] != ['6']:
+        raise RuntimeError('沙箱未返回预期计算结果')
+except (RuntimeError, OSError, ValueError) as error:
+    sys.exit(f'沙箱检查失败：{error} 请核对 Deno、AVATAR_SANDBOX_RUNTIME 和沙箱依赖。')
+print('Python 沙箱离线计算自检通过。')
+PYTHON
+}
+if [[ "$action" == check-sandbox ]]; then check_sandbox; exit; fi
 [[ "$action" == stop || -x .venv/bin/python ]] || uv sync --locked
+if [[ "$action" == start && -n "${AVATAR_SANDBOX_RUNTIME:-}" ]]; then check_sandbox; fi
 
 owned_process() {
   [[ "$1" =~ ^[1-9][0-9]*$ ]] &&

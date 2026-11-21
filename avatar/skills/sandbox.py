@@ -12,8 +12,13 @@ import signal
 import sys
 import tempfile
 
-RUNTIME = Path(sys.prefix).resolve() / 'share/avatar-sandbox'
+RUNTIME = Path(os.environ.get('AVATAR_SANDBOX_RUNTIME') or Path(sys.prefix) / 'share/avatar-sandbox').resolve()
 ANALYSIS_PACKAGES = {'numpy': 'numpy', 'pandas': 'pandas', 'matplotlib': 'matplotlib', 'PIL': 'pillow'}
+
+
+class SandboxUnavailable(RuntimeError):
+    def __init__(self):
+        super().__init__('服务器的 Python 沙箱运行环境尚未就绪，请联系管理员准备运行环境后重试。')
 
 
 @lru_cache(maxsize=1)
@@ -67,6 +72,10 @@ class LocalPythonSandbox:
                 from avatar.skills.https_inputs import fetch_inputs
                 if authorize:
                     authorize()
+                library = RUNTIME / 'cache/npm/registry.npmjs.org/pyodide/0.27.8'
+                if (not (RUNTIME / 'ready').is_file() or not (library / 'pyodide.asm.wasm').is_file()
+                        or not os.access(Path(sys.prefix) / 'bin/deno', os.X_OK)):
+                    raise SandboxUnavailable()
                 remote = await fetch_inputs(https_inputs or [])
                 code = await asyncio.to_thread(self.prepare, resources, script, args, remote)
                 if authorize and https_inputs:
@@ -134,8 +143,6 @@ class LocalPythonSandbox:
     # 职责：在临时目录运行离线沙箱命令并收集有界输出；所有结束路径杀死并回收所属进程组。
     async def run(self, code, timeout):
         cache=RUNTIME/'cache'
-        if not (RUNTIME/'ready').is_file():
-            raise RuntimeError('本地 Python 沙箱尚未准备，请运行 scripts/prepare_sandbox.py')
         with tempfile.TemporaryDirectory(prefix='avatar-python-') as work:
             private_cache=Path(work)/'cache'
             private_cache.mkdir(mode=0o700)
