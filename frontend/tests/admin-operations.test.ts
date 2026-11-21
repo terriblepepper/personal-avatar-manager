@@ -160,3 +160,15 @@ it('renders the current operations page and its row-specific waiting job when re
     expect(notifyError).not.toHaveBeenCalled()
   }finally{wrapper.unmount()}
 })
+
+it('reads runtime registration and resource status as escaped text', async () => {
+  request.mockImplementation(async (path: string) => path === '/admin/settings' ? {
+    settings: {}, environment: { registration_adapter: 'Actual-ACPS', manual_path: '/deployment/manual.md', communication: [{ name: 'Web', value: '<script>test</script>' }] },
+  } : { policy: {}, effective_cpu_cores: 4, effective_memory_bytes: 8 * 1024 ** 3, active_jobs: 2, waiting: 3, pressure: true, enforcement: { mode: 'soft' } })
+  const panel = mount(SettingsPanel)
+  try {
+    await flushPromises()
+    for (const text of ['Actual-ACPS', '/deployment/manual.md', '<script>test</script>', '4 核', '8.0 GiB', '活跃 2', '等待 3', '资源压力', '软预算']) expect(panel.text()).toContain(text)
+    expect(panel.find('script').exists()).toBe(false)
+  } finally { panel.unmount() }
+})

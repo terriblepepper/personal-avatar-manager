@@ -1,6 +1,10 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, expect, it, vi } from 'vitest'
 import FilePreview from '../src/components/FilePreview.vue'
+import MarkdownContent from '../src/components/MarkdownContent.vue'
+import MermaidDiagram from '../src/components/MermaidDiagram.vue'
+import ThemePicker from '../src/components/ThemePicker.vue'
+import { fileSizeMB } from '../src/utils/format'
 
 const pdfPage = vi.hoisted(() => vi.fn())
 vi.mock('/static/vendor/pdfjs/legacy/build/pdf.mjs', () => ({
@@ -64,4 +68,54 @@ it.each(['txt', 'pdf'])('cycles matching %s pages forwards and backwards, includ
   await enter()
   expect(wrapper.text()).toContain('未找到匹配内容')
   wrapper.unmount()
+})
+
+it('formats decimal megabytes and keeps nonempty small files distinct from empty ones', () => {
+  expect([0, 1, 9999, 10000, 1250000].map(fileSizeMB)).toEqual(['0 MB', '<0.01 MB', '<0.01 MB', '0.01 MB', '1.25 MB'])
+})
+
+it('keeps code and tables while removing active HTML and external tracking images', () => {
+  const view = mount(MarkdownContent, { props: { source: '# 消息\n\n```python\nprint(1)\n```\n\n<script>alert(1)</script><img src="https://tracker.invalid/x" onerror="alert(1)"><a href="javascript:alert(1)">危险链接</a>\n\n| A | B |\n| - | - |\n| 1 | 2 |' } })
+  expect(view.find('h1').text()).toBe('消息')
+  expect(view.find('pre code').text()).toBe('print(1)')
+  expect(view.find('table').exists()).toBe(true)
+  expect(view.find('script').exists()).toBe(false)
+  expect(view.find('img').exists()).toBe(false)
+  expect(view.find('[onerror]').exists()).toBe(false)
+  expect(view.find('a[href^="javascript:"]').exists()).toBe(false)
+})
+
+it('zooms the isolated diagram while preserving its layout height', async () => {
+  const diagram = mount(MermaidDiagram, { props: { source: 'graph TD; A-->B' } })
+  try {
+    const input = diagram.get('input[aria-label="预览缩放比例"]')
+    await input.setValue('200')
+    await input.trigger('change')
+    await flushPromises()
+    const frame = diagram.get('iframe').element
+    expect(frame.parentElement?.style.width).toBe('640px')
+    expect(frame.parentElement?.style.height).toBe('360px')
+    expect(frame.getAttribute('sandbox')).toBe('allow-scripts')
+  } finally { diagram.unmount() }
+})
+
+it('follows system and storage events and applies a choice when storage is unavailable', async () => {
+  const changes = new EventTarget()
+  const media = Object.assign(changes, { matches: true })
+  vi.stubGlobal('matchMedia', () => media)
+  vi.stubGlobal('localStorage', { getItem() { throw Error('blocked') }, setItem() { throw Error('blocked') } })
+  const picker = mount(ThemePicker)
+  try {
+    expect(document.documentElement.dataset.theme).toBe('dark')
+    media.matches = false; changes.dispatchEvent(new Event('change'))
+    expect(document.documentElement.dataset.theme).toBe('light')
+    await picker.findAll('[role=menuitemradio]')[2]!.trigger('click')
+    expect(document.documentElement.dataset.themeMode).toBe('dark')
+    window.dispatchEvent(new StorageEvent('storage', { key: 'avatar.theme', newValue: 'light' }))
+    expect(document.documentElement.dataset.theme).toBe('light')
+    vi.stubGlobal('localStorage', { getItem: () => 'dark', setItem: vi.fn() })
+    const restored = mount(ThemePicker)
+    expect(document.documentElement.dataset.theme).toBe('dark')
+    restored.unmount()
+  } finally { picker.unmount() }
 })
