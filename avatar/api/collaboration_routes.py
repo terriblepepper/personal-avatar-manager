@@ -292,6 +292,11 @@ def delete_all_session_tasks(identifier:str,request:Request,user=Depends(current
     return request.app.state.dialogues.dismiss_all_history(user,identifier)
 
 
+@router.get('/agent-sessions/{identifier}/compact')
+def compact_usage(identifier:str,request:Request,task_id:str|None=None,user=Depends(current_user)):
+    return request.app.state.dialogues.compact_usage(user,identifier,task_id)
+
+
 @router.post('/agent-sessions/{identifier}/compact')
 async def compact_peer_session(identifier:str,request:Request,task_id:str|None=None,focus:str=Body(default='',embed=True,max_length=2000),user=Depends(current_user)):
     return await request.app.state.dialogues.compact(user,identifier,task_id,focus)

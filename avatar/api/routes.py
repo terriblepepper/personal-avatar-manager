@@ -284,6 +284,11 @@ def create_conversation(body: ConversationRequest, request: Request, user=Depend
     return {'id':row['id'],'title':row['title']}
 
 
+@router.get('/conversations/{conversation_id}/compact')
+def compact_usage(conversation_id:str,request:Request,user=Depends(auth.current_user)):
+    return request.app.state.chat.compact_usage(user,conversation_id)
+
+
 @router.post('/conversations/{conversation_id}/compact')
 async def compact_conversation(conversation_id:str,request:Request,focus:str=Body(default='',embed=True,max_length=2000),user=Depends(auth.current_user)):
     return await request.app.state.chat.compact(user,conversation_id,focus)

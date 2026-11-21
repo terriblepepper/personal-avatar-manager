@@ -297,7 +297,7 @@ onUnmounted(()=>{destroyed=true;olderRequest?.abort();controller.abort();generat
         </template></ToolActivity><ChatMarkdown v-if="pending.reply || (!pauseId && completedFiles.length)" :source="pending.reply" :attachments="pauseId ? [] : completedFiles" @preview="previewAttachment" :events="pending.tool_events" :diagrams="pending.mermaid_enabled!==false" :conversation-id="conversationId"/><ChatNotices :items="pending.tool_events" :message="pauseId ? pending.status : pending.error" :tone="!pauseId && pending.error?'error':'info'"/></article></template>
     </div>
     <form id="personal-chat-compose" data-guide-target="chat" class="personal-compose" @submit.prevent="send()">
-      <ComposerInput ref="input" v-model="draft" :catalog="skillCatalog" :session="conversationId" label="聊天消息" :placeholder="pauseId ? '补充任务所需信息…' : '向自己的分身提问，或输入 $ 选择技能…'" :disabled="busy||loading||!conversationId" submit-on-enter @submit="send()"/>
+      <ComposerInput ref="input" v-model="draft" :catalog="skillCatalog" :session="conversationId" :usage-url="conversationId ? selectedURL(conversationId)+'/compact' : ''" :usage-revision="(messages.at(-1)?.id || 0)+'/'+compressionThrough" label="聊天消息" :placeholder="pauseId ? '补充任务所需信息…' : '向自己的分身提问，或输入 $ 选择技能…'" :disabled="busy||loading||!conversationId" submit-on-enter @submit="send()"/>
     </form>
     <div class="chat-compose-actions">
       <ComposerToolbar v-if="conversationId" class="personal-chat-toolbar">

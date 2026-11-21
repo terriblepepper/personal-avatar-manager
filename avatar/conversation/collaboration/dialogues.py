@@ -822,23 +822,46 @@ class AgentDialogues:
         return [{**dict(r),'download_url':'/api/conversations/'+workspace+'/files/'+r['id']}
                 for r in rows if self.chat.chat_files.directory.new(speaker_id,r['id']+'.blob').is_file()]
 
+    @staticmethod
+    def memory_query(session_id,task_id,through,user_id):
+        scope = 'd.id=?' if task_id else "d.session_id=? AND d.delivery_mode='message'"
+        query = (' FROM agent_dialogue_messages m JOIN agent_dialogues d ON d.id=m.dialogue_id WHERE '+scope+
+                 ' AND m.id>? AND NOT EXISTS(SELECT 1 FROM agent_task_members tm WHERE tm.task_id=d.id AND tm.user_id=? AND tm.hidden=1)')
+        return query,(task_id or session_id,through,user_id)
+
     def memory_rows(self,db,session_id,task_id,through,user_id):
-        scope='d.id=?' if task_id else "d.session_id=? AND d.delivery_mode='message'"
-        rows=[dict(r) for r in db.execute('SELECT m.*,d.objective AS task_title FROM agent_dialogue_messages m JOIN agent_dialogues d ON d.id=m.dialogue_id WHERE '+scope+' AND m.id>? AND NOT EXISTS(SELECT 1 FROM agent_task_members tm WHERE tm.task_id=d.id AND tm.user_id=? AND tm.hidden=1) ORDER BY m.id',(task_id or session_id,through,user_id))]
+        query,params = self.memory_query(session_id,task_id,through,user_id)
+        rows=[dict(r) for r in db.execute('SELECT m.*,d.objective AS task_title'+query+' ORDER BY m.id',params)]
         for row in rows:
             row['content']=self.resources.localize(db,row['content'],row['dialogue_id'],user_id,row['id'])
         return rows
 
+    def compact_scope(self,db,user,session_id,task_id):
+        uid=user['id']
+        member=self.member(db,user,session_id)
+        job=None
+        if task_id:
+            job=self.owned(db,user,task_id)
+            if job['session_id']!=session_id:raise HTTPException(404,'任务不存在')
+            if job['delivery_mode']=='message':task_id,job=None,None
+        memory=db.execute('SELECT * FROM agent_task_members WHERE task_id=? AND user_id=? AND hidden=0',(task_id,uid)).fetchone() if task_id else member
+        if not memory:raise HTTPException(404,'会话不存在')
+        return member,memory,task_id,job
+
+    def compact_usage(self,user,session_id,task_id):
+        with self.database.connect() as db:
+            member,memory,task_id,job=self.compact_scope(db,user,session_id,task_id)
+            through=max(member['cleared_through'],memory['summary_through'])
+            query,params=self.memory_query(session_id,task_id,through,user['id'])
+            size=db.execute("SELECT COALESCE(SUM((octet_length(m.speaker_name || '：' || m.content)+2)/3 + 16),0)"+query,params).fetchone()[0]
+        _,context=self.chat.context(user,ChatRequest(channel='avatar',message='/compact'))
+        task_context=(job['objective']+'\n'+(job['shared_content'] or '')) if job else ''
+        return self.chat.memory.usage(context[0],context[2],memory['summary'],int(size),task_context)
+
     async def compact(self,user,session_id,task_id,focus=''):
         uid=user['id']
         with self.database.connect() as db:
-            member=self.member(db,user,session_id)
-            if task_id:
-                job=self.owned(db,user,task_id)
-                if job['session_id']!=session_id:raise HTTPException(404,'任务不存在')
-                if job['delivery_mode']=='message':task_id=None
-            memory=db.execute('SELECT * FROM agent_task_members WHERE task_id=? AND user_id=? AND hidden=0',(task_id,uid)).fetchone() if task_id else member
-            if not memory:raise HTTPException(404,'会话不存在')
+            member,memory,task_id,_=self.compact_scope(db,user,session_id,task_id)
             rows=self.memory_rows(db,session_id,task_id,max(member['cleared_through'],memory['summary_through']),uid)
             if not rows:return {'message':'没有新的消息需要压缩。'}
         overview,context=self.chat.context(user,ChatRequest(channel='avatar',message='/compact'))

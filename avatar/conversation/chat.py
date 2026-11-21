@@ -223,6 +223,18 @@ class AvatarChat:
         local_date=(parent['skills_updated_at']+'|'+parent['tools_updated_at']) if parent else ''
         return overview['agent']['last_modified_at']+('|owner' if overview.get('_private_context') else '')+('|'+local_date if local_date else '')
 
+    def compact_usage(self,user,identifier):
+        session = self.session(user['id'],'assistant',identifier,personal=True)
+        overview,context = self.context(user,ChatRequest(channel='avatar',message='/compact'),private_access=True)
+        revision = self.owner_memory_revision(overview,session)
+        summary = session['summary'] if session['summary_profile_modified_at'] == revision else ''
+        through = session['summary_through'] if summary else 0
+        with self.service.database.connect() as db:
+            size = db.execute("""SELECT COALESCE(SUM((octet_length(content)+2)/3 + 16),0)
+                FROM chat_messages WHERE conversation_id=? AND profile_modified_at=? AND id>?""",
+                (identifier,overview['agent']['last_modified_at'],through)).fetchone()[0]
+        return self.memory.usage(context[0],context[2],summary,int(size))
+
     async def compact(self,user,identifier,focus=''):
         session=self.session(user['id'],'assistant',identifier,personal=True)
         self.memory.acquire(identifier)
