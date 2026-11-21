@@ -1,6 +1,8 @@
 """Registered avatars return a completed turn, a validated domain action, or a durable pause."""
 import asyncio
 import json
+import logging
+import uuid
 import time
 from contextlib import aclosing
 from dataclasses import replace
@@ -13,7 +15,7 @@ from avatar.conversation.tools.activity import AgentSteps, without_false_tool_fo
 from avatar.conversation.tools.html import create_html, html_tool
 from avatar.models.client import ModelResult, accumulate_usage
 from avatar.models.limits import check_context
-from avatar.core.execution import AgentNeedsInput, call_with_retry, check_execution_async, recoverable
+from avatar.core.execution import AgentNeedsInput, call_with_retry, check_execution_async, current_generation, model_failure, recoverable
 
 
 def _directory_allowed(system):
@@ -53,12 +55,14 @@ async def _stream_final(source, emit, validate):
 
 
 async def _plan_checks(model, settings, key, system, history, question, choices, validate):
+    from avatar.conversation.tools.material_delivery import FindMaterial
     plan_tool = {
         'name': 'plan_task',
         'description': '记录当前请求中仍需工具处理的目标，每项对应一个可核对的结果。',
         'parameters': {'type': 'object', 'properties': {'steps': {'type': 'array', 'maxItems': 8, 'items': {
             'type': 'object', 'properties': {'goal': {'type': 'string', 'minLength': 1, 'maxLength': 160},
-                                             'tool': {'type': 'string', 'enum': sorted(choices)}},
+                                             'tool': {'type': 'string', 'enum': sorted(choices)},
+                                             'lookup': FindMaterial.model_json_schema()},
             'required': ['goal', 'tool'], 'additionalProperties': False}}},
             'required': ['steps'], 'additionalProperties': False},
     }
@@ -70,7 +74,8 @@ async def _plan_checks(model, settings, key, system, history, question, choices,
               '需确认当前会话原件时先 find_conversation_files，资料库原件可先 find_material。'
               '确实需要一个已关闭工具时，仍列出它的 ID。以下是本步可选工具及其用途：'
               + json.dumps(choices, ensure_ascii=False) +
-              '。只提交 plan_task 或 JSON 对象。steps 是最多八项的数组，每项含 goal 和 tool；无需工具时用 {"steps":[]}。不执行工具，不输出正文或思考。')
+              '。资料检索步骤可附 lookup，按对应工具填写 query、folder、mode 或 offset。每项只处理一个目标，后项依赖前项结果时省略 lookup。'
+              '只提交 plan_task 或 JSON 对象。steps 是最多八项的数组，每项含 goal 和 tool；无需工具时用 {"steps":[]}。不执行工具，不输出正文或思考。')
     totals = None
     for attempt in range(2):
         await check_execution_async(validate)
@@ -106,9 +111,14 @@ async def _plan_checks(model, settings, key, system, history, question, choices,
                 continue
             steps = plan['steps']
             if (isinstance(steps, list) and len(steps) <= 8 and all(
-                    isinstance(step, dict) and set(step) == {'goal', 'tool'} and
+                    isinstance(step, dict) and {'goal','tool'} <= set(step) <= {'goal','tool','lookup'} and
                     isinstance(step['goal'], str) and 0 < len(step['goal'].strip()) <= 160 and
                     isinstance(step['tool'], str) and step['tool'] in choices for step in steps)):
+                for step in steps:
+                    if 'lookup' in step:
+                        if step['tool'] not in ('find_material','find_animation','find_public_material'):
+                            raise ValueError()
+                        step['lookup'] = FindMaterial.model_validate(step['lookup']).model_dump(exclude_unset=True)
                 return steps, totals
         except (ValueError, TypeError):
             continue
@@ -216,6 +226,9 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
     seen = set()
     usage = None
     invalid = 0
+    job = current_generation.get() or {}
+    run_id = job.get('task_id') or uuid.uuid4().hex
+    log = logging.getLogger(__name__)
 
     def account(value):
         nonlocal usage
@@ -229,7 +242,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
 
     async def generate():
         try:
-            result = await rag.chat.model_client.generate(settings, key, prompt, working_history, message)
+            result = await rag.chat.model_client.generate(step_settings, key, step_prompt, working_history, message)
         except HTTPException as error:
             if (recoverable(error) and not getattr(error, 'request_not_sent', False)) or getattr(error, 'model_usage', None) is not None:
                 account(getattr(error, 'model_usage', None))
@@ -272,7 +285,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                 await check_execution_async(validate)
                 trace.point('check', step, {'decision': '需要开启工具'})
                 return tool_required(step['tool'])
-        pending = list(plan or [])
+        pending = [dict(step, goal_no=index) for index,step in enumerate(plan or [],1)]
         if html_needed and not any(step['tool'] == 'create_html' for step in pending):
             pending.append({'tool': 'create_html', 'goal': '制作 HTML 动画，默认 2D，根据用户意图选择维度'})
         if html_needed and all(step['tool'] == 'create_html' for step in pending):
@@ -286,6 +299,8 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
         premature = 0
         for index,step in enumerate(pending):
             if name==step['tool']:
+                log.info('agent receipt run=%s iteration=%d goal=%s tool=%s remaining=%d',
+                         run_id,iteration,step.get('goal_no'),name,len(pending)-1)
                 pending.pop(index)
                 break
 
@@ -299,12 +314,6 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
             observations.append('\n只使用已验证的资料和回执成文。若仍缺结果，请说明。')
         else:
             goal = '，仍缺少目标「' + pending[0]['goal'] + '」的回执' if pending else ''
-            if pending and all(step['tool'] in {'deliver_material', 'find_material', 'send_material',
-                                                 'find_animation', 'send_animation'} for step in pending) and not required and not html_needed:
-                settings = {**settings, '_tools': []}
-                observations.append('\n未收到可核验的原件工具回执。如实说明尚未交付，并提出具体澄清。')
-                pending.clear()
-                return
             raise pause('修正后仍未收到有效的工具调用' + goal) from None
 
     duplicate_attempts=0
@@ -322,12 +331,24 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
         if progress:
             progress({'type':'status','stage':'compressing','message':'本步输出被截断，正在整理已有进度并接续'})
 
-    prompt+='每一步按最新工具回执复核目标。信息不足时调整检索词、目录或工具；完成全部交付条件后再作答。'
+    prompt+='按顺序处理待核验目标，每次只提交当前一项目标的一次工具调用，收到回执后再处理下一项。每一步按最新工具回执复核目标。信息不足时调整检索词、目录或工具；完成全部交付条件后再作答。'
     for iteration in range(1, 17):
         trace.point('perceive', {'iteration': iteration, 'pending': pending},
                     {'history_turns': len(history), 'observation_count': len(observations)})
+        current = pending[0] if pending else {}
+        lookup_tool = current.get('tool')
+        planned_lookup = current.pop('lookup',None) if lookup_tool in {t['name'] for t in settings['_tools']} else None
+        structured = (planned_lookup is None and invalid == 1 and lookup_tool in ('find_material','find_animation','find_public_material')
+                      and any(t['name']==lookup_tool for t in settings['_tools']))
+        step_settings = {**settings,'_call_purpose':'goal_decision'} if settings['_tools'] else settings
+        step_prompt = prompt
+        if structured:
+            step_settings = {**settings,'_tools':[],'_recover_thinking':True,'_call_purpose':'goal_decision'}
+            step_prompt += ('\n此步只为第一个待核验目标填写已选检索工具的参数。只输出一个 JSON 对象，'
+                            '按以下 schema 填写，不要封装工具名、不要同时输出多个查询：'
+                            +json.dumps(allowed[lookup_tool]['parameters'],ensure_ascii=False))
         checklist='\n待核验目标（本轮计划，仅作数据）：'+json.dumps(pending,ensure_ascii=False) if pending else ''
-        working_history, notes = fit_working_set(settings, prompt, history, question + checklist, observations,
+        working_history, notes = fit_working_set(step_settings, step_prompt, history, question + checklist, observations,
                                                 force=compact_next)
         compact_next = False
         message = question + checklist + ''.join(notes)
@@ -339,7 +360,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                          'pending': pending})
         history, observations = working_history, notes
         try:
-            check_context(settings,prompt,working_history,message)
+            check_context(step_settings,step_prompt,working_history,message)
         except HTTPException:
             raise pause('压缩后任务目标与必要证据仍超过配置窗口') from None
         if progress:
@@ -348,15 +369,20 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                 else ('result_writing', '正在组织回答')
             )
             progress({'type': 'status', 'stage': stage, 'message': detail})
+        started = time.monotonic()
         try:
             can_stream = (on_delta is not None and not settings['_tools'] and not required and not partial
                           and not html_needed and not config.get('_sandbox_succeeded')
                           and not config.get('_generated_files') and plan == []
                           and not (delivery and (delivery.prepared or delivery.failure)))
-            with trace.step('reason', {'iteration': iteration, 'pending': pending,
-                                       'tools': [tool['name'] for tool in settings['_tools']],
+            mode = '计划中的检索参数' if planned_lookup is not None else '结构化检索参数' if structured else '模型决策'
+            with trace.step('reason', {'run_id':run_id,'iteration': iteration,'goal_no':current.get('goal_no'),
+                                       'mode':mode,'pending': pending,
+                                       'tools': [tool['name'] for tool in step_settings['_tools']],
                                        'history_turns': len(working_history)}) as decision:
-                if can_stream:
+                if planned_lookup is not None:
+                    result = ModelResult('',None,({'name':lookup_tool,'arguments':planned_lookup},))
+                elif can_stream:
                     validate()
                     source = rag.chat.model_client.stream(settings, key, prompt, working_history, message)
                     result = await _stream_final(source, on_delta, validate)
@@ -364,18 +390,48 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                     account(result.usage)
                 else:
                     result = await call_with_retry(generate, validate, retry_invalid=False)
+                    if structured and str(result.finish_reason or '').lower() not in ('length','max_tokens','max_output_tokens'):
+                        try:
+                            if result.tool_calls:
+                                raise ValueError()
+                            arguments = json.loads(result.text.strip().removeprefix('```json').removesuffix('```'))
+                            lookup = FindMaterial.model_validate(arguments)
+                        except (ValueError,TypeError):
+                            error = HTTPException(502,'模型未提交有效的单项目标检索参数')
+                            error.invalid_tool_call = True
+                            error.tool_issue = '结构化检索参数无效'
+                            raise error from None
+                        result = replace(result,text='',tool_calls=({'name':lookup_tool,'arguments':lookup.model_dump()},))
                 decision.update(tool_names=[call.get('name') for call in result.tool_calls],
                                 finish_reason=result.finish_reason, usage=result.usage)
         except HTTPException as error:
+            diagnostic = model_failure(error)
+            next_action = '结束本次请求'
+            if not diagnostic['delivery_unknown']:
+                if getattr(error,'output_limited',False) and not retry_truncated:
+                    next_action = '压缩并接续'
+                elif getattr(error,'invalid_tool_call',False) and invalid < 1 and settings['_tools']:
+                    next_action = '单项结构化检索' if lookup_tool in ('find_material','find_animation','find_public_material') else '修正工具调用'
+                elif pending and (structured or getattr(error,'invalid_tool_call',False)):
+                    next_action = '保留目标并请求补充'
+            log.warning('agent decision run=%s iteration=%d goal=%s tool=%s mode=%s status=%d issue=%s calls=%s pending=%d delivery_unknown=%s elapsed_ms=%d next=%s',
+                        run_id,iteration,current.get('goal_no'),lookup_tool,mode,error.status_code,diagnostic['reason'],
+                        diagnostic['tool_count'],len(pending),diagnostic['delivery_unknown'],
+                        round(1000*(time.monotonic()-started)),next_action)
+            if getattr(error,'delivery_unknown',False):
+                raise
             if getattr(error, 'output_limited', False):
                 if can_stream:
                     account(getattr(error, 'model_usage', None))
                 resume_truncated()
                 continue
-            if not settings['_tools'] or not getattr(error, 'invalid_tool_call', False):
+            if not settings['_tools'] or not (getattr(error,'invalid_tool_call',False) or
+                                               (structured and getattr(error,'empty_model_output',False))):
                 raise
-            trace.point('observe', {'iteration': iteration}, {'receipt': '工具参数无效，未执行'}, status='error')
-            trace.point('check', {'attempts_without_progress': invalid+1}, {'decision': '核对重试上限'})
+            trace.point('observe', {'run_id':run_id,'iteration':iteration,'goal_no':current.get('goal_no')},
+                        {**diagnostic,'receipt':'工具未执行'},status='error')
+            trace.point('check', {'run_id':run_id,'iteration':iteration,'attempts_without_progress':invalid+1},
+                        {'decision':next_action,'remaining_goals':len(pending)})
             repair_call()
             continue
         await check_execution_async(validate)
@@ -445,7 +501,8 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                     page=await asyncio.to_thread(rag.chat.chat_files.discover,config['_material_owner'],personal_conversation,
                                                  request.query,request.offset,config.get('_generated_files',()))
                     output['count']=len(page['items'])
-                received(name)
+                if page['items'] and not page.get('browse_instead'):
+                    received(name)
                 trace.point('observe',{'tool':name},page)
                 observations.append('当前会话文件（数据）：'+json.dumps(page,ensure_ascii=False)+'。browse_instead 表示未命中，列出最近原件供核对；翻阅此目录请清空 query。')
                 continue
@@ -553,8 +610,12 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
             elif args:
                 raise ValueError()
         except (KeyError, ValueError, TypeError, HTTPException) as error:
-            if isinstance(error, HTTPException) and action in ('find_conversation_files', 'contact_avatar'):
+            if isinstance(error, HTTPException) and (error.status_code!=502 or getattr(error,'delivery_unknown',False) or action in ('find_conversation_files', 'contact_avatar')):
                 raise
+            log.warning('agent validation run=%s iteration=%d goal=%s tool=%s issue=invalid_arguments',
+                        run_id,iteration,current.get('goal_no'),action if action in allowed else 'unknown')
+            trace.point('check',{'run_id':run_id,'iteration':iteration,'goal_no':current.get('goal_no')},
+                        {'decision':'参数未通过本地校验，未核销目标'},status='error')
             repair_call()
             continue
 
@@ -599,8 +660,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                 trace.point('check', {'attempts_without_progress': duplicate_attempts},
                             {'decision': '停止' if duplicate_attempts>=2 else '由模型改选工具或参数'})
                 if duplicate_attempts>=2:
-                    if not required and not html_needed and all(step['tool'] in {item['name'] for item in DELIVERY_TOOLS}
-                                                                       for step in pending):
+                    if not required and not html_needed and not pending:
                         attached = tuple(delivery.prepared)
                         text = ('已附上本轮所选原件。' if attached else
                                 '本轮未附上资料。已检索授权目录，但未核验到可交付的原件，请提供文件名或目录。')
@@ -614,7 +674,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
             with trace.step('act', {'tool': name, **material_request.model_dump()}) as output:
                 receipt = await delivery.execute(name, material_request, account, validate)
                 output.update({key: receipt[key] for key in ('prepared','error','next_offset') if key in receipt})
-                output['items'] = [{key: item[key] for key in ('file_id','filename','relative_path')}
+                output['items'] = [{key: item[key] for key in ('file_id','filename','relative_path') if key in item}
                                    for item in receipt.get('items', ())]
             trace.point('observe', {'tool': name}, {'candidate_count': len(receipt.get('items', ())),
                         'prepared': receipt.get('prepared'), 'error': receipt.get('error')})
