@@ -6,6 +6,9 @@ import { useSessionStore } from '../../stores/session'
 import { date } from '../../utils/format'
 interface ResourceState {policy:Record<string,number|boolean>;enforcement:{mode:string;error?:string};effective_cpu_cores:number;effective_memory_bytes:number;active_jobs:number;waiting:number;pressure:boolean}
 interface Environment {registration_adapter?:string;registration_mode?:string;communication?:{name:string;value:string|null}[];framework_versions?:Record<string,string|null>;manual_path?:string}
+interface PlatformCert {certificate:{id:string;aic:string;generation:number;issuer:string;expires_at:string}|null;renewal:{state?:string;updated_at?:string}}
+const cert=ref<PlatformCert|null>(null), certError=ref(''), certBusy=ref(false)
+const certStates:Record<string,string>={queued:'已排队',running:'正在续签',done:'新证书已核验',changed:'证书已更换',unconfirmed:'续签结果待核对，请先刷新证书详情'}
 interface Registration {enabled:boolean;phase:string;registration_id?:string;aic?:string;aip?:{endpoint?:string;serving?:boolean};updated_at?:string;message?:string;reason?:string;avatar_ontology?:Registration;personal_registration_mode?:string}
 const session=useSessionStore(), registration=ref<Registration|null>(null), registrationError=ref(''), checking=ref(false)
 const resources=ref<ResourceState|null>(null),policy=ref<Record<string,number|boolean>>({}),settings=ref<Record<string,string>>({}),environment=ref<Environment>({}),mode=ref(''),busy=ref(false)
@@ -29,6 +32,18 @@ async function reg(manual=false){
     const value=await request<Registration>('/admin/system/registration'+(manual?'/refresh':''),manual?'POST':'GET')
     if(!disposed){registration.value=value;registrationError.value=''}
   }catch(e){if(!disposed)registrationError.value=e instanceof Error?e.message:'注册状态读取失败'}finally{checking.value=false}
+}
+async function certificate(renew=false){
+  if(!session.user?.is_root || certBusy.value)return
+  certBusy.value=true
+  try{
+    if(renew && cert.value?.certificate){
+      await request('/admin/system/certificate/'+encodeURIComponent(cert.value.certificate.id)+'/renew','POST')
+    }
+    const value=await request<PlatformCert>('/admin/system/certificate')
+    if(!disposed){cert.value=value;certError.value=''}
+  }catch(e){if(!disposed)certError.value=e instanceof Error?e.message:'平台证书操作失败'}
+  finally{if(!disposed)certBusy.value=false}
 }
 async function loadResources(initial=false){
   const ticket=++resourceSequence
@@ -59,7 +74,7 @@ async function save(resource:boolean){
     if(!disposed)ElMessage.success('配置已保存')
   }catch(e){if(!disposed)notifyError(e)}finally{busy.value=false}
 }
-onMounted(()=>{void loadSettings();void loadResources(true);if(session.user?.is_root){void reg();timer=setInterval(()=>{if(!document.hidden)void reg()},5000)}})
+onMounted(()=>{void loadSettings();void loadResources(true);if(session.user?.is_root){void reg();void certificate();timer=setInterval(()=>{if(!document.hidden){void reg();if(['queued','running'].includes(cert.value?.renewal?.state||''))void certificate()}},5000)}})
 onBeforeUnmount(()=>{disposed=true;clearInterval(timer)})
 </script>
 <template>
@@ -98,5 +113,19 @@ onBeforeUnmount(()=>{disposed=true;clearInterval(timer)})
     <dt>通信模式</dt><dd><div v-for="item in environment.communication" :key="item.name">{{ item.name }}：{{ item.value || '未启用' }}</div><span v-if="!environment.communication?.length">未提供</span></dd>
     <dt>身份框架</dt><dd>{{ Object.entries(environment.framework_versions || {}).map(([name,v])=>name+' '+(v || '版本信息不可用')).join(' / ') || '未提供' }}</dd>
     <dt>操作手册</dt><dd>{{ environment.manual_path || '当前部署未提供' }}</dd>
-  </dl></section>
+  </dl>
+    <template v-if="session.user?.is_root">
+      <div class="cardhead"><h3>平台证书</h3><div>
+        <button class="button small" :disabled="certBusy" @click="certificate()">刷新状态</button>
+        <button class="button small" :disabled="certBusy || !cert?.certificate || ['queued','running'].includes(cert?.renewal?.state||'')" @click="certificate(true)">立即续签</button>
+      </div></div>
+      <p v-if="certError" class="notice error" role="alert">{{ certError }}</p>
+      <dl v-if="cert?.certificate" class="kv">
+        <dt>系统 AIC</dt><dd>{{ cert.certificate.aic }}</dd><dt>签发者</dt><dd>{{ cert.certificate.issuer }}</dd>
+        <dt>客户端指纹</dt><dd>{{ cert.certificate.id }}</dd><dt>证书代次</dt><dd>{{ cert.certificate.generation }}</dd>
+        <dt>最早到期时间</dt><dd>{{ date(cert.certificate.expires_at) }}</dd>
+      </dl><p v-else-if="cert" class="sub">暂无可核验的平台证书。</p>
+      <p v-if="cert?.renewal?.state" class="sub" role="status">{{ certStates[cert.renewal.state] }} · {{ date(cert.renewal.updated_at || '') }}</p>
+    </template>
+  </section>
 </template>

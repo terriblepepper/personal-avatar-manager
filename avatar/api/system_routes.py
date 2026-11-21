@@ -75,6 +75,23 @@ async def refresh_system_registration(request: Request, user=Depends(current_use
     return system_registration_status(request, user)
 
 
+def certificate_admin(user=Depends(current_user)):
+    if not user.get('is_root') or user.get('access_scope', 'full') != 'full':
+        raise HTTPException(403, '仅根管理员可管理平台证书')
+    return user
+
+
+@router.get('/api/admin/system/certificate')
+def platform_certificate(request: Request, user=Depends(certificate_admin)):
+    return request.app.state.platform_certificate.status()
+
+
+@router.post('/api/admin/system/certificate/{fingerprint}/renew', status_code=202)
+async def renew_platform_certificate(fingerprint: str, request: Request, user=Depends(certificate_admin)):
+    await request.app.state.platform_certificate.request(fingerprint, user['username'])
+    return {'status':'accepted'}
+
+
 # 职责：拒绝通过普通 Web HTTP 端口冒用 AIP RPC。
 # 输入：不读取正文，不信任 X-Client-Cert、X-Peer-AIC 等伪造身份头。
 # 结果与约束：固定拒绝；真实 RPC 由独立 wit mTLS listener 处理，不能借此绕过客户端证书认证。

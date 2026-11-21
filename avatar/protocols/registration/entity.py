@@ -107,8 +107,9 @@ def build_entity_candidate(ontology, user_id, profile, endpoint=None, oidc_ident
 # 结果与约束：保存公开 PEM、指纹、到期日等，不保存私钥、ACME 账号或 EAB；私有状态继续由 wit 专用目录维护。
 def certificate_projection(material, generation, ontology_aic):
     certificate = x509.load_pem_x509_certificate(material.certificate.encode())
+    server = x509.load_pem_x509_certificate(material.server_certificate.encode())
     return {'id': certificate.fingerprint(hashes.SHA256()).hex(), 'generation': generation,
-            'expires_at': certificate.not_valid_after_utc.isoformat(), 'issuer': certificate.issuer.rfc4514_string(),
+            'expires_at': min(certificate.not_valid_after_utc, server.not_valid_after_utc).isoformat(), 'issuer': certificate.issuer.rfc4514_string(),
             'mode': 'acps-entity', 'status': '正式证书已核验', 'ontology_aic': ontology_aic,
             'public_pem': material.certificate, 'server_public_pem': material.server_certificate}
 

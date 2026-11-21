@@ -1096,7 +1096,7 @@ def test_html_modes_and_legacy_animation_setting(context):
 
     assert switches(result) == {'python': False, 'animation': False}
     updated = user.patch('/api/conversations/'+cid+'/tools', json={'tools': {'animation': True}})
-    assert switches(updated) == {'python': False, 'animation': True}
+    assert switches(updated) == {'python': True, 'animation': True}
     assert switches(user.get('/api/conversations/'+cid+'/tools')) == switches(updated)
     from avatar.conversation.tools.html import html_tool
     assert html_tool(True)['parameters']['properties']['mode']['enum'] == ['2d', '3d']

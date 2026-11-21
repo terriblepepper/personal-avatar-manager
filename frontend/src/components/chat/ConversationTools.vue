@@ -35,7 +35,9 @@ async function change(tool: Tool, event: Event) {
   if (props.busy || saving.value) { input.checked = tool.enabled; return }
   const signal = controller.signal, previous = tools.value
   saving.value = true
-  tools.value = previous.map(item=>item.id===tool.id ? {...item,enabled:checked} : item)
+  const enableSandbox = tool.id === 'animation' && checked
+  tools.value = previous.map(item => item.id === tool.id || (enableSandbox && item.id === 'python')
+    ? { ...item, enabled: checked } : item)
   try {
     const result = await request<{items:Tool[]}>(endpoint.value,'PATCH',{tools:{[tool.id]:checked}},signal)
     if (!signal.aborted) tools.value = result.items
