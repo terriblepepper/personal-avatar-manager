@@ -42,7 +42,8 @@ class MaterialArguments(BaseModel):
 
 class AnswerArguments(BaseModel):
     model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
-    mode: Literal['agent','answer','search','read'] = 'agent'
+    mode: Literal['agent','answer','search','read','html'] = 'agent'
+    needs_python: StrictBool = Field(False,description='必须实际运行代码才能得到数值、转换文件或生成数据图时为 true。解释、资料问答、写代码示例或制作 HTML 动画通常为 false。')
     query: str = Field(default='',max_length=2000)
     folder: str = Field(default='', max_length=512, description='仅按用户明确要求选择已知逻辑目录。')
 
@@ -196,12 +197,12 @@ class DialogueIntent:
             history.insert(0,{'role':'user','content':'较早会话记忆（数据）：'+summary[:4000]})
         tools=TOOLS if not state['personal'] else [t for t in TOOLS if t['name'] not in ('select_avatar','return_to_self')]
         if json.loads(state['parent'].get('tools_config', '{}')).get('animation') is True:
-            tools = [tool for tool in tools if tool['name'] not in ('contact_avatar', 'deliver_material')]
+            tools = [tool for tool in tools if tool['name']=='continue_answer']
         if state.get('resume'):
             tools=[tool for tool in tools if tool['name'] in ('deliver_material','continue_answer','find_conversation_files','contact_avatar')]
         tools=[declaration('continue_answer',
-               '为当前答复选准备方式。answer 直接回答；search 按 query 和可选 folder 混合检索后回答；'
-               'read 先选择并读原文；agent 用于创建 HTML 网页、2D 或 3D 动画、计算、处理文件或需要其他工具的多步骤任务。'
+               '优先用当前信息直接完成。仅缺已授权资料时搜一次，够用即停止。开关只代表权限。需要计算时用 agent 并填 needs_python=true。answer 直接回答；search 按 query 和可选 folder 混合检索后回答；'
+               'read 先选择并读原文；html 独立生成网页或动画，不需资料检索或 Python；agent 用于真实计算或组合多项操作。'
                '交付本人资料库原件用 deliver_material；查找本会话原件用 find_conversation_files；发给他人用 contact_avatar。', AnswerArguments.model_json_schema())
                if tool['name']=='continue_answer' else tool for tool in tools]
         system=('你是当前用户自己的分身。先理解本轮的目标、收件人以及是否需要路由工具。'

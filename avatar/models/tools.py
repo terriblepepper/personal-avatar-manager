@@ -3,20 +3,20 @@ import json
 from fastapi import HTTPException
 
 
-def configure_tools(fmt, body, tools, *, required=True):
+def configure_tools(fmt, body, tools, *, required=True, batch=False):
     """同一份函数定义分别转换为 OpenAI、Anthropic、Gemini 的工具声明。"""
     if fmt == 'openai':
         body.update(tools=[{'type': 'function', 'function': tool} for tool in tools],
-                    tool_choice='required' if required else 'auto', parallel_tool_calls=False)
+                    tool_choice='required' if required else 'auto', parallel_tool_calls=batch)
     elif fmt == 'anthropic':
         body.update(tools=[{'name': t['name'], 'description': t['description'], 'input_schema': t['parameters']} for t in tools],
-                    tool_choice={'type': 'any' if required else 'auto', 'disable_parallel_tool_use': True})
+                    tool_choice={'type': 'any' if required else 'auto', 'disable_parallel_tool_use': not batch})
     else:
         body.update(tools=[{'functionDeclarations': tools}],
                     toolConfig={'functionCallingConfig': {'mode': 'ANY' if required else 'AUTO'}})
 
 
-def parse_tools(fmt, data, tools, *, required=True):
+def parse_tools(fmt, data, tools, *, required=True, batch=False):
     """调用名/参数严格校验；必需工具缺失时报错，可选工具允许无调用，不从文字猜测计划。"""
     count = None
     issue = '工具调用结构无效'
@@ -38,21 +38,25 @@ def parse_tools(fmt, data, tools, *, required=True):
         count = len(calls)
         if not count and not required:
             return []
-        if count != 1:
-            issue = '未提交所需工具调用' if not count else '单步返回多个工具调用'
+        if not 1 <= count <= (8 if batch else 1):
+            issue = '未提交所需工具调用' if not count else '单批超过八项工具调用' if batch else '此决策只接受一个工具调用'
             raise ValueError()
-        name = calls[0].get('name')
-        if name not in [tool['name'] for tool in tools]:
-            issue = '选择了本步未提供的工具'
-            raise ValueError()
-        args = calls[0].get('arguments', {})
-        if isinstance(args,str):
-            issue = '工具参数不是有效 JSON'
-            args = json.loads(args)
-        if not isinstance(args,dict):
-            issue = '工具参数必须是对象'
-            raise ValueError()
-        return [{'name':name,'arguments':args}]
+        allowed = {tool['name'] for tool in tools}
+        parsed = []
+        for call in calls:
+            name = call.get('name')
+            if not isinstance(name,str) or name not in allowed:
+                issue = '选择了本步未提供的工具'
+                raise ValueError()
+            args = call.get('arguments', {})
+            if isinstance(args,str):
+                issue = '工具参数不是有效 JSON'
+                args = json.loads(args)
+            if not isinstance(args,dict):
+                issue = '工具参数必须是对象'
+                raise ValueError()
+            parsed.append({'name':name,'arguments':args})
+        return parsed
     except (ValueError, TypeError, KeyError, IndexError, AttributeError):
         error = HTTPException(502,'模型未返回有效的工具调用：'+issue+'。本次未执行工具。')
         error.invalid_tool_call = True

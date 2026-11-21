@@ -35,7 +35,7 @@ def tool_budget(config):
         return 0
     from avatar.models.tools import configure_tools
     body={}
-    configure_tools(config.get('api_format','openai'),body,config['_tools'],required=not config.get('_optional_tools'))
+    configure_tools(config.get('api_format','openai'),body,config['_tools'],required=not config.get('_optional_tools'),batch=bool(config.get('_batch_tools')))
     return estimate(json.dumps(body,ensure_ascii=False,separators=(',',':')))
 
 

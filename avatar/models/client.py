@@ -126,7 +126,7 @@ def parse_response(fmt, data, *, config=None, request_id=None, api_key=''):
     if config and config.get('_tools'):
         from avatar.models.tools import parse_tools
         try:
-            calls=tuple(parse_tools(fmt,data,config['_tools'],required=bool(text and str(text).strip()) and not config.get('_optional_tools')))
+            calls=tuple(parse_tools(fmt,data,config['_tools'],required=bool(text and str(text).strip()) and not config.get('_optional_tools'),batch=bool(config.get('_batch_tools'))))
         except HTTPException as error:
             error.model_usage=model_usage
             if str(reason or '').lower() in ('length','max_tokens','max_output_tokens'):
@@ -333,7 +333,7 @@ class ModelClient:
             body["stream_options"] = {"include_usage": True}
         if config.get('_tools'):
             from avatar.models.tools import configure_tools
-            configure_tools(fmt,body,config['_tools'],required=not config.get('_optional_tools'))
+            configure_tools(fmt,body,config['_tools'],required=not config.get('_optional_tools'),batch=bool(config.get('_batch_tools')))
         return fmt, endpoint, headers, body
 
     # 职责：在总超时内转发统一格式的上游流式事件。
