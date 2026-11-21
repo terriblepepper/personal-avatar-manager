@@ -111,7 +111,8 @@ class ProvisionWorker:
                 document = identity.get('acs_document') or build_acs(content, job['user_id'], public_base_url(db), identity['aic'])
                 # 正式 ACS 契约已绑定时不自动覆盖；新候选继续留在审核快照；派生正式能力继承本体，不能按用户改写注册声明。
                 previous_document = old.get('acs_document', {}) if old else {}
-                keep_input = old and not retired and (direct or not old.get('acs_input', {}).get('template_owner'))
+                keep_input = old and not retired and (direct or (not old.get('acs_input', {}).get('template_owner')
+                    and previous_document.get('name') == content.name))
                 if not retired and previous_document.get('aic') and (keep_input or not previous_document['aic'].startswith('DEMO-')):
                     document = previous_document
                 if old and not retired and old['aic'] != identity['aic']:
@@ -124,6 +125,11 @@ class ProvisionWorker:
                     saved_input = signed_input(saved_input, document)
                     if document.get('skills') and not document['skills'][0]['description'].startswith(content.template_owner+'能够'):
                         saved_input.pop('template_owner', None)
+                entity_meta = document.get('entityMeta') or {}
+                signed_name = entity_meta.get('avatarName') if entity_meta.get('ontologyAic') else document.get('name')
+                if signed_name:
+                    profile['avatar_name'] = signed_name
+                    saved_input = {**saved_input,'name':signed_name}
                 db.execute("INSERT INTO avatar_records(user_id,aic,certificate,profile,last_modified_at,created_at,updated_at,acs_input,acs_document) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET aic=excluded.aic,identity_status='active',certificate=excluded.certificate,profile=excluded.profile,acs_input=excluded.acs_input,acs_document=excluded.acs_document,last_modified_at=excluded.last_modified_at,updated_at=excluded.updated_at",
                            (job["user_id"], identity["aic"], dump(identity["certificate"]), dump(profile), job["last_modified_at"], now(), now(), dump(saved_input), dump(document)))
                 # 先写入该用户当前 AIC，再迁移会话引用；参与者触发器会核验账户归属。
@@ -132,7 +138,7 @@ class ProvisionWorker:
                     remap_identity(db,job['user_id'],old['aic'],identity['aic'])
                 completed_phase = 'certificate_reused' if direct and old and not retired and not old['aic'].startswith('DEMO-') else 'active'
                 db.execute("UPDATE provision_jobs SET status='done',registration_phase=?,error='',updated_at=? WHERE id=?", (completed_phase, now(), job["job_id"]))
-                db.execute("UPDATE profile_records SET status='active',reason='',updated_at=? WHERE user_id=? AND last_modified_at=? AND status='creating'", (now(), job["user_id"], job['last_modified_at']))
+                db.execute("UPDATE profile_records SET status='active',reason='',draft=jsonb_set(draft::jsonb,'{avatar_name}',to_jsonb(?::text))::text,updated_at=? WHERE user_id=? AND last_modified_at=? AND status='creating'", (profile['avatar_name'],now(), job["user_id"], job['last_modified_at']))
                 event(db, job["user_id"], "system", "分身资料已同步" if old else "分身自动注册完成", identity["aic"], actor_id=job["reviewer"])
         except RegistrationPending as exc:
             with self.database.connect(write=True) as db:

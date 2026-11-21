@@ -176,7 +176,7 @@ class PlatformEntryRequest(BaseModel):
 class Profile(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     name: str = Field(default="", max_length=80)
-    avatar_name: str = Field(default="", max_length=80)
+    avatar_name: str = Field(default="", max_length=100)
     bio: str = Field(default="", max_length=2000)
     organization: str = Field(default="", max_length=160)
     specialty: str = Field(default="", max_length=300)

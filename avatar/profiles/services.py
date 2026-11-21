@@ -97,7 +97,8 @@ class AvatarService:
         profile['draft']['visibility'] = {**profile['draft'].get('visibility', {}), **{key: 'public' for key in FIXED_PUBLIC_FIELDS}}
         model_settings = self.models.get(user_id)
         profile["model_config"] = model_settings['model_config']
-        content = self.personal_acs(json.loads(profile.get('acs_input', '{}')), profile['draft'])
+        stored_input = json.loads(profile.get('acs_input', '{}'))
+        content = self.personal_acs(stored_input, profile['draft'])
         profile['acs_input'] = content.model_dump()
         profile['acs_generated_description']=self.personal_acs({},profile['draft']).description
         profile['acs_online']=bool(agent and agent['identity_status']=='active')
@@ -107,6 +108,15 @@ class AvatarService:
             from avatar.protocols.registration.direct import signed_input
             active = json.loads(agent['acs_input']) or content.model_dump()
             profile['acs_active_input'] = signed_input(active,profile['acs_active_document'] or {})
+        profile['acs_editing'] = bool(profile['acs_online'] and profile['status']!='active' and
+            (profile.get('reuse_signed_acs')==0 or (profile.get('reuse_signed_acs') is None and
+             profile['acs_active_input'].get('name')!=content.name and stored_input.get('name'))))
+        inherited = self.inherited_acs(user_id)
+        visible_input = profile['acs_active_input'] if profile['acs_online'] and not profile['acs_editing'] else profile['acs_input']
+        if visible_input and visible_input.get('name') and not inherited:
+            profile['draft']['avatar_name'] = visible_input['name']
+            if not profile['acs_editing']:
+                profile['acs_input']['name'] = visible_input['name']
         if profile['acs_active_document']:
             profile['acs_active_document'].pop('webAppUrl',None)
             profile['acs_active_document']['entityMeta']={**profile['acs_active_document'].get('entityMeta',{}),'environment':'1.0.0'}
@@ -122,7 +132,6 @@ class AvatarService:
             except HTTPException as exc:
                 deployment_errors.append(str(exc.detail))
         profile['acs_document'] = document
-        inherited = self.inherited_acs(user_id)
         profile['acs_direct'] = getattr(self.provider,'mode','demo')=='acps-direct'
         if inherited:
             from avatar.protocols.identity.ontology import avatar_ontology_paths
@@ -235,8 +244,18 @@ class AvatarService:
             # 兼容旧客户端的输入也立即保存到账户设置，不进入个人资料或审核快照。
             if request.model_config_input is not None:
                 self.models.save_in_transaction(db,user,request.model_config_input)
-            previous = self.personal_acs(json.loads(p['acs_input']), json.loads(p['draft']))
-            content = self.personal_acs(request.acs_input.model_dump() if request.acs_input else previous.model_dump(), profile.model_dump())
+            saved = json.loads(p['draft'])
+            previous = self.personal_acs(json.loads(p['acs_input']), saved)
+            fields = request.acs_input.model_dump() if request.acs_input else previous.model_dump()
+            baseline = saved.get('avatar_name') or previous.name
+            name = profile.avatar_name if 'avatar_name' in profile.model_fields_set else saved.get('avatar_name','')
+            if request.acs_input and request.acs_input.name not in (baseline,name):
+                if name and name!=baseline:
+                    raise HTTPException(422,'同一草稿的分身名称与 ACS 名称不一致，请刷新后重试')
+                name = request.acs_input.name
+            fields['name'] = name
+            content = self.personal_acs(fields, profile.model_dump())
+            profile.avatar_name = content.name
             agent = self.decode_agent(db.execute('SELECT * FROM avatar_records WHERE user_id=?',(user['id'],)).fetchone())
             reuse = None
             if agent and agent['identity_status']=='active' and getattr(self.provider,'mode','demo')=='acps-direct':
@@ -246,11 +265,12 @@ class AvatarService:
                     reuse = int(content == active)
                 else:
                     original = self.personal_acs(previous.model_dump(),profile.model_dump())
-                    if request.acs_input is not None and content != original:
+                    if request.acs_input is not None and content != original.model_copy(update={'name':content.name}):
                         raise HTTPException(409,'上线 ACS 默认只读，请先点击修改')
                     # 已保存的 ACS 修改可稍后提交；锁定的表单不因改姓名或组织而意外换证。
                     reuse = p['reuse_signed_acs'] if p['status']!='active' else 1
                     if reuse is None:reuse = int(previous == active)
+                    if content.name != active.name:reuse = 0
             modified = next_modified_at(p['last_modified_at'])
             document = build_acs(content, user['id'], public_base_url(db), agent['aic'] if agent else '', modified)
             document=self.deployment_acs(document,user['id'],db)
@@ -274,11 +294,12 @@ class AvatarService:
             draft = json.loads(p['draft'])
             draft['visibility'] = {**draft.get('visibility', {}), **{key: 'public' for key in FIXED_PUBLIC_FIELDS}}
             validated = Profile(**draft)
+            content = self.personal_acs(json.loads(p['acs_input']), draft)
+            validated.avatar_name = content.name
             validated.validate_submission()
             if getattr(self.provider,'mode','demo')=='acps-direct':
                 from avatar.protocols.registration.direct import require_profile
                 require_profile(validated.model_dump())
-            content = self.personal_acs(json.loads(p['acs_input']), json.loads(p['draft']))
             if content.errors() and not self.inherited_acs(user['id']):
                 raise HTTPException(422, '；'.join(content.errors()))
             current = db.execute('SELECT * FROM avatar_records WHERE user_id=?', (user['id'],)).fetchone()
@@ -292,6 +313,7 @@ class AvatarService:
                 from avatar.protocols.registration.direct import signed_input
                 document=json.loads(current['acs_document'])
                 submitted_input=signed_input(json.loads(current['acs_input']),document)
+                validated.avatar_name=submitted_input.get('name') or validated.avatar_name
             db.execute("INSERT INTO profile_submissions(id,user_id,last_modified_at,snapshot,status,submitted_at,acs_input,acs_document,reuse_signed_acs) VALUES(?,?,?,?,?,?,?,?,?)",
                        (str(uuid.uuid4()), user["id"], p['last_modified_at'], dump(validated.model_dump(exclude={"attachments"})), "pending", now(), dump(submitted_input), dump(document),reuse))
             db.execute("UPDATE profile_records SET status=?,updated_at=?,reason='' WHERE user_id=?",

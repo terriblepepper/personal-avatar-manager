@@ -1399,6 +1399,34 @@ def install_schema(connection):
     connection.execute("ALTER TABLE profile_records ADD COLUMN IF NOT EXISTS reuse_signed_acs INTEGER")
     connection.execute("ALTER TABLE profile_submissions ADD COLUMN IF NOT EXISTS reuse_signed_acs INTEGER")
 
+    migrate_names = connection.execute("""INSERT INTO data_migrations(name,applied_at)
+        VALUES('unified_avatar_name',now()::text) ON CONFLICT DO NOTHING RETURNING name""").fetchone()
+    if migrate_names:
+        # 校正平台资料，已签发协议文档和历史审核快照保持原文。
+        connection.execute("""WITH names AS (
+            SELECT user_id, coalesce(CASE WHEN acs_document::jsonb #>> '{entityMeta,ontologyAic}' IS NOT NULL
+                THEN nullif(acs_document::jsonb #>> '{entityMeta,avatarName}','') END,
+                nullif(acs_document::jsonb->>'name',''),nullif(acs_input::jsonb->>'name','')) AS name
+            FROM avatar_records)
+            UPDATE avatar_records a SET profile=jsonb_set(a.profile::jsonb,'{avatar_name}',to_jsonb(n.name))::text
+            FROM names n WHERE a.user_id=n.user_id AND n.name IS NOT NULL
+            AND a.profile::jsonb->>'avatar_name' IS DISTINCT FROM n.name""")
+        connection.execute("""WITH names AS (
+            SELECT p.user_id, coalesce(CASE WHEN p.status='active' OR p.reuse_signed_acs=1
+                    THEN a.profile::jsonb->>'avatar_name' END,
+                nullif(p.acs_document::jsonb->>'name',''), nullif(p.acs_input::jsonb->>'name',''),
+                a.profile::jsonb->>'avatar_name') AS name
+            FROM profile_records p LEFT JOIN avatar_records a USING(user_id))
+            UPDATE profile_records p SET draft=jsonb_set(p.draft::jsonb,'{avatar_name}',to_jsonb(n.name))::text,
+                last_modified_at=CASE WHEN p.status IN ('active','draft','rejected') THEN
+                    to_char(greatest(now(),nullif(p.last_modified_at,'')::timestamptz + interval '1 microsecond')
+                        AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US') || '+00:00' ELSE p.last_modified_at END,
+                acs_input=CASE WHEN p.acs_input::jsonb ? 'name' THEN
+                    jsonb_set(p.acs_input::jsonb,'{name}',to_jsonb(n.name))::text ELSE p.acs_input END
+            FROM names n WHERE p.user_id=n.user_id AND n.name IS NOT NULL AND
+            (p.draft::jsonb->>'avatar_name' IS DISTINCT FROM n.name OR
+             (p.acs_input::jsonb ? 'name' AND p.acs_input::jsonb->>'name' IS DISTINCT FROM n.name))""")
+
     for table in ('attachments', 'chat_files'):
         connection.execute(f"""ALTER TABLE {table}
             ADD COLUMN IF NOT EXISTS animation_metadata TEXT NOT NULL DEFAULT '{{}}',

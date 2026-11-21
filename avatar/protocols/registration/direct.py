@@ -33,8 +33,6 @@ def personal_input(stored, profile):
     stored = dict(stored or {})
     defaults = default_input(profile)
     if not stored.get('template_owner'):
-        if stored.get('name') == (public.get('avatar_name') or '个人分身'):
-            stored['name'] = defaults.name
         if stored.get('description') == legacy_description(public):
             stored['description'] = defaults.description
     content = resolve_input(stored, profile)
