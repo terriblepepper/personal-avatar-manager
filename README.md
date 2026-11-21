@@ -104,3 +104,11 @@ HTTP 中间件会做同源 Origin 校验、按路径的请求体大小限额，�
 - `frontend/public/static/vendor/` 存放离线 PDF.js、Mermaid、隔离页使用的 DOMPurify 及许可证。主页面通过 npm 引入 Marked 与 DOMPurify。
 - `psutil`（BSD-3-Clause，PyPI 包）用于检索与索引的资源采样（CPU 亲和性、cgroup、内存）；它是普通 PyPI 依赖，交付 ZIP 的 `dependencies/` 携带 WIT、ACPS、EverOS 和 Redis 客户端 wheel。完全离线安装需自备其余依赖，包括 psutil。
 - EverOS 桥接进程在 `tools/everos/worker.py`，与主程序共用同一个 `.venv`。
+
+## Citation
+
+> EverOS: local-first memory runtime for AI agents
+>
+> Version: 1.5.1
+> URL: [https://github.com/EverMind-AI/EverOS](https://github.com/EverMind-AI/EverOS)
+> License: Apache 2.0
