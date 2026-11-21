@@ -10,13 +10,26 @@
 </head>
 <body>
   <script>
+    async function readDocument(event) {
+      if (event.source !== parent || !(event.data instanceof Blob)) return;
+      window.removeEventListener('message', readDocument);
+      const source = await event.data.text();
+      document.open();
+      document.write(source);
+      document.close();
+    }
     function render(event) {
-      if (event.source !== parent || event.origin !== location.origin || typeof event.data?.html !== 'string') return;
+      if (event.source !== parent || event.origin !== location.origin) return;
+      const html = event.data?.html;
+      if (typeof html !== 'string' && !(html instanceof Blob)) return;
+      const blob = typeof html === 'string' ? new Blob([html]) : html;
       window.removeEventListener('message', render);
       const frame = document.createElement('iframe');
       frame.setAttribute('sandbox', 'allow-scripts');
       frame.title = 'HTML 页面';
-      frame.srcdoc = event.data.html;
+      // Only the loader goes through srcdoc. Large documents cross renderer processes by Blob handle.
+      frame.srcdoc = '<script>' + readDocument.toString() + ';addEventListener("message",readDocument)<' + '/script>';
+      frame.addEventListener('load', () => frame.contentWindow.postMessage(blob, '*'), {once:true});
       document.body.replaceChildren(frame);
     }
     window.addEventListener('message', render);

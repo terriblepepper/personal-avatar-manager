@@ -3,32 +3,46 @@
 import asyncio
 from contextlib import aclosing
 import logging
-import codecs
+from io import StringIO
 import json
 import httpx
 from fastapi import HTTPException
+from avatar.models.tools import invalid_tool_call, load_model_json
 from avatar.models.client import parse_response, tokens, response_limit, generation_http_timeout, generation_deadline
 from avatar.models.diagnostics import transport_failure, unconfirmed_response
 
-LIMIT = 2 * 1024 * 1024
+
+def check_size(kind, size, limit):
+    if size > limit:
+        logging.getLogger(__name__).warning('Model response size limit kind=%s bytes=%d limit=%d',kind,size,limit)
+        raise HTTPException(502,f'模型响应超过大小限制（{kind}，{size} / {limit} 字节）')
 
 
 # 职责：将上游分片字节解析为完整 SSE 帧。
-# 输入：response 为 httpx 流式响应，使用增量 UTF-8 解码以兼容中文跨分片。
-# 结果与约束：异步返回事件名与 data 文本，支持 CRLF 和多行 data；总大小由调用者按输出预算限制，默认 2 MiB、最高 64 MiB，未完成帧结束视为流中断。
-async def frames(response,limit=LIMIT):
-    decoder = codecs.getincrementaldecoder('utf-8')()
-    buffer, data, event, size = '', [], '', 0
+# 输入：response 为 httpx 流式响应，保留未收全的行以兼容中文跨分片。
+# 结果与约束：分别限制传输总量与单个事件；每行完整后解码，兼容跨分片的中文和 CRLF。
+async def frames(response, wire_limit, event_limit):
+    pending = bytearray()
+    data, event = [], ''
+    wire_size = event_size = 0
     chunks = response.aiter_bytes()
     async for chunk in chunks:
-        size += len(chunk)
-        if size > limit:
-            raise HTTPException(502, '模型响应超过大小限制')
-        buffer += decoder.decode(chunk)
-        while '\n' in buffer:
-            line, buffer = buffer.split('\n', 1)
-            line = line.rstrip('\r')
+        wire_size += len(chunk)
+        check_size('SSE 传输',wire_size,wire_limit)
+        start = 0
+        while start < len(chunk):
+            newline = chunk.find(b'\n',start)
+            end = len(chunk) if newline < 0 else newline + 1
+            event_size += end - start
+            check_size('SSE 单帧',event_size,event_limit)
+            pending.extend(memoryview(chunk)[start:end])
+            start = end
+            if newline < 0:
+                break
+            line = pending.decode().rstrip('\r\n')
+            pending.clear()
             if not line:
+                event_size = 0
                 if data == ['[DONE]']:
                     # Let HTTP consume the message terminator and reuse the socket. Never wait for a long-lived SSE tail.
                     try:
@@ -45,7 +59,7 @@ async def frames(response,limit=LIMIT):
                 data.append(line[5:].lstrip(' '))
             elif line.startswith('event:'):
                 event = line[6:].strip()
-    try: buffer += decoder.decode(b'', final=True)
+    try: buffer = pending.decode()
     except UnicodeDecodeError: raise interrupted() from None
     # 连接结束时若仍有未闭合 SSE 帧，不能将部分事件视为完整成功响应。
     # 部分兼容服务最后一条 JSON 没有空行；交给下游终止标记校验，不能误判为随机断流。
@@ -54,7 +68,7 @@ async def frames(response,limit=LIMIT):
     if data:
         raw='\n'.join(data)
         if raw!='[DONE]':
-            try: json.loads(raw)
+            try: load_model_json(raw)
             except ValueError: raise interrupted() from None
         yield event,raw
 
@@ -81,9 +95,9 @@ def interrupted():
     return error
 
 
-async def response_frames(response, limit, complete):
+async def response_frames(response, wire_limit, event_limit, complete):
     # After a terminal frame only optional usage remains. Losing that tail cannot invalidate a completed call.
-    async with aclosing(frames(response,limit)) as source:
+    async with aclosing(frames(response,wire_limit,event_limit)) as source:
         tail_deadline = None
         while True:
             if complete() and tail_deadline is None:
@@ -103,21 +117,41 @@ async def response_frames(response, limit, complete):
 
 class ToolFragments:
     """Keep interleaved arguments apart until the provider confirms completion."""
-    def __init__(self):
+    def __init__(self, limit):
+        self.size = 0
+        self.limit = limit
         self.openai = {}
         self.anthropic = {}
         self.open_blocks = set()
         self.gemini = []
+
+    @staticmethod
+    def check_count(calls):
+        if len(calls) >= 8:
+            raise invalid_tool_call('单批超过八项工具调用',len(calls)+1)
+
+    def account(self, value):
+        if not isinstance(value,str):
+            value = json.dumps(value,ensure_ascii=False,separators=(',',':'))
+        self.size += len(value.encode())
+        check_size('有效输出',self.size,self.limit)
 
     def add_openai(self, delta):
         for part in delta.get('tool_calls') or ():
             index = part.get('index',0)
             if type(index) is not int or index < 0:
                 raise ValueError('Invalid tool index')
-            name,args = self.openai.setdefault(index,([],[]))
+            if index not in self.openai:
+                self.check_count(self.openai)
+                self.openai[index] = (StringIO(),StringIO())
+            name,args = self.openai[index]
             function = part.get('function') or {}
-            if function.get('name'): name.append(function['name'])
-            if function.get('arguments'): args.append(function['arguments'])
+            if function.get('name'):
+                self.account(function['name'])
+                name.write(function['name'])
+            if function.get('arguments'):
+                self.account(function['arguments'])
+                args.write(function['arguments'])
 
     def add_anthropic(self, kind, data):
         index = data.get('index',0)
@@ -126,25 +160,29 @@ class ToolFragments:
         if kind=='content_block_start' and block.get('type')=='tool_use':
             if index in self.anthropic:
                 raise ValueError('Repeated tool block')
-            self.anthropic[index] = (block.get('name'),block.get('input',{}),[])
+            self.check_count(self.anthropic)
+            self.account(block.get('name'))
+            self.account(block.get('input',{}))
+            self.anthropic[index] = (block.get('name'),block.get('input',{}),StringIO())
             self.open_blocks.add(index)
         elif kind=='content_block_delta' and delta.get('type')=='input_json_delta':
             if index not in self.open_blocks:
                 raise ValueError('Missing tool block')
-            self.anthropic[index][2].append(delta['partial_json'])
+            self.account(delta['partial_json'])
+            self.anthropic[index][2].write(delta['partial_json'])
         elif kind=='content_block_stop':
             self.open_blocks.discard(index)
 
     def response(self, fmt, text, usage, reason, thinking, refusal):
         if fmt=='openai':
-            tools=[{'function':{'name':''.join(name),'arguments':''.join(args)}} for _,(name,args) in sorted(self.openai.items())]
+            tools=[{'function':{'name':name.getvalue(),'arguments':args.getvalue()}} for _,(name,args) in sorted(self.openai.items())]
             message={'content':text,'tool_calls':tools,'reasoning_content':thinking,'refusal':refusal}
             return {'choices':[{'message':message,'finish_reason':reason}],'usage':usage}
         if fmt=='anthropic':
             blocks=[{'type':'text','text':text}]
             if thinking: blocks.append({'type':'thinking'})
             for _,(name,initial,parts) in sorted(self.anthropic.items()):
-                blocks.append({'type':'tool_use','name':name,'input':''.join(parts) if parts else initial})
+                blocks.append({'type':'tool_use','name':name,'input':parts.getvalue() if parts.tell() else initial})
             return {'content':blocks,'stop_reason':reason,'usage':usage}
         parts=[{'text':text},*self.gemini]
         if thinking: parts.append({'thought':True})
@@ -195,30 +233,30 @@ async def _stream_once(model, config, api_key, system, history, message, collect
                 await check_response(response,api_key)
                 receiving = True
                 yield {'type': 'status', 'stage': 'generating', 'message': '生成回答'}
+                content_limit = response_limit(config)
                 if 'text/event-stream' not in response.headers.get('content-type', ''):
                     # 部分兼容平台忽略 stream=true 并返回完整 JSON，此时只显示一次真实完整回答，
                     # 不把完整结果伪装成上游正在逐字生成。
                     payload = bytearray()
                     async for chunk in response.aiter_bytes():
+                        check_size('完整 JSON',len(payload)+len(chunk),content_limit)
                         payload.extend(chunk)
-                        if len(payload) > response_limit(config):
-                            raise HTTPException(502, '模型响应超过大小限制')
-                    result = parse_response(fmt,json.loads(payload),config=config,request_id=request_id(response.headers),api_key=api_key)
+                    result = parse_response(fmt,load_model_json(payload),config=config,request_id=request_id(response.headers),api_key=api_key)
                     if collect:
                         yield {'type':'result','result':result}
                         return
                     yield {'type': 'delta', 'text': result.text}
                     yield {'type': 'usage', 'usage': result.usage, **({'finish_reason': result.finish_reason} if config.get('_avatar_agent') else {})}
                     return
-                chunks = []
-                fragments = ToolFragments()
+                chunks = StringIO()
+                fragments = ToolFragments(content_limit)
                 usage, finished, thinking, action = {}, False, False, False
                 reason,refusal,visible=None,False,False
-                async for event, raw in response_frames(response,response_limit(config,True),lambda: finished and not fragments.open_blocks):
+                async for event, raw in response_frames(response,response_limit(config,True),content_limit,lambda: finished and not fragments.open_blocks):
                     if raw == '[DONE]':
                         finished = finished or (fmt=='openai' and not action)
                         break
-                    data = json.loads(raw)
+                    data = load_model_json(raw)
                     if event == 'error' or data.get('error') or data.get('type') == 'error':
                         from avatar.models.diagnostics import provider_error
                         raise provider_error(200,data.get('error') or data,request_id(response.headers),api_key)
@@ -268,6 +306,8 @@ async def _stream_once(model, config, api_key, system, history, message, collect
                                     if 'functionCall' in part and not part.get('thought'):
                                         if 'partialArgs' in part['functionCall'] or part['functionCall'].get('willContinue'):
                                             raise ValueError('Unexpected partial function call')
+                                        fragments.check_count(fragments.gemini)
+                                        fragments.account(part['functionCall'])
                                         fragments.gemini.append({'functionCall':part['functionCall']})
                             action |= any('functionCall' in p for p in parts)
                             thought = any(p.get('thought') for p in parts)
@@ -279,15 +319,16 @@ async def _stream_once(model, config, api_key, system, history, message, collect
                     if text:
                         if not isinstance(text, str):
                             raise ValueError('Invalid text delta')
+                        fragments.account(text)
                         visible|=bool(text.strip())
-                        if collect: chunks.append(text)
+                        if collect: chunks.write(text)
                         else: yield {'type': 'delta', 'text': text}
                 if refusal and not finished:
                     raise empty_response(fmt,reason=reason,refusal=True,usage=usage,request_id=request_id(response.headers),config=config)
                 if not finished or fragments.open_blocks:
                     raise interrupted()
                 if collect:
-                    data = fragments.response(fmt,''.join(chunks),usage,reason,thinking,refusal)
+                    data = fragments.response(fmt,chunks.getvalue(),usage,reason,thinking,refusal)
                     result = parse_response(fmt,data,config=config,request_id=request_id(response.headers),api_key=api_key)
                     yield {'type':'result','result':result}
                     return

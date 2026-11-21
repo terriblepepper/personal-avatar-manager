@@ -7,8 +7,8 @@ from pathlib import Path, PurePosixPath
 import uuid
 from fastapi import HTTPException
 from avatar.core.db import now
-from avatar.files.library.attachments import MAX_FILE, TYPES
-from avatar.files.parsing.animation import ANIMATION_MIME, MAX_SOURCE_BYTES, is_animation_file
+from avatar.files.library.attachments import TYPES, chat_file_limit
+from avatar.files.parsing.animation import ANIMATION_MIME, MAX_SOURCE_BYTES
 from avatar.files.uploads.buffer import upload_buffer, upload_work
 
 OUTPUT_TYPES={suffix: mime for suffix, mime in TYPES.items() if suffix != '.avanim'}
@@ -41,9 +41,13 @@ def remaining_chat_bytes(db,user_id):
     return max(0, CHAT_ACCOUNT_BYTES-int(used))
 
 
+def ordinary_chat_bytes(row):
+    return 0 if row['content_type'] in (ANIMATION_MIME,'text/html') else row['size']
+
+
 def check_chat_quota(db, user_id, conversation_id, added_count, added_bytes, ordinary_bytes):
     count, ordinary, pending = db.execute("""SELECT count(*),
-        coalesce(sum(size) FILTER (WHERE content_type<>? AND (content_type<>'text/html' OR coalesce(animation_metadata::jsonb->>'html_mode','') NOT IN ('2d','3d'))),0),
+        coalesce(sum(size) FILTER (WHERE content_type NOT IN (?, 'text/html')),0),
         count(*) FILTER (WHERE referenced=1 AND origin!='attachment')
         FROM chat_files WHERE conversation_id=?""", (ANIMATION_MIME,conversation_id)).fetchone()
     if count + added_count > 20 or ordinary + ordinary_bytes > 50*1024*1024 or added_bytes > remaining_chat_bytes(db,user_id):
@@ -52,13 +56,12 @@ def check_chat_quota(db, user_id, conversation_id, added_count, added_bytes, ord
 
 
 # 职责：校验沙箱回传的新文件，路径只用于命名，宿主保存路径始终由服务端 UUID 决定。
-def validate_output(filename,data, *, html_mode=None):
+def validate_output(filename,data):
     if (not isinstance(filename,str) or not filename or len(filename)>200 or PurePosixPath(filename).name!=filename
             or filename in ('.','..') or any(ord(c)<32 for c in filename) or '\\' in filename or ':' in filename
             or Path(filename).suffix.lower() not in OUTPUT_TYPES):
         raise ValueError('生成文件名或格式不支持')
-    animation = html_mode in ('2d', '3d') and OUTPUT_TYPES[Path(filename).suffix.lower()] == 'text/html'
-    limit = MAX_SOURCE_BYTES if animation else MAX_FILE
+    limit = chat_file_limit(filename)
     if not isinstance(data,bytes) or len(data)>limit:
         raise ValueError('生成文件超过大小限制')
     return OUTPUT_TYPES[Path(filename).suffix.lower()]
@@ -101,7 +104,7 @@ class ConversationResources:
                     from avatar.files.library.folders import with_folder_caption
                     row=with_folder_caption(db,row)
                     check_chat_quota(db,user['id'],conversation_id,1,row['size'],
-                                     0 if is_animation_file(row) else row['size'])
+                                     ordinary_chat_bytes(row))
             if not row:raise HTTPException(404,'文件不存在')
             return row,directory
         row,directory=await upload_work(source_row)
@@ -127,14 +130,14 @@ class ConversationResources:
             self.session(db,user_id,conversation_id)
             from avatar.files.library.public import PublicMaterials
             generated=[item for item in outputs if not item.get('public_material_id')]
-            ordinary=sum(len(item['data']) for item in generated if item.get('html_mode') not in ('2d','3d'))
+            ordinary=sum(len(item['data']) for item in generated if OUTPUT_TYPES.get(Path(item['filename']).suffix.lower()) != 'text/html')
             total=sum(len(item['data']) for item in generated)
             if len(outputs)>5 or ordinary>20*1024*1024 or total>MAX_SOURCE_BYTES:
                 raise HTTPException(413,'每轮最多五份，普通生成文件合计 20 MiB，生成文件总计 100 MiB')
             sources={item['id']:PublicMaterials.validate(db,user_id,item) for item in outputs if item.get('public_material_id')}
             new_sources=[sources[item['id']] for item in outputs if item.get('public_material_id') and not item.get('reuse')]
             check_chat_quota(db,user_id,conversation_id,len(generated)+len(new_sources),total+sum(row['size'] for row in new_sources),
-                             ordinary+sum(row['size'] for row in new_sources if not is_animation_file(row)))
+                             ordinary+sum(ordinary_chat_bytes(row) for row in new_sources))
             for item in outputs:
                 source=sources.get(item['id'])
                 if source and item.get('reuse'):
@@ -150,7 +153,7 @@ class ConversationResources:
                     mime, metadata, digest = source['content_type'], source['animation_metadata'], source['animation_digest']
                     size=source['size']
                 else:
-                    mime = validate_output(item['filename'], item['data'], html_mode=item.get('html_mode'))
+                    mime = validate_output(item['filename'], item['data'])
                     size = len(item['data'])
                     if item.get('html_mode'):
                         metadata = json.dumps({'html_mode': item['html_mode']})

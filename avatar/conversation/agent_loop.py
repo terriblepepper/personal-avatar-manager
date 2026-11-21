@@ -10,6 +10,7 @@ from dataclasses import replace
 
 from fastapi import HTTPException
 
+from avatar.models.tools import load_model_json
 from avatar.conversation.working_context import fit_turn, fit_working_set
 from avatar.conversation.tools.activity import AgentSteps, without_false_tool_footer
 from avatar.conversation.tools.html import create_html, html_tool, html_repair_prompt
@@ -442,7 +443,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                     result = await call_with_retry(generate, validate, retry_invalid=False)
                     if repairing_html and str(result.finish_reason or '').lower() not in ('length','max_tokens','max_output_tokens'):
                         try:
-                            args = json.loads(result.text.strip().removeprefix('```json').removesuffix('```'))
+                            args = load_model_json(result.text.strip().removeprefix('```json').removesuffix('```'))
                             if not isinstance(args,dict):
                                 raise ValueError()
                         except ValueError:

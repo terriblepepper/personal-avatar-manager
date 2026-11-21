@@ -128,7 +128,7 @@ class ChatFiles(ConversationResources):
             metadata['html_mode'] = html_mode
         with self.database.connect() as db:
             self.session(db,user['id'],conversation_id,editable=True)
-            check_chat_quota(db,user['id'],conversation_id,1,len(data),0 if scene or html_animation else len(data))
+            check_chat_quota(db,user['id'],conversation_id,1,len(data),0 if scene or TYPES[extension]=='text/html' else len(data))
         self.directory.mkdir(parents=True,exist_ok=True,mode=0o700)
         identifier=str(uuid.uuid4());path=self.directory.new(user['id'],identifier+'.blob');preview=self.directory.new(user['id'],identifier+'.jpg')
         sha = write_original(path,data)
@@ -158,7 +158,7 @@ class ChatFiles(ConversationResources):
                             old_md5=hashlib.file_digest(previous,lambda: hashlib.md5(usedforsecurity=False)).hexdigest()
                         db.execute('UPDATE chat_files SET sha256=?,md5=? WHERE id=?',(sha,old_md5,candidate['id']))
                     if old_md5==md5:raise HTTPException(409,'该文件已在当前会话中，无需重复引用或上传')
-                pending = check_chat_quota(db,user['id'],conversation_id,1,len(data),0 if scene or html_animation else len(data))
+                pending = check_chat_quota(db,user['id'],conversation_id,1,len(data),0 if scene or TYPES[extension]=='text/html' else len(data))
                 if not temporary and pending>=5:raise HTTPException(413,'同时引用文件最多五个，请先关闭不需要的引用')
                 db.execute('INSERT INTO chat_files(id,user_id,conversation_id,filename,content_type,size,extracted_text,extraction_status,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(identifier,user['id'],conversation_id,filename,TYPES[extension],len(data),extracted,status,now()))
                 db.execute('UPDATE chat_files SET parse_checked=1,extraction_version=1,sha256=?,md5=?,animation_metadata=?,animation_digest=?,source_animation_id=? WHERE id=?',

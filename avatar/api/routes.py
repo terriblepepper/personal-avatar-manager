@@ -13,7 +13,7 @@ from avatar.files.parsing.animation import MAX_SOURCE_BYTES
 from avatar.files.uploads.batches import batch_id as upload_batch_id, UploadComplete
 from avatar.profiles.profile_dates import ModifiedAt
 from avatar.models.model_settings import ModelSettingsRequest
-from avatar.files.library.attachments import AttachmentDescriptionRequest
+from avatar.files.library.attachments import ARTIFACT_SUFFIXES, AttachmentDescriptionRequest
 import avatar.accounts.auth as auth
 from avatar.core.schemas import Credentials, LoginRequest, RecoveryRequest, PasswordChangeRequest, ContactChangeRequest, RegistrationRequest, DraftRequest, SubmitRequest, ReviewRequest, ChatRequest, PlatformSettings
 from avatar.models.model_config import catalog
@@ -591,9 +591,9 @@ async def upload_attachment(request: Request, filename: str | None = Query(defau
             return files.quota(db,user['id'])
     quota = await asyncio.to_thread(read_quota)
     remaining = max(0,quota['limit_bytes']-quota['used_bytes'])
-    animation_upload = filename.lower().endswith('.avanim')
-    limit = min(remaining,MAX_SOURCE_BYTES) if animation_upload else remaining
-    reason = '动画源码不能超过 100 MiB' if animation_upload and limit==MAX_SOURCE_BYTES else '资料文件剩余额度不足'
+    artifact_upload = filename.lower().endswith(ARTIFACT_SUFFIXES)
+    limit = min(remaining,MAX_SOURCE_BYTES) if artifact_upload else remaining
+    reason = 'HTML 或动画文件不能超过 100 MiB' if artifact_upload and limit==MAX_SOURCE_BYTES else '资料文件剩余额度不足'
     if int(request.headers.get('content-length') or 0) > limit:
         raise HTTPException(413,reason)
     with TemporaryFile() as payload:

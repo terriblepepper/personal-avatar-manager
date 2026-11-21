@@ -174,9 +174,16 @@ def check_status(status):
         raise provider_error(status,{})
 
 
-# 职责：按输出预算放大响应传输上限，流式帧有额外封装开销；仍以 64 MiB 封顶。
+# 按 token 预算分别限制有效内容和 SSE 传输；每个 token 可能单独携带完整的 JSON 事件头。
 def response_limit(config,streaming=False):
-    return min(64*1024*1024,max(2*1024*1024,config['max_tokens']*(128 if streaming else 32)))
+    wire_allowance = min(64*1024*1024,max(8*1024*1024,config['max_tokens']*2048))
+    if config.get('_call_purpose') == 'html_generation' or any(tool.get('name')=='create_html' for tool in config.get('_tools') or ()):
+        from avatar.files.parsing.animation import MAX_ENVELOPE_BYTES
+        # HTML is nested inside JSON tool arguments. Escapes and streaming headers do not count toward file size.
+        return MAX_ENVELOPE_BYTES + (wire_allowance if streaming else 0)
+    if streaming:
+        return wire_allowance
+    return min(64*1024*1024,max(2*1024*1024,config['max_tokens']*32))
 
 
 def generation_deadline(config):
