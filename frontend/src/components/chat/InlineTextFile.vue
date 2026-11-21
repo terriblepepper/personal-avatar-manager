@@ -31,7 +31,8 @@ watch([visible,() => props.url,() => props.file.size,() => props.mode,running], 
   const active = new AbortController()
   cleanup(() => active.abort())
   try {
-    const bytes = await readPreviewBytes(url,limit,AbortSignal.any([active.signal,AbortSignal.timeout(15000)]))
+    const signal = mode === 'html' ? active.signal : AbortSignal.any([active.signal,AbortSignal.timeout(15000)])
+    const bytes = await readPreviewBytes(url,limit,signal)
     if (active.signal.aborted) return
     const value = decodePreviewText(bytes)
     text.value = mode !== 'text' ? value : value.slice(0,12000)
