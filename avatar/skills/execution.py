@@ -46,10 +46,10 @@ class SkillExecution:
         background['conversation_tools']={'items':config.get('_conversation_tools',[]),'python':bool(enabled),
                                           'libraries':libraries if enabled else []}
         background['tool_rules']=('Python 沙箱已开启，只有 skill_execution_results 中真实执行成功的结果可以作为操作依据；不要输出 DSML/XML 等伪工具调用。'
-                                  '凡涉及数学计算，必须以沙箱执行结果为准，不得心算或口算。'
+                                  '工具可用不代表需要执行。引用已知数值、解释公式或技术概念不需要运行代码；需要验证的计算结果应以实际回执为准。'
                                   '以本轮 outputs 为准，没有输出时不能声称文件已生成。' if enabled else
-                                  '本会话 Python 沙箱未开启。若本轮仍需实际计算、数据分析、生成数据图表或写出文件，使用 require_conversation_tool 指出需要的工具。'
-                                  '工具调用不可用时只提示开启工具。不得心算、口算、以 Mermaid 替代所需数据图表，或声称已执行脚本。普通聊天、解释概念和读取已有解析内容照常处理。')
+                                  '本会话 Python 沙箱未开启。若本轮仍需实际计算、数据分析、生成数据图表或需要 Python 转换文件，使用 require_conversation_tool 指出需要的工具。'
+                                  '工具调用不可用时只提示开启工具。不得编造计算结果、以 Mermaid 冒充所需数据图表，或声称已执行脚本。普通聊天、解释概念和读取已有解析内容照常处理。')
         saved=[{name:item[name] for name in ('id','filename','download_url') if isinstance(item.get(name),str)}
                for item in config.get('_agent_saved_files',[]) if isinstance(item,dict)] if agent else []
         if saved:
@@ -93,7 +93,7 @@ class SkillExecution:
                 return {'stopped':True}
             if results and config.get('_resume_results_only'):
                 return {'stopped':True}
-            prompt=('你是技能脚本规划器。仅在用户任务需要实际计算/脚本时执行当前已加载技能；普通聊天返回 finish。'
+            prompt=('你是技能脚本规划器。仅在用户任务需要实际计算/脚本时执行当前已加载技能；解释、资料阅读、比较、写作和示例代码优先用现有信息直接完成，返回 finish。开关表示许可，不能作为运行理由。'
                     '实际计算、数据分析和生成数据图表须使用沙箱回执。先检查 results：若已成功得到所求值或文件，立即返回 finish；不要更换代码重复验证。尚缺计算结果时再调用沙箱。'
                     '2D、3D 动画和通用网页由会话 HTML 工具生成。只有独立的计算或文件处理步骤需要 Python。'
                     '通用 Python 工作区的原件输入最多 8 MiB，导出每件 10 MiB、每轮 20 MiB。'

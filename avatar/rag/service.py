@@ -221,7 +221,7 @@ class MaterialRag(MaterialReading,FileRag):
     async def enrich(self,owner_id,aic,session,files,context,message,include_private=False,progress=None):
         config,key,system,history=context
         route = config.get('_answer_route', {})
-        if route.get('mode') == 'answer':
+        if route.get('mode') in ('answer','html'):
             return context
         session=dict(session)
         documents=self.documents(owner_id,aic,session,files,include_private)
