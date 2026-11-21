@@ -143,9 +143,10 @@ async function remove(clear:boolean){
   if(!confirm(clear?'清空当前会话聊天记录、记忆及附件？已转存资料与已学到的风格仍保留。':'删除当前会话、聊天、记忆及附件？已转存资料与已学到的风格仍保留。'))return
   try{await request(selectedURL(conversationId.value)+(clear?'/clear':'')+'?personal=true&channel=assistant',clear?'POST':'DELETE');selectedFiles.value=[];if(!clear)conversationId.value='';await load()}catch(e){notifyError(e)}
 }
-async function send(control: 'continue' | 'end' = 'continue') {
+async function send(control: 'continue' | 'retry' | 'end' = 'continue') {
   const pause = pauseId.value ? pending.value : null
-  const message = pause && control === 'end' ? '结束任务' : draft.value.trim(), id = conversationId.value
+  const id = conversationId.value
+  const message = pause && control === 'end' ? '结束任务' : pause && control === 'retry' ? '重试' : draft.value.trim()
   if (!message || !id || busy.value || uploading.value || toolsSaving.value || loading.value) return
   if (/^\/compact(?:\s|$)/.test(message)) {
     busy.value = true
@@ -167,7 +168,7 @@ async function send(control: 'continue' | 'end' = 'continue') {
     finally { if (id === conversationId.value) busy.value = false }
     return
   }
-  const files = pause && control === 'end' ? [] : [...selectedFiles.value], previous = unconfirmed.get(id)
+  const files = pause && control !== 'continue' ? [] : [...selectedFiles.value], previous = unconfirmed.get(id)
   const sameFiles = previous && previous.attachment_ids.length === files.length && files.every(file => previous.attachment_ids.includes(file))
   const command: GenerationRequest = previous && previous.message === message && sameFiles
     && previous.agent_pause_id === pause?.agent_pause_id && previous.agent_control === (pause ? control : undefined) ? previous : {
@@ -181,7 +182,7 @@ async function send(control: 'continue' | 'end' = 'continue') {
   const previousDraft = draft.value
   busy.value = true
   error.value = ''
-  draft.value = ''
+  if (control === 'continue') draft.value = ''
   pending.value = { message, reply: '', status: '正在发送问题…', stage: 'sending', done: false }
   await scrollBottom(true)
   let received = false
@@ -294,7 +295,10 @@ onUnmounted(()=>{destroyed=true;olderRequest?.abort();controller.abort();generat
           <small v-if="pending.target" class="stream-note">回答分身：{{ pending.target.name }}</small>
           <small v-if="pending.used_skills?.length" class="stream-note">本轮技能：{{ pending.used_skills.map(item=>item.name).join('、') }}</small>
           <small v-if="pending.usage" class="stream-note">本次用量：输入 {{ pending.usage.input_tokens ?? '未报告' }} / 输出 {{ pending.usage.output_tokens ?? '未报告' }} tokens</small>
-        </template></ToolActivity><ChatMarkdown v-if="pending.reply || (!pauseId && completedFiles.length)" :source="pending.reply" :attachments="pauseId ? [] : completedFiles" @preview="previewAttachment" :events="pending.tool_events" :diagrams="pending.mermaid_enabled!==false" :conversation-id="conversationId"/><ChatNotices :items="pending.tool_events" :message="pauseId ? pending.status : pending.error" :tone="!pauseId && pending.error?'error':'info'"/></article></template>
+        </template></ToolActivity><ChatMarkdown v-if="pending.reply || (!pauseId && completedFiles.length)" :source="pending.reply" :attachments="pauseId ? [] : completedFiles" @preview="previewAttachment" :events="pending.tool_events" :diagrams="pending.mermaid_enabled!==false" :conversation-id="conversationId"/><ChatNotices :items="pending.tool_events" :message="pauseId ? pending.status : pending.error" :tone="!pauseId && pending.error?'error':'info'"/><div v-if="pauseId && pending.stream_retryable" class="chat-retry-actions">
+          <button type="button" class="button small primary" :disabled="busy||loading||uploading||toolsSaving" @click="send('retry')">重试</button>
+          <button type="button" class="button small" :disabled="busy||loading||uploading||toolsSaving" @click="send('end')">结束任务</button>
+        </div></article></template>
     </div>
     <form id="personal-chat-compose" data-guide-target="chat" class="personal-compose" @submit.prevent="send()">
       <ComposerInput ref="input" v-model="draft" :catalog="skillCatalog" :session="conversationId" :usage-url="conversationId ? selectedURL(conversationId)+'/compact' : ''" :usage-revision="(messages.at(-1)?.id || 0)+'/'+compressionThrough" label="聊天消息" :placeholder="pauseId ? '补充任务所需信息…' : '向自己的分身提问，或输入 $ 选择技能…'" :disabled="busy||loading||!conversationId" submit-on-enter @submit="send()"/>
@@ -315,3 +319,7 @@ onUnmounted(()=>{destroyed=true;olderRequest?.abort();controller.abort();generat
     </div>
   </section><FilePreview v-if="preview" :file="preview.file" :url="preview.url" @close="preview=null"/>
 </template>
+
+<style scoped>
+.chat-retry-actions{display:flex;gap:.5rem;margin-top:.5rem}
+</style>

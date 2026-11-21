@@ -179,6 +179,19 @@ def response_limit(config,streaming=False):
     return min(64*1024*1024,max(2*1024*1024,config['max_tokens']*(128 if streaming else 32)))
 
 
+def generation_deadline(config):
+    return 600 if config.get('_call_purpose') in ('html_generation','animation') else 180
+
+
+def generation_http_timeout(config, *, streaming=False):
+    purpose = config.get('_call_purpose')
+    read = 120
+    if purpose in ('html_generation','animation'):
+        # A non-streaming provider may generate the entire document before sending its first byte.
+        read = 240 if streaming and purpose == 'animation' else generation_deadline(config)
+    return httpx.Timeout(120, connect=10, read=read)
+
+
 # 职责：提供多平台完整与流式文本生成的统一客户端。
 # 输入：可注入 transport 进行隔离测试，resolver 验证公网地址，proxy 仅使用显式配置。
 # 结果与约束：HTTPS、DNS 固定、原 Host/SNI、大小和超时限制共同保护请求；关闭环境代理与自动重定向。
@@ -241,26 +254,25 @@ class ModelClient:
 
     # 职责：在总超时范围内生成完整模型回答。
     # 输入：config、api_key、system、history、message 分别为已审核配置、凭据、身份提示、历史和问题。
-    # 结果与约束：返回 ModelResult；总时限 180 秒，超时返回 504 并提示可能计费，不自动重试。
+    # 结果与约束：返回 ModelResult；通常 180 秒，HTML 制作与动画分镜 600 秒，超时返回 504 并提示可能计费，不自动重试。
     async def generate(self, config, api_key, system, history, message):
         from avatar.core.execution import check_execution_async
         await check_execution_async()
         try:
-            async with asyncio.timeout(180):
-                try:
-                    return await self._generate(config, api_key, system, history, message)
-                except HTTPException as first:
-                    if not getattr(first,'thinking_only',False):
-                        raise
-                    previous=first.model_usage
-                await check_execution_async()
-                try:
-                    result=await self._generate({**config,'_recover_thinking':True}, api_key, self.recovery_prompt(system,config), history, message)
-                except HTTPException as error:
-                    error.model_usage=accumulate_usage(previous,getattr(error,'model_usage',None))
-                    error.recovery_attempted=True
+            try:
+                return await self._generate(config, api_key, system, history, message)
+            except HTTPException as first:
+                if not getattr(first,'thinking_only',False):
                     raise
-                return replace(result,usage=accumulate_usage(previous,result.usage))
+                previous=first.model_usage
+            await check_execution_async()
+            try:
+                result=await self._generate({**config,'_recover_thinking':True}, api_key, self.recovery_prompt(system,config), history, message)
+            except HTTPException as error:
+                error.model_usage=accumulate_usage(previous,getattr(error,'model_usage',None))
+                error.recovery_attempted=True
+                raise
+            return replace(result,usage=accumulate_usage(previous,result.usage))
         except HTTPException as exc:
             from avatar.models.diagnostics import contextual
             error=contextual(exc,config)
@@ -269,7 +281,7 @@ class ModelClient:
             raise error from None
         except TimeoutError as error:
             from avatar.models.diagnostics import contextual
-            raise contextual(transport_failure(error),config) from None
+            raise contextual(transport_failure(error,total_timeout=generation_deadline(config)),config) from None
 
     @staticmethod
     def recovery_prompt(system, config):
@@ -279,7 +291,7 @@ class ModelClient:
     # 职责：将统一上下文转换为对应平台 URL、请求头和 JSON。
     # 输入：config 决定格式与模型，api_key 仅写鉴权头，system/history/message 构成上下文，streaming 控制流式选项。
     # 结果与约束：返回格式、端点、请求头和请求体四元组；Gemini 模型名进行路径编码，OpenAI 流式请求启用用量汇报。
-    def build_request(self, config, api_key, system, history, message, streaming=False):
+    def build_request(self, config, api_key, system, history, message, streaming=True):
         from avatar.models.limits import check_context
         check_context(config,system,history,message)
         fmt = config["api_format"]
@@ -338,36 +350,36 @@ class ModelClient:
 
     # 职责：在总超时内转发统一格式的上游流式事件。
     # 输入：参数与 generate 一致，实际解析委托 model_stream.stream_response。
-    # 结果与约束：异步 yield 状态、可见文本及用量；通常总时限 180 秒，动画分镜最多 600 秒，aclosing 保证取消时关闭上游生成器。
+    # 结果与约束：异步 yield 状态、可见文本及用量；通常总时限 180 秒，HTML 制作与动画分镜最多 600 秒，aclosing 保证取消时关闭上游生成器。
     async def stream(self, config, api_key, system, history, message):
         from avatar.core.execution import check_execution_async
         await check_execution_async()
         from avatar.models.model_stream import stream_response
         try:
-            async with asyncio.timeout(600 if config.get('_call_purpose') == 'animation' else 180):
-                previous=None
-                emitted=False
-                for attempt in range(2):
-                    await check_execution_async()
-                    try:
-                        async with aclosing(stream_response(self, config, api_key, system, history, message)) as source:
-                            async for event in source:
-                                if event['type']=='delta' and event.get('text'):
-                                    emitted=True
-                                if attempt and event['type']=='usage':
-                                    event={**event,'usage':accumulate_usage(previous,event['usage'])}
-                                yield event
-                        return
-                    except HTTPException as error:
-                        if attempt:
-                            error.model_usage=accumulate_usage(previous,getattr(error,'model_usage',None))
-                            error.recovery_attempted=True
-                            raise
-                        if emitted or not getattr(error,'thinking_only',False):
-                            raise
-                        previous=error.model_usage
-                        config={**config,'_recover_thinking':True}
-                        system=self.recovery_prompt(system,config)
+            previous=None
+            emitted=False
+            for attempt in range(2):
+                await check_execution_async()
+                try:
+                    async with aclosing(stream_response(self, config, api_key, system, history, message)) as source:
+                        async for event in source:
+                            if event.get('reset_reply'): emitted=False
+                            if event['type']=='delta' and event.get('text'):
+                                emitted=True
+                            if attempt and event['type']=='usage':
+                                event={**event,'usage':accumulate_usage(previous,event['usage'])}
+                            yield event
+                    return
+                except HTTPException as error:
+                    if attempt:
+                        error.model_usage=accumulate_usage(previous,getattr(error,'model_usage',None))
+                        error.recovery_attempted=True
+                        raise
+                    if emitted or not getattr(error,'thinking_only',False):
+                        raise
+                    previous=error.model_usage
+                    config={**config,'_recover_thinking':True}
+                    system=self.recovery_prompt(system,config)
         except HTTPException as exc:
             from avatar.models.diagnostics import contextual
             error=contextual(exc,config)
@@ -376,30 +388,15 @@ class ModelClient:
             raise error from None
         except TimeoutError as error:
             from avatar.models.diagnostics import contextual
-            raise contextual(transport_failure(error),config) from None
+            raise contextual(transport_failure(error,total_timeout=generation_deadline(config)),config) from None
 
     # 职责：执行固定公网 IP 的 HTTPS 模型请求并解析完整回答。
     # 输入：参数为 build_request 所需上下文；DNS 返回值在发起请求前校验。
     # 结果与约束：保留原 Host/SNI，不跟随重定向、不继承代理；响应按输出预算限制为 2–64 MiB，连接与读超时分别设置，错误映射为脱敏 HTTPException。
     async def _generate(self, config, api_key, system, history, message):
-        fmt, endpoint, headers, body = self.build_request(config, api_key, system, history, message)
-        url = httpx.URL(endpoint)
-        # 固定已校验的公网 IP，同时保留原 Host 与 TLS SNI，防止校验后发生 DNS 重绑定。
-        headers["Host"] = url.netloc.decode()
-        try:
-            async with self.session(url, httpx.Timeout(120, connect=10)) as (addresses, client):
-                async with client.stream("POST", url.copy_with(host=addresses[0]), headers=headers, json=body,
-                                         extensions={"sni_hostname": url.host}) as response:
-                    from avatar.models.diagnostics import check_response
-                    await check_response(response,api_key)
-                    payload = bytearray()
-                    async for chunk in response.aiter_bytes():
-                        payload.extend(chunk)
-                        if len(payload) > response_limit(config):
-                            raise HTTPException(502, "模型响应超过大小限制")
-            data = json.loads(payload)
-            return parse_response(fmt,data,config=config,request_id=response.headers.get("x-request-id") or response.headers.get("request-id"),api_key=api_key)
-        except httpx.HTTPError as error:
-            raise transport_failure(error) from None
-        except (ValueError, KeyError, IndexError, TypeError, AttributeError):
-            raise HTTPException(502, "模型响应格式与所选接口不匹配，请核对平台配置")
+        from avatar.models.model_stream import stream_response
+        async with aclosing(stream_response(self,config,api_key,system,history,message,collect=True)) as events:
+            async for event in events:
+                if event['type']=='result':
+                    return event['result']
+        raise HTTPException(502,'模型流缺少完成回执')

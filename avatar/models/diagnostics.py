@@ -5,7 +5,7 @@ import ssl
 import httpx
 from fastapi import HTTPException
 
-PURPOSES={'agent_intent':'会话意图分析','task_planning':'任务分解','goal_decision':'目标核对与工具选择','material_selection':'资料原件筛选','animation':'动画分镜','skill_execution':'技能脚本规划','memory':'记忆压缩','skill_selection':'自动技能选择','file_embedding':'向量嵌入','file_search':'资料判断/检索','file_read':'资料原文读取','answer':'回答生成'}
+PURPOSES={'agent_intent':'会话意图分析','task_planning':'任务分解','goal_decision':'目标核对与工具选择','html_generation':'HTML 作品生成','material_selection':'资料原件筛选','animation':'动画分镜','skill_execution':'技能脚本规划','memory':'记忆压缩','skill_selection':'自动技能选择','file_embedding':'向量嵌入','file_search':'资料判断/检索','file_read':'资料原文读取','answer':'回答生成'}
 
 
 def connection_error(error,service='模型平台'):
@@ -71,6 +71,8 @@ def contextual(error,config):
     result.retryable=getattr(error,'retryable',False)
     result.request_not_sent=getattr(error,'request_not_sent',False)
     result.delivery_unknown=getattr(error,'delivery_unknown',False)
+    result.timeout_reason=getattr(error,'timeout_reason',None)
+    result.stream_exhausted=getattr(error,'stream_exhausted',False)
     result.output_limited=getattr(error,'output_limited',False)
     result.thinking_only=getattr(error,'thinking_only',False)
     result.recovery_attempted=getattr(error,'recovery_attempted',False)
@@ -150,12 +152,19 @@ def unconfirmed_response(status, detail):
     return result
 
 
-def transport_failure(error, service='模型平台'):
+def transport_failure(error, service='模型平台', *, read_timeout=None, total_timeout=None):
     if isinstance(error, httpx.ConnectError):
         return connection_error(error, service)
     if isinstance(error, (httpx.ConnectTimeout, httpx.PoolTimeout)):
         return transport_error(504, f'{service}连接超时，请求尚未发送')
     timed_out = isinstance(error, (TimeoutError, httpx.TimeoutException))
     detail = '请求超时' if timed_out else '传输中断'
-    return unconfirmed_response(504 if timed_out else 502,
-                                f'{service}{detail}，无法确认上游处理结果。请求可能已计费，系统未重发')
+    reason = None
+    if isinstance(error,httpx.ReadTimeout) and read_timeout is not None:
+        reason = f'等待上游响应数据超过 {read_timeout:g} 秒'
+    elif isinstance(error,TimeoutError) and total_timeout is not None:
+        reason = f'本次模型调用达到 {total_timeout:g} 秒总时限'
+    result = unconfirmed_response(504 if timed_out else 502,
+                                  f'{service}{reason or detail}，无法确认上游处理结果。请求可能已计费，系统未重发')
+    result.timeout_reason = reason
+    return result
