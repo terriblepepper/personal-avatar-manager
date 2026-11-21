@@ -213,7 +213,7 @@ class AvatarChat:
             with self.service.database.connect() as db:
                 task_memories=db.execute('SELECT content FROM agent_task_memories WHERE user_id=? ORDER BY created_at DESC LIMIT 10',(user['id'],)).fetchall()
             background['completed_agent_tasks']=[r['content'] for r in task_memories]
-            background['delegation_capability']='支持 contact_avatar 工具：气泡内选择发送消息/任务，用户确认后编辑表单并发送。普通聊天由本人分身处理后发送，对方分身自主回复，无需同意；任务在接收人同意后运行。'
+            background['delegation_capability']='支持 contact_avatar 工具：气泡内选择发送消息/任务，用户确认后编辑表单并发送。消息草稿应写成对收件人说的正文，用户确认后原样发送，对方分身自主回复，无需同意；任务在接收人同意后运行。'
             background['communication_policy']='双方拥有正式身份时只使用 ACPS，入口暂时不可用则等待恢复；尚未完成迁移的 Demo 分身可使用已授权内部通道。标题显示当前通信协议，历史记录保留实际传输方式。只有平台真实工具回执能证明已提交或送达。未收到通信工具结果时，不能声称已联系、已发送、已发起任务，也不要用文字要求用户重复口头确认代替界面授权。用户取消的调用不得擅自恢复。'
             system=system.split('\n',1)[0]+'\n'+json.dumps(background,ensure_ascii=False)
         return overview,(config,self.service.vault.decrypt(config['encrypted_key']),system,[])

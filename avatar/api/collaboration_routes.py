@@ -4,7 +4,7 @@ from typing import Annotated,Literal
 import json
 from fastapi import APIRouter, Body, Depends, Request, UploadFile, File, Query
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict, Field, StrictBool
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints
 from avatar.accounts.auth import current_user
 from avatar.skills.packages import MAX_UPLOAD
 
@@ -242,9 +242,9 @@ class IntentChoice(BaseModel):
 class IntentConfirm(BaseModel):
     model_config=ConfigDict(extra='forbid',str_strip_whitespace=True)
     target_aic:str=Field(min_length=1,max_length=160)
-    objective:str=Field(min_length=1,max_length=2000)
+    objective:Annotated[str,StringConstraints(strip_whitespace=False,min_length=1,max_length=2000)]
     share_content:bool=False
-    shared_content:str=Field(default='',max_length=60000)
+    shared_content:Annotated[str,StringConstraints(strip_whitespace=False,max_length=60000)]=''
     file_ids:list[Annotated[str,Field(min_length=1,max_length=80)]]=Field(default_factory=list,max_length=5)
 
 @router.get('/agent-dialogue-settings')

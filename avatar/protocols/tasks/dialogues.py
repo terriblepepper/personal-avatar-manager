@@ -6,6 +6,7 @@ import uuid
 import httpx
 import logging
 from fastapi import HTTPException
+from avatar.conversation.collaboration.dialogues import confirmed_message
 from avatar.core.db import now,dump
 from avatar.core.execution import AgentNeedsInput
 from avatar.protocols.tasks.store import ManagementTaskError
@@ -103,9 +104,11 @@ class PeerDialogueTasks:
                     resumable=any(i.get('type')=='data' and task['revision']>i['data']['revision'] for i in pause)
                 if (operation == 'start') != (latest is None) or latest and latest['state'] != 'awaiting-completion' and not resumable:
                     raise ManagementTaskError(-32010,'该方向当前状态不允许发言')
-                result = self.result(command,context,'working')
+                text = confirmed_message(task,user_id)
+                state = 'awaiting-completion' if text is not None else 'working'
+                result = self.result(command,context,state,text or '')
                 db.execute('INSERT INTO agent_wire_results VALUES(?,?,?,?,?,?,?)',
-                           (command['id'],*key[:2],command['sessionId'],command['taskId'],'working',dump(result)))
+                           (command['id'],*key[:2],command['sessionId'],command['taskId'],state,dump(result)))
             db.execute('INSERT INTO agent_wire_receipts(local_aic,peer_aic,command_id,fingerprint,document) VALUES(?,?,?,?,?)',
                        (*key,digest,dump(result) if is_control else None))
         if is_control:
@@ -113,6 +116,7 @@ class PeerDialogueTasks:
             if operation == 'cancel' and (active := self.running.get(scope)):
                 active.cancel()
             return result
+        if result['status']['state']=='awaiting-completion':return result
         pending=asyncio.create_task(self.generate(task,user_id,command,context,scope,key))
         self.running[scope]=pending
         def completed(job):
