@@ -1,0 +1,36 @@
+include README.md pyproject.toml setup.py uv.lock .env.example
+include run.sh service.sh
+include redis/redis.conf redis/service.sh redis/redis-*.whl
+include *.whl
+recursive-include avatar *.py *.ts
+recursive-include frontend/public *
+recursive-include frontend/static *.js
+include frontend/package.json frontend/package-lock.json frontend/index.html frontend/tsconfig.json frontend/vite.config.ts
+include frontend/vitest.config.ts frontend/playwright.config.ts
+recursive-include frontend/src *.vue *.ts *.css
+recursive-include frontend/tests *.ts
+recursive-include frontend/dist *
+prune frontend/node_modules
+prune frontend/test-results
+prune frontend/playwright-report
+recursive-include docs *.md
+recursive-include deploy *.in *.example *.json
+recursive-include scripts *.py
+recursive-include tests *.py
+recursive-include tools *.py *.md *.txt
+global-exclude __pycache__ *.py[cod] .env *.pem *.key *.log .DS_Store
+prune data
+prune .venv
+prune dist
+prune build
+recursive-include tools/question_bank *.json
+include vendor/EverOS/pyproject.toml vendor/EverOS/README.md vendor/EverOS/LICENSE
+include vendor/EverOS/NOTICE vendor/EverOS/UPSTREAM.json
+recursive-include vendor/EverOS/src *
+
+# Local agent plans and review records must not enter distributable sources.
+prune .superpowers
+prune superpowers
+prune docs/superpowers
+exclude .brooks-lint*
+exclude docs/*-review.md docs/*-review-*.md docs/*brooks*.md

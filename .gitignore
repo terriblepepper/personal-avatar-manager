@@ -1,0 +1,98 @@
+# ============================================================
+# 镜像 · 个人分身智能体管理系统 —— Git 忽略规则
+# 原则：源码、文档、锁文件、随包分发的 wheel 与前端第三方库入库；
+#       虚拟环境、运行数据、构建产物、本地工具缓存与密钥一律不入库。
+# ============================================================
+
+# ---------- Python 字节码与打包产物 ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+!frontend/public/static/vendor/pdfjs/legacy/build/
+dist/
+sdist/
+*.egg-info/
+*.egg
+.eggs/
+pip-wheel-metadata/
+
+# 注意：根目录的 wit_framework-*.whl 与 acps_sdk-*.whl 是内网依赖的安装源，
+# 必须随仓库分发，因此这里不要用通配的 *.whl。
+
+# ---------- 虚拟环境 ----------
+.venv/
+venv/
+env/
+ENV/
+
+# ---------- 测试、类型与静态检查缓存 ----------
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+node_modules/
+
+# ---------- 本地配置与密钥（绝不入库）----------
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+
+# ---------- 运行数据（私有：账号、资料、索引、Soul、证书、维护备份）----------
+/data/
+/redis/redis.sock
+/redis/redis.pid
+/redis/redis.lock
+*.sqlite3
+*.sqlite
+*.db
+*.db-wal
+*.db-shm
+
+# ---------- 本地工具与临时目录 ----------
+/.tools/
+tmp/
+temp/
+*.tmp
+
+# ---------- 日志 ----------
+*.log
+logs/
+
+# ---------- 编辑器与操作系统 ----------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ---------- 代码质量工具的过程记录 ----------
+
+# ---------- 打包生成的随包资源目录 ----------
+avatar/_resources/
+
+# ---------- 本地 AI 工作流程与审查记录（不上传） ----------
+# 本地入口、治理规则、会话记忆和项目专用 skill，均不随仓库分发。
+/Agent_Operate_Guide/
+/AGENTS.md
+.agents/
+.venv
+.superpowers/
+superpowers/
+docs/superpowers/
+.brooks-lint*
+

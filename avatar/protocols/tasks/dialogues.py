@@ -1,0 +1,167 @@
+"""经过真实 mTLS 认证的本平台分身任务；不借用最终用户令牌，不开放任意跨账户调用。"""
+import asyncio
+import hashlib
+import json
+import uuid
+import httpx
+import logging
+from fastapi import HTTPException
+from avatar.core.db import now,dump
+from avatar.core.execution import AgentNeedsInput
+from avatar.protocols.tasks.store import ManagementTaskError
+from avatar.protocols.transport.endpoints import entity_oidc_identity
+
+
+# 仅允许固定配对中的两个实体处理已存在且已接受的任务；普通聊天不要求任务同意。
+class PeerDialogueTasks:
+    def __init__(self,dialogues,settings=None):
+        self.dialogues=dialogues;self.database=dialogues.database;self.running={}
+        self.settings=settings or dialogues.transport.acps.runtime.settings
+
+    def scope(self,command,context,user_id,db):
+        row=db.execute('SELECT * FROM agent_dialogues WHERE id=? AND session_id=?',(command.get('taskId'),command.get('sessionId'))).fetchone()
+        pair=db.execute('SELECT * FROM agent_peer_sessions WHERE id=?',(command.get('sessionId'),)).fetchone()
+        peer=db.execute("SELECT a.user_id FROM avatar_records a JOIN users u ON u.id=a.user_id WHERE a.aic=? AND a.identity_status='active' AND u.account_status='active'",(context.peer_aic,)).fetchone()
+        if not row or not pair or not peer or not (row['accepted'] or row['delivery_mode']=='message') or {user_id,peer['user_id']}!={pair['left_user_id'],pair['right_user_id']}:raise ManagementTaskError(-32009,'分身会话或委派任务未授权')
+        expected=entity_oidc_identity(self.settings,peer['user_id'],db=db)
+        identity=(command.get('commandParams') or {}).get('requester')
+        if identity!={'id':expected['keycloakSubject'],'issuer':expected['keycloakIssuer']}:
+            raise ManagementTaskError(-32009,'消息中的请求者身份与 mTLS 分身绑定不一致')
+        return dict(row)
+
+    def result(self,command,context,state,text='',usage=None,task_action=None):
+        return {'type':'task-result','id':uuid.uuid4().hex,'sentAt':now(),'senderRole':'partner','senderId':context.local_aic,
+                'mentions':[context.peer_aic],'taskId':command['taskId'],'sessionId':command['sessionId'],
+                'status':{'state':state,'stateChangedAt':now()},'products':[{'id':uuid.uuid4().hex,'dataItems':([{'type':'text','text':text}] if text else [])+[{'type':'data','data':{'usage':usage,**({'peerTaskAction':task_action} if task_action else {})}}]}] if text or task_action else []}
+
+    @staticmethod
+    def latest(db, scope):
+        return db.execute(
+            'SELECT command_id,state,document FROM agent_wire_results '
+            'WHERE local_aic=? AND peer_aic=? AND task_id=? AND session_id=? ORDER BY rowid DESC LIMIT 1', scope
+        ).fetchone()
+
+    @staticmethod
+    def control(db, operation, latest, key):
+        if latest is None:
+            raise ManagementTaskError(-32001, '该方向没有已受理的任务')
+        result = json.loads(latest['document'])
+        target = 'completed' if operation == 'complete' else 'canceled'
+        if latest['state'] == target:
+            return result
+        allowed = ('awaiting-completion',) if operation == 'complete' else ('working','awaiting-completion','awaiting-input')
+        if latest['state'] not in allowed:
+            raise ManagementTaskError(-32010, '当前任务状态不允许该操作')
+        stamp = now()
+        result.update(id=uuid.uuid4().hex, sentAt=stamp, status={'state':target,'stateChangedAt':stamp})
+        db.execute('UPDATE agent_wire_results SET state=?,document=? WHERE local_aic=? AND peer_aic=? AND command_id=?',
+                   (target,dump(result),*key[:2],latest['command_id']))
+        return result
+
+    # start/continue 生成一方发言；command id 去重使网络重试不会重复调用模型。
+    async def handle(self,command,context,user_id):
+        operation = command.get('command')
+        if operation not in ('start','continue','get','complete','cancel'):
+            raise ManagementTaskError(-32602,'不支持的分身任务命令')
+        key = (context.local_aic,context.peer_aic,command['id'])
+        scope = (*key[:2],command['taskId'],command['sessionId'])
+        if operation == 'get':
+            with self.database.connect() as db:
+                self.scope(command,context,user_id,db)
+                latest = self.latest(db,scope)
+            if not latest:
+                raise ManagementTaskError(-32001,'该方向没有已受理的任务')
+            return json.loads(latest['document'])
+
+        semantic = {field: command.get(field) for field in
+                    ('command','taskId','sessionId','groupId','commandParams','dataItems','mentions')}
+        digest = hashlib.sha256(json.dumps(semantic,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+        is_control = operation in ('complete','cancel')
+        with self.database.connect(write=True) as db:
+            task = self.scope(command,context,user_id,db)
+            receipt = db.execute('SELECT fingerprint,document FROM agent_wire_receipts WHERE local_aic=? AND peer_aic=? AND command_id=?',key).fetchone()
+            if receipt:
+                if receipt['fingerprint'] != digest:
+                    raise ManagementTaskError(-32602,'命令 ID 已用于其他请求')
+                if receipt['document'] is not None:
+                    return json.loads(receipt['document'])
+            prior = db.execute('SELECT * FROM agent_wire_results WHERE local_aic=? AND peer_aic=? AND command_id=?',key).fetchone()
+            if prior:
+                if receipt is None or is_control or (prior['task_id'],prior['session_id']) != scope[2:]:
+                    raise ManagementTaskError(-32602,'命令 ID 已用于其他请求')
+                return json.loads(prior['document'])
+            latest = self.latest(db,scope)
+            if is_control:
+                result = self.control(db,operation,latest,key)
+            else:
+                speaker = task['user_id'] if task['next_speaker']==0 else task['target_user_id']
+                if speaker != user_id or task['status'] != 'running':
+                    raise ManagementTaskError(-32010,'任务当前不等待该分身发言')
+                resumable=latest and latest['state']=='awaiting-input' and task.get('agent_checkpoint')
+                if resumable:
+                    pause=json.loads(latest['document'])['status']['dataItems']
+                    resumable=any(i.get('type')=='data' and task['revision']>i['data']['revision'] for i in pause)
+                if (operation == 'start') != (latest is None) or latest and latest['state'] != 'awaiting-completion' and not resumable:
+                    raise ManagementTaskError(-32010,'该方向当前状态不允许发言')
+                result = self.result(command,context,'working')
+                db.execute('INSERT INTO agent_wire_results VALUES(?,?,?,?,?,?,?)',
+                           (command['id'],*key[:2],command['sessionId'],command['taskId'],'working',dump(result)))
+            db.execute('INSERT INTO agent_wire_receipts(local_aic,peer_aic,command_id,fingerprint,document) VALUES(?,?,?,?,?)',
+                       (*key,digest,dump(result) if is_control else None))
+        if is_control:
+            # 先持久化终态，再取消本进程的调用；迟到的回写必须仍匹配 working。
+            if operation == 'cancel' and (active := self.running.get(scope)):
+                active.cancel()
+            return result
+        pending=asyncio.create_task(self.generate(task,user_id,command,context,scope,key))
+        self.running[scope]=pending
+        def completed(job):
+            if self.running.get(scope) is job:self.running.pop(scope,None)
+            self.completed(job)
+        pending.add_done_callback(completed)
+        return result
+
+    @staticmethod
+    def completed(task):
+        if not task.cancelled() and task.exception():
+            logging.getLogger(__name__).error('Peer generation cleanup failed',exc_info=task.exception())
+
+    async def stop(self):
+        tasks=tuple(self.running.values())
+        for task in tasks:task.cancel()
+        await asyncio.gather(*tasks,return_exceptions=True)
+        self.recover()
+
+    def recover(self):
+        with self.database.connect(write=True) as db:
+            for row in db.execute("SELECT * FROM agent_wire_results WHERE state='working'").fetchall():
+                result=json.loads(row['document'])
+                result.update(id=uuid.uuid4().hex,sentAt=now())
+                result['status']={'state':'failed','stateChangedAt':now(),'dataItems':[{'type':'text','text':'服务重启，原请求结果未确认；不会自动重发'}]}
+                db.execute("UPDATE agent_wire_results SET state='failed',document=? WHERE local_aic=? AND peer_aic=? AND command_id=? AND state='working'",(dump(result),row['local_aic'],row['peer_aic'],row['command_id']))
+
+    async def generate(self,task,user_id,command,context,scope,key):
+        try:
+            answer=await self.dialogues.answer_peer(task,user_id)
+            result=self.result(command,context,'awaiting-completion',answer.text,answer.usage,answer.task_action)
+        except AgentNeedsInput as pause:
+            result=self.result(command,context,'awaiting-input')
+            result['status']['dataItems']=[{'type':'text','text':pause.question or str(pause)}, {'type':'data','data':{
+                'revision':task['revision'], 'sandbox_attempted':pause.checkpoint['sandbox_attempted']}}]
+        except asyncio.CancelledError:
+            result=self.result(command,context,'failed','发言被中断，未自动重试')
+            with self.database.connect(write=True) as db:db.execute("UPDATE agent_wire_results SET state='failed',document=? WHERE local_aic=? AND peer_aic=? AND command_id=? AND state='working'",(dump(result),*key))
+            raise
+        except HTTPException as error:
+            result=self.result(command,context,'failed',str(error.detail))
+            if error.status_code==504:result['status']['dataItems']=[{'type':'data','data':{'peerReplyTimedOut':True}}]
+        except (TimeoutError,httpx.TimeoutException):
+            result=self.result(command,context,'failed','接收方模型调用已超时，未自动重新调用')
+            result['status']['dataItems']=[{'type':'data','data':{'peerReplyTimedOut':True}}]
+        except Exception:
+            result=self.result(command,context,'failed','接收方生成失败，请检查模型配置；未自动重新调用')
+        finally:
+            if self.running.get(scope) is asyncio.current_task():self.running.pop(scope,None)
+        with self.database.connect(write=True) as db:
+            db.execute("UPDATE agent_wire_results SET state=?,document=? WHERE local_aic=? AND peer_aic=? AND command_id=? AND state='working'",(result['status']['state'],dump(result),*key))
+        return result

@@ -1,0 +1,17 @@
+[Unit]
+Description=Personal Avatar Agent Management Demo
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=@PROJECT_DIR@
+ExecStart="@PROJECT_DIR@/run.sh"
+ExecStopPost="@PROJECT_DIR@/redis/service.sh" stop
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,117 @@
+/* Native fields, Element Plus fields (including teleported dialogs), and compound inputs. */
+.form-control,
+.form-control-group,
+.el-input__wrapper,
+.el-textarea__inner,
+.el-select__wrapper {
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  border-inline-start-width: 3px;
+  border-radius: 6px;
+  background-color: var(--surface);
+  color: var(--text);
+  box-shadow: none;
+}
+
+/* A filled field reads like the approved ACS description until editing resumes. */
+.form-control:not(:placeholder-shown):not(select),
+select.form-control:not(:focus):has(option:checked:not([value=""])),
+.form-control:is([readonly], :disabled),
+.form-control-group:not(:focus-within):has(textarea:not(:placeholder-shown)),
+.el-input__wrapper:has(input:not(:placeholder-shown), input:read-only),
+.el-input.is-disabled .el-input__wrapper,
+.el-textarea__inner:is(:not(:placeholder-shown), [readonly], :disabled),
+.el-select__wrapper:not(.is-focused):has(.el-tag),
+.el-select__wrapper:not(.is-focused):has(.el-select__selected-item.el-select__placeholder:not(.is-transparent)),
+.el-select__wrapper.is-disabled,
+.soul-section > .markdown-content,
+.form-readout,
+:is(.kv, .account-profile-fields, .acs-deployment-fields, .document-fields) > dd:not(:has(dl, ul)),
+.info-value {
+  border-color: transparent;
+  border-inline-start: 3px solid var(--accent-border);
+  border-radius: 0;
+  background-color: var(--surface-alt);
+  color: var(--text);
+  box-shadow: none;
+}
+.soul-section > .markdown-content,
+.form-readout,
+:is(.kv, .account-profile-fields, .acs-deployment-fields, .document-fields) > dd:not(:has(dl, ul)),
+.info-value {
+  margin: 0;
+  min-inline-size: 0;
+  padding: .5rem .75rem;
+  overflow-wrap: anywhere;
+  line-height: 1.6;
+}
+.form-readout { white-space: pre-wrap; }
+
+.form-control:not(:disabled):not([readonly]):focus,
+.form-control-group:focus-within,
+.el-input__wrapper.is-focus:not(:has(input:read-only)),
+.el-textarea__inner:focus:not([readonly]),
+.el-select__wrapper.is-focused {
+  border: 1px solid var(--accent);
+  border-inline-start-width: 3px;
+  border-radius: 6px;
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  background-color: var(--surface);
+  box-shadow: none;
+}
+.form-control:is([aria-invalid=true], :user-invalid),
+.is-error :is(.el-input__wrapper, .el-textarea__inner, .el-select__wrapper) {
+  border-color: var(--danger);
+  outline-color: var(--danger);
+}
+.form-control:disabled,
+.el-input.is-disabled .el-input__inner,
+.el-textarea.is-disabled .el-textarea__inner {
+  color: var(--text-secondary);
+  -webkit-text-fill-color: currentColor;
+}
+.form-control-group {
+  display: flex;
+  align-items: flex-start;
+  gap: .5rem;
+  padding: .5rem .625rem;
+}
+.form-control-group > textarea,
+.form-control-group > textarea:focus-visible {
+  flex: 1;
+  min-width: 0;
+  padding: .125rem 0;
+  border: 0;
+  outline: 0;
+  box-shadow: none;
+  background: transparent;
+  line-height: 1.5;
+  resize: vertical;
+}
+.el-input__wrapper .el-input__inner,
+.el-select__wrapper .el-select__input {
+  border: 0;
+  outline: 0;
+  box-shadow: none;
+  background: transparent;
+}
+:where(label, .el-radio, .el-checkbox) input:is([type=radio], [type=checkbox]) { accent-color: var(--accent); }
+:is(.acs-mime-options, .soul-choice-question) label:has(input:checked),
+label.el-radio.is-checked,
+label.el-checkbox.is-checked { color: var(--accent); }
+:is(.acs-mime-options, .soul-choice-question) label:has(input:is([type=radio], [type=checkbox])) {
+  padding: .25rem .5rem;
+  border-inline-start: 3px solid transparent;
+}
+:is(.acs-mime-options, .soul-choice-question) label:has(input:checked) {
+  border-inline-start-color: var(--accent-border);
+  background-color: var(--surface-alt);
+}
+input[type=file]::file-selector-button {
+  padding: .3rem .65rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+}

@@ -1,0 +1,10 @@
+{
+  "registry_url": "https://registry.example.org",
+  "certificate_authority_url": "https://ca.example.org",
+  "registry_entity_mtls_url": "https://registry.example.org/acps-atr-v2",
+  "ca_cert_path": "../data/system_identity/ca/ca.pem",
+  "acs_path": "../data/system_identity/acs.json",
+  "state_dir": "../data/system_identity/certificates",
+  "mode": "ontology",
+  "use_saved_urls": false
+}

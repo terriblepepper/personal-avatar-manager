@@ -1,0 +1,74 @@
+/* 共用视觉层：紧凑布局、列表、窗口和状态；不修改业务组件的显示条件。 */
+:root{--ui-hover:var(--accent-subtle);--ui-focus:var(--accent);--ui-motion:640ms;--ui-radius:.7rem;--ui-ease:cubic-bezier(.2,.75,.25,1)}
+*,*::before,*::after{transition-timing-function:var(--ui-ease)!important;animation-timing-function:var(--ui-ease)!important}
+body,input,select,textarea,button{font-family:var(--font-ui)}
+.button,button,summary,.profile-tab,.sidebar a,.nav button,.notification-row{transition:background-color var(--ui-motion),color var(--ui-motion),border-color var(--ui-motion),box-shadow var(--ui-motion)}
+.button:hover:not(:disabled),button:hover:not(:disabled),summary:hover{background-color:var(--ui-hover);border-color:var(--text-disabled)}
+.button.primary:hover:not(:disabled){background-color:var(--text);color:var(--surface)}.button.danger:hover:not(:disabled){background-color:var(--warning-bg);color:var(--danger)}
+button:focus-visible,summary:focus-visible,a:focus-visible{outline:2px solid var(--ui-focus);outline-offset:2px}
+button:disabled{cursor:not-allowed}.profile-tab.active,.sidebar a.active,.nav button.active{background:var(--accent-subtle);color:var(--green)}
+.card{padding:1.35rem;border-radius:var(--ui-radius)}h1{font-size:1.8rem}h2{font-size:1.05rem}.button{font-size:.75rem;padding:.5rem .75rem}.button.small{font-size:.75rem;padding:.35rem .55rem}
+.sidebar,.topbar{background:color-mix(in srgb,var(--surface) 88%,transparent);backdrop-filter:blur(12px)}
+.avatar-window{background:color-mix(in srgb,var(--surface) 96%,transparent);backdrop-filter:blur(14px);box-shadow:0 .5rem 2.5rem color-mix(in srgb,var(--shadow-color) 13.33%,transparent);border-radius:1rem}
+dialog::backdrop{background:color-mix(in srgb,var(--shadow-color) 26.67%,transparent);backdrop-filter:blur(6px)}
+.avatar-window>.cardhead{gap:.45rem;margin-block-end:.5rem;align-items:center}
+.window-controls{display:flex;align-items:center;gap:0;margin-inline-start:auto;flex:none;align-self:flex-start}
+.window-controls .button{display:inline-flex;align-items:center;justify-content:center;inline-size:2.2rem;block-size:2rem;padding:0;border:0;border-radius:.3rem;background:transparent;color:var(--ink)}
+.window-controls .window-fullscreen{margin:0;position:static}.window-controls .button:hover{background:var(--border)}.window-controls .ui-window-close:hover{background:var(--warning);color:var(--surface)}
+.avatar-window>.window-controls{position:sticky;inset-block-start:0;float:right;align-self:flex-end;z-index:50;background:color-mix(in srgb,var(--surface) 96%,transparent);border-radius:.4rem}.icon-button{display:inline-flex;align-items:center;justify-content:center}.icon-button svg{flex:none;pointer-events:none}
+input[type=checkbox],.notification-row>input[type=checkbox],.notification-batch .privacy input[type=checkbox]{appearance:auto;inline-size:.875rem;block-size:.875rem;width:.875rem;height:.875rem;min-inline-size:.875rem;margin:0;flex:none;accent-color:var(--green)}
+.notification-row,.notification-line,.notification-batch,.notification-batch .privacy,.notification-state{font-size:.75rem}
+.notification-row{min-block-size:2.5rem;gap:.6rem;padding:.4rem .3rem;border-bottom:1px solid var(--line)}.notification-row:hover{background:var(--surface-alt)}
+.notification-line{font:inherit}.notification-line strong{font-weight:650}.notification-line strong:only-child{max-inline-size:100%}.notification-row.unread{border-inline-start:.18rem solid var(--green)}
+.notification-filters{gap:.4rem;margin-block-end:.6rem}.notification-filters .profile-tab{font-size:.8rem;padding:.5rem .65rem}.notification-batch{gap:.45rem;align-items:center;margin-block:.55rem}.notification-batch .privacy{font:inherit}.notification-pagination{font-size:.75rem}.peer-session-settings{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;font-size:.75rem}.peer-session-settings input{max-inline-size:5rem}.peer-session-list .notification-line{font-size:.8rem}.peer-task-nav{background:var(--surface-alt);border-radius:.5rem;padding:.6rem}.peer-task-list button[aria-current=true]{background:var(--ui-hover);border-color:var(--text-disabled)}
+.task-status.peer-message-status{font-size:.75rem!important;font-weight:400;line-height:1.5;color:var(--green);border-top:1px solid var(--line);padding-block-start:.55rem;margin-block-start:.65rem;overflow-wrap:anywhere}
+.task-event-bubble{padding:.8rem 1rem;background:var(--surface-alt);border:1px solid var(--accent-subtle);max-inline-size:min(42rem,95%)}.task-event-card>header{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}.task-event-card>header strong{font-size:.8rem}.task-event-badge{font-size:.7rem;font-weight:650;padding:.2rem .45rem;border-radius:.35rem;color:var(--green);background:var(--accent-subtle)}.task-event-end .task-event-badge{background:var(--accent-subtle)}.task-event-card>.markdown-content{margin-block:.6rem;font-size:.85rem}.task-event-card>.task-status{margin-block:.55rem}
+.chat-session-menu{position:relative}.chat-session-menu>summary{list-style:none;cursor:pointer;padding:.35rem .55rem;border:1px solid var(--line);border-radius:.5rem}.chat-session-menu>summary::-webkit-details-marker{display:none}.chat-session-menu .chat-session-actions{position:absolute;right:0;top:100%;z-index:25;min-inline-size:10rem;background:var(--surface);padding:.4rem;border:1px solid var(--line);border-radius:.5rem;box-shadow:0 .4rem 1rem color-mix(in srgb,var(--shadow-color) 13.33%,transparent)}.chat-session-actions .button{display:block;inline-size:100%;margin-block:.2rem;text-align:start}
+.info-card>p.info-value{font:inherit;font-size:.75rem;line-height:1.6}.info-card>p.sub{font-family:inherit;font-size:.75rem}.model-save-actions{display:flex;align-items:center;justify-content:space-between;gap:.6rem;flex-wrap:wrap}.model-save-actions .model-saved-at{font-size:.625rem;line-height:1.5;color:var(--muted);margin-inline-start:auto;align-self:flex-end;text-align:end}
+@media(max-width:43.75rem){.card{padding:1rem}.window-controls .button{inline-size:2rem}.notification-line{font-size:.75rem}.task-event-bubble{max-inline-size:100%}.model-save-actions .model-saved-at{font-size:.625rem}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+
+/* 标题栏在所属窗口内部置顶，小窗／全屏滚动均保留窗口控制。 */
+.avatar-window .window-header{position:sticky;inset-block-start:0;z-index:45;flex-shrink:0;background:color-mix(in srgb,var(--surface) 96%,transparent);backdrop-filter:blur(14px);padding-block:.35rem;border-radius:.4rem;isolation:isolate}
+
+/* 继承的 ACS 技能沿用平台表单和紧凑卡片字号。 */
+.acs-editor[data-inherited=true]{font-family:inherit;font-size:.75rem;line-height:1.6}
+.acs-editor[data-inherited=true]>p,.acs-editor[data-inherited=true] .acs-skill p{font-size:.75rem;line-height:1.65;margin-block:.45rem;color:var(--muted)}
+.acs-editor[data-inherited=true] h3{font-size:.8125rem;font-weight:650;margin-block:0 .5rem}
+.acs-editor[data-inherited=true] .acs-skill{padding:.75rem;margin-block:.5rem;border-color:var(--line);border-radius:var(--ui-radius);background:var(--surface)}
+.acs-editor[data-inherited=true] .acs-skill .mono{display:block;font-size:.625rem;line-height:1.5;margin-block-start:.5rem;color:var(--muted);overflow-wrap:anywhere}
+.acs-editor[data-inherited=true] .acs-layout{gap:1rem;margin-block-start:.75rem}
+.acs-editor[data-inherited=true] .acs-preview{padding:.8rem;background:var(--surface-alt);border:1px solid var(--line)}
+.profile-tabs [role=tab]{transition:background-color var(--ui-motion),color var(--ui-motion),border-color var(--ui-motion)}
+.profile-tabs [role=tab]:hover{background:var(--ui-hover)}
+
+/* 所有单选下拉框保留原生表单语义，选项在共用浮层中展示。 */
+select{transition:background-color var(--ui-motion),border-color var(--ui-motion),box-shadow var(--ui-motion)}
+select[aria-expanded=true]{border-color:var(--green);box-shadow:0 0 0 2px color-mix(in srgb,var(--shadow-color) 10.2%,transparent)}
+@media(prefers-reduced-motion:reduce){details[open]>:not(summary){animation:none}}
+
+/* PDF 翻页独立于文档滚动区，小窗及全屏都停留在窗口底部。 */
+
+/* 同一玻璃材质供窗口、选项和浮动菜单复用；位移只在主动操作时发生。 */
+:root{--ui-glass:color-mix(in srgb,var(--surface) 78%,transparent);--ui-glass-blur:blur(24px) saturate(135%);--ui-glass-border:color-mix(in srgb,var(--surface) 72%,transparent)}
+.avatar-window,.composer-popover,.peer-more-actions,.peer-task-menu-content,.chat-session-actions,.chat-quick .quick,.record-search-panel,.skill-picker{background:var(--ui-glass);backdrop-filter:var(--ui-glass-blur);-webkit-backdrop-filter:var(--ui-glass-blur);border-color:var(--ui-glass-border);box-shadow:0 16px 48px color-mix(in srgb,var(--shadow-color) 10.98%,transparent),0 2px 10px color-mix(in srgb,var(--shadow-color) 7.06%,transparent),inset 0 0 0 1px color-mix(in srgb,var(--surface) 33.33%,transparent)}
+.avatar-window .window-header,.avatar-window>.window-controls{background:color-mix(in srgb,var(--surface) 68%,transparent);backdrop-filter:blur(18px)}
+dialog::backdrop{background:color-mix(in srgb,var(--shadow-color) 22%,transparent);backdrop-filter:blur(8px) saturate(90%)}
+.button,summary{transition-timing-function:cubic-bezier(.22,.68,.24,1)}
+.chatlog,.dialogue-log,.preview-document,.notification-list{scrollbar-gutter:stable;overflow-anchor:none}
+input[type=file]{font:inherit;font-size:.75rem;padding:.5rem;background:var(--surface)}
+input[type=file]::file-selector-button{font:inherit;color:var(--green);background:var(--accent-subtle);border:1px solid var(--accent-subtle);border-radius:.35rem;padding:.4rem .65rem;margin-inline-end:.65rem;cursor:pointer;transition:background-color 160ms}
+input[type=file]::file-selector-button:hover{background:var(--accent-subtle)}
+.ui-nav-indicator{position:absolute;z-index:0;pointer-events:none;border-radius:.65rem;background:var(--accent-subtle);transform-origin:top left;box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--accent-subtle) 43.92%,transparent)}
+.profile-tabs>.ui-nav-indicator{border-bottom:2px solid var(--green);border-radius:.45rem .45rem .15rem .15rem}.sidebar .ui-nav-indicator::after{content:'';position:absolute;left:.2rem;top:30%;height:40%;width:3px;border-radius:3px;background:var(--green)}
+[data-rag-file]{overflow-wrap:anywhere;white-space:normal}
+@supports not (backdrop-filter:blur(1px)){.avatar-window,.composer-popover,.peer-more-actions{background:var(--surface)}}
+
+/* 聊天能力提醒始终位于记录区外，长对话滚动时保持可见。 */
+.embedding-notice{display:flex;align-items:center;gap:.65rem;flex:none;margin:.45rem 0 .65rem;padding:.65rem .8rem;border:1px solid var(--warning);border-inline-start:.22rem solid var(--warning);border-radius:.6rem;background:color-mix(in srgb,var(--surface) 94%,transparent);color:var(--warning);font-size:.75rem;line-height:1.55;backdrop-filter:blur(12px)}
+.embedding-notice>div{flex:1;min-inline-size:0}.embedding-notice strong,.embedding-notice span{display:block}.embedding-notice strong{font-size:.8rem}.embedding-notice .button{flex:none;border-color:var(--warning);background:transparent;color:inherit}.embedding-notice[hidden]{display:none!important}
+@media(max-width:30rem){.embedding-notice{align-items:flex-start;flex-wrap:wrap}.embedding-notice .button{margin-inline-start:auto}}
+
+/* Keep glass at rest; avoid rerasterizing nested backdrops while large surfaces move. */
+.task-event-card .task-event-excerpt{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;line-clamp:3;overflow:hidden;text-overflow:ellipsis;white-space:pre-line;overflow-wrap:anywhere;line-height:1.6;max-block-size:4.8em;min-inline-size:0}
+.task-event-card>header{flex-wrap:nowrap}.task-event-card>header>.task-event-badge{flex-shrink:0}.task-event-card>header>.task-event-excerpt{flex:1}.task-event-summary{margin-block:.6rem;font-size:.85rem}

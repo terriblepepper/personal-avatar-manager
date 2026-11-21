@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>分身动画播放器</title>
+  <style>
+    html,body,svg { margin:0; width:100%; height:100%; display:block; overflow:hidden }
+    svg { --bg:#f6f8fc; --ink:#233953; --rim:#94a9c3; --node:#fff; --blue:#1e59a8; --packet:#ffb754; background:var(--bg); color:var(--ink); font:500 14px system-ui,sans-serif }
+    svg[data-theme=dark] { --bg:#152031; --ink:#e2edff; --rim:#70849d; --node:#243449; --blue:#8ebfff }
+    svg[data-theme=light] { --bg:#fff }
+    svg[data-template=blueprint] { --bg:#eaf3fb; --ink:#153750; --rim:#7099b3; --node:#f7fcff; --blue:#116187; --packet:#ffd279 }
+    svg[data-template=blueprint][data-theme=dark] { --bg:#102d45; --ink:#e7f5ff; --rim:#578397; --node:#173c56; --blue:#82d9f1; --packet:#ffcb75 }
+    svg[data-template=timeline] { --bg:#faf7f0; --ink:#3e362d; --rim:#ad9580; --node:#fffaf0; --blue:#97502e; --packet:#fbc56b }
+    svg[data-template=timeline][data-theme=dark] { --bg:#302a26; --ink:#fff0db; --rim:#8f7965; --node:#44382d; --blue:#f4bf83; --packet:#ffcd83 }
+    svg[data-template=orbit] { --bg:#f4f1fb; --ink:#352e4f; --rim:#a196b8; --node:#fcfaff; --blue:#694b97; --packet:#efaf71 }
+    svg[data-template=orbit][data-theme=dark] { --bg:#201d30; --ink:#f2eefe; --rim:#7e719a; --node:#332c48; --blue:#caadfa; --packet:#ffd69c }
+    svg:not([data-template=classic])[data-theme=light] { --bg:white }
+    .grid-line { fill:none; stroke:var(--rim); stroke-width:1; opacity:.28 }
+    .node-detail { fill:none; stroke:var(--rim); stroke-width:1.4; stroke-linecap:round }
+    .node.focus .node-detail { stroke:var(--blue) }
+    [data-template=blueprint] .edge { stroke-linejoin:bevel }
+    [data-template=timeline] .edge { stroke-width:3 }
+    [data-template=orbit] .edge:not(.focus) { stroke-dasharray:2 4 }
+    .grid { fill:var(--rim); opacity:.36 }
+    .edge { fill:none; stroke:var(--rim); stroke-width:2; stroke-linecap:round }
+    .edge.focus { stroke:var(--blue); stroke-dasharray:6 5 }
+    .playing .edge.focus { animation:lane-flow .7s linear infinite }
+    .node-box { fill:var(--node); stroke:var(--rim); stroke-width:1.8 }
+    .node.focus .node-box { stroke:var(--blue); stroke-width:3 }
+    .glyph { stroke:var(--blue); fill:none; stroke-width:2; stroke-linecap:round; stroke-linejoin:round }
+    text { fill:var(--ink); text-anchor:middle; paint-order:stroke; stroke:var(--bg); stroke-width:3.5; stroke-linejoin:round }
+    .packet-dot { fill:var(--packet); stroke:var(--ink); stroke-width:1.7 }
+    .pulse-ring { fill:none; stroke:var(--blue); stroke-width:1.5; opacity:.8 }
+    .playing .pulse-ring { animation:packet-pulse 1s ease-out infinite }
+    @keyframes packet-pulse { from { transform:scale(.7); opacity:.95 } to { transform:scale(1.3); opacity:.15 } }
+    .packet-label { font-size:12px; font-weight:650 }
+    @keyframes lane-flow { to { stroke-dashoffset:-22 } }
+    @media (prefers-reduced-motion:reduce) { .playing .edge.focus,.playing .pulse-ring { animation:none } }
+  </style>
+  <script defer src="/static/preview/animation-player.js"></script>
+</head>
+<body><svg xmlns="http://www.w3.org/2000/svg" role="img"></svg></body>
+</html>

@@ -1,0 +1,256 @@
+# CI is a thin wrapper over the Makefile — single source of truth for commands.
+# See docs/engineering.md and the Makefile for what each target does.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      # Full history: scripts/check_file_sizes.py diffs against the base
+      # branch's merge base, which a shallow clone cannot resolve.
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies (frozen)
+        run: make install-deps
+
+      - name: Lint (ruff + import-linter + repo gates + datetime + openapi drift)
+        run: make lint
+
+  unit:
+    name: unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies (frozen)
+        run: make install-deps
+
+      - name: Unit tests
+        run: make test
+
+  unit-windows:
+    name: unit tests (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      # No `make` on the Windows image — call uv directly. The lock is
+      # universal (it carries sys_platform == 'win32' resolution markers and
+      # pywin32, which portalocker requires on Windows), so --frozen resolves here.
+      - name: Install dependencies (frozen)
+        run: uv sync --frozen
+
+      - name: Unit tests
+        run: uv run pytest tests/unit -q
+
+  unit-py313:
+    name: unit tests (3.13)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Install dependencies (frozen)
+        run: make install-deps
+
+      - name: Unit tests
+        run: make test
+
+  integration:
+    name: integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies (frozen)
+        run: make install-deps
+
+      - name: Integration tests
+        run: make integration
+
+  integration-py313:
+    name: integration tests (3.13)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Install dependencies (frozen)
+        run: make install-deps
+
+      - name: Integration tests
+        run: make integration
+
+  integration-milvus:
+    name: integration tests (Milvus 2.6)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies (frozen)
+        run: make install-deps
+
+      # One container instead of the three-service compose file: embedded etcd
+      # plus local-disk segment storage, the same knobs upstream's
+      # scripts/standalone_embed.sh uses. The compose file wants MinIO, and
+      # MinIO now refuses anonymous pulls on both Docker Hub and quay.io
+      # ("unauthorized"), which broke this job. Local storage is a dev/CI mode
+      # -- it drops the object-store hop, not any behaviour these tests read.
+      - name: Start Milvus 2.6.22
+        run: |
+          cat > /tmp/embedEtcd.yaml <<'EOF'
+          listen-client-urls: http://0.0.0.0:2379
+          advertise-client-urls: http://0.0.0.0:2379
+          quota-backend-bytes: 4294967296
+          auto-compaction-mode: revision
+          auto-compaction-retention: '1000'
+          EOF
+          docker run -d --name milvus --security-opt seccomp:unconfined \
+            -e ETCD_USE_EMBED=true \
+            -e ETCD_DATA_DIR=/var/lib/milvus/etcd \
+            -e ETCD_CONFIG_PATH=/milvus/configs/embedEtcd.yaml \
+            -e COMMON_STORAGETYPE=local \
+            -e DEPLOY_MODE=STANDALONE \
+            -v /tmp/embedEtcd.yaml:/milvus/configs/embedEtcd.yaml \
+            -p 19530:19530 -p 9091:9091 \
+            milvusdb/milvus:v2.6.22 milvus run standalone
+          for attempt in {1..60}; do
+            if curl --fail --silent http://127.0.0.1:9091/healthz >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs milvus
+          exit 1
+
+      - name: Milvus repository contract
+        env:
+          EVEROS_TEST_MILVUS_URI: http://127.0.0.1:19530
+          EVEROS_TEST_MILVUS_FULL_STARTUP: "1"
+        run: uv run --frozen pytest tests/integration/test_milvus_remote.py -v
+
+      - name: Milvus /get truncation telemetry
+        env:
+          EVEROS_TEST_MILVUS_URI: http://127.0.0.1:19530
+        run: >-
+          uv run --frozen pytest
+          tests/e2e/test_get_endpoint_e2e.py::test_get_truncates_above_max_fetch
+          -v -k milvus
+
+      # The contract tests above exercise the repository port directly. This
+      # drives the same request path the application does -- /add, /flush,
+      # cascade, every search method, /get -- against the remote backend, so a
+      # break anywhere between the API and Milvus surfaces here rather than in
+      # production. Deselecting the LanceDB half keeps the job to its subject.
+      - name: Milvus end-to-end (tiered API suites)
+        env:
+          EVEROS_TEST_MILVUS_URI: http://127.0.0.1:19530
+        run: uv run --frozen pytest tests/integration/test_tiers -v -k milvus
+
+      # The structural half of the port contract runs in the ordinary unit job
+      # for both adapters. The behavioural half needs a server, so it only has
+      # a backend to compare against here.
+      - name: Derived-index port contract (both backends)
+        env:
+          EVEROS_TEST_MILVUS_URI: http://127.0.0.1:19530
+        run: uv run --frozen pytest tests/unit/test_infra/test_index_contract.py -v
+
+      - name: Stop Milvus
+        if: always()
+        run: docker rm -f milvus
+
+  package:
+    name: package build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Build and smoke-test package
+        run: make package

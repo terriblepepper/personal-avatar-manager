@@ -1,0 +1,213 @@
+"""Local Word conversion and exhaustive document visual traversal; no model keys."""
+from contextlib import contextmanager
+import io
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import zipfile
+from fastapi import HTTPException
+
+DOCUMENTS = ('.pdf', '.doc', '.docx')
+RASTER = ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tif', '.tiff', '.webp')
+
+
+def pdf_image(path,page):
+    with tempfile.TemporaryDirectory(prefix='avatar-rag-') as directory:
+        output=Path(directory)/'page'
+        subprocess.run(['pdftoppm','-f',str(page),'-l',str(page),'-singlefile','-scale-to','1600','-jpeg',str(path),str(output)],capture_output=True,timeout=30,check=True)
+        return (output.with_suffix('.jpg')).read_bytes()
+
+
+def office_runtime():
+    local = Path(sys.prefix) / 'share/avatar-office/usr/lib/libreoffice/program'
+    binary = shutil.which('libreoffice') or shutil.which('soffice')
+    env = {**os.environ, 'SAL_USE_VCLPLUGIN': 'svp', 'OMP_THREAD_LIMIT': '1'}
+    if not binary and (local / 'soffice').is_file():
+        binary = str(local / 'soffice')
+        libs = (Path(sys.prefix) / 'share/avatar-office/usr/lib').glob('*-linux-gnu')
+        env['LD_LIBRARY_PATH'] = os.pathsep.join([str(local), *map(str, libs)])
+    if not binary:
+        raise ValueError('Word 转换需要 LibreOffice；请安装 libreoffice-writer 或执行 scripts/install_runtime.py office')
+    return binary, env
+
+
+@contextmanager
+def converted(path, extension, output):
+    binary, env = office_runtime()
+    with tempfile.TemporaryDirectory(prefix='avatar-office-') as directory:
+        root = Path(directory)
+        profile = root / 'profile/user'
+        profile.mkdir(parents=True)
+        # Each conversion has a fresh profile with macros and link updates disabled.
+        (profile / 'registrymodifications.xcu').write_text('''<?xml version="1.0"?>
+<oor:items xmlns:oor="http://openoffice.org/2001/registry">
+<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop><prop oor:name="DisableMacrosExecution" oor:op="fuse"><value>true</value></prop></item>
+<item oor:path="/org.openoffice.Office.Writer/Content/Update"><prop oor:name="Link" oor:op="fuse"><value>0</value></prop></item>
+</oor:items>''')
+        source = root / ('source' + extension)
+        shutil.copyfile(path, source)
+        result = subprocess.run([sys.executable,'-m','avatar.files.parsing.office',binary, '-env:UserInstallation=' + (root/'profile').as_uri(),
+            '--headless', '--nologo', '--nodefault', '--norestore', '--nolockcheck',
+            '--convert-to', output, '--outdir', str(root), str(source)],
+            env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
+        target = root / ('source.' + output)
+        if result.returncode or not target.is_file():
+            raise ValueError('Word 转换失败：文件可能已损坏、加密或格式不受支持')
+        if target.stat().st_size > 64*1024*1024:
+            raise ValueError('Word 转换结果超过 64 MiB 资源上限，未作为完整解析')
+        yield target
+
+
+@contextmanager
+def word_source(path, extension):
+    if extension == '.doc':
+        with converted(path, extension, 'docx') as source:
+            yield source
+    else:
+        yield Path(path)
+
+
+def pdf_visual_pages(reader):
+    paints = {b'Do', b'INLINE IMAGE', b'sh', b'S', b's', b'f', b'f*', b'F', b'B', b'B*', b'b', b'b*'}
+    for index, page in enumerate(reader.pages, 1):
+        content = page.get_contents()
+        if content is not None and any(operator in paints for _, operator in content.operations):
+            yield index
+
+
+def pdf_images(path, pages=None):
+    from pypdf import PdfReader
+    from avatar.files.parsing.images import jpeg_bytes
+    reader = PdfReader(path, strict=False)
+    if reader.is_encrypted:
+        raise ValueError('PDF 已加密，无法解析图片')
+    for number in pdf_visual_pages(reader):
+        if pages is not None and number not in pages:
+            continue
+        # Render the page as well: vector plots, masks and nested forms are visual evidence too.
+        with tempfile.TemporaryDirectory(prefix='avatar-document-page-') as directory:
+            target = Path(directory) / 'page'
+            subprocess.run(['pdftoppm', '-f', str(number), '-l', str(number), '-singlefile',
+                '-scale-to', '2400', '-jpeg', str(path), str(target)],
+                stdin=subprocess.DEVNULL, capture_output=True, check=True, timeout=30)
+            yield {'id':f'page-{number}', 'page':number, 'label':f'第 {number} 页完整画面（含图表、矢量图及布局）', 'data':target.with_suffix('.jpg').read_bytes()}
+        try:
+            images = reader.pages[number-1].images
+            for index in range(len(images)):
+                try:
+                    image = images[index]
+                    data = jpeg_bytes(io.BytesIO(image.data))
+                except (ValueError, OSError, NotImplementedError, HTTPException):
+                    continue  # This object is already covered by the rendered page.
+                yield {'id':f'page-{number}-image-{index+1}', 'page':number, 'label':f'第 {number} 页图片 {index+1}', 'data':data}
+        except (ValueError, OSError, NotImplementedError):
+            pass  # The full page remains the fallback for unsupported image codecs.
+
+
+def images(path, extension, pages=None):
+    """Yield every raster asset and a page fallback for drawings; never sample the first N."""
+    if extension == '.pdf':
+        yield from pdf_images(path, pages)
+        return
+    if extension not in ('.doc', '.docx') or pages is not None and 1 not in pages:
+        return
+    from avatar.files.parsing.word import docx_html
+    from avatar.files.parsing.images import jpeg_bytes
+    with word_source(path, extension) as source:
+        docx_html(source)  # Reuse ZIP, macro and expansion validation before traversing media.
+        fallback = False
+        with zipfile.ZipFile(source) as archive:
+            for name in archive.namelist():
+                if name.startswith('word/media/') and not name.endswith('/'):
+                    try:
+                        if Path(name).suffix.lower() not in RASTER:
+                            raise ValueError('vector')
+                        data = jpeg_bytes(io.BytesIO(archive.read(name)))
+                    except (ValueError, OSError, HTTPException):
+                        fallback = True
+                        continue
+                    yield {'id':name, 'page':1, 'label':'Word 内嵌图片 '+Path(name).name+'（资源序号，不代表物理页码）', 'data':data}
+                elif name.startswith(('word/charts/', 'word/diagrams/')):
+                    fallback = True
+                elif name.startswith('word/') and name.endswith('.xml'):
+                    value = archive.read(name)
+                    if b'<w:pict' in value or b'<wps:wsp' in value or b'<v:shape' in value:
+                        fallback = True
+        if fallback:
+            rendered=False
+            with converted(source, '.docx', 'pdf') as pdf:
+                for item in pdf_images(pdf):
+                    rendered=True
+                    yield {**item, 'id':'word-render-'+item['id'], 'page':1,
+                           'label':'Word 转换画面 '+item['label']+'（转换后的页码）'}
+            if not rendered:
+                raise ValueError('Word 中存在无法直接解码的图片/绘图，但转换后未获得画面；未标记完整解析')
+
+
+async def traverse(path, extension, pages=None):
+    import asyncio
+    import base64
+    import json
+    import signal
+    from avatar.core.config import ROOT
+    from avatar.core.performance import measure
+    with measure('document_image_process_start'):
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, '-m', 'avatar.files.parsing.document_images', str(path),
+            extension, json.dumps(sorted(pages) if pages is not None else None),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.DEVNULL, cwd=ROOT, limit=16*1024*1024, start_new_session=True,
+        )
+    try:
+        while True:
+            line = await asyncio.wait_for(process.stdout.readline(), timeout=90)
+            if not line:
+                raise ValueError('文档图片解析中断，未完成全部图片读取')
+            item = json.loads(line)
+            if item.get('error'):
+                raise ValueError(item['error'])
+            if item.get('done'):
+                await process.wait()
+                if process.returncode:
+                    raise ValueError('文档图片解析进程异常退出')
+                break
+            item['data'] = base64.b64decode(item['data'])
+            yield item
+    finally:
+        try:os.killpg(process.pid,signal.SIGKILL)
+        except ProcessLookupError:pass
+        await process.wait()
+
+
+def main():
+    import base64
+    import json
+    import resource
+    extension = sys.argv[2]
+    resource.setrlimit(resource.RLIMIT_AS, (4*1024**3, 4*1024**3))
+    resource.setrlimit(resource.RLIMIT_CPU, (120, 120))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
+    try:
+        pages = json.loads(sys.argv[3]) if len(sys.argv)>3 else None
+        collected = []
+        size = 0
+        for item in images(Path(sys.argv[1]), extension, set(pages) if pages is not None else None):
+            value = {**item, 'data':base64.b64encode(item['data']).decode()}
+            if '--collect' in sys.argv:
+                size += len(value['data'])
+                if size > 64*1024*1024:
+                    raise ValueError('文档图片合计超过 64 MiB，请拆分文档；未作为完整解析')
+                collected.append(value)
+            else:
+                print(json.dumps(value), flush=True)
+        print(json.dumps({'done':True, **({'images':collected} if '--collect' in sys.argv else {})}), flush=True)
+    except Exception as exc:
+        print(json.dumps({'error':str(exc) if isinstance(exc,ValueError) else '文档图片解析失败（'+type(exc).__name__+'）'}), flush=True)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

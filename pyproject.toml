@@ -1,0 +1,88 @@
+[project]
+name = "personal-avatar-manager"
+version = "1.2.8"
+description = "Personal avatar platform with Web UI and embeddable WitComponent"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "psycopg[binary]>=3.2,<4",
+    "psycopg-pool>=3.2,<4",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.30.0",
+    "httpx>=0.28,<0.29",
+    "httpcore>=1.0.9,<1.1",
+    "cryptography>=44,<45",
+    "wit==3.2.0",
+    "acps-sdk==2.2.0",
+    "pypdf>=6,<7",
+    "pyjwt[crypto]>=2.10,<3",
+    "pyyaml>=6,<7",
+    "python-multipart>=0.0.22,<0.1",
+    "pillow>=11,<13",
+    "langgraph>=1.2.16,<2",
+    "langchain-core>=1.4.7,<2",
+    "deno>=2.9.7",
+    "numpy>=2,<3",
+    "unstructured>=0.27.36,<0.28",
+    "rank-bm25==0.2.2",
+    "psutil>=6,<8",
+    "mammoth>=1.13,<2",
+    "everos==1.5.1",
+    "redis>=5,<8",
+]
+
+[project.optional-dependencies]
+legacy-migration = ["chromadb>=1.5.9,<1.6"]
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project.scripts]
+avatar-platform = "avatar.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["avatar*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+avatar = ["skills/runtime.ts"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<10",
+    "build>=1.2,<2",
+    "setuptools>=77",
+    "hatchling>=1.27,<2",
+    "pytest-xdist>=3.8,<4",
+]
+
+[tool.uv]
+package = true
+environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+[tool.uv.sources]
+wit = [
+    { path = "wit-3.2.0-cp312-abi3-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+]
+acps-sdk = { path = "acps_sdk-2.2.0-py3-none-any.whl" }
+everos = { workspace = true }
+
+[tool.uv.workspace]
+members = [
+    "vendor/EverOS",
+]
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    "error::langchain_core._api.deprecation.LangChainPendingDeprecationWarning",
+    "error::langchain_core._api.deprecation.LangChainDeprecationWarning",
+    "error::langgraph.warnings.LangGraphDeprecationWarning",
+]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-p no:cacheprovider"
+tmp_path_retention_count = 0
+tmp_path_retention_policy = "none"

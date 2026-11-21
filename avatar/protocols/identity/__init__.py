@@ -1,0 +1,1 @@
+"""avatar/protocols/identity package."""
