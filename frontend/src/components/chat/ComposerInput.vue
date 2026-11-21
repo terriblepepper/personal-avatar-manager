@@ -18,21 +18,27 @@ function removeCompact() {
   void nextTick(() => {field.value?.focus(); field.value?.setSelectionRange(0,0)})
 }
 const slashOpen = ref(false)
-const usageText = ref('')
+const usage = ref<number | '' | '…' | '占用未知'>('')
+const usageText = computed(() => {
+  const percent = usage.value
+  if (typeof percent !== 'number') return percent
+  return percent > 0 && percent < 0.1 ? '<0.1%' : Number(percent.toFixed(1))+'%'
+})
+const usageRing = computed(() => typeof usage.value === 'number'
+  ? { '--usage-fill': Math.min(100, usage.value) + '%' } : undefined)
 const usageTitle = '当前上下文占用估算，含基础提示、摘要与未压缩消息'
 watch([() => (compact.value || slashOpen.value) ? props.usageUrl : '', () => props.usageRevision], async ([url], _, onCleanup) => {
-  usageText.value = ''
+  usage.value = ''
   if (typeof url !== 'string' || !url) return
   const controller = new AbortController()
   onCleanup(() => controller.abort())
-  usageText.value = '…'
+  usage.value = '…'
   try {
     const {used_tokens, context_tokens} = await request<{used_tokens:number;context_tokens:number}>(url,'GET',undefined,controller.signal)
     if (controller.signal.aborted) return
-    if (!Number.isFinite(used_tokens) || used_tokens < 0 || !(context_tokens > 0)) throw new Error()
-    const percent = 100 * used_tokens / context_tokens
-    usageText.value = percent > 0 && percent < 0.1 ? '<0.1%' : Number(percent.toFixed(1))+'%'
-  } catch { if (!controller.signal.aborted) usageText.value = '占用未知' }
+    if (!Number.isFinite(used_tokens) || used_tokens < 0 || !Number.isFinite(context_tokens) || context_tokens <= 0) throw new Error()
+    usage.value = 100 * used_tokens / context_tokens
+  } catch { if (!controller.signal.aborted) usage.value = '占用未知' }
 }, {immediate:true})
 const compactDescription = '压缩当前会话记忆，可指定保留重点'
 const slashDescription = shallowRef<HTMLElement>()
@@ -132,7 +138,7 @@ defineExpose({focus:()=>field.value?.focus()})
 
 <template>
   <div class="composer-input" :class="{'has-compact-command':compact}">
-    <button v-if="compact" class="composer-command-pill" type="button" :disabled="disabled" aria-label="移除压缩会话记忆命令" :title="usageTitle+' · 点击移除命令'" :aria-description="usageTitle+' '+usageText" @click="removeCompact">/compact <span>{{ usageText }}</span></button>
+    <button v-if="compact" class="composer-command-pill" type="button" :disabled="disabled" aria-label="移除压缩会话记忆命令" :title="usageTitle+' · 点击移除命令'" :aria-description="usageTitle+' '+usageText" @click="removeCompact">/compact <small v-if="usageText" class="context-usage" :class="{'has-value': usageRing}" :style="usageRing">{{ usageText }}</small></button>
     <textarea class="form-control" ref="field" :value="editable" rows="2" :aria-label="label" :placeholder="compact ? '可选：希望摘要保留的重点' : placeholder" :disabled="disabled" :maxlength="compact ? 1991 : 2000"
       aria-autocomplete="list" :aria-controls="open || slashOpen ? popup : undefined" :aria-activedescendant="slashOpen ? popup+'-compact' : open && highlight>=0 ? popup+'-'+highlight : undefined"
       @input="update($event)" @focus="refresh" @click="refresh" @compositionend="update($event)" @blur="closePicker" @keydown="keydown"/>
@@ -140,7 +146,7 @@ defineExpose({focus:()=>field.value?.focus()})
       <div :id="popup" role="listbox" aria-label="会话命令">
         <button :id="popup+'-compact'" type="button" class="skill-picker-option slash-option" role="option" aria-selected="true" tabindex="-1"
           @mouseenter="showSlashHelp" @mouseleave="slashHelp=false" @mousedown.prevent @click="chooseCompact">
-          <strong :title="usageTitle">/compact {{ usageText }}</strong>
+          <strong :title="usageTitle">/compact <small v-if="usageText" class="context-usage" :class="{'has-value': usageRing}" :style="usageRing">{{ usageText }}</small></strong>
           <ElTooltip :visible="slashHelp && slashOpen" :content="compactDescription" placement="right" popper-class="slash-description-tooltip">
             <span ref="slashDescription">{{ compactDescription }}</span>
           </ElTooltip>
@@ -175,6 +181,35 @@ defineExpose({focus:()=>field.value?.focus()})
   line-height: 1.4;
 }
 .slash-option strong { flex: none; }
+.composer-command-pill, .slash-option strong {
+  display: inline-flex;
+  align-items: center;
+  gap: .4rem;
+}
+.composer-input .context-usage {
+  display: inline-flex;
+  align-items: center;
+  gap: .2rem;
+  margin: 0;
+  font-size: .75rem;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  white-space: nowrap;
+}
+.context-usage::before {
+  content: '';
+  inline-size: .75rem;
+  block-size: .75rem;
+  border-radius: 50%;
+  box-sizing: border-box;
+  border: 1px dotted currentColor;
+}
+.context-usage.has-value::before {
+  border: 0;
+  background: conic-gradient(currentColor var(--usage-fill), color-mix(in srgb, currentColor 22%, transparent) 0);
+  mask: radial-gradient(closest-side, transparent 62%, black 72%);
+}
 .slash-option > span { min-width: 0; margin: 0; }
 :global(.slash-description-tooltip) { max-inline-size: min(15rem, calc(100vw - 1rem)); font-size: .75rem; }
 @media (pointer: coarse) { .slash-option { min-block-size: 2.75rem; } }
