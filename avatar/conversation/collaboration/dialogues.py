@@ -48,6 +48,12 @@ def reply_status(text,side):
     return text[:start].rstrip(),state,detail,required
 
 
+def confirmed_message(job, speaker_id):
+    if job.get('message_prepared') and job['next_speaker']==0 and speaker_id==job['user_id']:
+        return job['objective']+job['shared_content']
+    return None
+
+
 @dataclass(frozen=True)
 class PeerRequest:
     scope: str
@@ -129,7 +135,7 @@ class AgentDialogues:
         return None
 
     # 配对唯一约束覆盖正反两个方向；同一对分身只能有一个长期会话，任务可排队多个。
-    def create(self,user,body,source_conversation_id=None,skills='',db=None,request=None):
+    def create(self,user,body,source_conversation_id=None,skills='',db=None,request=None,*,prepared=False):
         request = request or PeerRequest.from_body('create', body.request_id, body)
         with nullcontext(db) if db is not None else self.database.connect(write=True) as db:
             previous = db.execute('SELECT id FROM agent_dialogues WHERE user_id=? AND request_id=?',
@@ -137,9 +143,15 @@ class AgentDialogues:
             replayed = self.replay(db, user, request, previous[0] if previous else None)
             if replayed:
                 return replayed
-            commands,objective=self.chat.skills.split_commands(user['id'],body.objective,db=db)
-            if not objective:raise HTTPException(422,'请补充要发送的内容或任务')
-            skills=commands or skills
+            mode=getattr(body,'delivery_mode','negotiation')
+            if prepared:
+                objective,skills=body.objective,''
+                if not (objective+body.shared_content).strip():
+                    raise HTTPException(422,'请补充要发送的内容')
+            else:
+                commands,objective=self.chat.skills.split_commands(user['id'],body.objective,db=db)
+                if not objective.strip():raise HTTPException(422,'请补充要发送的内容或任务')
+                skills=commands or skills
             own,target=self.participants(db,user['id'],body.target_aic)
             if db.execute("SELECT COUNT(*) FROM agent_dialogues WHERE status NOT IN ('ended','failed')").fetchone()[0]>=64:raise HTTPException(429,'分身任务队列已满，请先处理或结束已有任务')
             left,right=sorted((own['user_id'],target['user_id']))
@@ -155,10 +167,9 @@ class AgentDialogues:
             limits={r['user_id']:r['max_rounds'] for r in db.execute('SELECT * FROM agent_dialogue_preferences WHERE user_id IN (?,?)',(left,right))}
             limit=min(getattr(body,'max_rounds',None) or limits.get(user['id'],10),limits.get(target['user_id'],10))
             kind=getattr(body,'kind','chat');shared=getattr(body,'shared_content','')
-            mode=getattr(body,'delivery_mode','negotiation')
             db.execute('''INSERT INTO agent_dialogues(id,user_id,own_aic,target_user_id,target_aic,objective,request_id,created_at,updated_at,status,session_id,round_limit,task_kind,shared_content,initiator_skills,source_conversation_id)
               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(identifier,user['id'],own['aic'],target['user_id'],target['aic'],objective,body.request_id,stamp,stamp,'queued' if mode=='message' else 'awaiting_acceptance',sid,limit,kind,shared,skills,source_conversation_id))
-            db.execute('UPDATE agent_dialogues SET delivery_mode=?,next_speaker=0,accepted=? WHERE id=?',(mode,int(mode=='message'),identifier))
+            db.execute('UPDATE agent_dialogues SET delivery_mode=?,next_speaker=0,accepted=?,message_prepared=? WHERE id=?',(mode,int(mode=='message'),int(prepared),identifier))
             for uid in (left,right):db.execute('INSERT INTO agent_task_members(task_id,user_id) VALUES(?,?)',(identifier,uid))
             draft_workspace=getattr(body,'resource_conversation_id',None)
             if draft_workspace and mode!='message':
@@ -192,6 +203,7 @@ class AgentDialogues:
             with self.database.connect() as db:self.check_retry(db,user,saved['retry_of'])
         booking=bool(saved.get('requires_confirmation'))
         if saved.get('delivery_mode')=='negotiation':
+            if not body.objective.strip():raise HTTPException(422,'请补充任务要求')
             booking=await self.intent.requires_confirmation(user,body.objective) or booking
         with self.database.connect(write=True) as db:
             row=self.intent.load(db,user,identifier)
@@ -205,7 +217,8 @@ class AgentDialogues:
                 task=SimpleNamespace(target_aic=body.target_aic,objective=body.objective,request_id='intent:'+identifier,
                     kind='booking' if booking else 'chat',
                     delivery_mode=saved['delivery_mode'],shared_content=body.shared_content if body.share_content else '',max_rounds=None,file_ids=getattr(body,'file_ids',[]),resource_conversation_id=row['conversation_id'] if saved.get('origin')=='peer_task_draft' else None)
-                task_id=self.create(user,task,row['conversation_id'],saved.get('skills',''),db=db,request=request)
+                prepared=task.delivery_mode=='message' and (saved.get('origin')!='peer_task_draft' or saved.get('message_prepared') is True)
+                task_id=self.create(user,task,row['conversation_id'],saved.get('skills',''),db=db,request=request,prepared=prepared)
                 saved.update(objective=body.objective,target_aic=body.target_aic,shared_content=task.shared_content)
                 db.execute("UPDATE agent_intents SET status='confirmed',task_id=?,document=? WHERE id=?",(task_id,dump(saved),identifier))
                 self.intent.record_result(db,row,'已确认'+('发送消息' if task.delivery_mode=='message' else '发起任务')+'，请求已进入通信队列。实际送达与失败原因请查看分身会话；尚不能视为已送达。',task_event={'kind':'start','task_id':task_id,'title':body.objective,'mode':task.delivery_mode,'state':'submitted','reason':'请求已提交，实际进度请查看对应会话。'})
@@ -280,6 +293,8 @@ class AgentDialogues:
                           'objective':task['objective'],'shared_content':task['shared_content'],'skills':task['initiator_skills'],
                           'requires_confirmation':task['task_kind']=='booking','delivery_mode':task['delivery_mode'],
                           'origin':'peer_task_draft','session_id':task['session_id'],'retry_of':identifier,'file_ids':files}
+                if task['message_prepared']:
+                    document.update(objective=task['objective']+task['shared_content'],shared_content='',message_prepared=True)
                 db.execute("INSERT INTO agent_intents(id,user_id,conversation_id,document,created_at,status) VALUES(?,?,?,?,?,'editing')",(intent_id,user['id'],workspace,dump(document),now()))
         return self.intent.get(user,intent_id)
 
@@ -779,6 +794,8 @@ class AgentDialogues:
 
     # 接收方独立加载本人公开资料、本人技能与本人会话摘要；不读取对方私密档案。
     async def answer_peer(self,job,speaker_id):
+        if (text := confirmed_message(job,speaker_id)) is not None:
+            return SimpleNamespace(text=text,usage=None,task_action=None)
         from avatar.conversation.tools.activity import ToolActivity
         events = []
         activity = ToolActivity(events, lambda event: self.record_turn_activity(job, speaker_id, event))
@@ -1101,7 +1118,10 @@ class AgentDialogues:
                            (result['needs_input'],dump(checkpoint),now(),job['id'],job['revision']))
             return
         ordinary=job['delivery_mode']=='message'
-        if result.get('task_action') and not ordinary:
+        if (confirmed := confirmed_message(job,speaker['user_id'])) is not None:
+            if result['text']!=confirmed:raise HTTPException(502,'通信回执与确认正文不符，本次未发布消息')
+            text,state,waiting,required=confirmed,'queued','',0
+        elif result.get('task_action') and not ordinary:
             text,state,waiting,required,_=task_tool_result([result['task_action']])
         else:text,state,waiting,required=reply_status(result['text'],job['next_speaker'])
         done=state=='ended'

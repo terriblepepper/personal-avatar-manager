@@ -20,7 +20,7 @@ class ContactArguments(BaseModel):
     """通信工具只能提供搜索词及草稿，不能指定账户、地址或直接授权发送。"""
     model_config=ConfigDict(extra='forbid', str_strip_whitespace=True)
     target_query: str=Field(default='', max_length=200)
-    content: str=Field(min_length=1, max_length=2000)
+    content: str=Field(min_length=1, max_length=2000, description='填写可直接发给收件人的消息正文或任务要求，用户确认后投递。')
     shared_content: str=Field(default='', max_length=60000)
     file_ids:list[str]=Field(default_factory=list,max_length=5,description='仅选择当前用户明确要求发送的文件，从可用文件目录复制 ID；无明确文件要求留空，不继承历史引用。')
     requires_owner_confirmation: StrictBool=False
