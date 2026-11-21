@@ -112,6 +112,8 @@ def test_everos_episode_profile_and_completed_receipt_offline(tmp_path):
                 return {'result':{'rows':rows}}
             if operation == 'existing_vectors':
                 return {'result':{'rows':[row for row in records if row.get('md_path') == message.get('md_path')]}}
+            if operation == 'has_episode_vectors':
+                return {'result':{'ready':any(row['kind']=='episode' and (row.get('embedding') or row.get('subject_embedding')) for row in records)}}
             if operation == 'upsert_file':
                 records[:] = [row for row in records if row.get('md_path') != message['md_path']] + message['records']
                 return {'result':{'upserted':len(message['records'])}}
@@ -447,6 +449,7 @@ def _storage_reply(conn,message):
     elif operation=='queue_claim':return {'rows':everos_storage.queue_claim(conn,scope,project,message.get('limit',50))}
     elif operation=='queue_complete':everos_storage.queue_complete(conn,scope,project,message['rows'])
     elif operation=='existing_vectors':return {'rows':everos_storage.existing_vectors(conn,scope,project,message.get('md_path'))}
+    elif operation=='has_episode_vectors':return {'ready':everos_storage.has_episode_vectors(conn,scope,project)}
     elif operation=='vector_begin':everos_storage.vector_begin(conn,scope,project,message['generation'])
     elif operation=='vector_chunk':everos_storage.vector_chunk(conn,scope,project,message['generation'],message['records'])
     elif operation=='vector_commit_file':everos_storage.vector_commit_file(conn,scope,project,message['generation'],message['md_path'])
