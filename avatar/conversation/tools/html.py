@@ -1,9 +1,10 @@
 """Create a UTF-8 HTML artifact for the current attachment-capable turn."""
+import json
 import uuid
 from typing import Literal
 
 from fastapi import HTTPException
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from avatar.conversation.tools.animation_templates import Scene, TEMPLATES, render_animation
 from avatar.files.conversation.resources import validate_output
@@ -39,16 +40,35 @@ CREATE_HTML = {
 }
 
 
-def html_tool(animation_required):
-    if not animation_required:
+def html_tool(animation_required, expected_mode=None):
+    if not animation_required and not expected_mode:
         return CREATE_HTML
     schema = CREATE_HTML['parameters']
-    properties = {**schema['properties'], 'mode': {'type': 'string', 'enum': ['2d', '3d'], 'default': '2d'}}
+    properties = {**schema['properties'], 'mode': {'type': 'string', 'enum': [expected_mode] if expected_mode else ['2d', '3d'], 'default': expected_mode or '2d'}}
     return {**CREATE_HTML, 'parameters': {**schema, 'properties': properties, 'required': ['mode', 'filename']}}
 
 
-def create_html(args, outputs, available, *, animation_required=False):
-    artifact = HtmlArtifact.model_validate(args)
+def html_repair_prompt(mode, animation_required):
+    if mode in ('2d','3d') or animation_required:
+        choices = {mode:TEMPLATES[mode]} if mode in ('2d','3d') else TEMPLATES
+        return ('提交 filename（.html）、mode、template、title 和 1 至 12 项 scenes。'
+                '每项只填 label（1 至 40 字）、caption（1 至 400 字），省略 html。'
+                '根据用户目标选择对应维度的模板：'+json.dumps(choices,ensure_ascii=False))
+    return ('通用网页只填 mode="html"、filename 和完整 html。'
+            '若目标是动画，请保留用户要求的维度。'+CREATE_HTML['description'])
+
+
+def create_html(args, outputs, available, *, animation_required=False, expected_mode=None):
+    try:
+        artifact = HtmlArtifact.model_validate(args)
+    except ValidationError as error:
+        issues = []
+        for failure in error.errors(include_input=False,include_url=False)[:4]:
+            field = '.'.join(str(k) if isinstance(k,int) or k in (*HtmlArtifact.model_fields,'label','caption') else '?' for k in failure['loc'])
+            issues.append(field+' '+failure['type'])
+        raise ValueError('HTML 参数校验失败：'+'；'.join(issues)) from None
+    if expected_mode and artifact.mode != expected_mode:
+        raise ValueError('mode 应为 '+expected_mode)
     if animation_required and artifact.mode == 'html':
         raise HTTPException(422, '本轮必须交付 HTML 动画。按用户意图选择 2d 或 3d，默认 2d。')
     if artifact.template:
@@ -56,7 +76,7 @@ def create_html(args, outputs, available, *, animation_required=False):
             raise ValueError('动画模板需要标题和分镜，请省略 html')
         source = render_animation(artifact.mode,artifact.template,artifact.title,artifact.scenes)
     else:
-        if artifact.scenes or artifact.title or not artifact.html:
+        if artifact.scenes or not artifact.html:
             raise ValueError('自定义页面需要完整 html，使用分镜时须选择动画模板')
         source = artifact.html
     data = source.encode('utf-8')
