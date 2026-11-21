@@ -150,16 +150,23 @@ class ConversationMemory:
             rows = db.execute('SELECT id,role,content FROM chat_messages WHERE conversation_id=? AND profile_modified_at=? AND id>? ORDER BY id', (conversation_id,profile_modified_at,through)).fetchall()
         return summary, [dict(r) for r in rows]
 
+    @staticmethod
+    def usage(config, system, summary, history_tokens, message=''):
+        # Use the input side of the compression budget. Reserved output is still available to the model.
+        used = estimate(system) + estimate(summary) + history_tokens + estimate(message) + tool_budget(config) + 512
+        from avatar.models.limits import limits
+        window = config.get('context_tokens') or (limits(config.get('provider'), config.get('model')) or {}).get('context_tokens',128000)
+        return {'used_tokens':used, 'context_tokens':window}
+
     # 职责：按用户配置的模型窗口比例判断压缩，包含系统提示、消息开销及预留输出。
     # 结果与约束：默认 60%；旧适配器显式 threshold 仅作为兼容覆盖，不改变正式用户配置。
     def needs_compression(self, summary, rows, message, config=None, system=''):
         if self.policy.threshold is not None:
             return estimate(summary + message + ''.join(r['content'] for r in rows)) >= self.policy.threshold
         config = config or {}
-        from avatar.models.limits import limits
-        window = config.get('context_tokens') or (limits(config.get('provider'), config.get('model')) or {}).get('context_tokens', 128000)
-        used = tool_budget(config) + estimate(system) + estimate(summary) + estimate(message) + sum(estimate(r['content']) + 16 for r in rows) + config.get('max_tokens',1024) + 512
-        return used >= round(window * compression_ratio(config))
+        history_tokens = sum(estimate(r['content']) + 16 for r in rows)
+        usage = self.usage(config,system,summary,history_tokens,message)
+        return usage['used_tokens'] + config.get('max_tokens',1024) >= round(usage['context_tokens'] * compression_ratio(config))
 
     # 职责：共用普通聊天与分身协商的摘要生成和有效性校验。
     # 输入：context 为目标模型上下文，summary/rows 为不可信历史数据。

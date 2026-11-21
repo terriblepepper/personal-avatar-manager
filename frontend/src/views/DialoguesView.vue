@@ -466,7 +466,7 @@ onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
       <div class="bubble"><ToolActivity :items="runningTask.tool_activity || []" pending="准备回答"/><ChatNotices :items="runningTask.tool_activity"/></div>
     </article>
   </div><div class="peer-composer">
-  <ComposerInput v-model="message" :catalog="skills" :session="taskId || current" :disabled="switching" label="分身会话消息" @submit="send()" :placeholder="pausedTask ? '补充任务所需信息…' : '输入消息或任务目标，$ 选择技能…'" @update:model-value="pending=''"/>
+  <ComposerInput v-model="message" :catalog="skills" :session="taskId || current" :usage-url="current ? '/agent-sessions/'+encodeURIComponent(current)+'/compact'+(taskId?'?task_id='+encodeURIComponent(taskId):'') : ''" :usage-revision="(detail?.history_revision||'')+'/'+(detail?.summary_through||0)" :disabled="switching" label="分身会话消息" @submit="send()" :placeholder="pausedTask ? '补充任务所需信息…' : '输入消息或任务目标，$ 选择技能…'" @update:model-value="pending=''"/>
   <div class="chat-compose-actions">
   <ComposerToolbar class="peer-composer-toolbar" label="分身会话工具栏">
     <details class="composer-menu composer-tool">
