@@ -66,6 +66,13 @@ function activityName(event: ToolEvent) {
     if (output.tool === 'clarify_material') return '指出尚需明确的资料条件'
     return '比对文件说明、路径和正文证据'
   }
+  if (phase(event) === 'reason' && typeof input.iteration === 'number') {
+    const goal = typeof input.goal_no === 'number' ? `目标 ${input.goal_no}` : '本轮答复'
+    if (event.status === 'error' && typeof output.reason === 'string') return `${goal} · ${output.reason}`
+    if (input.mode === '结构化检索参数') return `为${goal}修正检索参数`
+    if (input.mode === '计划中的检索参数') return `采用${goal}已规划的检索参数`
+    if (event.status === 'running') return `正在为${goal}选择下一步`
+  }
   if (input.tool === 'python') return actions.python
   if (Array.isArray(output.plan)) return output.plan.length ? `确定 ${output.plan.length} 项待完成目标` : '确认已有信息足以回答'
   if (output.decision === 'search_materials') return '确认需要检索授权资料'

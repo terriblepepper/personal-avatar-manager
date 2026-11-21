@@ -123,6 +123,23 @@ def _trace_value(value, depth=0):
     return value
 
 
+def model_failure(error):
+    issue = getattr(error,'tool_issue',None)
+    if not issue:
+        if getattr(error,'delivery_unknown',False):
+            issue = '上游请求已发出，响应未确认，未自动重发'
+        elif getattr(error,'request_not_sent',False):
+            issue = '连接失败，请求未发出'
+        elif getattr(error,'output_limited',False):
+            issue = '模型输出达到上限'
+        elif getattr(error,'empty_model_output',False):
+            issue = '模型未返回可用输出'
+        else:
+            issue = '模型决策请求失败'
+    return {'reason':issue,'tool_count':getattr(error,'tool_count',None),
+            'delivery_unknown':bool(getattr(error,'delivery_unknown',False))}
+
+
 class AgentSteps:
     """Publish bounded workflow state. Callers project permitted fields before tracing."""
     PHASES = {'perceive': '感知', 'reason': '推理', 'act': '行动',
@@ -155,6 +172,8 @@ class AgentSteps:
             output['error'] = type(error).__name__
             if hasattr(error, 'status_code'):
                 output['status_code'] = error.status_code
+                if phase=='reason' and 'iteration' in inputs:
+                    output.update(model_failure(error))
             raise
         finally:
             self.progress({**event, 'status': status, 'output': _trace_value(output)})
