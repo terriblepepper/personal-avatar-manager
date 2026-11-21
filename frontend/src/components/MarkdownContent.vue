@@ -29,7 +29,7 @@ function fileLink(node: HTMLAnchorElement | HTMLImageElement, url: URL) {
   if (file) {
     const button = document.createElement('button')
     button.type = 'button'
-    button.className = 'file-link'
+    button.className = 'button small file-link'
     button.dataset.previewFile = file.id
     button.textContent = label
     node.replaceWith(button)
@@ -174,15 +174,15 @@ const rendered = computed(() => {
         <InlineTextFile v-else-if="block.mode === 'text' || block.mode === 'mermaid' || block.mode === 'html'" :file="block.file" :url="block.url" :mode="block.mode" :saved="savedFileIds?.has(block.file.id)" @preview="emit('preview',$event)" @promote="emit('promote',$event)"/>
         <audio v-else-if="block.mode === 'audio'" :src="block.url" :aria-label="block.file.filename" controls preload="none"/>
         <video v-else-if="block.mode === 'video'" :src="block.url" :aria-label="block.file.filename" controls playsinline preload="none"/>
-        <button v-else type="button" class="file-link" @click="emit('preview',block.file)">{{ block.file.filename }}</button>
+        <button v-else type="button" class="button small file-link" @click="emit('preview',block.file)">{{ block.file.filename }}</button>
       </template>
       <span v-else-if="block.kind === 'pending'" class="sub">正在接收动画包…</span>
-      <div v-else v-html="block.source" />
+      <div v-else class="markdown-prose" v-html="block.source" />
     </template>
   </div>
 </template>
 
 <style scoped>
 .markdown-content :is(audio,video) { max-inline-size:100%; max-block-size:60dvh; }
-.markdown-content :deep(.file-link) { background: none; border: 0; padding: 0; font: inherit; color: var(--accent); text-decoration: underline; cursor: pointer; }
+.markdown-content :deep(.file-link) { max-inline-size:100%; overflow-wrap:anywhere; text-align:start; }
 </style>

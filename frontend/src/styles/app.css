@@ -208,6 +208,7 @@
   --el-border-color: var(--border);
 }
 body { font: 400 var(--type-body)/1.55 var(--font-ui); }
+a.el-button { text-decoration:none; }
 .el-button--primary:not(.is-plain,.is-link,.is-text) { --el-button-text-color: var(--on-accent); --el-button-hover-text-color: var(--on-accent); --el-button-hover-bg-color: var(--accent-hover); --el-button-active-text-color: var(--on-accent); }
 .el-dialog, .avatar-window { font-size: var(--type-body); }
 .skip-navigation { position: fixed; inset: .5rem auto auto .5rem; z-index: 2100; transform: translateY(calc(-100% - 1rem)); }

@@ -73,7 +73,7 @@ onMounted(async () => {
         <template v-if="session.authConfig?.oidc_enabled && !local">
           <p class="sub">通过 Keycloak 统一认证登录。</p>
           <ElButton type="primary" :loading="busy" @click="oidc">前往 Keycloak 登录</ElButton>
-          <div class="actions"><ElButton link @click="local = true; error = ''">根管理员本地登录</ElButton></div>
+          <div class="actions"><ElButton @click="local = true; error = ''">根管理员本地登录</ElButton></div>
         </template>
         <template v-else>
           <div class="tabs">
@@ -98,7 +98,7 @@ onMounted(async () => {
             <button class="button primary" type="submit" :disabled="busy">{{ mode === 'recover' ? '重置密码 →' : mode === 'register' ? '注册账户 →' : '登录工作台 →' }}</button>
           </form>
           <p class="sub" style="margin-top:24px">{{ mode === 'recover' ? 'DEMO 简化找回：仅匹配注册联系方式，未验证邮箱或手机持有人。' : '手机号选填。登录联系方式与资料公开性独立管理。' }}</p>
-          <div v-if="session.authConfig?.oidc_enabled" class="actions"><ElButton link @click="local = false; error = ''; form.username = ''">返回 Keycloak 登录</ElButton></div>
+          <div v-if="session.authConfig?.oidc_enabled" class="actions"><ElButton @click="local = false; error = ''; form.username = ''">返回 Keycloak 登录</ElButton></div>
         </template>
       </div>
     </section>
