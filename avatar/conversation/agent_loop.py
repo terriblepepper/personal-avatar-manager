@@ -12,7 +12,7 @@ from fastapi import HTTPException
 
 from avatar.conversation.working_context import fit_turn, fit_working_set
 from avatar.conversation.tools.activity import AgentSteps, without_false_tool_footer
-from avatar.conversation.tools.html import create_html, html_tool
+from avatar.conversation.tools.html import create_html, html_tool, html_repair_prompt
 from avatar.models.client import ModelResult, accumulate_usage
 from avatar.models.limits import check_context
 from avatar.core.execution import AgentNeedsInput, call_with_retry, check_execution_async, current_generation, model_failure, recoverable
@@ -164,9 +164,16 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
     tools = config.get('_conversation_tools', ())
     animation_required = any(tool['id'] == 'animation' and tool['enabled'] for tool in tools)
     html_receipts = [*config.get('_generated_files', ()), *config.get('_agent_saved_files', ())]
-    html_needed = animation_required and not any(item.get('html_mode') in ('2d', '3d') for item in html_receipts)
+    route = config.get('_answer_route', {})
+    expected_mode = route.get('html_mode') if route.get('mode') in ('html','agent') else None
+    if animation_required and expected_mode == 'html':
+        expected_mode = None
+    required_modes = ('2d','3d') if animation_required else ()
+    if expected_mode in ('2d','3d'):
+        required_modes = (expected_mode,)
+    html_needed = bool(required_modes) and not any(item.get('html_mode') in required_modes for item in html_receipts)
     if config.get('_html_enabled'):
-        allowed['create_html'] = html_tool(html_needed)
+        allowed['create_html'] = html_tool(html_needed,expected_mode)
     personal_conversation = config.get('_personal_conversation') if delivery and not domain else None
     for tool in TOOLS:
         name = tool['name']
@@ -204,8 +211,8 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
         prompt += '2D 动画、3D 动画和通用网页均用 create_html。最终正文只说明作品，禁止重复源码和生成脚本。'
         if animation_required and not html_needed:
             prompt += '本轮此前已生成所要求的 HTML 作品，继续处理剩余目标。'
-        elif animation_required:
-            prompt += '用户已开启制作动画。本轮必须取得 create_html 的动画回执。根据意图选择 2d 或 3d，默认 2d。'
+        elif html_needed:
+            prompt += '本轮需要交付动画。本轮必须取得 create_html 的动画回执。根据意图选择 2d 或 3d，默认 2d。'
     if config.get('_sandbox_succeeded'):
         prompt += '本轮已有成功的沙箱回执。最终成文阶段没有新调用不影响之前的执行。'
     if disabled:
@@ -213,10 +220,10 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                    '使用 require_conversation_tool，停止本轮。不要猜测结果、换一种方式计算或绘图、'
                    '交付替代产物，或用 continue_answer 绕过提示。仅转达对方请求时无需本方工具。')
     settings = {**config, '_tools': list(allowed.values()), '_optional_tools': not required}
-    route_mode = config.get('_answer_route', {}).get('mode')
+    route_mode = route.get('mode')
     ready_to_answer = route_mode=='answer' or (route_mode in ('search','read') and
                       (config.get('_material_sources') or not personal_conversation))
-    if ready_to_answer and not domain and not html_needed and not config.get('_used_skills'):
+    if ready_to_answer and not domain and not html_needed and (route_mode=='answer' or not config.get('_used_skills')):
         settings = {**settings, '_tools': []}
     if progress:
         progress({'type': 'status', 'stage': 'intent_analysis', 'message': '正在分析本轮目标和所需工具'})
@@ -265,6 +272,9 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
         actions = ({'name': 'wait_for_user', 'arguments': {'content': notice, 'reason': notice,
                     'who': config['_conversation_tool_owner']}},) if required else ()
         return ModelResult(notice, usage, tool_calls=actions, finish_reason='tool_required')
+
+    if route_mode == 'agent' and route.get('needs_python') and 'python' in disabled and not domain:
+        return tool_required('python')
 
     # Keep verified goals separate from the model's proposed actions.
     pending = []
@@ -319,7 +329,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                 pending.pop(index)
                 break
 
-    def repair_call():
+    def repair_call(detail=''):
         nonlocal settings, invalid
         invalid += 1
         if invalid < 2:
@@ -329,8 +339,9 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
             observations.append('\n只使用已验证的资料和回执成文。若仍缺结果，请说明。')
         else:
             goal = '，仍缺少目标「' + pending[0]['goal'] + '」的回执' if pending else ''
-            raise pause('修正后仍未收到有效的工具调用' + goal) from None
+            raise pause((detail or '修正后仍未收到有效的工具调用') + goal) from None
 
+    html_repair = None
     duplicate_attempts=0
     premature=0
     retry_truncated = False
@@ -363,7 +374,11 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                       and any(t['name']==lookup_tool for t in settings['_tools']))
         step_settings = {**settings,'_call_purpose':'goal_decision','_batch_tools':True} if settings['_tools'] else settings
         step_prompt = prompt
-        if structured:
+        repairing_html = html_repair is not None and not queued_call
+        if repairing_html:
+            step_settings = {**settings,'_tools':[],'_recover_thinking':True,'_call_purpose':'goal_decision'}
+            step_prompt += '\n修复已选择的 create_html，仅返回其参数 JSON，不包裹工具名。'+html_repair
+        elif structured:
             step_settings = {**settings,'_tools':[],'_recover_thinking':True,'_call_purpose':'goal_decision'}
             step_prompt += ('\n此步只为第一个待核验目标填写已选检索工具的参数。只输出一个 JSON 对象，'
                             '按以下 schema 填写，不要封装工具名、不要同时输出多个查询：'
@@ -396,7 +411,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                           and not html_needed and not config.get('_sandbox_succeeded')
                           and not config.get('_generated_files') and plan == []
                           and not (delivery and (delivery.prepared or delivery.failure)))
-            mode = '执行同批下一项' if queued_call else '计划中的检索参数' if planned_lookup is not None else '结构化检索参数' if structured else '模型决策'
+            mode = '执行同批下一项' if queued_call else '计划中的检索参数' if planned_lookup is not None else '修复 HTML 参数' if repairing_html else '结构化检索参数' if structured else '模型决策'
             with trace.step('reason', {'run_id':run_id,'iteration': iteration,'goal_no':current.get('goal_no'),
                                        'mode':mode,'pending': pending,
                                        'tools': [tool['name'] for tool in step_settings['_tools']],
@@ -413,6 +428,14 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                     account(result.usage)
                 else:
                     result = await call_with_retry(generate, validate, retry_invalid=False)
+                    if repairing_html and str(result.finish_reason or '').lower() not in ('length','max_tokens','max_output_tokens'):
+                        try:
+                            args = json.loads(result.text.strip().removeprefix('```json').removesuffix('```'))
+                            if not isinstance(args,dict):
+                                raise ValueError()
+                        except ValueError:
+                            raise pause('HTML 参数修复仍未返回 JSON 对象，作品尚未生成') from None
+                        result = replace(result,text='',tool_calls=({'name':'create_html','arguments':args},))
                     if structured and str(result.finish_reason or '').lower() not in ('length','max_tokens','max_output_tokens'):
                         try:
                             if result.tool_calls:
@@ -433,6 +456,8 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
             if not diagnostic['delivery_unknown']:
                 if getattr(error,'output_limited',False) and not retry_truncated:
                     next_action = '压缩并接续'
+                elif lookup_tool == 'create_html' and getattr(error,'invalid_tool_call',False) and invalid < 1:
+                    next_action = '修复 HTML 参数'
                 elif getattr(error,'invalid_tool_call',False) and invalid < 1 and settings['_tools']:
                     next_action = '单项结构化检索' if lookup_tool in ('find_material','find_animation','find_public_material') else '修正工具调用'
                 elif pending and (structured or getattr(error,'invalid_tool_call',False)):
@@ -449,13 +474,15 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                 resume_truncated()
                 continue
             if not settings['_tools'] or not (getattr(error,'invalid_tool_call',False) or
-                                               (structured and getattr(error,'empty_model_output',False))):
+                                               ((structured or repairing_html) and getattr(error,'empty_model_output',False))):
                 raise
             trace.point('observe', {'run_id':run_id,'iteration':iteration,'goal_no':current.get('goal_no')},
                         {**diagnostic,'receipt':'工具未执行'},status='error')
             trace.point('check', {'run_id':run_id,'iteration':iteration,'attempts_without_progress':invalid+1},
                         {'decision':next_action,'remaining_goals':len(pending)})
-            repair_call()
+            if lookup_tool == 'create_html' and not repairing_html:
+                html_repair = html_repair_prompt(expected_mode,html_needed)
+            repair_call('HTML 参数修复失败：'+diagnostic['reason'] if repairing_html else '')
             continue
         await check_execution_async(validate)
         calls = getattr(result, 'tool_calls', ())
@@ -578,16 +605,21 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                 await check_execution_async(validate)
                 with trace.step('act', {'tool': name, 'filename': args.get('filename')}) as output:
                     try:
-                        item = create_html(args, outputs, capacity, animation_required=html_needed)
+                        item = create_html(args, outputs, capacity, animation_required=html_needed,expected_mode=expected_mode)
                     except (ValueError, HTTPException) as error:
-                        detail = str(error.detail) if isinstance(error, HTTPException) else 'HTML 或文件名无效'
+                        detail = str(error.detail) if isinstance(error, HTTPException) else str(error)
                         output.update(error=detail, retry_required=True)
                     else:
                         output['filename'] = item['filename']
                 if 'error' in output:
-                    repair_call()
-                    observations.append('HTML 未创建：'+output['error'])
+                    detail = 'HTML 未创建：'+output['error']
+                    log.warning('agent HTML validation run=%s iteration=%d goal=%s reason=%s',run_id,iteration,current.get('goal_no'),detail)
+                    repair_call(detail)
+                    observations.append(detail)
+                    html_repair = html_repair_prompt(expected_mode or args.get('mode'),html_needed)
                     continue
+                html_repair = None
+                expected_mode = None
                 html_needed = False
                 allowed['create_html'] = html_tool(False)
                 received(name)

@@ -309,17 +309,22 @@ class AvatarChat:
             if progress:progress({'type':'status','stage':'skills','message':'准备本轮技能'})
             context = await self.skills.load_context(overview['agent']['user_id'],context,request.message,self.model_client,user['id'])
             overview['_used_skills']=context[0].get('_used_skills',[]) if overview['agent']['user_id']==user['id'] else []
-            context=await self.rag.enrich(overview['agent']['user_id'],overview['agent']['aic'],session,files,context,request.message,include_private=bool(overview.get('_private_context')),progress=progress)
             tools=(await asyncio.to_thread(self.tools.get,user['id'],parent_id))['items']
             if not overview.get('_private_context'):
                 tools=[item for item in tools if item['id']=='animation']
             enabled=next((tool['enabled'] for tool in tools if tool['id']=='python'),False)
             context=({**context[0],'_conversation_tools':tools,'_animation_request':request.message},*context[1:])
-            route=config.get('_answer_route',{})
-            needs_python=route.get('needs_python',False) if route else config.get('_needs_python',True)
-            if needs_python or overview['_used_skills'] or config.get('_agent_checkpoint',{}).get('sandbox_attempted'):
+            route=context[0].get('_answer_route')
+            resumed=bool(config.get('_agent_checkpoint',{}).get('sandbox_attempted'))
+            if route is None and enabled and self.dialogues and not resumed:
+                # Compatibility entry points may reach prepare without the personal conversation router.
+                route=await self.dialogues.intent.answer_route(overview['agent']['user_id'],session['id'],context,request.message)
+                context=({**context[0],'_answer_route':route},*context[1:])
+            context=await self.rag.enrich(overview['agent']['user_id'],overview['agent']['aic'],session,files,context,request.message,include_private=bool(overview.get('_private_context')),progress=progress)
+            needs_python=bool(route and route.get('mode')=='agent' and route.get('needs_python') is True)
+            if needs_python or resumed:
                 inputs={}
-                if overview.get('_private_context'):
+                if enabled and overview.get('_private_context'):
                     from avatar.conversation.jobs.pipeline import sandbox_inputs
                     inputs=await asyncio.to_thread(sandbox_inputs,self,user['id'],parent_id,files,context[0].get('_agent_saved_files',()),request.agent_pause_id)
                 context=await self.skill_execution.enrich(overview['agent']['user_id'],context,request.message,self.model_client,caller_id=user['id'],conversation_id=session['id'],parent_id=parent_id,inputs=inputs,progress=progress,enabled=enabled,allow_code=enabled)
@@ -462,10 +467,8 @@ class AvatarChat:
         overview,context=await asyncio.to_thread(self.context,user,request,own,private_access=True)
         if action=='deliver_material' and not declared:
             context=({**context[0],'_material_delivery':arguments},*context[1:])
-        elif action=='continue_answer' and arguments.get('mode','agent')=='agent':
-            context=({**context[0],'_needs_python':arguments.get('needs_python',True)},*context[1:])
         elif action=='continue_answer':
-            context=({**context[0],'_answer_route':arguments},*context[1:])
+            context=({**context[0],'_answer_route':{'mode':'answer',**arguments}},*context[1:])
         if observation is not None:
             config,key,system,history=context
             instruction,raw=system.split('\n',1)
@@ -555,10 +558,8 @@ class AvatarChat:
                                 context=(config,context[1],prefix+'\n'+dump(background),context[3])
                             elif decision['action']=='deliver_material':
                                 context=({**config,'_material_delivery':arguments},*context[1:])
-                            elif decision['action']=='continue_answer' and arguments.get('mode','agent')=='agent':
-                                context=({**config,'_needs_python':arguments.get('needs_python',True)},*context[1:])
-                            elif arguments.get('mode','agent')!='agent':
-                                context=({**config,'_answer_route':arguments},*context[1:])
+                            elif decision['action']=='continue_answer':
+                                context=({**config,'_answer_route':{'mode':'answer',**arguments}},*context[1:])
                         overview['_tool_events'] = route_records
                         for event in route_events:
                             yield event

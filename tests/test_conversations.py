@@ -357,6 +357,7 @@ def test_sandbox_inputs_cannot_expand_after_submission(context,jobs,monkeypatch)
     from avatar.conversation.jobs.pipeline import generation_scope
     from tests.support import saved_file
     app,client,_=context;store,user,_,cid=jobs;chat=app.state.chat
+    assert client.patch('/api/conversations/'+cid+'/tools',json={'tools':{'python':True}}).status_code==200
     original=saved_file(client,'original.txt',b'original')
     store.submit(user,request(cid,'inputs'));job=store.claim()[0]
     late=saved_file(client,'late.txt',b'late')
@@ -372,7 +373,8 @@ def test_sandbox_inputs_cannot_expand_after_submission(context,jobs,monkeypatch)
     monkeypatch.setattr(chat.skill_execution,'enrich',execute)
     overview={'agent':{'user_id':user['id'],'aic':'aic','last_modified_at':''},'_private_context':True}
     session={'id':cid,'parent_id':None}
-    context=({'context_tokens':32768,'max_tokens':16},'key','system\n'+json.dumps({'available_skills':[]}),[])
+    route={'mode':'agent','needs_python':True}
+    context=({'context_tokens':32768,'max_tokens':16,'_answer_route':route},'key','system\n'+json.dumps({'available_skills':[]}),[])
     with generation_scope(job):asyncio.run(chat.prepare(user,request(cid,'inputs'),overview,context,session))
     assert original in captured and late not in captured
     assert captured[original]['read']()==b'original'

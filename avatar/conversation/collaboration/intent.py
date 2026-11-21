@@ -42,13 +42,19 @@ class MaterialArguments(BaseModel):
 
 class AnswerArguments(BaseModel):
     model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
-    mode: Literal['agent','answer','search','read','html'] = 'agent'
+    mode: Literal['agent','answer','search','read','html'] = 'answer'
+    html_mode: Literal['2d','3d','html',''] = Field('',description='创建作品时按本轮要求选维度，通用网页用 html。')
     needs_python: StrictBool = Field(False,description='必须实际运行代码才能得到数值、转换文件或生成数据图时为 true。解释、资料问答、写代码示例或制作 HTML 动画通常为 false。')
     query: str = Field(default='',max_length=2000)
     folder: str = Field(default='', max_length=512, description='仅按用户明确要求选择已知逻辑目录。')
 
     @model_validator(mode='after')
     def check_search(self):
+        if 'mode' not in self.model_fields_set:
+            if self.needs_python:
+                self.mode = 'agent'
+            elif self.html_mode:
+                self.mode = 'html'
         if self.mode=='search':
             from avatar.rag.query import FileQuery
             FileQuery(query=self.query,folder=self.folder)
@@ -97,6 +103,12 @@ TOOLS=[
     declaration('select_avatar', '仅供旧助手兼容入口：用户希望直接向指定分身提问。Web 本人对话应使用 contact_avatar 联系对方。', QueryArguments.model_json_schema()),
     declaration('return_to_self', '仅供旧助手兼容入口：用户明确返回本人分身或退出之前的目标。', {'type':'object', 'properties':{}, 'additionalProperties':False}),
 ]
+
+
+ANSWER_TOOL = declaration('continue_answer',
+               '优先用当前信息直接完成。仅缺已授权资料时搜一次，够用即停止。问候、闲聊、已有知识能回答的问题选 answer。只有本轮确实依赖代码执行或技能脚本才填 needs_python=true；开关、已加载技能和历史任务均不构成调用理由。需要计算时用 agent 并填 needs_python=true。answer 直接回答；search 按 query 和可选 folder 混合检索后回答；'
+               'read 先选择并读原文；html 独立生成网页或动画，不需资料检索或 Python；agent 用于真实计算或组合多项操作。'
+               '交付本人资料库原件用 deliver_material；查找本会话原件用 find_conversation_files；发给他人用 contact_avatar。', AnswerArguments.model_json_schema())
 
 
 class IntentState(TypedDict, total=False):
@@ -154,6 +166,23 @@ class DialogueIntent:
                                (uid,config['provider'],config['model'],dump(usage),now(),'agent_intent',uid,conversation_id))
             await run_blocking(record_usage)
 
+    async def answer_route(self, owner, session, context, question):
+        from avatar.conversation.working_context import fit_turn
+        config,key,_,history=context
+        options={**config,'_tools':[ANSWER_TOOL],'_optional_tools':True,'_call_purpose':'agent_intent'}
+        instruction=ANSWER_TOOL['description']
+        rows,message=fit_turn(options,instruction,history,question,[])
+        try:
+            pick=await self.model_selection(owner,session,options,key,instruction,rows,message)
+            args=pick.tool_calls[0]['arguments'] if pick.tool_calls else {}
+            return AnswerArguments.model_validate(args).model_dump()
+        except ValidationError:
+            return {'mode':'agent'}
+        except HTTPException as error:
+            if not getattr(error,'invalid_tool_call',False):
+                raise
+            return {'mode':'agent'}
+
     async def choose_tool(self, state):
         try:
             return await call_with_retry(lambda: self._choose_tool(state), retry_invalid=False)
@@ -200,10 +229,7 @@ class DialogueIntent:
             tools = [tool for tool in tools if tool['name']=='continue_answer']
         if state.get('resume'):
             tools=[tool for tool in tools if tool['name'] in ('deliver_material','continue_answer','find_conversation_files','contact_avatar')]
-        tools=[declaration('continue_answer',
-               '优先用当前信息直接完成。仅缺已授权资料时搜一次，够用即停止。开关只代表权限。需要计算时用 agent 并填 needs_python=true。answer 直接回答；search 按 query 和可选 folder 混合检索后回答；'
-               'read 先选择并读原文；html 独立生成网页或动画，不需资料检索或 Python；agent 用于真实计算或组合多项操作。'
-               '交付本人资料库原件用 deliver_material；查找本会话原件用 find_conversation_files；发给他人用 contact_avatar。', AnswerArguments.model_json_schema())
+        tools=[ANSWER_TOOL
                if tool['name']=='continue_answer' else tool for tool in tools]
         system=('你是当前用户自己的分身。先理解本轮的目标、收件人以及是否需要路由工具。'
                 '用 continue_answer 明确选择回答方式。给本人资料库原件用 deliver_material；查询当前会话、刚才生成或上传的原件用 find_conversation_files；把文件发给他人用 contact_avatar。'
@@ -225,7 +251,7 @@ class DialogueIntent:
             available = check_context(config,system+catalog_label+'[]'+tool_text,[],message)
         except HTTPException as exc:
             if exc.status_code!=422:raise
-            return {'action':'continue_answer','arguments':{},'file_catalog':files}
+            return {'action':'continue_answer','arguments':{'mode':'agent'},'file_catalog':files}
         # Allocate at most a third of spare input tokens to the profile, keeping space for named files.
         profile = (own['profile'][:12000] if own else '{}').encode()[:available].decode('utf-8','ignore')
         available -= estimate(profile)
@@ -244,7 +270,7 @@ class DialogueIntent:
             if json_mode:
                 calls=(json.loads(result.text.strip().removeprefix('```json').removesuffix('```')),)
             elif not calls:
-                return {'action':'continue_answer','arguments':{}}
+                return {'action':'continue_answer','arguments':{'mode':'answer'}}
             if (len(calls)!=1 or not isinstance(calls[0],dict) or set(calls[0])!={'name','arguments'}
                     or calls[0]['name'] not in {tool['name'] for tool in tools}
                     or not isinstance(calls[0]['arguments'],dict)
