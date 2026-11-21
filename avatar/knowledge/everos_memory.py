@@ -138,6 +138,7 @@ class EverOSMemory:
             if operation=='queue_claim':return {'rows':everos_storage.queue_claim(db,scope,project,payload.get('limit',50))}
             if operation=='queue_complete':everos_storage.queue_complete(db,scope,project,payload.get('rows',[]));return {'completed':True}
             if operation=='existing_vectors':return {'rows':everos_storage.existing_vectors(db,scope,project,payload.get('md_path'))}
+            if operation=='has_episode_vectors':return {'ready':everos_storage.has_episode_vectors(db,scope,project)}
             if operation=='archive_rows':return {'archived':everos_storage.archive_rows(db,scope,payload.get('table',''),payload.get('rows',[]),payload.get('source_schema',''))}
             if operation=='archive_blob':return {'stored':everos_storage.archive_blob(db,scope,payload.get('kind',''),payload.get('record_id',''),bytes.fromhex(payload.get('payload_hex','')),payload.get('media_type',''))}
             if operation=='archive_source':everos_storage.archive_source(db,scope,payload.get('table',''),payload.get('source_schema',''),payload.get('source_count',0),payload.get('digest',''));return {'archived':True}

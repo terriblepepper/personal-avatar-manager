@@ -211,26 +211,40 @@ async def _records_for_path(files,owner,project,md_path,profile_reader,tokenizer
     return [_episode_record(owner,project,md_path,entry,tokenizer) for entry in parsed.entries]
 
 
+EPISODE_VECTOR_FIELDS = (('content','embedding'),('title','subject_embedding'))
+
+
+def _missing_episode_embeddings(record):
+    return [(vector,record[source]) for source,vector in EPISODE_VECTOR_FIELDS
+            if record.get(vector) is None and record.get(source,'').strip()]
+
+
 def _reuse_embeddings(records,existing,embedding_enabled):
-    prior={row['record_id']:row for row in existing};to_embed=[]
+    prior={row['record_id']:row for row in existing}
+    changed=[];to_embed=[]
     for record in records:
-        old=prior.get(record['record_id'])
-        if old and old.get('content_sha256')==record['content_sha256']:
-            record['embedding']=old.get('embedding');record['subject_embedding']=old.get('subject_embedding')
-        if embedding_enabled and record['kind']=='episode':
-            if record.get('embedding') is None:to_embed.append(record)
-            elif record.get('title') and record.get('subject_embedding') is None:to_embed.append(record)
-    changed=[record for record in records if not prior.get(record['record_id']) or prior[record['record_id']].get('content_sha256')!=record['content_sha256']
-             or embedding_enabled and (record.get('embedding') is None or record.get('title') and record.get('subject_embedding') is None)]
+        old=prior.get(record['record_id'],{})
+        same_record=old.get('content_sha256')==record['content_sha256']
+        if record['kind']=='episode':
+            for source,vector in EPISODE_VECTOR_FIELDS:
+                text=record.get(source,'')
+                if text.strip() and text==old.get(source):
+                    record[vector]=old.get(vector)
+            missing=embedding_enabled and bool(_missing_episode_embeddings(record))
+            if missing:to_embed.append(record)
+        else:
+            if same_record:
+                record['embedding']=old.get('embedding');record['subject_embedding']=old.get('subject_embedding')
+            missing=embedding_enabled and (record.get('embedding') is None or
+                                            record.get('title') and record.get('subject_embedding') is None)
+        if not same_record or missing or any(record.get(vector)!=old.get(vector) for _,vector in EPISODE_VECTOR_FIELDS):
+            changed.append(record)
     return changed,to_embed
 
 
 async def _embed_records(embedder,records,embedding_enabled):
     if not embedding_enabled:return
-    inputs=[]
-    for record in records:
-        if record.get('embedding') is None:inputs.append((record,'embedding',record['content']))
-        if record.get('title') and record.get('subject_embedding') is None:inputs.append((record,'subject_embedding',record['title']))
+    inputs=[(record,field,text) for record in records for field,text in _missing_episode_embeddings(record)]
     for start in range(0,len(inputs),10):
         batch=inputs[start:start+10];vectors=await embedder.embed_batch([text for _,_,text in batch])
         if len(vectors)!=len(batch):raise ValueError('EverOS vector response incomplete')
@@ -342,7 +356,14 @@ async def compile_memory(payload,root,files):
                 except Exception as error:
                     retryable=not isinstance(error,(ValueError,KeyError,TypeError));failures.append(type(error).__name__);await pg('queue_complete',rows=[{'md_path':row['md_path'],'status':'failed','retryable':retryable,'retry_count':int(row.get('retry_count',0))+1,'error':type(error).__name__}])
         if failures:raise RuntimeError('EverOS index incomplete: '+','.join(sorted(set(failures))))
-    payload['_stage']='search';enabled=bool(payload.get('embedding_enabled'));query='本人表达风格、语气、措辞、句式、习惯和最新修正';existing=await pg('existing_vectors');vector_ready=any(row.get('embedding') or row.get('subject_embedding') for row in existing['rows'] if row['kind']=='episode');method='hybrid' if enabled and vector_ready else 'keyword';query_vector=await embedder.embed(query) if method=='hybrid' else None;found=(await pg('search',query=query,query_tokens=tokenizer.tokenize(query),method=method,embedding=query_vector,limit=6,include_profile=False))['rows'];profile_row=(await pg('profile'))['row']
+    payload['_stage']='search'
+    query='本人表达风格、语气、措辞、句式、习惯和最新修正'
+    vector_ready=bool(payload.get('embedding_enabled')) and (await pg('has_episode_vectors'))['ready']
+    method='hybrid' if vector_ready else 'keyword'
+    query_vector=await embedder.embed(query) if vector_ready else None
+    found=(await pg('search',query=query,query_tokens=tokenizer.tokenize(query),method=method,
+                    embedding=query_vector,limit=6,include_profile=False))['rows']
+    profile_row=(await pg('profile'))['row']
     episodes=[]
     for row in found:
         metadata=row.get('metadata') or {};episodes.append({'id':row['record_id'],'user_id':metadata.get('owner_id'),'app_id':'avatar-soul','project_id':payload['project'],'session_id':metadata.get('session_id'),'timestamp':metadata.get('timestamp'),'sender_ids':metadata.get('sender_ids',[]),'summary':row.get('summary',''),'subject':row.get('title',''),'episode':row.get('content',''),'type':'Conversation','score':row['score'],'atomic_facts':[]})

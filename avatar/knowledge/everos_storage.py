@@ -230,10 +230,19 @@ def load_blob(conn,scope,kind,record_id):
     return {'media_type':row[0],'payload':payload,'digest':row[2]}
 
 
-def existing_vectors(conn,scope,project,md_path=None):
+def has_episode_vectors(conn,scope,project):
     owner_hash,index_signature=_scope(scope)
-    sql="""SELECT kind,record_id,entry_id,md_path,content_sha256,group_name,title,summary,content,tokens,metadata,embedding,subject_embedding
-      FROM everos_vectors WHERE owner_hash=? AND index_signature=? AND project_id=?"""
+    return conn.execute("""SELECT EXISTS (
+      SELECT 1 FROM everos_vectors WHERE owner_hash=? AND index_signature=? AND project_id=?
+      AND kind='episode' AND (cardinality(embedding)>0 OR cardinality(subject_embedding)>0)
+    )""",(owner_hash,index_signature,project)).fetchone()[0]
+
+
+def existing_vectors(conn,scope,project,md_path=None,*,include_embeddings=True):
+    owner_hash,index_signature=_scope(scope)
+    columns='kind,record_id,entry_id,md_path,content_sha256,group_name,title,summary,content,tokens,metadata'
+    if include_embeddings:columns+=',embedding,subject_embedding'
+    sql=f"SELECT {columns} FROM everos_vectors WHERE owner_hash=? AND index_signature=? AND project_id=?"
     args=[owner_hash,index_signature,project]
     if md_path is not None:sql+=' AND md_path=?';args.append(md_path)
     sql+=' ORDER BY md_path,record_id'
@@ -352,8 +361,8 @@ def _public_row(row):
 
 
 def search_vectors(conn,scope,project,query,method='keyword',embedding=None,limit=6,include_profile=False,query_tokens=None):
-    owner_hash,index_signature=_scope(scope)
-    rows=existing_vectors(conn,scope,project)
+    use_vectors=method in ('vector','hybrid') and embedding is not None
+    rows=existing_vectors(conn,scope,project,include_embeddings=use_vectors)
     if not include_profile:rows=[row for row in rows if row['kind']!='user_profile']
     terms=set(query_tokens) if query_tokens else _tokens(query)
     documents=[]
@@ -369,7 +378,7 @@ def search_vectors(conn,scope,project,query,method='keyword',embedding=None,limi
             df=document_frequency[term];inverse=math.log(1+(total-df+.5)/(df+.5))
             score+=inverse*frequency*2.2/(frequency+1.2*(.25+.75*len(tokens)/max(1,avg_length)))
         if score:keyword.append((score,row['record_id'],row))
-        if method in ('vector','hybrid') and embedding is not None:
+        if use_vectors:
             dense=max(_cosine(embedding,row.get('embedding') or []),_cosine(embedding,row.get('subject_embedding') or []))
             if dense>=0:vector.append((dense,row['record_id'],row))
     keyword.sort(key=lambda item:(-item[0],item[1]));vector.sort(key=lambda item:(-item[0],item[1]))
