@@ -24,7 +24,8 @@ const actions: Record<string, string> = {
   send_public_material: '准备公开原件',
   find_animation: '查找已保存动画',
   send_animation: '准备动画原件',
-  create_html: '制作 HTML 作品',
+  create_html: '制作网页',
+  create_animation: '制作动画',
   list_avatars: '查询公开分身目录',
   contact_avatar: '准备分身联络草稿',
   find_conversation_files: '查找当前会话原件',
@@ -52,6 +53,11 @@ function activityName(event: ToolEvent) {
     if (input.tool === 'select_materials' && Array.isArray(output.files)) return `核验 ${output.files.length} 份原件`
     const name = actions[String(input.tool)] || '执行已选工具'
     return typeof input.query === 'string' && input.query ? `${name}「${input.query}」` : name
+  }
+  if (input.operation === 'check_file_receipt') {
+    if (output.decision === 'webpage') return '核对后补做网页'
+    if (output.decision === '2d' || output.decision === '3d') return '核对后补做动画'
+    return output.decision === 'plain_answer' ? '已确认本轮可用文字回答' : '核对本轮文件交付'
   }
   if (input.stage === 'route' || input.stage === 'resume_route') {
     if (output.action === 'deliver_material') return '识别索件意图并进入原件交付'

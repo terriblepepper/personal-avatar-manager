@@ -18,7 +18,6 @@ def terms(text):
 
 
 _DATE=re.compile(r'(?<!\d)((?:19|20)\d{2})[-./年_]?([01]?\d)[-./月_]?([0-3]?\d)(?:日)?(?!\d)')
-_RECENT=re.compile(r'最新(?:的)?|最近(?:的)?|most recent|latest',re.I)
 
 
 def document_date(text):
@@ -48,24 +47,20 @@ class MaterialDiscovery:
             matches=[item for item in directories if not query or query in folded(item['path']+' '+item['description'])]
             return {'items':[], 'directories':matches[request.offset:request.offset+10],
                     'next_offset':request.offset+10 if len(matches)>request.offset+10 else None}
-        key=(query,folder,animation_only)
+        key=(query,folder,animation_only,request.sort)
         if key!=self.last_key:
             scoped=[row for row in self.documents if folded(row.get('relative_path') or row['filename']).startswith(prefix)
                     and (not animation_only or is_animation_file(row))]
-            self.last_rows=await self.rank(scoped,request.query.strip())
+            self.last_rows=await self.rank(scoped,request.query.strip(),latest=request.sort=='latest')
             self.last_key=key
         rows=self.last_rows
         return {'items':rows[request.offset:request.offset+10],
                 'directories':directories[:10],
                 'next_offset':request.offset+10 if len(rows)>request.offset+10 else None}
 
-    async def rank(self, documents, question):
+    async def rank(self, documents, question, *, latest):
         query=folded(question)
-        latest=bool(_RECENT.search(query))
-        topic=_RECENT.sub('',query) if latest else query
-        if latest:
-            topic=re.sub(r'(?:微信|公众号)?(?:的)?(?:文章|推文|文档|资料|文件)$','',topic).strip(' 的') or query
-        words=terms(topic)
+        words=terms(query)
         ascii_words=[word for word in words if len(word)>=4 and word.isascii()]
         hits={}
         for row in documents:
@@ -83,7 +78,7 @@ class MaterialDiscovery:
             name_hits=sum(word in name for word in words)
             hits[row['id']]=[exact,named,0,overlap,fuzzy,'',name_hits]
         if query and documents and not any(hit[0] for hit in hits.values()):
-            evidence,_=await self.retrieve(documents,topic if latest else question,published_only=True)
+            evidence,_=await self.retrieve(documents,question,published_only=True)
             for rank,doc in enumerate(evidence):
                 hit=hits.get(doc.metadata.get('file_id'))
                 if hit is not None and not hit[2]:
@@ -105,7 +100,7 @@ class MaterialDiscovery:
             exact,named,rag,metadata,fuzzy,_,filename=entry[1]
             if latest:
                 item=self.catalog[entry[0]]
-                relevant=bool(topic and topic in folded(item['filename']+' '+item['description']+' '+entry[1][5]))
+                relevant=(not query or query in folded(item['filename']+' '+item['description']+' '+entry[1][5]))
                 return exact,named,relevant,dates[entry[0]][0] if relevant else '',bool(filename and rag),filename,rag or fuzzy,metadata
             return exact,named,bool(filename and rag),max(filename,metadata),rag or fuzzy,filename
         for identifier,hit in sorted(hits.items(),key=priority,reverse=True):
