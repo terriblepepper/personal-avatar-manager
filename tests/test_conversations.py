@@ -1100,10 +1100,13 @@ def test_html_modes_and_legacy_animation_setting(context):
     updated = user.patch('/api/conversations/'+cid+'/tools', json={'tools': {'animation': True}})
     assert switches(updated) == {'python': True, 'animation': True}
     assert switches(user.get('/api/conversations/'+cid+'/tools')) == switches(updated)
-    from avatar.conversation.tools.html import html_tool
-    assert html_tool(True)['parameters']['properties']['mode']['enum'] == ['2d', '3d']
-    assert html_tool(True)['parameters']['properties']['mode']['default'] == '2d'
-    assert 'html' in html_tool(False)['parameters']['properties']['mode']['enum']
+    from avatar.conversation.tools.html import CREATE_HTML, animation_tool
+    page = CREATE_HTML['parameters']
+    assert CREATE_HTML['name']=='create_html' and set(page['properties'])==set(page['required'])=={'filename','html'}
+    animation = animation_tool()
+    assert animation['name']=='create_animation' and animation['parameters']['properties']['mode']['enum']==['2d','3d']
+    assert animation['parameters']['properties']['mode']['default']=='2d'
+    assert animation_tool('3d')['parameters']['properties']['mode']['enum']==['3d']
     assert user.patch('/api/conversations/'+cid+'/tools',json={'tools':{'mermaid':False}}).status_code==422
     assert user.patch('/api/conversations/'+cid+'/tools',json={'tools':{'python':True}}).status_code==200
     from avatar.conversation.tools.builtin import MERMAID_INSTRUCTIONS

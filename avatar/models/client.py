@@ -177,7 +177,7 @@ def check_status(status):
 # 按 token 预算分别限制有效内容和 SSE 传输；每个 token 可能单独携带完整的 JSON 事件头。
 def response_limit(config,streaming=False):
     wire_allowance = min(64*1024*1024,max(8*1024*1024,config['max_tokens']*2048))
-    if config.get('_call_purpose') == 'html_generation' or any(tool.get('name')=='create_html' for tool in config.get('_tools') or ()):
+    if config.get('_call_purpose') == 'html_generation' or any(tool.get('name') in ('create_html','create_animation') for tool in config.get('_tools') or ()):
         from avatar.files.parsing.animation import MAX_ENVELOPE_BYTES
         # HTML is nested inside JSON tool arguments. Escapes and streaming headers do not count toward file size.
         return MAX_ENVELOPE_BYTES + (wire_allowance if streaming else 0)
@@ -322,7 +322,7 @@ class ModelClient:
             limit_field = "max_completion_tokens" if config["provider"] == "openai" else "max_tokens"
             body = {"model": config["model"], "messages": [{"role": "system", "content": system}]+conversation,
                     limit_field: config["max_tokens"], "stream": streaming}
-            if (config.get('_recover_thinking') or config.get('_brief_visual_parse') or config.get('_call_purpose') in ('skill_execution','task_planning','material_selection','agent_intent')
+            if (config.get('_recover_thinking') or config.get('_brief_visual_parse') or config.get('_call_purpose') in ('skill_execution','task_planning','material_selection','agent_intent','delivery_review')
                     or (config.get('_tools') and config.get('_call_purpose') in ('file_read','rag_query_construction'))) and config['provider']=='custom' and config['model'].split('/')[-1].lower().startswith('qwen'):
                 body['enable_thinking']=False
                 body['chat_template_kwargs']={'enable_thinking':False}
