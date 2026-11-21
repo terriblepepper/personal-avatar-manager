@@ -11,7 +11,7 @@ from avatar.protocols.identity.atr_config import read_atr_config
 from avatar.protocols.identity.document import LocalEntityDirectory, identity_json
 from avatar.protocols.identity.system import SYSTEM_ENTITY_ID, system_identity_paths
 from avatar.protocols.registration.entity import certificate_projection
-from avatar.protocols.registration.maintenance import maintain_registered
+from avatar.protocols.registration.maintenance import RENEWAL_SCAN_SECONDS, maintain_registered
 
 log = logging.getLogger(__name__)
 
@@ -120,6 +120,6 @@ class PlatformCertificate:
             except Exception as error:
                 log.warning('平台证书检查未完成（%s）', type(error).__name__)
             try:
-                await asyncio.wait_for(self.wake.wait(), timeout=60)
+                await asyncio.wait_for(self.wake.wait(), timeout=RENEWAL_SCAN_SECONDS)
             except TimeoutError:
                 pass
