@@ -123,7 +123,7 @@ onUnmounted(() => { controller.abort(); clearTimeout(timer); window.removeEventL
         <iframe ref="frame" src="/static/preview/mermaid.html" title="Mermaid 隔离图表" sandbox="allow-scripts" referrerpolicy="no-referrer"/>
       </div>
     </div>
-    <p v-if="link"><a :href="link" target="_blank" rel="noopener noreferrer">打开图表链接</a></p>
+    <p v-if="link"><a class="button small" :href="link" target="_blank" rel="noopener noreferrer">打开图表链接</a></p>
   </figure>
   <MaterialFileDialog v-if="promoting" filename="Mermaid绘图.mmd" :save="promote" @close="promoting=false"/>
   <FilePreview v-if="preview" :file="{ id: 'diagram', filename: 'Mermaid 图表.png' }" url="" :image-data="preview" @close="preview=''"/>

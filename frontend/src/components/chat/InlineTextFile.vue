@@ -43,7 +43,7 @@ watch([visible,() => props.url,() => props.file.size,() => props.mode,running], 
 
 <template>
   <section ref="host" class="inline-document">
-    <button type="button" class="file-link" @click="emit('preview',file)">{{ file.filename }}</button>
+    <button type="button" class="button small file-link" @click="emit('preview',file)">{{ file.filename }}</button>
     <div v-if="mode === 'html'" class="html-actions">
       <button type="button" class="button small" @click="running = !running">{{ running ? '停止预览' : '运行预览' }}</button>
       <button type="button" class="button small" @click="emit('preview',file)">小窗查看</button>

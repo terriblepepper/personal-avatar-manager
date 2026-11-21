@@ -120,7 +120,7 @@ onMounted(loadFolders)
             <template v-else>
               <td><input v-model="selectedFiles" type="checkbox" data-material-pick :value="entry.asset.id" :aria-label="'选择 '+entry.asset.filename"><button type="button" class="material-entry" @click="inspected={...entry.asset}"><MaterialTypeIcon :filename="entry.asset.filename"/><span>{{ entry.asset.filename }}<small v-if="entry.asset.relative_path && entry.asset.relative_path!==entry.asset.filename">{{ entry.asset.relative_path }}</small></span></button></td>
               <td><input type="checkbox" :checked="selected.includes(entry.asset.id)" :disabled="!supportsSoulAsset(entry.asset.filename)" :aria-label="'用于构建 '+entry.asset.filename" @change="emit('update:selected',($event.target as HTMLInputElement).checked ? [...selected,entry.asset.id] : selected.filter(id=>id!==entry.asset.id))"></td>
-              <td><div class="soul-asset-actions"><button type="button" class="button small" @click="preview=entry.asset">预览</button><a :href="entry.asset.download_url || `/api/me/knowledge/assets/${encodeURIComponent(entry.asset.id)}`" target="_blank" rel="noopener">下载</a><button type="button" class="button small" @click="rename('',entry.asset)">重命名</button></div></td>
+              <td><div class="soul-asset-actions"><button type="button" class="button small" @click="preview=entry.asset">预览</button><a class="button small" :href="entry.asset.download_url || `/api/me/knowledge/assets/${encodeURIComponent(entry.asset.id)}`" target="_blank" rel="noopener">下载</a><button type="button" class="button small" @click="rename('',entry.asset)">重命名</button></div></td>
             </template>
           </tr>
         </tbody>

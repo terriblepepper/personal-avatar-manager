@@ -62,7 +62,7 @@ const cards = computed(() => {
         <button type="button" class="button animation-file" :disabled="!url || result === undefined"
           @click="emit('preview',file)"><MaterialTypeIcon :filename="file.filename"/><span>{{ file.filename }}</span>
           <small>{{ result === undefined ? '正在加载' : '文件预览' }}</small></button>
-        <a v-if="url && result === null" :href="url" :download="file.filename">下载原件</a>
+        <a v-if="url && result === null" class="button small" :href="url" :download="file.filename">下载原件</a>
       </div>
     </template>
   </div>
