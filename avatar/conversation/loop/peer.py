@@ -9,6 +9,20 @@ from avatar.core.db import dump, now
 from avatar.models.client import accumulate_usage
 from avatar.conversation.loop.runtime import resume_safe
 from avatar.conversation.loop.store import RunStore
+from avatar.knowledge.learning import auto_style_advance
+
+
+def active_peer_style(db, owner):
+    style=db.execute("""SELECT b.id,md5(b.document) AS checksum FROM active_souls s
+        JOIN soul_builds b ON b.id=s.build_id AND b.user_id=s.user_id AND b.status='approved'
+        WHERE s.user_id=?""",(owner,)).fetchone()
+    return dict(style) if style else {'id':None,'checksum':None}
+
+
+def check_peer_style(db, owner, pinned):
+    current=active_peer_style(db,owner)
+    if current!=pinned and not auto_style_advance(db,owner,pinned['id'],pinned['checksum'],current['id']):
+        raise HTTPException(409,'原任务绑定的 Soul 风格已撤回或修改')
 
 
 def speaker(task):
@@ -51,6 +65,10 @@ class PeerTurn:
         with service.database.connect(write=True) as db:
             self.workspace = service.resources.workspace(db, owner, task['session_id'], task['id'])
             self.settings_workspace = service.resources.settings_workspace(db, owner, task['session_id'], task['id'])
+            state=RunStore.inspect_in(db,owner,'dialogue',task['id'],'turn') or {}
+            receipt=json.loads(task.get('pending_file_delivery') or '{}')
+            prior=state or (receipt if receipt.get('speaker')==owner else {})
+            self.style=self.resolve_style(service,db,task,owner,self.workspace,prior)
             self.source = self.authority(db)
 
     def authority(self, db):
@@ -62,10 +80,27 @@ class PeerTurn:
             if not db.execute("SELECT 1 FROM agent_wire_results WHERE local_aic=? AND peer_aic=? AND command_id=? "
                               "AND task_id=? AND session_id=? AND state='working'", (*key,task['id'],task['session_id'])).fetchone():
                 raise HTTPException(409, '分身协议命令已停止')
-        return self.source_version(self.service, db, task, self.owner, self.workspace)
+        return self.source_version(self.service, db, task, self.owner, self.workspace, style=self.style)
 
     @staticmethod
-    def source_version(service, db, task, owner, workspace):
+    def resolve_style(service, db, task, owner, workspace, state):
+        if 'peer_style' in state:
+            return state['peer_style']
+        current=active_peer_style(db,owner)
+        expected=state.get('peer_source') or state.get('authority')
+        if not expected or PeerTurn.source_version(service,db,task,owner,workspace,style=current)==expected:
+            return current
+        # Legacy receipts contain only a source hash. Try an original approved ancestor and recheck every other source.
+        older=db.execute("SELECT id,md5(document) AS checksum FROM soul_builds WHERE user_id=? AND status='approved' AND id IS DISTINCT FROM ?",
+                         (owner,current['id'])).fetchall()
+        for candidate in [*(dict(row) for row in older),{'id':None,'checksum':None}]:
+            if auto_style_advance(db,owner,candidate['id'],candidate['checksum'],current['id']):
+                if PeerTurn.source_version(service,db,task,owner,workspace,style=candidate)==expected:
+                    return candidate
+        return current
+
+    @staticmethod
+    def source_version(service, db, task, owner, workspace, *, style=None):
         side = 'initiator' if owner == task['user_id'] else 'target'
         table,key=('agent_session_members','session_id') if task['delivery_mode']=='message' else ('agent_task_members','task_id')
         scope_id=task['session_id'] if key=='session_id' else task['id']
@@ -80,7 +115,7 @@ class PeerTurn:
         own, target = service.participants(db, task['user_id'], task['target_aic'])
         if own['aic'] != task['own_aic'] or target['user_id'] != task['target_user_id']:
             raise HTTPException(409, '参与分身的身份已变化')
-        return hashlib.sha256(dump([service.output_revision(db,task,owner), task[side+'_skills'],
+        return hashlib.sha256(dump([service.output_revision(db,task,owner,style=style), task[side+'_skills'],
                                     task[side+'_excluded_skills'], *row]).encode()).hexdigest()
 
     def validate(self, db):
@@ -108,7 +143,7 @@ class PeerTurn:
         if not exported and not resume_safe(state, initial=not state):
             raise HTTPException(409, '原操作结果尚未确认，请核对后结束任务')
         self.active = store
-        fields = {'peer_source':self.source, 'peer_workspace':self.workspace, 'phase':state.get('phase','planning')}
+        fields = {'peer_source':self.source, 'peer_style':self.style, 'peer_workspace':self.workspace, 'phase':state.get('phase','planning')}
         if not state:
             fields['objective'] = self.task['objective']
         store.merge(fields)
@@ -143,7 +178,8 @@ class PeerTurn:
         if state or known:
             workspace = state.get('peer_workspace') or receipt.get('workspace')
             try:
-                current = PeerTurn.source_version(service,db,task,owner,workspace)
+                style = PeerTurn.resolve_style(service,db,task,owner,workspace,state or receipt)
+                current = PeerTurn.source_version(service,db,task,owner,workspace,style=style)
             except HTTPException:
                 return False
             if (state and state.get('peer_source')!=current) or (known and receipt.get('authority')!=current):

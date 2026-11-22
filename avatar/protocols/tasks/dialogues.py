@@ -5,10 +5,13 @@ import json
 import uuid
 import httpx
 import logging
+import traceback
 from fastapi import HTTPException
 from avatar.conversation.collaboration.dialogues import confirmed_message
 from avatar.conversation.collaboration.tools import task_tool_result
 from avatar.conversation.loop.peer import PeerTurn, speaker as turn_speaker, wire_id
+from avatar.conversation.loop.runtime import resume_safe
+from avatar.conversation.loop.store import RunStore
 from avatar.core.db import now,dump
 from avatar.core.execution import AgentNeedsInput
 from avatar.protocols.tasks.store import ManagementTaskError
@@ -46,7 +49,12 @@ class PeerDialogueTasks:
     def validate_delivery(self, db, task, owner):
         receipt = json.loads(task.get('pending_file_delivery') or '{}')
         if receipt.get('authority') and receipt.get('revision')==task['revision'] and receipt.get('speaker')==owner:
-            if receipt['authority'] != PeerTurn.source_version(self.dialogues,db,task,owner,receipt['workspace']):
+            try:
+                style=PeerTurn.resolve_style(self.dialogues,db,task,owner,receipt['workspace'],receipt)
+                authorized=receipt['authority']==PeerTurn.source_version(self.dialogues,db,task,owner,receipt['workspace'],style=style)
+            except HTTPException:
+                authorized=False
+            if not authorized:
                 raise ManagementTaskError(-32009,'原任务资料或工具授权已变化')
             if proofs:=receipt.get('session_file_reads'):
                 try:
@@ -71,7 +79,7 @@ class PeerDialogueTasks:
         target = 'completed' if operation == 'complete' else 'canceled'
         if latest['state'] == target:
             return result
-        allowed = ('awaiting-completion',) if operation == 'complete' else ('working','awaiting-completion','awaiting-input')
+        allowed = ('awaiting-completion',) if operation == 'complete' else ('working','awaiting-completion','awaiting-input','failed')
         if latest['state'] not in allowed:
             raise ManagementTaskError(-32010, '当前任务状态不允许该操作')
         stamp = now()
@@ -79,6 +87,20 @@ class PeerDialogueTasks:
         db.execute('UPDATE agent_wire_results SET state=?,document=? WHERE local_aic=? AND peer_aic=? AND command_id=?',
                    (target,dump(result),*key[:2],latest['command_id']))
         return result
+
+    @staticmethod
+    def can_follow_failure(db, task, owner, command, latest):
+        if command['id']!=wire_id(db,task,owner):
+            return False
+        checkpoint=json.loads(task.get('agent_checkpoint') or '{}')
+        if checkpoint.get('unconfirmed_wire'):
+            return False
+        failed=json.loads(latest['document'])
+        # A locally returned failure has a result product. Restart recovery alone has no confirmed result.
+        if not failed.get('products'):
+            return False
+        state=RunStore.inspect_in(db,owner,'dialogue',task['id'],'turn') or {}
+        return resume_safe(state,initial=not state)
 
     # start/continue 生成一方发言；command id 去重使网络重试不会重复调用模型。
     async def handle(self,command,context,user_id):
@@ -130,8 +152,11 @@ class PeerDialogueTasks:
                     raise ManagementTaskError(-32010,'任务当前不等待该分身发言')
                 resumable=latest and latest['state']=='awaiting-input' and task.get('agent_checkpoint')
                 if resumable:
-                    pause=json.loads(latest['document'])['status']['dataItems']
-                    resumable=any(i.get('type')=='data' and task['revision']>i['data']['revision'] for i in pause)
+                    pause=json.loads(latest['document'])['status'].get('dataItems',[])
+                    resumable=any(i.get('type')=='data' and isinstance(i.get('data'),dict)
+                                  and type(i['data'].get('revision')) is int and task['revision']>i['data']['revision'] for i in pause)
+                if latest and latest['state']=='failed':
+                    resumable=self.can_follow_failure(db,task,user_id,command,latest)
                 if (operation == 'start') != (latest is None) or latest and latest['state'] != 'awaiting-completion' and not resumable:
                     raise ManagementTaskError(-32010,'该方向当前状态不允许发言')
                 text = confirmed_message(task,user_id)
@@ -194,6 +219,9 @@ class PeerDialogueTasks:
         except asyncio.CancelledError:
             raise
         except HTTPException as error:
+            frames=[(frame.filename.rsplit('/',1)[-1],frame.lineno,frame.name) for frame in traceback.extract_tb(error.__traceback__)]
+            logging.getLogger(__name__).warning('Peer turn rejected: task=%s revision=%s status=%s frames=%s',
+                                               task['id'],task['revision'],error.status_code,frames)
             result=self.result(command,context,'failed','分身任务或资料状态已变化，请核对后继续' if error.status_code in (403,404,409) else '接收方未完成发言，请核对任务状态')
             if error.status_code==504:result['status']['dataItems']=[{'type':'data','data':{'peerReplyTimedOut':True}}]
         except (TimeoutError,httpx.TimeoutException):

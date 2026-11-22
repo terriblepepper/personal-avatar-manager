@@ -90,18 +90,19 @@ class PeerAcpsTransport:
 
     async def _control(self,job,left,right,operation):
         with self.runtime.database.connect() as db:
-            rows = db.execute('SELECT DISTINCT local_aic,peer_aic FROM agent_wire_results WHERE task_id=? AND session_id=?',
+            rows = db.execute('SELECT DISTINCT ON (local_aic,peer_aic) local_aic,peer_aic,state FROM agent_wire_results '
+                              'WHERE task_id=? AND session_id=? ORDER BY local_aic,peer_aic,rowid DESC',
                               (job['id'],job['session_id'])).fetchall()
-        started = {(r['local_aic'], r['peer_aic']) for r in rows}
+        started = {(r['local_aic'], r['peer_aic']):r['state'] for r in rows}
         directions = {
             (job['target_aic'],job['own_aic']): (left,right),
             (job['own_aic'],job['target_aic']): (right,left),
         }
-        if started - directions.keys():
+        if started.keys() - directions.keys():
             raise HTTPException(502,'已受理命令的身份与任务配对不一致，请核对协议记录')
         expected = 'completed' if operation == 'complete' else 'canceled'
         for pair,(leader,partner) in directions.items():
-            if pair not in started:
+            if pair not in started or (operation=='complete' and started[pair] in ('failed','canceled')):
                 continue
             command_id = str(uuid.uuid5(uuid.NAMESPACE_URL,job['id']+':'+operation+':'+leader))
             result = await self.send(job,leader,partner,operation,command_id)

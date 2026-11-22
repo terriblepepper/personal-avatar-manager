@@ -18,7 +18,7 @@ from avatar.core.db import now,dump
 from avatar.models.effort import with_chat_effort
 from avatar.core.schemas import ChatRequest
 from avatar.core.execution import AgentNeedsInput,sandbox_checkpoint,execution_guard
-from avatar.conversation.loop.peer import PeerTurn, speaker as turn_speaker
+from avatar.conversation.loop.peer import PeerTurn, check_peer_style, speaker as turn_speaker
 from avatar.files.conversation.peer import workspace_expired
 from avatar.conversation.loop.store import RunStore
 from avatar.conversation.collaboration.inbox import AgentInbox,notify
@@ -176,7 +176,12 @@ class AgentDialogues:
                 return replayed
             mode=getattr(body,'delivery_mode','negotiation')
             if prepared:
-                objective,skills=body.objective,''
+                objective=body.objective
+                if mode=='message':
+                    skills=''
+                else:
+                    commands,_=self.chat.skills.split_commands(user['id'],objective,db=db)
+                    skills=commands or skills
                 if not (objective+body.shared_content).strip():
                     raise HTTPException(422,'请补充要发送的内容')
             else:
@@ -214,7 +219,12 @@ class AgentDialogues:
                 if private_draft and not taken:
                     db.execute('UPDATE agent_task_members SET resource_conversation_id=? WHERE task_id=? AND user_id=?',(draft_workspace,identifier,user['id']))
                     self.resources.sync_task_expiry(db,identifier)
-            if shared and mode!='message':
+            if prepared and mode!='message':
+                db.execute('''INSERT INTO agent_dialogue_messages
+                    (dialogue_id,turn,speaker_aic,speaker_name,speaker_user_id,content,usage,created_at,state,task_action)
+                    VALUES(?,1,?,?,?,?,'null',?,'awaiting_acceptance','send_message')''',
+                    (identifier,own['aic'],json.loads(own['profile']).get('avatar_name','分身'),user['id'],objective+shared,stamp))
+            elif shared and mode!='message':
                 db.execute("INSERT INTO agent_dialogue_messages(dialogue_id,turn,speaker_aic,speaker_name,speaker_role,content,usage,created_at) VALUES(?,1,?,'用户授权共享资料','user',?,'null',?)",(identifier,own['aic'],'任务：'+objective+'\n\n'+shared,stamp))
             auto_accept = mode!='message' and self.auto_accept_enabled(db,target['user_id'],own['user_id'])
             if mode!='message' and not auto_accept:
@@ -244,10 +254,8 @@ class AgentDialogues:
         saved=json.loads(initial['document'])
         if saved.get('retry_of'):
             with self.database.connect() as db:self.check_retry(db,user,saved['retry_of'])
-        booking=bool(saved.get('requires_confirmation'))
-        if saved.get('delivery_mode')=='negotiation':
-            if not body.objective.strip():raise HTTPException(422,'请补充任务要求')
-            booking=await self.intent.requires_confirmation(user,body.objective) or booking
+        if saved.get('delivery_mode')=='negotiation' and not (body.objective+body.shared_content).strip():
+            raise HTTPException(422,'请补充任务要求')
         with self.database.connect(write=True) as db:
             row=self.intent.load(db,user,identifier)
             task_id = self.replay(db, user, request, row['task_id'])
@@ -258,10 +266,9 @@ class AgentDialogues:
                 # 用户在表单内可搜索并选择任何当前公开且可用的其他分身，模型不授予身份权限。
                 if body.target_aic not in {t['aic'] for t in self.targets(user)}:raise HTTPException(422,'目标分身已不可用，请重新搜索选择')
                 task=SimpleNamespace(target_aic=body.target_aic,objective=body.objective,request_id='intent:'+identifier,
-                    kind='booking' if booking else 'chat',
+                    kind='booking' if saved.get('requires_confirmation') else 'chat',
                     delivery_mode=saved['delivery_mode'],shared_content=body.shared_content if body.share_content else '',max_rounds=None,file_ids=getattr(body,'file_ids',[]),resource_conversation_id=row['conversation_id'] if saved.get('origin')=='peer_task_draft' else None)
-                prepared=task.delivery_mode=='message' and (saved.get('origin')!='peer_task_draft' or saved.get('message_prepared') is True)
-                task_id=self.create(user,task,row['conversation_id'],saved.get('skills',''),db=db,request=request,prepared=prepared)
+                task_id=self.create(user,task,row['conversation_id'],saved.get('skills',''),db=db,request=request,prepared=True)
                 saved.update(objective=body.objective,target_aic=body.target_aic,shared_content=task.shared_content)
                 db.execute("UPDATE agent_intents SET status='confirmed',task_id=?,document=? WHERE id=?",(task_id,dump(saved),identifier))
                 self.intent.record_result(db,row,'已确认'+('发送消息' if task.delivery_mode=='message' else '发起任务')+'，请求已进入通信队列。实际送达与失败原因请查看分身会话；尚不能视为已送达。',task_event={'kind':'start','task_id':task_id,'title':body.objective,'mode':task.delivery_mode,'state':'submitted','reason':'请求已提交，实际进度请查看对应会话。'})
@@ -285,6 +292,7 @@ class AgentDialogues:
         result.update(is_initiator=row['user_id']==user['id'],confirmed_by_me=bool(row['confirmation_acknowledged']&(1 if row['user_id']==user['id'] else 2)),expires_at=row['expires_at'] if row['delivery_mode']!='message' and row['status']=='ended' else None,
                       workspace_expired=expired,other_deleted=False)
         result['rejected']=bool(row['rejected'])
+        result['sending_prepared']=confirmed_message(row,row['user_id']) is not None and row['status'] in ('queued','running')
         result['message_delivered']=False
         if row['delivery_mode']=='message' and row['status']=='ended':
             with self.database.connect() as db:
@@ -342,8 +350,8 @@ class AgentDialogues:
                           'objective':task['objective'],'shared_content':task['shared_content'],'skills':task['initiator_skills'],
                           'requires_confirmation':task['task_kind']=='booking','delivery_mode':task['delivery_mode'],
                           'origin':'peer_task_draft','session_id':task['session_id'],'retry_of':identifier,'file_ids':files}
-                if task['message_prepared']:
-                    document.update(objective=task['objective']+task['shared_content'],shared_content='',message_prepared=True)
+                if task['message_prepared'] or db.execute("SELECT 1 FROM agent_request_receipts WHERE task_id=? AND scope='intent' LIMIT 1",(identifier,)).fetchone():
+                    document.update(objective=task['objective']+task['shared_content'],shared_content='')
                 db.execute("INSERT INTO agent_intents(id,user_id,conversation_id,document,created_at,status) VALUES(?,?,?,?,?,'editing')",(intent_id,user['id'],workspace,dump(document),now()))
         return self.intent.get(user,intent_id)
 
@@ -1002,7 +1010,7 @@ class AgentDialogues:
                     cleanup.enter_context(self.chat.chat_files.storing_outputs(db,speaker_id,workspace,None,outputs))
                 held = json.loads(task['agent_checkpoint'] or '{}')
                 old_activity = held.get('activity', []) if held.get('speaker_id')==speaker_id else []
-                checkpoint={**pause.checkpoint,'speaker_id':speaker_id,'file_ids':[item['id'] for item in [*prior,*outputs]],
+                checkpoint={**pause.checkpoint,'speaker_id':speaker_id,'peer_style':run.style,'file_ids':[item['id'] for item in [*prior,*outputs]],
                             'source_revision':job.get('_output_source_revision'),
                             'activity':[*old_activity,*json.loads(task['tool_activity'])]}
                 if pause.user_question:
@@ -1011,21 +1019,26 @@ class AgentDialogues:
                 pause.usage = run.settle(db)
             raise
 
-    def output_revision(self,db,job,speaker_id,files=None):
+    def output_revision(self,db,job,speaker_id,files=None,*,style=None):
         # 补充前撤销的资料权限也约束旧草稿的交付。
         sources=db.execute('SELECT a.aic,a.identity_status,a.last_modified_at,u.account_status,c.updated_at,k.updated_at,s.build_id '
                            'FROM avatar_records a JOIN users u ON u.id=a.user_id LEFT JOIN attachment_collections c ON c.user_id=a.user_id '
                            'LEFT JOIN agent_skill_collections k ON k.user_id=a.user_id LEFT JOIN active_souls s ON s.user_id=a.user_id WHERE a.user_id=?',
                            (speaker_id,)).fetchone()
         files=self.resources.model_files(db,job['id'],speaker_id) if files is None else files
-        scope=[list(sources) if sources else [],sorted((f['id'],f['sha256'],f['description']) for f in files)]
+        identity=list(sources) if sources else []
+        if style is not None:
+            check_peer_style(db,speaker_id,style)
+            if identity:
+                identity[-1]=style['id']
+        scope=[identity,sorted((f['id'],f['sha256'],f['description']) for f in files)]
         return hashlib.sha256(dump(scope).encode()).hexdigest()
 
     def saved_outputs(self,db,job,speaker_id,workspace):
         checkpoint=json.loads(job['agent_checkpoint']) if job.get('agent_checkpoint') else {}
         ids=checkpoint.get('file_ids') if checkpoint.get('speaker_id')==speaker_id else []
         if not ids:return []
-        if checkpoint.get('source_revision')!=self.output_revision(db,job,speaker_id):
+        if checkpoint.get('source_revision')!=self.output_revision(db,job,speaker_id,style=checkpoint.get('peer_style')):
             raise HTTPException(409,'原作品的资料授权已变化')
         storage_owner=self.chat.chat_files.session(db,speaker_id,workspace)['user_id']
         rows=db.execute("SELECT id,filename,size,sha256,animation_metadata::jsonb->>'html_mode' AS html_mode FROM chat_files WHERE user_id=? AND conversation_id=? AND origin='generated' "
@@ -1145,6 +1158,7 @@ class AgentDialogues:
             through=max(member['cleared_through'],memory['summary_through']) if ordinary else memory['summary_through']
             rows=self.memory_rows(db,job['session_id'],None if ordinary else job['id'],through,speaker_id)
         actor={'id':speaker_id,'username':speaker['username'],'account_status':speaker['account_status']}
+        run = job['_peer_run']
         with self.database.connect(write=True) as db:
             workspace=self.resources.workspace(db,speaker_id,job['session_id'],job['id'])
             files=[row for row in self.resources.model_files(db,job['id'],speaker_id) if row['conversation_id']==workspace]
@@ -1153,10 +1167,9 @@ class AgentDialogues:
                     WHERE a.task_id=? AND a.source_user_id=? AND f.id=ANY(?::text[]) AND a.message_id IS NULL
                     AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now')) ORDER BY f.created_at,f.id LIMIT 5""",
                 (job['id'],speaker_id,[row['id'] for row in files]))]
-            job['_output_source_revision']=self.output_revision(db,job,speaker_id,files)
+            job['_output_source_revision']=self.output_revision(db,job,speaker_id,files,style=run.style)
             saved=self.saved_outputs(db,job,speaker_id,workspace)
             db.execute("UPDATE agent_dialogues SET tool_activity='[]',waiting_reason='',pending_file_delivery=NULL WHERE id=? AND revision=?",(job['id'],job['revision']))
-        run = job['_peer_run']
         store, state = run.open()
         if prepared := state.get('peer_export'):
             export_store, _ = run.open('public-reply')
@@ -1182,6 +1195,14 @@ class AgentDialogues:
             config['_agent_persisted_file_ids']=checkpoint.get('file_ids', [])
         side='initiator' if speaker_id==job['user_id'] else 'target'
         background=json.loads(raw)
+        if 'approved_soul_style' in background:
+            if run.style['id']:
+                from avatar.knowledge.service import approved_style
+                with self.database.connect() as db:
+                    check_peer_style(db,speaker_id,run.style)
+                    background['approved_soul_style']=approved_style(db,speaker_id,build_id=run.style['id'])
+            else:
+                background.pop('approved_soul_style')
         if checkpoint and checkpoint['speaker_id']==speaker_id and (answer:=checkpoint.get('question_answer')):
             config['_agent_input_revision']=answer['id']
             config['_answered_question']=answer
@@ -1355,7 +1376,7 @@ class AgentDialogues:
             answer['usage'] = run.settle(db)
             # 本地交付与已验证的答复共用一个事务，重启后只提取收据。
             delivery={'speaker':speaker_id,'revision':job['revision'],'reply_sha':hashlib.sha256(text.encode()).hexdigest(),
-                      'source_revision':job['_output_source_revision'],'authority':run.source,'workspace':workspace,'answer':answer,
+                      'source_revision':job['_output_source_revision'],'authority':run.source,'peer_style':run.style,'workspace':workspace,'answer':answer,
                       'public':public,'file_ids':list(dict.fromkeys(item['id'] for item in [*saved,*outputs]))}
             if proofs:=context[0].get('_session_read_proofs'):
                 delivery['session_file_reads']=proofs
@@ -1396,7 +1417,7 @@ class AgentDialogues:
             if not current or current['revision']!=job['revision'] or current['status']!='running':return
             pending=bool(db.execute("SELECT 1 FROM agent_pending_inputs WHERE task_id=? AND applied=0 AND (message!='' OR skill_commands!='' OR removed_skills='[]')",(job['id'],)).fetchone())
             reply_owed=not ordinary and self.needs_peer_reply(db,job['id'],speaker['aic'])
-            action_name=result.get('task_action',{}).get('name','') if result.get('task_action') else ''
+            action_name='send_message' if confirmed is not None else (result.get('task_action') or {}).get('name','')
             if done and not ordinary and not text.strip() and self.needs_peer_reply(db,job['id'],peer['aic']):
                 raise HTTPException(502,'分身未返回对最新补充的回复正文，任务未结束')
             if done and (reply_owed or pending):
@@ -1405,17 +1426,29 @@ class AgentDialogues:
             turn=db.execute('SELECT COALESCE(MAX(turn),0)+1 FROM agent_dialogue_messages WHERE dialogue_id=?',(job['id'],)).fetchone()[0]
             held=json.loads(current['agent_checkpoint'] or '{}')
             prior=held.get('activity', []) if held.get('speaker_id')==speaker['user_id'] else []
-            activity=dump([*prior,*json.loads(current['tool_activity'])])
-            cursor=db.execute('INSERT INTO agent_dialogue_messages(dialogue_id,turn,speaker_aic,speaker_name,content,usage,created_at,state,state_detail,tool_activity) VALUES(?,?,?,?,?,?,?,?,?,?)',(job['id'],turn,speaker['aic'],json.loads(speaker['profile']).get('avatar_name','分身'),text,dump(result.get('usage')),now(),state,waiting,activity))
-            db.execute('UPDATE agent_dialogue_messages SET transport_mode=?,speaker_user_id=?,task_action=? WHERE id=?',(result.get('transport_mode','acps'),speaker['user_id'],action_name,cursor.lastrowid))
+            activity=dump([] if confirmed is not None else [*prior,*json.loads(current['tool_activity'])])
+            mode=result.get('transport_mode','acps')
+            proposal=None
+            if confirmed is not None and not ordinary:
+                proposal=db.execute("UPDATE agent_dialogue_messages SET state=?,transport_mode=? WHERE dialogue_id=? AND turn=1 AND state='awaiting_acceptance' RETURNING id",
+                                    (state,mode,job['id'])).fetchone()
+            if proposal:
+                message_id=proposal['id']
+            else:
+                message_id=db.execute('''INSERT INTO agent_dialogue_messages(dialogue_id,turn,speaker_aic,speaker_name,
+                    speaker_user_id,content,usage,created_at,state,state_detail,tool_activity,transport_mode,task_action)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                    (job['id'],turn,speaker['aic'],json.loads(speaker['profile']).get('avatar_name','分身'),speaker['user_id'],
+                     text,dump(result.get('usage')),now(),state,waiting,activity,mode,action_name)).lastrowid
             delivery=json.loads(current['pending_file_delivery'] or '{}')
             if delivery.get('revision')==job['revision'] and delivery.get('speaker')==speaker['user_id']:
-                if (delivery['reply_sha']!=hashlib.sha256(result['text'].encode()).hexdigest()
-                        or delivery['source_revision']!=self.output_revision(db,job,speaker['user_id'])):
-                    raise HTTPException(409,'文件交付回执或授权已改变，请重新发送')
                 uid=speaker['user_id']
                 workspace=self.resources.workspace(db,uid,job['session_id'],job['id'])
-                if delivery.get('authority') and delivery['authority'] != PeerTurn.source_version(self,db,dict(current),uid,workspace):
+                style=PeerTurn.resolve_style(self,db,dict(current),uid,workspace,delivery) if delivery.get('authority') else None
+                if (delivery['reply_sha']!=hashlib.sha256(result['text'].encode()).hexdigest()
+                        or delivery['source_revision']!=self.output_revision(db,job,uid,style=style)):
+                    raise HTTPException(409,'文件交付回执或授权已改变，请重新发送')
+                if delivery.get('authority') and delivery['authority'] != PeerTurn.source_version(self,db,dict(current),uid,workspace,style=style):
                     raise HTTPException(409,'分身资料或工具授权已改变，未交付答复')
                 if proofs:=delivery.get('session_file_reads'):
                     self.resources.validate_file_receipts(db,dict(current),speaker['user_id'],workspace,proofs)
@@ -1426,7 +1459,7 @@ class AgentDialogues:
             if delivery:
                 db.execute('UPDATE agent_dialogues SET pending_file_delivery=NULL WHERE id=?',(job['id'],))
             PeerTurn.clear(db, job['id'], speaker['user_id'])
-            db.execute('UPDATE agent_task_files SET message_id=? WHERE task_id=? AND source_user_id=? AND message_id IS NULL',(cursor.lastrowid,job['id'],speaker['user_id']))
+            db.execute('UPDATE agent_task_files SET message_id=? WHERE task_id=? AND source_user_id=? AND message_id IS NULL',(message_id,job['id'],speaker['user_id']))
             if ordinary:
                 db.execute('UPDATE agent_session_members SET hidden=0 WHERE session_id=?',(job['session_id'],))
             count=db.execute("SELECT COUNT(*) FROM agent_dialogue_messages WHERE dialogue_id=? AND speaker_role='agent'",(job['id'],)).fetchone()[0]
@@ -1444,11 +1477,11 @@ class AgentDialogues:
                     state='awaiting_input'
                     waiting=pause_reason
                     checkpoint=dump({'v':1,'speaker_id':peer['user_id'],'sandbox_attempted':False})
-            db.execute("UPDATE agent_dialogues SET agent_checkpoint=?,revision=revision+1,next_speaker=?,rounds_done=?,status=?,waiting_reason=?,confirmation_required=?,active_speaker='',error='',retry_until=0,updated_at=? WHERE id=?",(checkpoint,1-job['next_speaker'],rounds,'queued' if done else state,waiting,required,now(),job['id']))
+            db.execute("UPDATE agent_dialogues SET agent_checkpoint=?,revision=revision+1,next_speaker=?,rounds_done=?,status=?,waiting_reason=?,confirmation_required=?,message_prepared=0,active_speaker='',error='',retry_until=0,updated_at=? WHERE id=?",(checkpoint,1-job['next_speaker'],rounds,'queued' if done else state,waiting,required,now(),job['id']))
             if required:
                 db.execute('UPDATE agent_dialogues SET initiator_confirmed=CASE WHEN ?&1 THEN 0 ELSE initiator_confirmed END,target_confirmed=CASE WHEN ?&2 THEN 0 ELSE target_confirmed END WHERE id=?',(required,required,job['id']))
             if ordinary:
-                notify(db,peer['user_id'],'message',job['session_id'],job['id'],'收到分身回复' if job['next_speaker'] else '收到分身消息',text,'message:'+str(cursor.lastrowid))
+                notify(db,peer['user_id'],'message',job['session_id'],job['id'],'收到分身回复' if job['next_speaker'] else '收到分身消息',text,'message:'+str(message_id))
             self.apply_inputs(db,job['id'])
             if pending:
                 db.execute("UPDATE agent_dialogues SET status='queued',rounds_done=0 WHERE id=?",(job['id'],))

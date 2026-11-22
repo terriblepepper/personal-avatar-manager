@@ -33,7 +33,7 @@ const IntentDialog = defineAsyncComponent(() => import('../components/collaborat
 interface Session { session_id:string; peer_name:string; messages?: Pick<Message, 'speaker_role' | 'content'>[] }
 interface Message { dialogue_id:string; turn:number; speaker_name:string; speaker_role:string; speaker_user_id?:string; content:string; state?:string; state_detail?:string; task_action?:string; tool_activity?:ToolEvent[]; is_own:boolean }
 interface TaskFile extends ChatFile {message_id:number|null;sender_user_id:string}
-interface Task { rejected?:boolean; expires_at?:string | null; workspace_expired?:boolean; user_question?:AgentQuestion; can_supplement?:boolean; revision?:number; files?:TaskFile[];id:string; objective:string; status:string; can_accept?:boolean; needs_confirmation?:boolean; delivery_mode:string; can_retry?:boolean; auto_retrying?:boolean; error?:string; rounds_done?:number; round_limit?:number;tool_activity?:ToolEvent[];skill_commands?:string;created_at?:string;ended_at?:string;returned_summary?:string;waiting_reason?:string;waiting_for_other?:boolean; end_reason?:string; reason?:string; message_delivered?:boolean; active_speaker?:string; active_speaker_is_own?:boolean }
+interface Task { rejected?:boolean; sending_prepared?:boolean; expires_at?:string | null; workspace_expired?:boolean; user_question?:AgentQuestion; can_supplement?:boolean; revision?:number; files?:TaskFile[];id:string; objective:string; status:string; can_accept?:boolean; needs_confirmation?:boolean; delivery_mode:string; can_retry?:boolean; auto_retrying?:boolean; error?:string; rounds_done?:number; round_limit?:number;tool_activity?:ToolEvent[];skill_commands?:string;created_at?:string;ended_at?:string;returned_summary?:string;waiting_reason?:string;waiting_for_other?:boolean; end_reason?:string; reason?:string; message_delivered?:boolean; active_speaker?:string; active_speaker_is_own?:boolean }
 interface Intent {id:string;conversation_id:string;target_query:string;target_aic:string;objective:string;shared_content:string}
 interface Detail { auto_accept?:boolean; auto_accept_available?:boolean; settings_conversation_id?:string|null; legacy_file_conversation_id?:string|null; summary_through?:number; history_revision?:string; task_page?:Page<Task>; embedding_status?:{configured?:boolean;peerConfigured?:boolean}; resource_conversation_id:string | null; current_transport_mode?:string; chat?:Task; peer_name:string; messages:Message[]; message_tasks?:Task[]; tasks:Task[]; task?:Task; has_more:boolean }
 interface Skill {id:string;name:string;enabled:boolean}
@@ -55,6 +55,7 @@ const activeTask=computed(()=>detail.value?.task || detail.value?.chat)
 const runningTask = computed(() => activeTask.value?.status === 'running' ? activeTask.value : undefined)
 const activeStage = computed(() => {
   if (!runningTask.value) return ''
+  if (runningTask.value.sending_prepared) return '正在发送'
   const stage = runningTask.value.tool_activity?.at(-1)
   return stage?.status === 'running' ? stage.steps?.at(-1)?.message || stage.name : stage?.name || '准备回答'
 })
@@ -72,11 +73,12 @@ const progress=computed(()=>{
   if (task.status==='awaiting_input' && typeof task.can_supplement === 'boolean') return {label:task.can_supplement?'等待本人补充信息':'等待对方补充信息',tone:'waiting',note:task.waiting_reason || ''}
   if (task.status==='awaiting_input') return {label:task.needs_confirmation?'等待本人确认':task.waiting_for_other?'等待对方确认':'等待用户',tone:'waiting',note:task.waiting_reason || ''}
   if (task.status==='ended') return {label:task.message_delivered?'已回复':'任务已结束',tone:'success',note:task.end_reason || task.reason || ''}
+  if (task.status==='running' && task.sending_prepared) return {label:'正在发送',tone:'active',note:''}
   if (task.status==='running') return {label:(task.active_speaker || '分身')+'正在回答',tone:'active',note:''}
   return {label:taskStatuses[task.status] || task.status,tone:task.status==='failed'?'error':'neutral',note:task.error || task.waiting_reason || ''}
 })
 function messageFeedback(item:Message) {
-  const source = item.content.trimEnd()
+  const source = item.task_action ? item.content : item.content.trimEnd()
   const trailer = !item.task_action && /(?:^|\n)\[(?:等待用户|方案待确认)\]\s*([^\n]*)$/.exec(source)
   const body = trailer ? source.slice(0,trailer.index).trimEnd() : source
   const state = item.state==='ended'?'ended':item.state==='awaiting_input'||trailer?'awaiting_input':''
@@ -511,7 +513,7 @@ onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
       <div v-if="ends" class="peer-request-boundary" role="separator">请求结束<template v-if="task?.ended_at"> · {{ date(task?.ended_at) }}</template></div>
       <ContextCompacted v-if="item.turn === compactedAfter"/>
     </template>
-    <article v-if="runningTask" :key="runningTask.id + ':' + runningTask.active_speaker" class="peer-turn peer-pending"
+    <article v-if="runningTask && (!runningTask.sending_prepared || !detail?.task)" :key="runningTask.id + ':' + runningTask.active_speaker" class="peer-turn peer-pending"
       :class="runningTask.active_speaker_is_own ? 'peer-own' : 'peer-other'">
       <strong class="peer-speaker-name">{{ runningTask.active_speaker || '分身' }}</strong>
       <div class="bubble"><ToolActivity :items="runningTask.tool_activity || []" :pending="activeStage"/><ChatNotices :items="runningTask.tool_activity"/></div>

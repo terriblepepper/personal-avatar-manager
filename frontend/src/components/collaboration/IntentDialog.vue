@@ -8,11 +8,11 @@ import MarkdownContent from '../MarkdownContent.vue'
 import ChatFilesManager from '../chat/ChatFilesManager.vue'
 import ComposerToolbar from '../chat/ComposerToolbar.vue'
 import ConversationTools from '../chat/ConversationTools.vue'
-interface Intent {id:string;conversation_id:string;target_query:string;target_aic:string;objective:string;shared_content:string;delivery_mode?:string;file_ids?:string[];origin?:string;message_prepared?:boolean}
+interface Intent {id:string;conversation_id:string;target_query:string;target_aic:string;objective:string;shared_content:string;delivery_mode?:string;file_ids?:string[];origin?:string}
 interface Target {aic:string;name:string}
 interface Skill {id:string;name:string;enabled:boolean}
 const props=defineProps<{intent:Intent}>(),emit=defineEmits<{closed:[];sent:[sessionId:string,taskId:string]}>()
-const directMessage = props.intent.delivery_mode === 'message' && (props.intent.origin !== 'peer_task_draft' || props.intent.message_prepared === true)
+const directMessage = props.intent.delivery_mode === 'message'
 const toolsSaving = ref(false)
 const skills=ref<Skill[]>([]), sourceView=ref(true),resourceBusy=ref(false)
 const search=ref(props.intent.target_query),target=ref(props.intent.target_aic),objective=ref(props.intent.objective+(props.intent.shared_content?'\n\n'+props.intent.shared_content:'')),items=ref<Target[]>([]),offset=ref(0),total=ref(0),files=ref<string[]>([...(props.intent.file_ids || [])]),busy=ref(false)
@@ -56,4 +56,4 @@ onMounted(()=>{void find();if(!directMessage)void request<Skill[]>('/me/skills')
   </details>
   <ChatFilesManager :conversation-id="intent.conversation_id" :selected-ids="intent.file_ids || []" temporary include-conversation-files :busy="busy" @selected="files=$event" @uploading="resourceBusy=$event"/>
   <ConversationTools v-if="!directMessage" :conversation-id="intent.conversation_id" @saving="toolsSaving=$event" :busy="busy || resourceBusy"/>
-</ComposerToolbar><p class="sub">{{ directMessage ? '确认后按当前正文发送。' : '确认前不会联系对方。' }}已选文件发送副本，原资料权限不变。</p><ElButton :disabled="busy||resourceBusy" @click="cancel">取消</ElButton><ElButton type="primary" :loading="busy" :disabled="resourceBusy||toolsSaving||!target||!objective.trim()" @click="send">确认发送</ElButton></AppDialog></template>
+</ComposerToolbar><p class="sub">确认后原样发送正文，所选附件以副本交付。<template v-if="!directMessage">任务由接收方同意后开始执行。</template></p><ElButton :disabled="busy||resourceBusy" @click="cancel">取消</ElButton><ElButton type="primary" :loading="busy" :disabled="resourceBusy||toolsSaving||!target||!objective.trim()" @click="send">确认发送</ElButton></AppDialog></template>

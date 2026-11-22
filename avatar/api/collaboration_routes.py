@@ -242,12 +242,12 @@ class IntentChoice(BaseModel):
     delivery_mode:Literal['message','negotiation']
 
 class IntentConfirm(BaseModel):
-    model_config=ConfigDict(extra='forbid',str_strip_whitespace=True)
-    target_aic:str=Field(min_length=1,max_length=160)
-    objective:Annotated[AgentText,StringConstraints(strip_whitespace=False,min_length=1)]
+    model_config=ConfigDict(extra='forbid')
+    target_aic:Annotated[str,StringConstraints(strip_whitespace=True,min_length=1,max_length=160)]
+    objective:AgentText=Field(min_length=1)
     share_content:bool=False
-    shared_content:Annotated[str,StringConstraints(strip_whitespace=False,max_length=60000)]=''
-    file_ids:list[Annotated[str,Field(min_length=1,max_length=80)]]=Field(default_factory=list,max_length=5)
+    shared_content:str=Field(default='',max_length=60000)
+    file_ids:list[Annotated[str,StringConstraints(strip_whitespace=True,min_length=1,max_length=80)]]=Field(default_factory=list,max_length=5)
 
 @router.get('/agent-dialogue-settings')
 def dialogue_settings(request:Request,user=Depends(current_user)):
