@@ -7,9 +7,9 @@ import type { ChatFile } from '../types'
 import { previewKind } from '../utils/previewFile'
 import { chatFileURL } from '../utils/chatFileURL'
 import MermaidDiagram from './MermaidDiagram.vue'
+import InlineTextFile from './chat/InlineTextFile.vue'
 
 const AnimationDiagram = defineAsyncComponent(() => import('./AnimationDiagram.vue'))
-const InlineTextFile = defineAsyncComponent(() => import('./chat/InlineTextFile.vue'))
 const GeneratedImage = defineAsyncComponent(() => import('./chat/GeneratedImage.vue'))
 const AnimationAttachments = defineAsyncComponent(() => import('./chat/AnimationAttachments.vue'))
 
