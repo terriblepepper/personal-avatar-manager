@@ -245,7 +245,7 @@ def needs_confirmation(step):
     # A single saved artifact is already verified by the artifact tool. Composite goals need their own result.
     names=step.get('tools',())
     return (not step['tool'] or len(names)>1 or
-            bool(step.get('criterion') and step['tool'] not in ('create_html','deliver_material',
+            bool(step.get('criterion') and step['tool'] not in ('create_html','deliver_material','list_avatars',
                                                                   'send_material','send_animation','contact_avatar',
                                                                   'end_task','send_message','wait_for_user','ask_user')))
 
