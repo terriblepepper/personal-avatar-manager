@@ -120,6 +120,8 @@ def finish_in(db, rowid, result, run, state, message):
     else:
         document['status']['dataItems']=[{'type':'text','text':message}]
     if state=='awaiting-input':
+        if run.get('user_question'):
+            document['status']['dataItems'].append({'type':'data','data':{'user_question':run['user_question']}})
         document['_agent_resume']={**current['_agent_resume'],**run}
     else:
         clear_run(db,row,run)

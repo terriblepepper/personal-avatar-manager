@@ -1,4 +1,5 @@
 """Execution boundaries can revoke work without depending on a transport."""
+from avatar.core.text_budget import AgentText, TEXT_LIMIT, fits_text_budget
 import asyncio
 import json
 import re
@@ -7,7 +8,10 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 
+from typing import Annotated
+
 from fastapi import HTTPException
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 _validator=ContextVar('execution_validator',default=None)
 
@@ -78,17 +82,33 @@ def sandbox_checkpoint(raw):
     return result
 
 
+class AskUser(BaseModel):
+    model_config = ConfigDict(extra='forbid', str_strip_whitespace=True, strict=True)
+    question: AgentText = Field(min_length=1)
+    options: list[Annotated[str, Field(min_length=1, max_length=120)]] = Field(default_factory=list, max_length=3)
+
+    @model_validator(mode="after")
+    def check_budget(self):
+        if not fits_text_budget(self.question, *self.options):
+            raise ValueError(TEXT_LIMIT)
+        return self
+
+    def pending(self):
+        return {'id': uuid.uuid4().hex, **self.model_dump(exclude_defaults=True)}
+
+
 class AgentNeedsInput(Exception):
-    def __init__(self, message, usage=None, checkpoint=None, *, question=None):
+    def __init__(self, message, usage=None, checkpoint=None, *, user_question=None):
         super().__init__(message)
-        self.question = question
+        self.user_question = user_question
+        self.question = user_question['question'] if user_question else None
         self.usage = usage
         self.checkpoint = sandbox_checkpoint(checkpoint)
         self.generated_files = []
 
     @classmethod
-    def from_context(cls, message, config, usage=None, *, question=None):
-        error = cls(message, usage, config.get('_agent_checkpoint'), question=question)
+    def from_context(cls, message, config, usage=None, *, user_question=None):
+        error = cls(message, usage, config.get('_agent_checkpoint'), user_question=user_question)
         error.generated_files = config.get('_generated_files', [])
         return error
 

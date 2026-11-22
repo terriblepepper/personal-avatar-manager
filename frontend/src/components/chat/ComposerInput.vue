@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, shallowRef, useId, watch } from 'vue'
-import { ElTooltip } from 'element-plus'
+import { chatTextFits } from '../../chatTextBudget'
+import { ElMessage, ElTooltip } from 'element-plus'
 import { request } from '../../api/client'
 
 interface Skill { id: string; name: string; description?: string; enabled: boolean | number }
@@ -90,7 +91,7 @@ async function choose(skill:Skill) {
   const suffix = rest.slice(full.length)
   const insert = command(skill.name) + (/^\s/.test(suffix) ? '' : ' ')
   const value = input.value.slice(0,entry.start) + insert + suffix
-  if (value.length > 2000) return
+  if (!chatTextFits(value)) { ElMessage.warning('消息最多 64 KiB（UTF-8）'); return }
   emit('update:modelValue', value)
   token.value = undefined
   await nextTick()
@@ -139,9 +140,11 @@ defineExpose({focus:()=>field.value?.focus()})
 <template>
   <div class="composer-input" :class="{'has-compact-command':compact}">
     <button v-if="compact" class="composer-command-pill" type="button" :disabled="disabled" aria-label="移除压缩会话记忆命令" :title="usageTitle+' · 点击移除命令'" :aria-description="usageTitle+' '+usageText" @click="removeCompact">/compact <small v-if="usageText" class="context-usage" :class="{'has-value': usageRing}" :style="usageRing">{{ usageText }}</small></button>
-    <textarea class="form-control" ref="field" :value="editable" rows="2" :aria-label="label" :placeholder="compact ? '可选：希望摘要保留的重点' : placeholder" :disabled="disabled" :maxlength="compact ? 1991 : 2000"
+    <textarea class="form-control" ref="field" :value="editable" rows="2" :aria-label="label" :placeholder="compact ? '可选：希望摘要保留的重点' : placeholder" :disabled="disabled" :maxlength="compact ? 1991 : undefined"
+      :aria-invalid="!chatTextFits(modelValue)"
       aria-autocomplete="list" :aria-controls="open || slashOpen ? popup : undefined" :aria-activedescendant="slashOpen ? popup+'-compact' : open && highlight>=0 ? popup+'-'+highlight : undefined"
       @input="update($event)" @focus="refresh" @click="refresh" @compositionend="update($event)" @blur="closePicker" @keydown="keydown"/>
+    <small v-if="!chatTextFits(modelValue)" role="alert">消息超过 64 KiB（UTF-8），请缩短后发送。</small>
     <Transition name="menu-pop"><div v-if="slashOpen" class="skill-picker slash-picker">
       <div :id="popup" role="listbox" aria-label="会话命令">
         <button :id="popup+'-compact'" type="button" class="skill-picker-option slash-option" role="option" aria-selected="true" tabindex="-1"

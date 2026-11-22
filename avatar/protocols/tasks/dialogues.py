@@ -184,7 +184,7 @@ class PeerDialogueTasks:
             result=self.result(command,context,'awaiting-completion',answer.text,answer.usage,answer.task_action)
         except AgentNeedsInput as pause:
             result=self.result(command,context,'awaiting-input')
-            result['status']['dataItems']=[{'type':'text','text':pause.question or str(pause)}, {'type':'data','data':{
+            result['status']['dataItems']=[{'type':'text','text':str(pause)}, {'type':'data','data':{
                 'revision':task['revision'], 'sandbox_attempted':pause.checkpoint['sandbox_attempted']}}]
         except asyncio.CancelledError:
             raise

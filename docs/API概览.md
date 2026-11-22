@@ -3,6 +3,10 @@
 本文按模块列出平台对浏览器暴露的全部 HTTP 接口，帮助前端与外部集成快速定位入口。
 机器可读的完整定义以运行时生成的 **OpenAPI** 为准：`/api/openapi.json`，交互文档 `/api/docs`。
 
+## 会话提问与补答
+
+个人生成任务等待补答时返回 `user_question`，含稳定的 `id`、`question` 和可选的 `options`。回答时提交该 `question_id`、当前暂停标识和回答内容。协作会话仅向待答用户提供问题，补答沿用该会话的恢复接口。普通聊天消息和问题回答最多 64 KiB，按 UTF-8 编码计量。
+
 ## 通用约定
 
 - 所有业务接口挂在 `/api` 前缀下；`/`、`/admin`、`/platform-entry` 返回同一个单页入口 `frontend/dist/index.html`。

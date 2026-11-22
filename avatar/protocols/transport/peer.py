@@ -76,9 +76,8 @@ class PeerAcpsTransport:
             raise HTTPException(504,'ACPS 原任务结果未确认；不会自动重发，请稍后查询会话') from None
         if result.get('status',{}).get('state')=='awaiting-input':
             items=result['status'].get('dataItems',[])
-            prompt=next((i['text'] for i in items if i.get('type')=='text' and isinstance(i.get('text'),str)),'请补充信息或结束任务')
             attempted=any(i.get('type')=='data' and isinstance(i.get('data'),dict) and i['data'].get('sandbox_attempted') is True for i in items)
-            return {'needs_input':prompt[:2000],'checkpoint':{'v':1,'sandbox_attempted':attempted}}
+            return {'needs_input':'等待当前分身的所有人补充信息','checkpoint':{'v':1,'sandbox_attempted':attempted}}
         if result.get('status',{}).get('state')!='awaiting-completion':
             items=result.get('status',{}).get('dataItems',[])+[i for p in result.get('products',[]) for i in p.get('dataItems',[])]
             detail='；'.join(i['text'] for i in items if i.get('type')=='text' and isinstance(i.get('text'),str))[:1000] if result.get('status',{}).get('state')=='failed' else ''
@@ -154,7 +153,7 @@ class PeerTransport:
                 answer=await self.dialogues.answer_peer(current,partner_id)
                 result={'text':answer.text,'usage':answer.usage,'task_action':answer.task_action}
             except AgentNeedsInput as pause:
-                result={'needs_input':pause.question or str(pause),'checkpoint':pause.checkpoint}
+                result={'needs_input':str(pause),'checkpoint':pause.checkpoint}
         return {**result,'transport_mode':mode}
 
     async def complete(self,job,left,right):

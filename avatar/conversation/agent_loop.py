@@ -13,12 +13,13 @@ from itertools import count
 from fastapi import HTTPException
 from pydantic import ValidationError
 
+from avatar.core.text_budget import fits_text_budget
 from avatar.conversation.loop.continuation import DraftLimit, MemoryDraftStore, SegmentedDraft
 from avatar.conversation.loop.store import RunCapacity
 from avatar.conversation.loop.runtime import LoopState, restore_files, restore_materials, resume_safe, verified_context
 from avatar.conversation.loop.context import TurnContext
 from avatar.conversation.loop.planning import (available_tools, disclosure_catalog, disclose_tools, validate_disclosure,
-                                               REQUEST_TOOLS, UPDATE_TASK, needs_confirmation, confirm_goal, revise_goals)
+                                               REQUEST_TOOLS, UPDATE_TASK, EVIDENCE_TOOLS, WRITING_CONTROLS, action_ready, needs_confirmation, confirm_goal, revise_goals)
 from avatar.conversation.loop.turns import stream_final
 from avatar.conversation.working_context import excerpt
 from avatar.conversation.tools.activity import AgentSteps, without_false_tool_footer
@@ -27,7 +28,7 @@ from avatar.conversation.tools.html import (ARTIFACT_TOOLS, CREATE_HTML, animati
 from avatar.models.client import ModelResult, accumulate_usage
 from avatar.models.diagnostics import stop_reason
 from avatar.models.limits import check_context
-from avatar.core.execution import AgentNeedsInput, call_with_retry, check_execution_async, current_generation, model_failure, recoverable
+from avatar.core.execution import AgentNeedsInput, AskUser, call_with_retry, check_execution_async, current_generation, model_failure, recoverable
 
 
 async def run_agent(rag, context, question, *, progress=None, on_delta=None):
@@ -98,6 +99,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
     if not state.get('final') and await draft.migrate_animation():
         await journal.save(draft=state['draft'])
     if state.get('phase') == 'retry':
+        await draft.prepare_retry()
         draft.reset_attempts()
     revision = config.get('_agent_input_revision') or config.get('_run_input_id')
     supplements = list(state.get('supplements', ()))
@@ -264,11 +266,11 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         selected = list(dict.fromkeys(n for n in selected if n in allowed))
     else:
         progress_data = {'remaining':state.get('remaining', []),
-                         'draft':{k:v for k,v in (state.get('draft') or {}).items() if k in ('kind','tool','mode','offset')}}
+                         'draft':{k:v for k,v in (state.get('draft') or next(iter(state.get('parked_drafts') or ()), {})).items() if k in ('kind','tool','mode','offset')}}
         planning_question = question
         if changed:
             planning_question += '\n先前已确认进度（数据）：'+json.dumps(progress_data,ensure_ascii=False)
-        revise = changed and draft.active
+        revise = changed and bool(draft.active or state.get('parked_drafts'))
         with trace.step('reason', {'operation':'disclose_tools','tools':list(choices),'history_turns':len(history)}) as decision:
             proposed = route.get('disclosure') if not changed else None
             if proposed is not None:
@@ -293,16 +295,8 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             if name in disabled:
                 return tool_required(name)
         plan = planned
-        if changed and draft.active:
-            first = planned[0] if planned else {}
-            meta = state['draft']
-            compatible = (meta['kind']=='answer' and not planned or meta['kind']=='artifact'
-                          and first.get('tool')==meta['tool'] and first.get('html_mode') in (None, meta.get('mode')))
-            if keep_draft and compatible:
-                meta['finished'] = False
-            else:
-                await journal.save(prior_drafts=[*state.get('prior_drafts', ()), meta])
-                draft.clear()
+        if revise:
+            draft.revise_goals(planned,keep_draft)
         if changed:
             missing_modes = [step['html_mode'] for step in planned if step.get('html_mode')]
             html_needed = html_needed or any(step['tool']=='create_animation' for step in planned)
@@ -318,31 +312,33 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         plan = [dict(step) for step in planned]
         selected = list(dict.fromkeys([*selected,*(s['tool'] for s in planned if s['tool'])]))
 
-    def selected_definitions():
-        names = [n for n in selected if n in allowed]
-        definitions = [allowed[n] for n in dict.fromkeys(names)]
-        if required or pending or definitions:
-            definitions.append(REQUEST_TOOLS)
-        if any(needs_confirmation(s) for s in pending):
-            definitions.append(UPDATE_TASK)
-        return definitions
+    defaults = {tool['name']:tool for tool in (REQUEST_TOOLS, allowed['ask_user'])}
+    if 'search_materials' in allowed:
+        defaults['search_materials'] = allowed['search_materials']
 
-    definitions = [] if state.get('final_writing') and not changed and not pending and not required else selected_definitions()
-    settings = {**settings,'_tools':definitions,'_optional_tools':not required}
-    if definitions:
-        if required:
-            prompt += '协议要求以会话动作收尾。若当前未披露合适的终态函数，先用 request_tools 描述所需的交接方式。'
-        prompt += ('遇到新的证据缺口、缺少工具或需要调整后续目标时调用 request_tools。'
-                   '纯文本或综合子目标可用 update_task 提交子结果并引用实际回执编号。')
-    redisclosures = set(state.get('redisclosures', ()))
-    disclosure_attempts = state.get('disclosure_attempts',0) if not changed else 0
+    def selected_definitions(*, final=False):
+        definitions = dict(defaults)
+        if not final:
+            definitions.update((n,allowed[n]) for n in selected if n in allowed)
+        if any(needs_confirmation(s) for s in pending):
+            definitions['update_task'] = UPDATE_TASK
+        return list(definitions.values())
+
+    final_writing = bool(state.get('final_writing') and not changed and not pending and not required)
+    settings = {**settings,'_tools':selected_definitions(final=final_writing),'_optional_tools':not required}
+    if required:
+        prompt += '协议要求以会话动作收尾。若当前未披露合适的终态函数，先用 request_tools 描述所需的交接方式。'
+    prompt += ('可直接回答时直接回答。工具可见不表示必须调用。'
+               '需要更多能力或调整后续目标时用 request_tools；缺少用户才能给出的信息时用 ask_user。'
+               '已有依赖目标先取实际回执，再创作或交付。综合目标可用 update_task 提交子结果及真实回执编号。')
+    disclosure_misses = state.get('disclosure_no_progress',0) if not changed else 0
 
     queued = []
     receipt_ok = False
 
     def received(name, mode=None):
-        nonlocal premature, invalid, receipt_ok, disclosure_attempts, settings
-        disclosure_attempts = 0
+        nonlocal premature, invalid, receipt_ok, disclosure_misses, settings
+        disclosure_misses = 0
         receipt_ok = True
         invalid = 0
         premature = 0
@@ -363,8 +359,8 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         invalid += 1
         if invalid < 2:
             observations.append('\n上一步工具调用未执行。'+(detail+'。' if detail else '')+'请按当前目标和工具声明修正参数。缺少可用工具或用户信息时用 ask_user 提出具体问题；证据足够时直接完成。')
-        elif not required and not pending and not html_needed:
-            settings = {**settings, '_tools': []}
+        elif invalid == 2 and not required and not pending and not html_needed:
+            settings = {**settings, '_tools': selected_definitions(final=True)}
             observations.append('\n只使用已验证的资料和回执成文。若仍缺结果，请说明。')
         else:
             goal = '，仍缺少目标「' + pending[0]['goal'] + '」的回执' if pending else ''
@@ -402,14 +398,15 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
 
     async def checkpoint(phase='decision', *, artifact=None):
         fields = dict(phase=phase, plan=plan, remaining=pending, disclosed_tools=selected,
-                           redisclosures=sorted(redisclosures)[-32:], disclosure_attempts=disclosure_attempts, receipts=receipts_log, handoff=state.get('handoff'),
+                           disclosure_no_progress=disclosure_misses, receipts=receipts_log, handoff=state.get('handoff'),
                            **await turn_context.checkpoint_observations(observations),
                            material=delivery.prepared if delivery else [], files=state.get('files', []),
-                           draft=state.get('draft'), usage=usage, input_id=revision,
+                           draft=state.get('draft'), parked_drafts=state.get('parked_drafts',[]),
+                           prior_drafts=state.get('prior_drafts',[]), usage=usage, input_id=revision,
                            material_visible=sorted(delivery.visible_ids) if delivery else [],
                            public_visible=sorted(config.get('_peer_visible_materials', ())),
                            seen=list(seen), verified_reads=list(verified_material_reads),
-                           supplements=supplements, final_writing=not settings['_tools'])
+                           supplements=supplements, final_writing=all(t['name'] in defaults for t in settings['_tools']))
         if artifact:
             await journal.file(*artifact, fields)
         else:
@@ -427,33 +424,39 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         if streamed:
             discard()
             streamed = False
+        artifact_ready = not pending or action_ready(pending[0]['tool'],pending,receipts_log,revision)
+        draft.align(pending, artifact_ready=artifact_ready)
         await checkpoint('writing' if draft.active else 'decision')
         trace.point('perceive', {'iteration': iteration, 'pending': len(pending)},
                     {'history_turns': len(history), 'observation_count': len(observations)})
         await check_execution_async(validate)
         if queued and not receipt_ok:
-            observations.append('本批前一步没有取得有效回执，余项未执行。依据已有结果重新决定。')
-            queued.clear()
+            independent = [c for c in queued if c['name'] in EVIDENCE_TOOLS or c['name']=='list_avatars']
+            if len(independent)!=len(queued):
+                observations.append('本批前一步没有取得有效回执。其余查阅继续，交付动作留待重新决定。')
+            queued = independent
         queued_call = queued.pop(0) if queued else None
         receipt_ok = False
         current = pending[0] if pending else {}
         lookup_tool = current.get('tool')
         step_mode = current.get('html_mode') or (expected_mode if expected_mode in ('2d','3d') else None)
-        if (current.get('segmented') and not draft.active and not queued_call and html_repair is None
+        if (artifact_ready and current.get('segmented') and not draft.active and not queued_call and html_repair is None
                 and lookup_tool in ARTIFACT_TOOLS):
             await draft.start(ModelResult('',None),tool=lookup_tool,mode=step_mode)
             await checkpoint('writing')
         planned_lookup = current.pop('lookup',None) if not draft.active and not queued_call and lookup_tool in {t['name'] for t in settings['_tools']} else None
         structured = (planned_lookup is None and invalid == 1 and lookup_tool in ('find_material','find_animation','find_public_material')
                       and any(t['name']==lookup_tool for t in settings['_tools']))
-        step_settings = {**settings,'_call_purpose':'goal_decision','_batch_tools':True} if settings['_tools'] else settings
-        if lookup_tool in ARTIFACT_TOOLS and lookup_tool in {t['name'] for t in settings['_tools']} and not queued_call:
+        ready = [t for t in settings['_tools'] if action_ready(t['name'],pending,receipts_log,revision)]
+        step_settings = {**settings,'_tools':ready,'_call_purpose':'goal_decision','_batch_tools':True}
+        if artifact_ready and lookup_tool in ARTIFACT_TOOLS and lookup_tool in {t['name'] for t in ready} and not queued_call:
             definition = animation_tool(step_mode) if lookup_tool=='create_animation' else allowed[lookup_tool]
             helpers = [n for n in dict.fromkeys([*current.get('tools',()), *current.get('support',())])
                        if n!=lookup_tool and n in selected and n in allowed]
-            step_settings = {**step_settings,'_tools':[definition, REQUEST_TOOLS, *(allowed[n] for n in helpers)],
-                             '_optional_tools':False}
-        names = {t['name'] for t in step_settings['_tools']} - {'request_tools'}
+            artwork = {**defaults, lookup_tool:definition}
+            artwork.update((n,allowed[n]) for n in helpers if action_ready(n,pending,receipts_log,revision))
+            step_settings = {**step_settings,'_tools':list(artwork.values()),'_optional_tools':not required}
+        names = {t['name'] for t in step_settings['_tools']} - defaults.keys()
         if names and names.issubset(ARTIFACT_TOOLS):
             step_settings = {**step_settings,'_call_purpose':'html_generation'}
         step_prompt = prompt
@@ -461,8 +464,11 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         continuing = draft.active
         writing = continuing and state['draft']['kind'] != 'decision'
         if writing:
+            controls = {t['name']:t for t in step_settings['_tools'] if t['name'] in WRITING_CONTROLS}
             step_settings = {**settings, '_tools': [], '_call_purpose': 'segmented_writing'}
             step_prompt = system + '\n接续已经选择的输出。本步只返回请求的游标分片。'
+            step_prompt += '可在游标边界申请以下辅助动作。名称及参数字段：'+json.dumps({
+                n:list(t['parameters'].get('properties',{})) for n,t in controls.items()},ensure_ascii=False)
         elif repairing_html:
             step_settings = {**settings,'_tools':[],'_recover_thinking':True,'_call_purpose':'html_generation'}
             repair_tool, repair_mode, repair_filename = html_repair
@@ -525,9 +531,9 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                          and not any(item.get('html_mode') in ('html','2d','3d') for item in receipts)
                          and not (delivery and delivery.failure))
         try:
-            can_stream = (not review_needed and on_delta is not None and not settings['_tools'] and not required and not continuing
-                          and not html_needed and not config.get('_sandbox_succeeded')
-                          and not config.get('_generated_files') and plan == []
+            can_stream = (not review_needed and on_delta is not None and not pending and not required and not continuing
+                          and not names and not html_needed and not config.get('_sandbox_succeeded')
+                          and not config.get('_generated_files')
                           and not (delivery and (delivery.prepared or delivery.failure)))
             mode = '分片续写' if writing else '执行同批下一项' if queued_call else '计划中的检索参数' if planned_lookup is not None else '修复 HTML 参数' if repairing_html else '结构化检索参数' if structured else '模型决策'
             with trace.step('reason', {'run_id':run_id,'iteration': iteration,'goal_no':current.get('goal_no'),
@@ -577,7 +583,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                     next_action = '输入精简后接续' if not context_retry else '输入超窗，暂停'
                 elif getattr(error,'output_limited',False):
                     next_action = '压缩并接续'
-                elif lookup_tool in ARTIFACT_TOOLS and getattr(error,'invalid_tool_call',False) and invalid < 1:
+                elif artifact_ready and lookup_tool in ARTIFACT_TOOLS and getattr(error,'invalid_tool_call',False) and invalid < 1:
                     next_action = '修复 HTML 参数'
                 elif getattr(error,'invalid_tool_call',False) and invalid < 1 and settings['_tools']:
                     next_action = '单项结构化检索' if lookup_tool in ('find_material','find_animation','find_public_material') else '修正工具调用'
@@ -609,7 +615,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                     if status == 'retry':
                         raise await no_progress() from None
                 else:
-                    await draft.start(result, tool=lookup_tool, mode=step_mode, decision=bool(pending or required))
+                    await draft.start(result, tool=lookup_tool if artifact_ready else None, mode=step_mode, decision=bool(pending or required))
                 continue
             if not settings['_tools'] or not (getattr(error,'invalid_tool_call',False) or
                                                ((structured or repairing_html) and getattr(error,'empty_model_output',False))):
@@ -618,22 +624,31 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                         {**diagnostic,'receipt':'工具未执行'},status='error')
             trace.point('check', {'run_id':run_id,'iteration':iteration,'attempts_without_progress':invalid+1},
                         {'decision':next_action,'remaining_goals':len(pending)})
-            if lookup_tool in ARTIFACT_TOOLS and not repairing_html:
+            if artifact_ready and lookup_tool in ARTIFACT_TOOLS and not repairing_html:
                 html_repair = (lookup_tool,expected_mode,'index.html')
             repair_call('HTML 参数修复失败：'+diagnostic['reason'] if repairing_html else '')
             continue
         await check_execution_async(validate)
         calls = getattr(result, 'tool_calls', ())
+        if streamed and calls:
+            discard()
+            streamed = False
         reason = str(getattr(result, 'finish_reason', '') or '').lower()
         limited = stop_reason(reason) == 'output_limit'
         context_retry = False
         if continuing:
+            old_offset = state['draft']['offset']
             status, payload = completed or await draft.accept(result, limited)
+            if state['draft']['offset'] > old_offset:
+                invalid = disclosure_misses = 0
             if status == 'retry':
                 raise await no_progress()
             if status == 'more':
                 continue
-            if status == 'artifact':
+            if status == 'control' and (not writing or payload['name'] not in controls):
+                repair_call('该辅助动作在本次分片中未获披露或不能执行，草稿仍在原游标')
+                continue
+            if status in ('control','artifact'):
                 result = replace(result, text='', tool_calls=(payload,), finish_reason='tool_calls', partial_tool_calls=())
             elif status == 'answer':
                 result = replace(result, text=payload, tool_calls=(), finish_reason='stop', partial_tool_calls=())
@@ -642,7 +657,13 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             calls = result.tool_calls
             reason = result.finish_reason
         elif limited:
-            await draft.start(result, tool=repair_tool if repairing_html else lookup_tool, mode=step_mode,
+            declared = {t['name'] for t in step_settings['_tools']}
+            partial_calls = result.partial_tool_calls or calls
+            if any(c.get('name') not in declared or not action_ready(c.get('name'),pending,receipts_log,revision)
+                   for c in partial_calls):
+                repair_call('截断的工具请求不在本步声明中，尚未开始作品。先完成当前目标或申请补充工具')
+                continue
+            await draft.start(result, tool=repair_tool if repairing_html else (lookup_tool if artifact_ready else None), mode=step_mode,
                               filename=repair_filename if repairing_html else 'index.html', decision=bool(required or pending))
             await checkpoint('writing')
             if progress:
@@ -650,16 +671,23 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             continue
         declared_now = {t['name'] for t in step_settings['_tools']}
         if len(calls)>1 and any(c.get('name') not in declared_now for c in calls):
-            repair_call('模型选择了本轮未披露的工具')
-            continue
+            reads = [c for c in calls if c.get('name') in declared_now and c['name'] in EVIDENCE_TOOLS]
+            if not reads:
+                repair_call('模型选择了本轮未披露的工具')
+                continue
+            observations.append('本批仅执行已披露的查证操作。其他动作须在取得回执后重新决定。')
+            calls = tuple(reads)
+            result = replace(result,tool_calls=calls)
         if len(calls)>1:
             batch = []
             for call in calls:
                 if call not in batch:
                     batch.append(call)
             # Handoffs return control to another workflow; decide them against the completed receipts.
-            serial = [c for c in batch if c['name'] in ('list_avatars','find_conversation_files','find_material',
-                       'find_animation','find_public_material','send_material','send_animation',*ARTIFACT_TOOLS)]
+            serial = [c for c in batch if c['name'] in EVIDENCE_TOOLS or
+                      c['name'] in ('list_avatars','send_material','send_animation',*ARTIFACT_TOOLS)]
+            if any(c['name'] in EVIDENCE_TOOLS for c in serial):
+                serial = [c for c in serial if c['name'] in EVIDENCE_TOOLS or c['name']=='list_avatars']
             if len(batch)==1:
                 calls = (batch[0],)
             elif serial:
@@ -667,7 +695,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 queued.extend(serial[1:])
                 deferred = [c['name'] for c in batch if c not in serial]
                 if deferred:
-                    observations.append('这些结束或交接动作尚未执行，须在收到本批回执后重新决定：'+json.dumps(deferred))
+                    observations.append('这些动作尚未执行，须在收到本批回执后重新决定：'+json.dumps(deferred))
             else:
                 observations.append('一次只能提交一个结束、确认或交接决定。请根据目标选择一个，所有候选均未执行。')
                 repair_call()
@@ -737,7 +765,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                     if name not in selected:
                         selected.append(name)
                     pending.append({'tool':name,'goal':'生成并交付本轮要求的作品','goal_no':len(plan or [])+1})
-                    settings = {**settings,'_tools':[allowed[name]],'_optional_tools':False}
+                    settings = {**settings,'_tools':selected_definitions(),'_optional_tools':not required}
                     draft.clear()
                     observations.append('交付核验未找到本轮作品；先制作并取得回执。')
                     continue
@@ -754,12 +782,16 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
 
         active_tools = {tool['name'] for tool in step_settings['_tools']}
         # A queued call was authorized in the same batch; a finished draft or repair names its original tool.
-        if queued_call or continuing or repairing_html or structured or planned_lookup is not None:
+        if queued_call or repairing_html or structured or planned_lookup is not None or (continuing and status=='artifact'):
             active_tools = {tool['name'] for tool in settings['_tools']}
+        elif continuing and status=='control':
+            active_tools = controls.keys()
         try:
             if len(calls) != 1 or not settings['_tools']:
                 raise ValueError()
             name, args = calls[0]['name'], calls[0]['arguments']
+            if not action_ready(name,pending,receipts_log,revision):
+                raise ValueError('当前子目标的前置证据尚未取得，已阻止提前交付')
             if name not in active_tools or not isinstance(args, dict):
                 raise ValueError()
             if name == 'request_tools':
@@ -768,14 +800,12 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 if (not isinstance(replace_goals,list) or any(type(i) is not int or
                         not any(s['goal_no']==i for s in pending) for i in replace_goals)):
                     raise ValueError('待调整的子目标不存在')
-                if set(args)-{'need','replace_goals'} or not isinstance(need,str) or not 0 < len(need.strip()) <= 800:
+                if set(args)-{'need','replace_goals'} or not isinstance(need,str) or not need.strip() or not fits_text_budget(need):
                     raise ValueError()
                 focus = {'request':question,'need':need,'goals':pending,'selected':selected,
                          'recent_results':[excerpt(n,600) for n in observations[-4:]]}
-                signature = sha256(json.dumps([need,len(receipts_log)],ensure_ascii=False).encode()).hexdigest()
-                if signature in redisclosures or disclosure_attempts>=3:
-                    raise pause('补充披露未产生可执行的新证据。仍需要确认：'+need)
-                disclosure_attempts+=1
+                if disclosure_misses>=3:
+                    raise pause('连续三次补充披露没有新增能力或取得可核验的进展。仍需要确认：'+need)
                 with trace.step('reason', {'operation':'disclose_tools','need':need,'tools':list(choices)}) as out:
                     addition,cost = await disclose_tools(rag.chat.model_client,settings,key,system,working_history,
                         '请为当前证据缺口选择补充工具或新子目标。已经存在的目标无需重列。数据：'+
@@ -784,11 +814,12 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                     if addition is None:
                         raise pause('未能确定满足新需求的附加工具')
                     out.update(tools=addition['tools'],goals=[s['goal'] for s in addition['steps']])
-                redisclosures.add(signature)
                 for n in addition['tools']:
                     if n in disabled:
                         return tool_required(n)
-                if lookup_tool in ARTIFACT_TOOLS:
+                gained = set(addition['tools']).intersection(allowed).difference(selected,defaults)
+                disclosure_misses = 0 if gained else disclosure_misses+1
+                if current:
                     current['support'] = list(dict.fromkeys([*current.get('support',()),*addition['tools']]))
                 revised = revise_goals(plan,pending,selected,addition,replace_goals)
                 if not revised:
@@ -800,8 +831,8 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 note = confirm_goal(args,pending,receipts_log,revision)
                 remember(note)
                 receipt_ok=True
-                invalid=premature=disclosure_attempts=0
-                settings={**settings,'_tools':selected_definitions() if required or pending else []}
+                invalid=premature=disclosure_misses=0
+                settings={**settings,'_tools':selected_definitions(final=not (required or pending))}
                 continue
             if name in {t['name'] for t in config.get('_entry_tools',())}:
                 argument_id = sha256(json.dumps(args,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest()
@@ -826,6 +857,12 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 await check_execution_async(validate)
                 seen.add(identity)
                 duplicate_attempts=0
+                if name in ('search_materials','read_material'):
+                    proof = json.loads(note)
+                    if not isinstance(proof,dict) or proof.get('has_evidence') is not True:
+                        remember(note)
+                        observations.append('本次检索未获得支持当前目标的材料。请调整查询、申请其他工具，或向用户说明缺口。')
+                        continue
                 received(name)
                 remember(note)
                 continue
@@ -903,7 +940,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                         observations.append('已有同名作品回执。另一个目标需要独立的文件名。')
                         repair_call()
                     else:
-                        settings = {**settings, '_tools': []}
+                        settings = {**settings, '_tools': selected_definitions(final=True)}
                     draft.clear()
                     continue
                 await check_execution_async(validate)
@@ -944,7 +981,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                     html_needed = bool(missing_modes)
                     allowed[name] = animation_tool()
                 received(name,item.get('html_mode'))
-                settings = {**settings, '_tools': selected_definitions() if required or pending or queued else [],
+                settings = {**settings, '_tools': selected_definitions(final=not (required or pending or queued)),
                             '_optional_tools': not required}
                 observations.append('HTML 已创建并随最终回复附上：'+json.dumps({'id':item['id'],'filename':item['filename']},ensure_ascii=False)+'。系统将自动预览。继续本轮剩余任务，不输出源码或生成脚本。')
                 await checkpoint('artifact_receipt', artifact=(item, digest, current.get('goal_no')))
@@ -1008,10 +1045,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             elif name == 'list_avatars':
                 lookup = CatalogArguments.model_validate(args)
             elif name == 'ask_user':
-                question_for_user = args.get('question')
-                if set(args) != {'question'} or not isinstance(question_for_user,str) or not 1 <= len(question_for_user.strip()) <= 600:
-                    raise ValueError()
-                question_for_user = question_for_user.strip()
+                question_for_user = AskUser.model_validate(args).pending()
             elif args:
                 raise ValueError()
         except (RunCapacity, DraftLimit):
@@ -1064,11 +1098,11 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             trace.point('check', {'pending': len(pending)}, {'decision': '根据本轮回执继续'})
             continue
         if name == 'ask_user':
-            trace.point('check', {'pending': len(pending)}, {'decision': '等待用户补充','question':question_for_user})
+            trace.point('check', {'pending': len(pending)}, {'decision': '等待用户补充','question':question_for_user['question']})
             await checkpoint()
-            raise AgentNeedsInput.from_context('等待你补充任务信息', config, usage, question=question_for_user)
+            raise AgentNeedsInput.from_context('等待你补充任务信息', config, usage, user_question=question_for_user)
         if name == 'continue_answer':
-            settings = {**settings, '_tools': []}
+            settings = {**settings, '_tools': selected_definitions(final=True)}
             continue
         if name in ('send_animation','find_animation','send_material','find_material'):
             identity = (name, *(delivery.lookup_key(material_request) if isinstance(material_request, FindMaterial)

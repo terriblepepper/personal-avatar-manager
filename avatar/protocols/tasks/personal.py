@@ -6,6 +6,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from fastapi import HTTPException
+from avatar.core.text_budget import fits_text_budget
 from avatar.core.db import dump, now
 from avatar.core.schemas import ChatRequest
 from avatar.core.execution import AgentNeedsInput, execution_guard
@@ -147,8 +148,8 @@ class PersonalTaskService:
             else:
                 raise ManagementTaskError(-32602, '只接受文本提问或固定技能参数')
         question = '\n'.join(parts).strip()
-        if not 1 <= len(question) <= 2000:
-            raise ManagementTaskError(-32602, '问题长度需为 1～2000 个字符')
+        if not question or not fits_text_budget(question):
+            raise ManagementTaskError(-32602, '请填写问题，最多 64 KiB（UTF-8）')
         return question
 
     @staticmethod
@@ -254,7 +255,19 @@ class PersonalTaskService:
                 if db.execute('SELECT 1 FROM avatar_aip_task_commands WHERE local_aic=? AND peer_aic=? AND group_id=? AND session_id=? AND command_id=?',(*scope[:4],command['id'])).fetchone():
                     raise ManagementTaskError(-32602,'命令 id 已用于其他任务')
                 selected = dict(run.get('skills', {}))
-                question = self.question(command.get('dataItems'), self.approved_skills(target, selected), selected=selected)
+                items=command.get('dataItems') or []
+                answers=[item for item in items if item.get('type')=='data' and isinstance(item.get('data'),dict)
+                         and set(item['data'])=={'question_id'}]
+                if answers:
+                    pending=run.get('user_question')
+                    if len(answers)!=1 or not pending or answers[0]['data']['question_id']!=pending['id']:
+                        raise ManagementTaskError(-32009,'分身提问已改变，请查询当前任务')
+                    items=[item for item in items if item is not answers[0]]
+                if run.get('user_question') and not any(item.get('type')=='text' and isinstance(item.get('text'),str)
+                                                        and item['text'].strip() for item in items):
+                    raise ManagementTaskError(-32602,'请填写对分身提问的回答')
+                run.pop('user_question',None)
+                question = self.question(items, self.approved_skills(target, selected), selected=selected)
                 inputs = [*run.get('inputs', ()), question]
                 if sum(len(text) + 8 for text in inputs) > 16000:
                     raise ManagementTaskError(-32602,'本任务补充内容已达上限，请结束后使用新任务整理要求')
@@ -349,7 +362,7 @@ class PersonalTaskService:
             nonlocal committed
             store.check_in(db)
             if pause:
-                run.update(checkpoint=pause.checkpoint,clarification=pause.question)
+                run.update(checkpoint=pause.checkpoint,clarification=pause.question,user_question=pause.user_question)
                 if pause.usage:
                     store.mark_usage_recorded_in(db)
             committed = turns.finish_in(db,rowid,result,run,'awaiting-input' if pause else 'awaiting-completion',reply)
@@ -381,7 +394,7 @@ class PersonalTaskService:
                 raise RunConflict('缺少本次回答的提交回执')
             return committed
         except AgentNeedsInput as exc:
-            run.update(checkpoint=exc.checkpoint,clarification=exc.question)
+            run.update(checkpoint=exc.checkpoint,clarification=exc.question,user_question=exc.user_question)
             return turns.finish(self.database,rowid,result,run,'awaiting-input',exc.question or str(exc))
         except asyncio.CancelledError:
             # Fence the writer before draining an interrupted provider or a blocking tool.

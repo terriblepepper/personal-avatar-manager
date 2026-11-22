@@ -15,7 +15,17 @@ from avatar.core.config import ROOT
 from avatar.core.performance import measure
 from avatar.core.db import dump,now
 from avatar.core.tokens import estimate
+from avatar.core.text_budget import AgentText
 from avatar.models.limits import check_context
+
+
+class ReadingNeedsInput(AgentNeedsInput):
+    """A read produced no usable content; an enclosing agent can choose another source."""
+
+
+def read_has_content(item):
+    return (any(text.strip() for text in item.get('summaries', ())) or
+            any(page.get('text','').strip() for page in item.get('pages', ())))
 
 
 class ReadRequest(BaseModel):
@@ -25,7 +35,7 @@ class ReadRequest(BaseModel):
     start:int=Field(default=1,ge=1,le=100000)
     end:int|None=Field(default=None,ge=1,le=100000)
     offset:int=Field(default=0,ge=0)
-    query:str=Field(default='',max_length=200)
+    query:AgentText=''
 
     @model_validator(mode='after')
     def search_query(self):
@@ -82,7 +92,7 @@ class MaterialReading:
         sources=[];seen=set()
         for kind,items in (('RAG',data.get('file_evidence',[])),('源文件',readings or [])):
             for item in items:
-                if kind=='源文件' and not (item.get('pages') or item.get('summaries')):continue
+                if kind=='源文件' and not read_has_content(item):continue
                 name=item.get('filename');identity=(item.get('file_id'),name,kind)
                 if not name or identity in seen:continue
                 seen.add(identity);sources.append({'file_id':item.get('file_id'),'filename':name,'type':kind})
@@ -174,11 +184,11 @@ class MaterialReading:
         readings=[];requested=set()
         agent = config.get('_avatar_agent')
         def no_progress():
-            raise AgentNeedsInput.from_context('资料工具未取得新内容。可补充文件、页码或关键词后继续。', config)
+            raise ReadingNeedsInput.from_context('资料工具未取得新内容。可补充文件、页码或关键词后继续。', config)
 
         evidence=data.pop('file_evidence',[])
         def has_content():
-            return any(item.get('summaries') or any(page.get('text','').strip() for page in item.get('pages',[])) for item in readings) or any(item.get('text','').strip() for item in evidence)
+            return any(map(read_has_content,readings)) or any(item.get('text','').strip() for item in evidence)
 
         planner_evidence=[{**item,'text':item.get('text','')[:1500]} for item in evidence[:3]]
         budget=max(0,min(16000,check_context(config,prefix+'\n'+dump(data),history,message)-1800))
@@ -260,11 +270,11 @@ class MaterialReading:
                 elif getattr(error,'invalid_tool_call',False) or getattr(error,'output_limited',False):
                     reason = '模型未能选定有效的文件与读取范围，本步尚未取得原文。'
                     if agent and not has_content():
-                        raise AgentNeedsInput.from_context(reason+'可重试，或指定要读的文件和页码。', config) from None
+                        raise ReadingNeedsInput.from_context(reason+'可重试，或指定要读的文件和页码。', config) from None
                 elif agent and recoverable(error):
                     reason = '读取规划暂时无法连接模型服务，本步尚未取得原文。'
                     if not has_content():
-                        raise AgentNeedsInput.from_context(reason+'请稍后重试。',config) from None
+                        raise ReadingNeedsInput.from_context(reason+'请稍后重试。',config) from None
                 elif getattr(error,'empty_model_output',False) and has_content():
                     reason = '读取规划未返回新决定。'
                 else:

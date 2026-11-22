@@ -12,12 +12,14 @@ import ChatMarkdown from '../components/chat/ChatMarkdown.vue'
 import ChatNotices from '../components/chat/ChatNotices.vue'
 import ContextCompacted from '../components/chat/ContextCompacted.vue'
 import { date } from '../utils/format'
-import type { ChatFile, Page, ToolEvent } from '../types'
+import type { AgentQuestion, ChatFile, Page, QuestionReply, ToolEvent } from '../types'
 import MarkdownContent from '../components/MarkdownContent.vue'
 import ComposerToolbar from '../components/chat/ComposerToolbar.vue'
 import ComposerInput from '../components/chat/ComposerInput.vue'
 import ChatFilesManager from '../components/chat/ChatFilesManager.vue'
 import ComposerAction from '../components/chat/ComposerAction.vue'
+import { chatTextFits } from '../chatTextBudget'
+import AgentQuestionPrompt from '../components/chat/AgentQuestionPrompt.vue'
 import EffortPicker from '../components/chat/EffortPicker.vue'
 import ConversationTools from '../components/chat/ConversationTools.vue'
 import AppIcon from '../components/AppIcon.vue'
@@ -31,7 +33,7 @@ const IntentDialog = defineAsyncComponent(() => import('../components/collaborat
 interface Session { session_id:string; peer_name:string; messages?: Pick<Message, 'speaker_role' | 'content'>[] }
 interface Message { dialogue_id:string; turn:number; speaker_name:string; speaker_role:string; speaker_user_id?:string; content:string; state?:string; state_detail?:string; task_action?:string; tool_activity?:ToolEvent[]; is_own:boolean }
 interface TaskFile extends ChatFile {message_id:number|null;sender_user_id:string;download_url:string}
-interface Task { can_supplement?:boolean; revision?:number; files?:TaskFile[];id:string; objective:string; status:string; can_accept?:boolean; needs_confirmation?:boolean; delivery_mode:string; can_retry?:boolean; auto_retrying?:boolean; error?:string; rounds_done?:number; round_limit?:number;tool_activity?:ToolEvent[];skill_commands?:string;created_at?:string;ended_at?:string;returned_summary?:string;waiting_reason?:string;waiting_for_other?:boolean; end_reason?:string; reason?:string; message_delivered?:boolean; active_speaker?:string; active_speaker_is_own?:boolean }
+interface Task { user_question?:AgentQuestion; can_supplement?:boolean; revision?:number; files?:TaskFile[];id:string; objective:string; status:string; can_accept?:boolean; needs_confirmation?:boolean; delivery_mode:string; can_retry?:boolean; auto_retrying?:boolean; error?:string; rounds_done?:number; round_limit?:number;tool_activity?:ToolEvent[];skill_commands?:string;created_at?:string;ended_at?:string;returned_summary?:string;waiting_reason?:string;waiting_for_other?:boolean; end_reason?:string; reason?:string; message_delivered?:boolean; active_speaker?:string; active_speaker_is_own?:boolean }
 interface Intent {id:string;conversation_id:string;target_query:string;target_aic:string;objective:string;shared_content:string}
 interface Detail { summary_through?:number; history_revision?:string; task_page?:Page<Task>; embedding_status?:{configured?:boolean;peerConfigured?:boolean}; resource_conversation_id:string; current_transport_mode?:string; chat?:Task; peer_name:string; messages:Message[]; message_tasks?:Task[]; tasks:Task[]; task?:Task; has_more:boolean }
 interface Skill {id:string;name:string;enabled:boolean}
@@ -47,7 +49,7 @@ const toolPending = ref(false), effortPending = ref(false)
 const toolsSaving = computed(() => toolPending.value || effortPending.value)
 const commandsDisabled = computed(() => busy.value || switching.value || resourceBusy.value || !detail.value)
 const sendDisabled = computed(() => commandsDisabled.value || toolsSaving.value || (!message.value.trim() && !pausedTask.value) || (!/^\/compact(?:\s|$)/.test(message.value.trim()) && (detail.value?.task?.can_supplement === false ||
-  detail.value?.task?.status === 'ended' || detail.value?.task?.status === 'awaiting_acceptance' || !!detail.value?.task?.needs_confirmation)))
+  detail.value?.task?.status === 'ended' || detail.value?.task?.status === 'awaiting_acceptance' || (!!detail.value?.task?.needs_confirmation && !userQuestion.value))))
 const activeTask=computed(()=>detail.value?.task || detail.value?.chat)
 const runningTask = computed(() => activeTask.value?.status === 'running' ? activeTask.value : undefined)
 const activeStage = computed(() => {
@@ -56,6 +58,8 @@ const activeStage = computed(() => {
   return stage?.status === 'running' ? stage.steps?.at(-1)?.message || stage.name : stage?.name || '准备回答'
 })
 const pausedTask = computed(() => activeTask.value && (activeTask.value.status === 'paused' || (activeTask.value.status === 'awaiting_input' && activeTask.value.can_supplement)) ? activeTask.value : undefined)
+const questionPrompt = ref<InstanceType<typeof AgentQuestionPrompt>>()
+const userQuestion = computed(() => !switching.value && pausedTask.value?.can_supplement === true ? pausedTask.value.user_question : undefined)
 const transport=computed(()=>detail.value?.current_transport_mode==='acps'?'ACPS'
   :detail.value?.current_transport_mode==='internal'?'平台内部传输':'')
 const progress=computed(()=>{
@@ -257,9 +261,16 @@ function saveRounds() {
 function finishMessage(requestId:string) {
   if (pending === requestId) { message.value=''; pending='' }
 }
-function send() {
+function send(answer?: QuestionReply) {
   if (sendDisabled.value || !current.value) return
-  if (/^\/compact(?:\s|$)/.test(message.value.trim())) {
+  const question = userQuestion.value
+  if (answer && question?.id !== answer.question_id) return
+  if (!chatTextFits(answer?.message ?? message.value)) {
+    ElMessage.warning('消息超过 64 KiB（UTF-8），请缩短后发送。')
+    return
+  }
+  if (question && !answer && !message.value.trim()) { questionPrompt.value?.open(); return }
+  if (!answer && /^\/compact(?:\s|$)/.test(message.value.trim())) {
     const submitted = message.value
     const query = taskId.value ? '?task_id='+encodeURIComponent(taskId.value) : ''
     return action('/agent-sessions/'+encodeURIComponent(current.value)+'/compact'+query,'POST',{focus:submitted.trim().slice(8).trim()}, result => {
@@ -268,12 +279,16 @@ function send() {
       else if (transcript.value) transcript.value.scrollTop = transcript.value.scrollHeight
     })
   }
-  const token = pending ||= id()
+  const token = answer?.request_id || (pending ||= id())
   const target = pausedTask.value?.id || taskId.value
   const path = target ? '/agent-dialogues/'+encodeURIComponent(target)+'/resume'
     : '/agent-sessions/'+encodeURIComponent(current.value)+'/messages'
-  return action(path,'POST',{message:message.value,file_ids:fileIds.value,request_id:token,
-    ...(pausedTask.value ? {expected_revision:pausedTask.value.revision} : target ? {} : {new_task:true,delivery_mode:'message'})}, () => finishMessage(token), 'sending')
+  return action(path,'POST',{message:answer?.message ?? message.value,file_ids:answer ? [] : fileIds.value,request_id:token,
+    ...(question ? {question_id:question.id} : {}),
+    ...(pausedTask.value ? {expected_revision:pausedTask.value.revision} : target ? {} : {new_task:true,delivery_mode:'message'})}, () => {
+    if (!answer) finishMessage(token)
+    if (question && activeTask.value?.user_question?.id === question.id) delete activeTask.value.user_question
+  }, 'sending')
 }
 function removeSkill(skill:Skill) {
   if (!taskId.value || busy.value || switching.value) return
@@ -285,6 +300,10 @@ function taskAction(name:string) {
   const target = name === 'cancel' ? runningTask.value?.id || taskId.value : taskId.value
   if (!target || busy.value || switching.value || resourceBusy.value) return
   const confirms = name==='accept' || name==='confirm'
+  if (confirms && !chatTextFits(message.value)) {
+    ElMessage.warning('消息超过 64 KiB（UTF-8），请缩短后发送。')
+    return
+  }
   if (confirms && !confirm('确认由分身继续处理本任务？所选文件和补充意图将一并发送。')) return
   const token = pending ||= id()
   return action('/agent-dialogues/'+encodeURIComponent(target)+'/'+name, 'POST',
@@ -467,6 +486,8 @@ onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
       <div class="bubble"><ToolActivity :items="runningTask.tool_activity || []" :pending="activeStage"/><ChatNotices :items="runningTask.tool_activity"/></div>
     </article>
   </div><div class="peer-composer">
+  <AgentQuestionPrompt ref="questionPrompt" :key="current+'/'+shownTask" :scope="'peer:'+current+'/'+shownTask" :question="userQuestion"
+    :disabled="commandsDisabled || toolsSaving" @answer="send"/>
   <ComposerInput v-model="message" :catalog="skills" :session="taskId || current" :usage-url="current ? '/agent-sessions/'+encodeURIComponent(current)+'/compact'+(taskId?'?task_id='+encodeURIComponent(taskId):'') : ''" :usage-revision="(detail?.history_revision||'')+'/'+(detail?.summary_through||0)" :disabled="switching" label="分身会话消息" @submit="send()" :placeholder="pausedTask ? '补充任务所需信息…' : '输入消息或任务目标，$ 选择技能…'" @update:model-value="pending=''"/>
   <div class="chat-compose-actions">
   <ComposerToolbar class="peer-composer-toolbar" label="分身会话工具栏">
@@ -500,7 +521,7 @@ onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
     <div class="composer-primary-actions">
       <EffortPicker :conversation-id="resourceId" :busy="!!runningTask" @saving="effortPending=$event"/>
       <ComposerAction v-if="runningTask" label="暂停任务" stop :disabled="commandsDisabled" @click="taskAction('cancel')"/>
-      <ComposerAction v-else :resume="!!pausedTask" :label="pausedTask ? (message.trim() ? '补充并继续' : '继续任务') : '发送'" :aria-busy="writeState==='sending'" :disabled="sendDisabled" @click="send"/>
+      <ComposerAction v-else :resume="!!pausedTask" :label="pausedTask ? (message.trim() ? '补充并继续' : '继续任务') : '发送'" :aria-busy="writeState==='sending'" :disabled="sendDisabled" @click="send()"/>
     </div>
   </ComposerToolbar>
   </div>

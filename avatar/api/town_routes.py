@@ -4,7 +4,8 @@ import json
 import secrets
 from types import SimpleNamespace
 from fastapi import APIRouter, HTTPException, Request, Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+from avatar.core.text_budget import AgentText
 from avatar.protocols.tasks.store import ManagementTaskError
 from avatar.core.db import now
 
@@ -90,8 +91,15 @@ class PublicTaskRequest(BaseModel):
     command_id: str = Field(min_length=1, max_length=128, pattern=r'^[A-Za-z0-9_-]+$')
     task_id: str = Field(min_length=1, max_length=128, pattern=r'^[A-Za-z0-9_-]+$')
     session_id: str = Field(default='', max_length=128, pattern=r'^[A-Za-z0-9_-]*$')
-    message: str = Field(default='', max_length=2000)
+    message: AgentText = ''
     operation: str = Field(default='start', pattern=r'^(start|continue|get|complete|cancel)$')
+    question_id: str | None = Field(default=None, pattern=r'^[0-9a-f]{32}$')
+
+    @model_validator(mode='after')
+    def validate_answer(self):
+        if self.question_id and (self.operation!='continue' or not self.message.strip()):
+            raise ValueError('回答分身提问时请使用 continue 并填写回答')
+        return self
 
 
 @router.post('/avatars/{target}/tasks')
@@ -107,6 +115,8 @@ async def public_task(target: str, body: PublicTaskRequest, request: Request, re
             'senderId': 'town-http', 'mentions': [row['aic']], 'command': body.operation,
             'taskId': body.task_id, 'sessionId': body.session_id,
             'dataItems': [{'type': 'text', 'text': body.message}] if body.operation in ('start', 'continue') else []}
+    if body.question_id:
+        wire['dataItems'].append({'type':'data','data':{'question_id':body.question_id}})
     try:
         return await service(request).handle(wire, context(request, row['aic'],visitor), row['user_id'], row['aic'])
     except ManagementTaskError as exc:

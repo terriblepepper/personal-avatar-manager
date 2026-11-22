@@ -24,6 +24,11 @@ def checked(db, user_id, request):
     if request.agent_control:
         if not task or task['snapshot']['agent_pause_id'] != request.agent_pause_id:
             raise HTTPException(409,'原暂停状态已改变，请刷新会话')
+        question = task['snapshot'].get('user_question')
+        if request.question_id and (not question or request.question_id != question['id']):
+            raise HTTPException(409,'分身提问已改变，请刷新后回答')
+        if question and request.agent_control=='continue' and not request.message.strip():
+            raise HTTPException(422,'请填写对分身提问的回答')
         if request.agent_control=='retry' and not task['snapshot'].get('stream_retryable'):
             raise HTTPException(409,'该任务需要补充信息才能继续')
     elif task:
@@ -181,7 +186,9 @@ def update_waiters(db, user_id, parent_id, pause_id, state, result):
     else:
         changes={'state':state,'stage':state,'done':state=='succeeded','status':result['reply'] if state=='cancelled' else '回答完成',
                  'reply':result['reply'],'result':result,'usage':result.get('usage'),'agent_pause_id':None}
-    db.execute("""UPDATE chat_generation_jobs SET state=?,snapshot=(snapshot::jsonb || ?::jsonb)::text,updated_at=?
+    if result.get('user_question'):
+        changes['user_question'] = result['user_question']
+    db.execute("""UPDATE chat_generation_jobs SET state=?,snapshot=((snapshot::jsonb - 'user_question') || ?::jsonb)::text,updated_at=?
         WHERE user_id=? AND conversation_id=? AND state='awaiting_input'
         AND json_extract(snapshot,'$.agent_pause_id')=?""",(state,dump(changes),time.time(),user_id,parent_id,pause_id))
 
@@ -215,6 +222,8 @@ def pause(chat, user, request, work, parent, session, overview, error, previous,
     transaction = db
     result={'state':'awaiting_input','done':False,'reply':error.question or '','status':str(error),'usage':error.usage,
             'agent_pause_id':pause_id,'conversation_id':parent['id'],'message':request.message,'stage':'awaiting_input'}
+    if error.user_question:
+        result['user_question'] = error.user_question
     result['stream_retryable'] = bool(getattr(error,'stream_retryable',False))
     if job:result.update(request_id=job['request_id'],task_id=job['task_id'])
     owner=overview['agent']

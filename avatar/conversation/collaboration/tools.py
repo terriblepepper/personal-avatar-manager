@@ -2,6 +2,7 @@
 from typing import Literal
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from avatar.core.text_budget import AgentText
 from avatar.conversation.collaboration.intent import declaration
 
 
@@ -12,7 +13,7 @@ class MessageArguments(BaseModel):
 
 class EndArguments(MessageArguments):
     content:str=Field(default='',max_length=60000)
-    reason:str=Field(min_length=1,max_length=2000)
+    reason:AgentText=Field(min_length=1)
 
 
 class WaitArguments(EndArguments):

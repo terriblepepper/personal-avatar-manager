@@ -6,12 +6,14 @@ import AppIcon from '../components/AppIcon.vue'
 import ComposerToolbar from '../components/chat/ComposerToolbar.vue'
 import ComposerInput from '../components/chat/ComposerInput.vue'
 import ComposerAction from '../components/chat/ComposerAction.vue'
+import { chatTextFits } from '../chatTextBudget'
+import AgentQuestionPrompt from '../components/chat/AgentQuestionPrompt.vue'
 import EffortPicker from '../components/chat/EffortPicker.vue'
 import ConversationTools from '../components/chat/ConversationTools.vue'
 import { request, notifyError } from '../api/client'
 import { useHistoryScroll } from '../composables/useHistoryScroll'
 import { observeGeneration, submitAndObserve } from '../api/generations'
-import type { ChatFile, ChatMessage, GenerationRequest, GenerationSnapshot } from '../types'
+import type { ChatFile, ChatMessage, GenerationRequest, GenerationSnapshot, QuestionReply } from '../types'
 import MessageCopyMenu from '../components/chat/MessageCopyMenu.vue'
 import EmbeddingNotice from '../components/chat/EmbeddingNotice.vue'
 import ChatMarkdown from '../components/chat/ChatMarkdown.vue'
@@ -33,6 +35,9 @@ const pending=ref<GenerationSnapshot|null>(null),draft=ref(''),busy=ref(false),l
 const compressionThrough = computed(() => messages.value.at(-1)?.summary_through || 0)
 const compactedAfter = computed(() => messages.value.filter(row => row.id <= compressionThrough.value).at(-1)?.id)
 const pauseId = computed(() => pending.value?.state === 'awaiting_input' ? pending.value.agent_pause_id : undefined)
+const questionPrompt = ref<InstanceType<typeof AgentQuestionPrompt>>()
+const userQuestion = computed(() => pauseId.value && (!pending.value?.conversation_id || pending.value.conversation_id === conversationId.value)
+  ? pending.value?.user_question : undefined)
 const completedFiles = computed(() => {
   const job = pending.value
   return job?.done && job.state === 'succeeded' && !job.error ? job.result?.generated_files || [] : []
@@ -147,13 +152,20 @@ async function remove(clear:boolean){
   if(!confirm(clear?'清空当前会话聊天记录、记忆及附件？已转存资料与已学到的风格仍保留。':'删除当前会话、聊天、记忆及附件？已转存资料与已学到的风格仍保留。'))return
   try{await request(selectedURL(conversationId.value)+(clear?'/clear':'')+'?personal=true&channel=assistant',clear?'POST':'DELETE');selectedFiles.value=[];if(!clear)conversationId.value='';await load()}catch(e){notifyError(e)}
 }
-async function send(control: NonNullable<GenerationRequest['agent_control']> = 'continue') {
+async function send(control: NonNullable<GenerationRequest['agent_control']> = 'continue', answer?: QuestionReply) {
   const pause = pauseId.value ? pending.value : null
   const id = conversationId.value
-  const actionText = { continue: draft.value.trim(), retry: '重试', end: '结束任务' }
+  const question = userQuestion.value
+  if (answer && (!pause || question?.id !== answer.question_id)) return
+  if (question && !answer && control === 'continue' && !draft.value.trim()) { questionPrompt.value?.open(); return }
+  const actionText = { continue: answer?.message ?? draft.value.trim(), retry: '重试', end: '结束任务' }
   const message = pause ? actionText[control] : draft.value.trim()
   if ((!message && !pause) || !id || busy.value || uploading.value || toolsSaving.value || loading.value) return
-  if (/^\/compact(?:\s|$)/.test(message)) {
+  if ((!pause || control === 'continue') && !chatTextFits(answer?.message ?? draft.value)) {
+    ElMessage.warning('消息超过 64 KiB（UTF-8），请缩短后发送。')
+    return
+  }
+  if (!answer && /^\/compact(?:\s|$)/.test(message)) {
     busy.value = true
     try {
       const active = controller.signal
@@ -173,12 +185,14 @@ async function send(control: NonNullable<GenerationRequest['agent_control']> = '
     finally { if (id === conversationId.value) busy.value = false }
     return
   }
-  const files = pause && control !== 'continue' ? [] : [...selectedFiles.value], previous = unconfirmed.get(id)
+  const files = answer || (pause && control !== 'continue') ? [] : [...selectedFiles.value], previous = unconfirmed.get(id)
   const sameFiles = previous && previous.attachment_ids.length === files.length && files.every(file => previous.attachment_ids.includes(file))
-  const command: GenerationRequest = previous && previous.message === message && sameFiles
+  const questionId = control === 'continue' ? question?.id : undefined
+  const command: GenerationRequest = previous && previous.message === message && sameFiles && previous.question_id === questionId
     && previous.agent_pause_id === pause?.agent_pause_id && previous.agent_control === (pause ? control : undefined) ? previous : {
-    request_id: requestId(), conversation_id: id, message, channel: 'assistant', personal: true, attachment_ids: files,
+    request_id: answer?.request_id || requestId(), conversation_id: id, message, channel: 'assistant', personal: true, attachment_ids: files,
     ...(pause ? { agent_pause_id: pause.agent_pause_id, agent_control: control } : {}),
+    ...(questionId ? {question_id:questionId} : {}),
   }
   unconfirmed.set(id, command)
   generation?.abort()
@@ -187,7 +201,7 @@ async function send(control: NonNullable<GenerationRequest['agent_control']> = '
   const previousDraft = draft.value
   busy.value = true
   error.value = ''
-  if (control === 'continue') draft.value = ''
+  if (!answer && control === 'continue') draft.value = ''
   pending.value = { message, reply: '', status: '正在发送问题…', stage: 'sending', done: false }
   await scrollBottom(true)
   let received = false
@@ -199,7 +213,7 @@ async function send(control: NonNullable<GenerationRequest['agent_control']> = '
     received = true
     unconfirmed.delete(id)
     snapshot(value)
-    if (value.error && value.state !== 'indeterminate') draft.value = previousDraft
+    if (!answer && value.error && value.state !== 'indeterminate') draft.value = previousDraft
     if (pause && value.error) {
       const latest = await request<GenerationSnapshot | null>('/chat/pending?conversation_id=' + encodeURIComponent(id), 'GET', undefined, active.signal)
       if (!active.signal.aborted && id === conversationId.value && latest?.state === 'awaiting_input') {
@@ -221,7 +235,7 @@ async function send(control: NonNullable<GenerationRequest['agent_control']> = '
         error.value = e instanceof Error ? e.message : '提交结果尚未确认，请查看会话记录'
         if (pause) pending.value = pause
         else if (pending.value) pending.value.error = error.value
-        draft.value = previousDraft
+        if (!answer) draft.value = previousDraft
       }
     }
   } finally { if (generation === active && !active.signal.aborted) busy.value = false }
@@ -305,6 +319,8 @@ onUnmounted(()=>{destroyed=true;olderRequest?.abort();controller.abort();generat
           <button type="button" class="button small" :disabled="busy||loading||uploading||toolsSaving" @click="send('end')">结束任务</button>
         </div></article></template>
     </div>
+    <AgentQuestionPrompt ref="questionPrompt" :key="conversationId" :scope="'chat:'+conversationId" :question="userQuestion"
+      :disabled="busy || uploading || toolsSaving || loading" @answer="answer => send('continue', answer)"/>
     <form id="personal-chat-compose" data-guide-target="chat" class="personal-compose" @submit.prevent="send()">
       <ComposerInput ref="input" v-model="draft" :catalog="skillCatalog" :session="conversationId" :usage-url="conversationId ? selectedURL(conversationId)+'/compact' : ''" :usage-revision="(messages.at(-1)?.id || 0)+'/'+compressionThrough" label="聊天消息" :placeholder="pauseId ? (pending?.stream_retryable ? '可直接重试，也可补充要求后继续…' : '补充任务所需信息…') : '向自己的分身提问，或输入 $ 选择技能…'" :disabled="busy||loading||!conversationId" submit-on-enter @submit="send()"/>
     </form>

@@ -1,10 +1,12 @@
 # 模块说明：应用入口：组装 wit 3.0 组件与 HTTP 边界，管理智能体生命周期，装配本人技能、分身协商后台、安全中间件、API 和 Web 静态入口。
 from contextlib import AsyncExitStack, asynccontextmanager
 import asyncio
+import re
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from avatar.core.text_budget import TEXT_BYTES
 from avatar.core.config import ROOT, Settings, application_version, require_database_url
 from avatar.runtime.wit_runtime import AvatarRuntime
 from avatar.files.library.attachments import MAX_STORED_SIZE
@@ -283,6 +285,13 @@ def create_app(settings=None, provider=None, run_worker=True, model_client=None)
             ):
                 # The JSON envelope may escape bytes in the animation source.
                 limit = MAX_ENVELOPE_BYTES
+            if re.fullmatch(r"/api/(?:chat(?:/stream|/generations)?|agent-dialogues(?:/[^/]+/(?:resume|confirm|accept))?|"
+                            r"agent-sessions/[^/]+/(?:messages|accept|task-draft)|agent-intents/[^/]+/confirm|"
+                            r"town/avatars/[^/]+/tasks)", request.url.path):
+                # A JSON escape can take six wire bytes for one byte of decoded text.
+                limit = 7 * TEXT_BYTES
+                if request.url.path.startswith("/api/agent-intents/"):
+                    limit += 12 * 60000  # Optional legacy shared_content, up to 60k Unicode characters.
             if size > limit:
                 return JSONResponse({"detail": "请求内容过大"}, status_code=413)
         response = await call_next(request)

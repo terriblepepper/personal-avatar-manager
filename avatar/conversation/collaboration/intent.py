@@ -9,6 +9,7 @@ from typing import Annotated, Literal, TypedDict
 from fastapi import HTTPException
 from langgraph.graph import StateGraph, START, END
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints, ValidationError, model_validator
+from avatar.core.text_budget import AgentText, TEXT_LIMIT, fits_text_budget
 from avatar.core.db import dump, now
 from avatar.core.tokens import estimate
 from avatar.files.library.catalog import fit_catalog, model_animation_metadata
@@ -20,7 +21,7 @@ class ContactArguments(BaseModel):
     """通信工具只能提供搜索词及草稿，不能指定账户、地址或直接授权发送。"""
     model_config=ConfigDict(extra='forbid', str_strip_whitespace=True)
     target_query: str=Field(default='', max_length=200)
-    content: str=Field(min_length=1, max_length=2000, description='填写可直接发给收件人的消息正文或任务要求，用户确认后投递。')
+    content: AgentText=Field(min_length=1, description='填写可直接发给收件人的消息正文或任务要求，用户确认后投递。')
     shared_content: str=Field(default='', max_length=60000)
     file_ids:list[str]=Field(default_factory=list,max_length=5,description='仅选择当前用户明确要求发送的文件，从可用文件目录复制 ID；无明确文件要求留空，不继承历史引用。')
     requires_owner_confirmation: StrictBool=False
@@ -28,14 +29,16 @@ class ContactArguments(BaseModel):
 
 class MaterialArguments(BaseModel):
     model_config=ConfigDict(extra='forbid', str_strip_whitespace=True)
-    query: str = Field(default='', max_length=200, description='单个目标时使用。多个目标由 queries 表示。')
-    queries: list[Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]] = Field(default_factory=list, max_length=5, description='多目标时逐项给出可独立检索的主题，保留目录、日期和类型。')
+    query: AgentText = Field(default='', description='单个目标时使用。多个目标由 queries 表示。')
+    queries: list[Annotated[AgentText, StringConstraints(strip_whitespace=True, min_length=1)]] = Field(default_factory=list, max_length=5, description='多目标时逐项给出可独立检索的主题，保留目录、日期和类型。')
     sort: Literal['relevance','latest'] = Field(default='relevance',description='按发布时间选取原件时选 latest，查询词只填主题。')
     exclude_ids: list[Annotated[str, StringConstraints(min_length=1, max_length=80)]] = Field(default_factory=list, max_length=20, description='只在索要其他资料时列出已交付且需排除的 ID。')
     animation_only: StrictBool = Field(False, description='仅查找历史 .avanim 或本平台转存的 HTML 动画时开启。')
 
     @model_validator(mode='after')
     def has_target(self):
+        if not fits_text_budget(self.query, *self.queries):
+            raise ValueError(TEXT_LIMIT)
         if not self.query and not self.queries:
             raise ValueError('至少提供一个资料检索目标')
         return self
@@ -46,7 +49,7 @@ class AnswerArguments(BaseModel):
     mode: Literal['agent','answer','search','read','html'] = 'answer'
     html_mode: Literal['2d','3d','both','html',''] = Field('',description='创建作品时按本轮要求选维度。明确要求同时交付二维和三维时填 both，通用网页用 html。')
     needs_python: StrictBool = Field(False,description='必须实际运行代码才能得到数值、转换文件或生成数据图时为 true。解释、资料问答、写代码示例或制作 HTML 动画通常为 false。')
-    query: str = Field(default='',max_length=2000)
+    query: AgentText = ''
     folder: str = Field(default='', max_length=512, description='仅按用户明确要求选择已知逻辑目录。')
 
     @model_validator(mode='after')

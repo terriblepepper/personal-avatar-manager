@@ -5,6 +5,7 @@ import json
 from fastapi import APIRouter, Body, Depends, Request, UploadFile, File, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints
+from avatar.core.text_budget import AgentText
 from avatar.accounts.auth import current_user
 from avatar.skills.packages import MAX_UPLOAD
 
@@ -25,7 +26,7 @@ class SkillToggle(BaseModel):
 class DialogueRequest(BaseModel):
     model_config=ConfigDict(extra='forbid',str_strip_whitespace=True)
     target_aic: str=Field(min_length=1,max_length=160)
-    objective: str=Field(min_length=1,max_length=2000)
+    objective: AgentText=Field(min_length=1)
     request_id: str=Field(default_factory=lambda:str(uuid.uuid4()),min_length=1,max_length=80)
     max_rounds: int|None=Field(default=None,ge=1,le=1000)
     kind: Literal['chat','booking']='chat'
@@ -33,9 +34,10 @@ class DialogueRequest(BaseModel):
 
 
 class DialogueResume(BaseModel):
+    question_id: str|None=Field(default=None,pattern=r'^[0-9a-f]{32}$')
     expected_revision: int|None=Field(default=None,ge=0)
     model_config=ConfigDict(extra='forbid',str_strip_whitespace=True)
-    message: str=Field(default='',max_length=2000)
+    message: AgentText=''
     remove_skills: list[Annotated[str,Field(min_length=1,max_length=80)]]=Field(default_factory=list,max_length=3)
     request_id: str=Field(min_length=1,max_length=80)
     file_ids:list[Annotated[str,Field(min_length=1,max_length=80)]]=Field(default_factory=list,max_length=5)
@@ -242,7 +244,7 @@ class IntentChoice(BaseModel):
 class IntentConfirm(BaseModel):
     model_config=ConfigDict(extra='forbid',str_strip_whitespace=True)
     target_aic:str=Field(min_length=1,max_length=160)
-    objective:Annotated[str,StringConstraints(strip_whitespace=False,min_length=1,max_length=2000)]
+    objective:Annotated[AgentText,StringConstraints(strip_whitespace=False,min_length=1)]
     share_content:bool=False
     shared_content:Annotated[str,StringConstraints(strip_whitespace=False,max_length=60000)]=''
     file_ids:list[Annotated[str,Field(min_length=1,max_length=80)]]=Field(default_factory=list,max_length=5)
