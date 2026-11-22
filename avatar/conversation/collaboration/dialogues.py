@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from functools import partial
 import json
+import logging
 import re
 import time
 import uuid
@@ -25,6 +26,7 @@ from avatar.conversation.collaboration.intent import DialogueIntent
 from avatar.conversation.collaboration.tools import TASK_TOOLS,task_tool_result
 from avatar.conversation.tools.activity import had_successful_sandbox, without_false_tool_footer
 
+logger=logging.getLogger(__name__)
 RETRY_WINDOW=300
 RETRY_TIMEOUT='通信入口自动重试已超时，本请求已停止自动尝试；可重新编辑并发送'
 
@@ -120,6 +122,21 @@ class AgentDialogues:
             row=db.execute('SELECT max_rounds FROM agent_dialogue_preferences WHERE user_id=?',(user_id,)).fetchone()
         return {'max_rounds':row[0] if row else 10}
 
+    @staticmethod
+    def auto_accept_enabled(db,owner,peer):
+        return bool(db.execute('SELECT 1 FROM agent_peer_auto_accept WHERE user_id=? AND peer_user_id=?',(owner,peer)).fetchone())
+
+    def auto_accept(self,user,session_id,enabled):
+        owner=user['id']
+        with self.database.connect(write=True) as db:
+            session=self.member(db,user,session_id)
+            peer=session['right_user_id'] if session['left_user_id']==owner else session['left_user_id']
+            if enabled:
+                db.execute('INSERT INTO agent_peer_auto_accept(user_id,peer_user_id) VALUES(?,?) ON CONFLICT DO NOTHING',(owner,peer))
+            else:
+                db.execute('DELETE FROM agent_peer_auto_accept WHERE user_id=? AND peer_user_id=?',(owner,peer))
+        return {'auto_accept':enabled}
+
     def member(self,db,user,identifier,hidden=False):
         row=db.execute('SELECT s.*,m.hidden,m.cleared_through,m.cleared_at,m.summary,m.summary_through FROM agent_peer_sessions s JOIN agent_session_members m ON m.session_id=s.id WHERE s.id=? AND m.user_id=?',(identifier,user['id'])).fetchone()
         if not row or row['hidden'] and not hidden:raise HTTPException(404,'分身会话不存在')
@@ -167,10 +184,11 @@ class AgentDialogues:
             sid=pair['id'] if pair else str(uuid.uuid4());stamp=now()
             if not pair:db.execute('INSERT INTO agent_peer_sessions VALUES(?,?,?,?,0,?,?)',(sid,left,right,user['id'],stamp,stamp))
             for uid in (left,right):db.execute('INSERT OR IGNORE INTO agent_session_members(session_id,user_id) VALUES(?,?)',(sid,uid))
-            db.execute('UPDATE agent_session_members SET hidden=0 WHERE session_id=? AND user_id=?',(sid,user['id']))
+            db.execute('UPDATE agent_session_members SET hidden=0 WHERE session_id=?',(sid,))
             if source_conversation_id:
-                if not db.execute("SELECT 1 FROM chat_conversations WHERE id=? AND user_id=? AND platform='web' AND parent_id IS NULL",(source_conversation_id,user['id'])).fetchone():raise HTTPException(404,'来源会话不存在')
-                db.execute('UPDATE agent_session_members SET source_conversation_id=? WHERE session_id=? AND user_id=?',(source_conversation_id,sid,user['id']))
+                source=self.chat.chat_files.session(db,user['id'],source_conversation_id)
+                if source['channel']!='peer':
+                    db.execute('UPDATE agent_session_members SET source_conversation_id=? WHERE session_id=? AND user_id=?',(source_conversation_id,sid,user['id']))
             identifier=str(uuid.uuid4())
             limits={r['user_id']:r['max_rounds'] for r in db.execute('SELECT * FROM agent_dialogue_preferences WHERE user_id IN (?,?)',(left,right))}
             limit=min(getattr(body,'max_rounds',None) or limits.get(user['id'],10),limits.get(target['user_id'],10))
@@ -192,12 +210,16 @@ class AgentDialogues:
                     self.resources.sync_task_expiry(db,identifier)
             if shared and mode!='message':
                 db.execute("INSERT INTO agent_dialogue_messages(dialogue_id,turn,speaker_aic,speaker_name,speaker_role,content,usage,created_at) VALUES(?,1,?,'用户授权共享资料','user',?,'null',?)",(identifier,own['aic'],'任务：'+objective+'\n\n'+shared,stamp))
-            if mode!='message':
+            auto_accept = mode!='message' and self.auto_accept_enabled(db,target['user_id'],own['user_id'])
+            if mode!='message' and not auto_accept:
                 notify(db,target['user_id'],'request',sid,identifier,'收到分身任务请求',objective,'request:'+identifier)
             db.execute('UPDATE agent_peer_sessions SET updated_at=? WHERE id=?',(stamp,sid))
             file_ids=getattr(body,'file_ids',[])
             file_source=source_conversation_id or (self.resources.workspace(db,user['id'],sid) if file_ids else None)
             self.resources.share(db,user,identifier,file_ids,file_source,attachments=request.scope=='intent')
+            if auto_accept:
+                self.accept({'id':target['user_id']},sid,identifier,transaction=db)
+                notify(db,target['user_id'],'accepted',sid,identifier,'已自动同意分身任务',objective,'auto-accept:'+identifier)
             request.remember(db, user, identifier)
         return identifier
 
@@ -242,9 +264,10 @@ class AgentDialogues:
     def owned(self,db,user,identifier):
         row=db.execute('SELECT * FROM agent_dialogues WHERE id=?',(identifier,)).fetchone()
         if not row:raise HTTPException(404,'任务不存在')
-        member=self.member(db,user,row['session_id'])
-        if db.execute('SELECT 1 FROM agent_task_members WHERE task_id=? AND user_id=? AND hidden=1',(identifier,user['id'])).fetchone():raise HTTPException(404,'本方任务记录已删除')
-        if row['status']=='ended' and member['cleared_at'] and db.execute('SELECT 1 WHERE julianday(?)<=julianday(?)',(row['ended_at'] or row['updated_at'],member['cleared_at'])).fetchone() and not db.execute('SELECT 1 FROM agent_dialogue_messages WHERE dialogue_id=? AND id>?',(identifier,member['cleared_through'])).fetchone():raise HTTPException(404,'本方任务记忆已清理')
+        ordinary=row['delivery_mode']=='message'
+        member=self.member(db,user,row['session_id'],hidden=not ordinary)
+        if not db.execute('SELECT 1 FROM agent_task_members WHERE task_id=? AND user_id=? AND hidden=0',(identifier,user['id'])).fetchone():raise HTTPException(404,'本方任务记录已删除')
+        if ordinary and row['status']=='ended' and member['cleared_at'] and db.execute('SELECT 1 WHERE julianday(?)<=julianday(?)',(row['ended_at'] or row['updated_at'],member['cleared_at'])).fetchone() and not db.execute('SELECT 1 FROM agent_dialogue_messages WHERE dialogue_id=? AND id>?',(identifier,member['cleared_through'])).fetchone():raise HTTPException(404,'本方任务记忆已清理')
         return dict(row)
 
     def view(self,row,user):
@@ -307,7 +330,7 @@ class AgentDialogues:
                 workspace=self.resources.workspace(db,user['id'],task['session_id'],identifier)
                 avatar=db.execute('SELECT aic,profile FROM avatar_records WHERE user_id=?',(task['target_user_id'],)).fetchone()
                 if not avatar:raise HTTPException(409,'目标分身不可用')
-                files=[r[0] for r in db.execute("SELECT f.id FROM chat_files f JOIN agent_task_files a ON a.file_id=f.id WHERE a.task_id=? AND a.source_user_id=? AND f.user_id=? AND f.conversation_id=? AND f.referenced=1 AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now')) ORDER BY f.created_at,f.id LIMIT 5",(identifier,user['id'],user['id'],workspace))]
+                files=[r[0] for r in db.execute("SELECT f.id FROM chat_files f JOIN agent_task_files a ON a.file_id=f.id WHERE a.task_id=? AND a.source_user_id=? AND f.conversation_id=? AND f.referenced=1 AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now')) ORDER BY f.created_at,f.id LIMIT 5",(identifier,user['id'],workspace))]
                 document={'target_query':json.loads(avatar['profile']).get('avatar_name',''),'target_aic':avatar['aic'],
                           'objective':task['objective'],'shared_content':task['shared_content'],'skills':task['initiator_skills'],
                           'requires_confirmation':task['task_kind']=='booking','delivery_mode':task['delivery_mode'],
@@ -367,21 +390,28 @@ class AgentDialogues:
     def session(self,user,identifier,before=None,after=None,task_id=None,*,task_paging=None):
         if before is not None and after is not None or any(v is not None and not 0<=v<=2**63-1 for v in [before,after]):raise HTTPException(422,'消息游标无效')
         with self.database.connect() as db:
-            self.member(db,user,identifier)
             task=self.owned(db,user,task_id) if task_id else None
             separate=bool(task and task['delivery_mode']!='message')
+            self.member(db,user,identifier,hidden=separate)
             table,key=('agent_task_members','task_id') if separate else ('agent_session_members','session_id')
-            workspace=db.execute(f'SELECT resource_conversation_id FROM {table} WHERE {key}=? AND user_id=?',(task_id if separate else identifier,user['id'])).fetchone()[0]
+            settings_id=db.execute(f'SELECT resource_conversation_id FROM {table} WHERE {key}=? AND user_id=?',(task_id if separate else identifier,user['id'])).fetchone()[0]
+            workspace=self.resources.shared_id(db,identifier,task_id if separate else None)
         if separate and workspace_expired(task):
-            workspace=None
-        elif not workspace and not (separate and task['status']=='ended'):
+            workspace=settings_id=None
+        elif not workspace or not settings_id and not (separate and task['status']=='ended'):
             with self.database.connect(write=True) as db:
-                self.member(db,user,identifier)
+                self.member(db,user,identifier,hidden=separate)
                 current=self.owned(db,user,task_id) if separate else None
-                if not current or current['status']!='ended':
+                if not workspace_expired(current):
                     workspace=self.resources.workspace(db,user['id'],identifier,task_id)
+                    if not current or current['status']!='ended':
+                        settings_id=self.resources.settings_workspace(db,user['id'],identifier,task_id)
         with self.database.connect() as db:
-            pair=self.member(db,user,identifier)
+            pair=self.member(db,user,identifier,hidden=separate)
+            legacy_files=bool(settings_id and db.execute("""SELECT 1 FROM chat_files f WHERE f.conversation_id=?
+                AND f.user_id=? AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now'))
+                AND NOT EXISTS(SELECT 1 FROM agent_task_files a WHERE a.file_id=f.id) LIMIT 1""",
+                (settings_id,user['id'])).fetchone())
             snapshot={}
             if task_paging is not None:
                 hidden = db.execute('''SELECT m.task_id FROM agent_task_members m JOIN agent_dialogues d ON d.id=m.task_id
@@ -392,8 +422,8 @@ class AgentDialogues:
             condition=' AND m.id>?' if after is not None else ' AND m.id<?' if before is not None else ''
             memory=db.execute('SELECT summary_through FROM agent_task_members WHERE task_id=? AND user_id=? AND hidden=0',(task_id,user['id'])).fetchone() if separate else pair
             through=memory['summary_through'] if memory else 0
-            snapshot['summary_through']=through if through>pair['cleared_through'] else 0
-            params=[identifier,pair['cleared_through']]+([after if after is not None else before] if condition else [])
+            snapshot['summary_through']=through if separate or through>pair['cleared_through'] else 0
+            params=[identifier,0 if separate else pair['cleared_through']]+([after if after is not None else before] if condition else [])
             scope=' AND d.id=?' if task_id else " AND d.delivery_mode='message'"
             if task_id:params.append(task_id)
             rows=db.execute('''SELECT m.*,d.objective AS task_title,d.user_id AS initiator_id,d.target_user_id AS recipient_id,d.own_aic AS initiator_aic,d.target_aic AS recipient_aic FROM agent_dialogue_messages m JOIN agent_dialogues d ON d.id=m.dialogue_id
@@ -403,6 +433,7 @@ class AgentDialogues:
             message_ids=list({r['dialogue_id'] for r in rows})
             message_tasks=db.execute('SELECT * FROM agent_dialogues WHERE session_id=? AND id IN ('+','.join('?' for _ in message_ids)+')',(identifier,*message_ids)).fetchall() if message_ids else []
             peer=pair['right_user_id'] if pair['left_user_id']==user['id'] else pair['left_user_id']
+            auto_accept=self.auto_accept_enabled(db,user['id'],peer)
             from avatar.models.embedding import EmbeddingSettings
             embedding_status={'configured':EmbeddingSettings.configured(db,user['id']),'peerConfigured':EmbeddingSettings.configured(db,peer)}
             avatar=db.execute('SELECT aic,profile FROM avatar_records WHERE user_id=?',(peer,)).fetchone()
@@ -432,7 +463,7 @@ class AgentDialogues:
         if after is None:messages.reverse()
         page=self.task_page(user,identifier,*(task_paging or (0,'')))
         if task_paging is not None:snapshot['task_page']=page
-        return {'current_transport_mode':protocol,'embedding_status':embedding_status,'viewer_user_id':user['id'],'session_id':identifier,'id':identifier,'resource_conversation_id':workspace,'accepted':bool(pair['accepted']),'can_accept':bool(task_id and any(t['id']==task_id and t['target_user_id']==user['id'] and t['status']=='awaiting_acceptance' for t in tasks)),
+        return {'auto_accept':auto_accept,'current_transport_mode':protocol,'embedding_status':embedding_status,'viewer_user_id':user['id'],'session_id':identifier,'id':identifier,'resource_conversation_id':workspace,'settings_conversation_id':settings_id,'legacy_file_conversation_id':settings_id if legacy_files else None,'accepted':bool(pair['accepted']),'can_accept':bool(task_id and any(t['id']==task_id and t['target_user_id']==user['id'] and t['status']=='awaiting_acceptance' for t in tasks)),
                 'peer_name':json.loads(avatar['profile']).get('avatar_name','分身') if avatar else '分身','peer_aic':avatar['aic'] if avatar else '',
                 'messages':messages,'has_more':len(rows)==10,'chat':self.view(dict(chat),user) if chat else None,'message_tasks':[self.view(dict(r),user) for r in message_tasks],
                 'tasks':[self.view(dict(r),user) for r in tasks],'task_total':page['total'],**snapshot}
@@ -484,7 +515,7 @@ class AgentDialogues:
     def accept(self,user,identifier,task_id=None,transaction=None):
         """仅目标用户可接受指定任务；普通聊天无需授权，不批量放行其他任务。"""
         with (nullcontext(transaction) if transaction is not None else self.database.connect(write=True)) as db:
-            self.member(db,user,identifier)
+            self.member(db,user,identifier,hidden=bool(task_id))
             if task_id:row=self.owned(db,user,task_id)
             else:
                 found=db.execute("SELECT * FROM agent_dialogues WHERE session_id=? AND target_user_id=? AND status='awaiting_acceptance' ORDER BY created_at,id LIMIT 1",(identifier,user['id'])).fetchone()
@@ -739,12 +770,13 @@ class AgentDialogues:
                 self.resources.release_workspaces(db,resources,[(user['id'],row[0])])
             maximum=db.execute('SELECT COALESCE(MAX(m.id),0) FROM agent_dialogue_messages m JOIN agent_dialogues d ON d.id=m.dialogue_id WHERE d.session_id=?',(identifier,)).fetchone()[0]
             db.execute("UPDATE agent_session_members SET hidden=?,cleared_through=?,summary='',summary_through=?,cleared_at=? WHERE session_id=? AND user_id=?",(int(hide),maximum,maximum,now(),identifier,user['id']))
+            if hide:self.resources.release_shared(db,resources,'session',identifier)
             sources=db.execute('SELECT source_message_id FROM agent_task_memories WHERE session_id=? AND user_id=?',(identifier,user['id'])).fetchall()
             for source in sources:
                 db.execute("UPDATE chat_conversations SET summary='',summary_through=0 WHERE user_id=? AND id IN (SELECT conversation_id FROM chat_messages WHERE id=? AND user_id=?)",(user['id'],source['source_message_id'],user['id']))
                 db.execute('DELETE FROM chat_messages WHERE id=? AND user_id=?',(source['source_message_id'],user['id']))
             db.execute('DELETE FROM agent_task_memories WHERE session_id=? AND user_id=?',(identifier,user['id']))
-            db.execute("UPDATE agent_task_members SET summary='',summary_through=? WHERE user_id=? AND task_id IN (SELECT id FROM agent_dialogues WHERE session_id=?)",(maximum,user['id'],identifier))
+            db.execute("UPDATE agent_task_members SET summary='',summary_through=? WHERE user_id=? AND task_id IN (SELECT id FROM agent_dialogues WHERE session_id=? AND delivery_mode='message')",(maximum,user['id'],identifier))
         return {'cleared':True}
 
     def dismiss_all_history(self,user,session=None):
@@ -758,10 +790,14 @@ class AgentDialogues:
                 db.execute('UPDATE agent_task_members SET resource_conversation_id=NULL WHERE user_id=? AND task_id=ANY(?::text[])',
                            (user['id'],[row['task_id'] for row in tasks]))
             if not session:
-                sessions=db.execute("UPDATE agent_session_members SET hidden=1,summary='',cleared_at=?,cleared_through=(SELECT coalesce(max(m.id),0) FROM agent_dialogue_messages m JOIN agent_dialogues d ON d.id=m.dialogue_id WHERE d.session_id=agent_session_members.session_id),summary_through=0 WHERE user_id=? AND hidden=0 AND NOT EXISTS(SELECT 1 FROM agent_dialogues d WHERE d.session_id=agent_session_members.session_id AND d.status!='ended') RETURNING resource_conversation_id",(now(),user['id'])).fetchall()
-                workspaces.extend(row[0] for row in sessions)
+                sessions=db.execute("UPDATE agent_session_members SET hidden=1,summary='',cleared_at=?,cleared_through=(SELECT coalesce(max(m.id),0) FROM agent_dialogue_messages m JOIN agent_dialogues d ON d.id=m.dialogue_id WHERE d.session_id=agent_session_members.session_id),summary_through=0 WHERE user_id=? AND hidden=0 AND NOT EXISTS(SELECT 1 FROM agent_dialogues d WHERE d.session_id=agent_session_members.session_id AND d.status!='ended') RETURNING session_id,resource_conversation_id",(now(),user['id'])).fetchall()
+                workspaces.extend(row['resource_conversation_id'] for row in sessions)
             else:sessions=[]
             self.resources.release_task_workspaces(db,resources,[(user['id'],workspace) for workspace in workspaces])
+            for row in tasks:
+                self.resources.release_shared(db,resources,'task',row['task_id'])
+            for row in sessions:
+                self.resources.release_shared(db,resources,'session',row['session_id'])
         return {'deleted':len(tasks),'sessions':len(sessions)}
 
     async def delete(self,user,identifier):
@@ -778,6 +814,7 @@ class AgentDialogues:
                 db.execute('UPDATE agent_task_members SET resource_conversation_id=NULL WHERE task_id=? AND user_id=?',
                            (identifier,user['id']))
                 self.resources.release_task_workspaces(db,resources,[(user['id'],member[0])])
+                self.resources.release_shared(db,resources,'task',identifier)
             db.execute('UPDATE agent_notifications SET deleted_at=? WHERE task_id=? AND user_id=?',(now(),identifier,user['id']))
         await self.interrupt(identifier)
         await self.flush_controls(identifier)
@@ -855,7 +892,7 @@ class AgentDialogues:
             # 已保存到气泡的调用状态须保留，否则刷新后会丢失取消/确认结果。
             db.execute("DELETE FROM agent_intents WHERE julianday(created_at)<julianday('now','-1 day') AND message_id IS NULL AND status='pending'")
             db.execute('''DELETE FROM agent_dialogue_messages WHERE id IN (SELECT m.id FROM agent_dialogue_messages m JOIN agent_dialogues d ON d.id=m.dialogue_id
-              WHERE m.id <= (SELECT MIN(cleared_through) FROM agent_session_members WHERE session_id=d.session_id)
+              WHERE (d.delivery_mode='message' AND m.id <= (SELECT MIN(cleared_through) FROM agent_session_members WHERE session_id=d.session_id))
               OR (d.status='ended' AND 2=(SELECT COUNT(*) FROM agent_task_members WHERE task_id=d.id AND hidden=1)))''')
 
     def claim(self):
@@ -957,13 +994,14 @@ class AgentDialogues:
         if not ids:return []
         if checkpoint.get('source_revision')!=self.output_revision(db,job,speaker_id):
             raise HTTPException(409,'原作品的资料授权已变化')
+        storage_owner=self.chat.chat_files.session(db,speaker_id,workspace)['user_id']
         rows=db.execute("SELECT id,filename,size,sha256,animation_metadata::jsonb->>'html_mode' AS html_mode FROM chat_files WHERE user_id=? AND conversation_id=? AND origin='generated' "
                         "AND (expires_at IS NULL OR julianday(expires_at)>julianday('now')) AND id IN ("+','.join('?' for _ in ids)+')',
-                        (speaker_id,workspace,*ids))
+                        (storage_owner,workspace,*ids))
         from avatar.files.conversation.resources import original_hashes
         saved = []
         for row in rows:
-            path = self.chat.chat_files.directory.path(speaker_id,workspace,row['id']+'.blob')
+            path = self.chat.chat_files.directory.path(storage_owner,workspace,row['id']+'.blob')
             try:
                 actual, _ = original_hashes(path,row['size'])
             except FileNotFoundError:
@@ -995,12 +1033,12 @@ class AgentDialogues:
 
     def compact_scope(self,db,user,session_id,task_id):
         uid=user['id']
-        member=self.member(db,user,session_id)
         job=None
         if task_id:
             job=self.owned(db,user,task_id)
             if job['session_id']!=session_id:raise HTTPException(404,'任务不存在')
             if job['delivery_mode']=='message':task_id,job=None,None
+        member=self.member(db,user,session_id,hidden=bool(task_id))
         memory=db.execute('SELECT * FROM agent_task_members WHERE task_id=? AND user_id=? AND hidden=0',(task_id,uid)).fetchone() if task_id else member
         if not memory:raise HTTPException(404,'会话不存在')
         return member,memory,task_id,job
@@ -1008,7 +1046,7 @@ class AgentDialogues:
     def compact_usage(self,user,session_id,task_id):
         with self.database.connect() as db:
             member,memory,task_id,job=self.compact_scope(db,user,session_id,task_id)
-            through=max(member['cleared_through'],memory['summary_through'])
+            through=memory['summary_through'] if task_id else max(member['cleared_through'],memory['summary_through'])
             query,params=self.memory_query(session_id,task_id,through,user['id'])
             size=db.execute("SELECT COALESCE(SUM((octet_length(m.speaker_name || '：' || m.content)"
                             " + CASE WHEN m.speaker_user_id=? THEN octet_length(m.tool_activity) ELSE 0 END + 2)/3 + 16),0)"+query,(user['id'],*params)).fetchone()[0]
@@ -1022,7 +1060,8 @@ class AgentDialogues:
             member,memory,task_id,job=self.compact_scope(db,user,session_id,task_id)
             if job and job['status']=='ended':
                 raise HTTPException(409,'任务已完成，仅可查看记录')
-            rows=self.memory_rows(db,session_id,task_id,max(member['cleared_through'],memory['summary_through']),uid)
+            through=memory['summary_through'] if task_id else max(member['cleared_through'],memory['summary_through'])
+            rows=self.memory_rows(db,session_id,task_id,through,uid)
             if not rows:return {'message':'没有新的消息需要压缩。'}
         overview,context=self.chat.context(user,ChatRequest(channel='avatar',message='/compact'))
         speaker=overview['agent']
@@ -1033,8 +1072,8 @@ class AgentDialogues:
         history=[{'role':'assistant' if r['speaker_role']=='agent' and r['speaker_aic']==speaker['aic'] else 'user','content':r['speaker_name']+'：'+r['content']} for r in rows]
         result=await self.billed({'user_id':uid},speaker,context[0],self.chat.memory.summarize(context,memory['summary'],history,self.chat.model_client,focus=focus),'agent_dialogue_memory')
         with self.database.connect(write=True) as db:
-            current=self.member(db,user,session_id)
-            if current['cleared_through']!=member['cleared_through']:raise HTTPException(409,'会话记录已变化，请重试')
+            current=self.member(db,user,session_id,hidden=bool(task_id))
+            if not task_id and current['cleared_through']!=member['cleared_through']:raise HTTPException(409,'会话记录已变化，请重试')
             if task_id:
                 self.owned(db,user,task_id)
                 updated=db.execute('UPDATE agent_task_members SET summary=?,summary_through=? WHERE task_id=? AND user_id=? AND hidden=0 AND summary_through=?',(result.text,rows[-1]['id'],task_id,uid,memory['summary_through']))
@@ -1070,7 +1109,8 @@ class AgentDialogues:
             reply_owed=not ordinary and self.needs_peer_reply(db,job['id'],speaker['aic'])
             response_owed=not ordinary and self.needs_peer_reply(db,job['id'],peer['aic'])
             memory=member if ordinary else task_member
-            rows=self.memory_rows(db,job['session_id'],None if ordinary else job['id'],max(member['cleared_through'],memory['summary_through']),speaker_id)
+            through=max(member['cleared_through'],memory['summary_through']) if ordinary else memory['summary_through']
+            rows=self.memory_rows(db,job['session_id'],None if ordinary else job['id'],through,speaker_id)
         actor={'id':speaker_id,'username':speaker['username'],'account_status':speaker['account_status']}
         with self.database.connect(write=True) as db:
             workspace=self.resources.workspace(db,speaker_id,job['session_id'],job['id'])
@@ -1091,7 +1131,7 @@ class AgentDialogues:
             export_store = None
         _,context=self.chat.context(actor,ChatRequest(channel='avatar',message=job['objective']),speaker,private_access=False)
         config,key,system,_=context
-        preferences = self.chat.tools.get(speaker_id, workspace)
+        preferences = self.chat.tools.get(speaker_id, run.settings_workspace)
         config = with_chat_effort(config, preferences.get('reasoning_effort'))
         tools = preferences['items']
         settings={item['id']:item['enabled'] for item in tools}
@@ -1179,7 +1219,7 @@ class AgentDialogues:
                 row=self.chat.chat_files.owned(db,speaker_id,workspace,identifier)
                 if not row['referenced'] and identifier not in {item['id'] for item in self.saved_outputs(db,task,speaker_id,workspace)}:
                     raise HTTPException(409,'文件已取消引用')
-                with self.chat.chat_files.directory.path(speaker_id,workspace,identifier+'.blob').open('rb') as stream:
+                with self.chat.chat_files.directory.path(row['user_id'],workspace,identifier+'.blob').open('rb') as stream:
                     return stream.read(8*1024*1024+1)
         async def sandbox(context, objective):
             inputs={file['id']:{'path':'inputs/'+file['id']+'/'+Path(file['filename']).name,'read':lambda identifier=file['id']:read_input(identifier)} for file in [*files,*saved]}
@@ -1214,13 +1254,14 @@ class AgentDialogues:
             context=({**cfg,'_tools':[*cfg.get('_tools',[]),find_public,SEND_PUBLIC_MATERIAL],'_optional_tools':ordinary,
                       '_peer_material_owner':speaker_id,'_peer_visible_materials':visible_ids},key,prefix+'\n'+dump(background),history)
         from avatar.conversation.loop.entry_tools import bind_entry_tools
-        snapshot={item['id']:item['sha256'] for item in [*files,*saved] if item.get('sha256')}
+        with self.database.connect() as db:
+            snapshot=self.resources.session_file_grants(db,job,speaker_id,workspace)
         def file_grants(db):
             live=self.resources.session_file_grants(db,job,speaker_id,workspace)
             return {identifier:digest for identifier,digest in snapshot.items() if live.get(identifier)==digest}
         context=await bind_entry_tools(self.chat,context,speaker_id,speaker['aic'],{'id':workspace},files,
                                        sandbox=sandbox if settings['python'] else None, progress=progress,
-                                       session_file_scope=workspace if snapshot else None,
+                                       session_file_scope=workspace,
                                        session_file_grants=file_grants, directory_reply=self.chat.assistant_router.catalog_reply)
         run.validate_session_files=context[0].get('_validate_session_files_in')
         context[0].setdefault('_generated_files', [])
@@ -1353,7 +1394,8 @@ class AgentDialogues:
                 db.execute('UPDATE agent_dialogues SET pending_file_delivery=NULL WHERE id=?',(job['id'],))
             PeerTurn.clear(db, job['id'], speaker['user_id'])
             db.execute('UPDATE agent_task_files SET message_id=? WHERE task_id=? AND source_user_id=? AND message_id IS NULL',(cursor.lastrowid,job['id'],speaker['user_id']))
-            db.execute('UPDATE agent_session_members SET hidden=0 WHERE session_id=?',(job['session_id'],))
+            if ordinary:
+                db.execute('UPDATE agent_session_members SET hidden=0 WHERE session_id=?',(job['session_id'],))
             count=db.execute("SELECT COUNT(*) FROM agent_dialogue_messages WHERE dialogue_id=? AND speaker_role='agent'",(job['id'],)).fetchone()[0]
             rounds=job['rounds_done']+int(count%2==0)
             checkpoint=current['agent_checkpoint'] if not done and state=='queued' and held.get('speaker_id') not in (None,speaker['user_id']) else None
@@ -1437,7 +1479,12 @@ class AgentDialogues:
             if not await self.once():await asyncio.sleep(.4)
 
     async def cleanup_loop(self):
-        while True:await asyncio.sleep(60);await asyncio.to_thread(self.cleanup)
+        while True:
+            try:
+                await asyncio.to_thread(self.cleanup)
+            except Exception as exc:
+                logger.error('Peer cleanup failed: type=%s sqlstate=%s',type(exc).__name__,getattr(exc,'sqlstate',None))
+            await asyncio.sleep(60)
 
     async def run(self):
         with self.database.connect(write=True) as db:
@@ -1456,7 +1503,6 @@ class AgentDialogues:
                            ('queued' if safe else 'paused',dump(checkpoint) if checkpoint else None,
                             '' if safe else '上次进程中断，未自动重放，请核对后继续',task['id']))
             db.execute("UPDATE agent_protocol_controls SET status='queued' WHERE status='running'")
-        await asyncio.to_thread(self.cleanup)
         tasks=[asyncio.create_task(self.worker()) for _ in range(4)]+[asyncio.create_task(self.cleanup_loop()),asyncio.create_task(self.control_loop())]
         try:await asyncio.gather(*tasks)
         finally:

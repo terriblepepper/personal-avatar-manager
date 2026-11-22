@@ -62,7 +62,7 @@ class ConversationResources:
         with self.database.connect() as db:
             self.session(db,user_id,conversation_id)
             rows=[dict(row) for row in db.execute("""SELECT a.id,a.filename,a.relative_path,a.sha256,a.content_type,a.animation_metadata,a.size,a.caption AS description,a.created_at,'profile' AS source,
-                     EXISTS(SELECT 1 FROM chat_files f WHERE f.conversation_id=? AND f.user_id=a.user_id AND f.sha256=a.sha256 AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now'))) AS already_referenced
+                     EXISTS(SELECT 1 FROM chat_files f WHERE f.conversation_id=? AND f.sha256=a.sha256 AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now'))) AS already_referenced
                      FROM attachments a WHERE a.user_id=? ORDER BY a.created_at DESC,a.id""",(conversation_id,user_id))]
             folders={row['path']:row['caption'] for row in db.execute('SELECT path,caption FROM material_folders WHERE user_id=? ORDER BY path',(user_id,))}
         for row in rows:
@@ -111,7 +111,7 @@ class ConversationResources:
     def storing_outputs(self,db,user_id,conversation_id,message_id,outputs):
         paths=[]
         try:
-            self.session(db,user_id,conversation_id)
+            storage_owner=self.session(db,user_id,conversation_id)['user_id']
             from avatar.files.library.public import PublicMaterials
             generated=[item for item in outputs if not item.get('public_material_id')]
             ordinary=sum(len(item['data']) for item in generated if OUTPUT_TYPES.get(Path(item['filename']).suffix.lower()) != 'text/html')
@@ -139,7 +139,7 @@ class ConversationResources:
                     if item.get('html_mode'):
                         metadata = json.dumps({'html_mode': item['html_mode']})
                 identifier=str(uuid.UUID(item['id']))
-                path=self.directory.path(user_id,conversation_id,identifier+'.blob',create=True)
+                path=self.directory.path(storage_owner,conversation_id,identifier+'.blob',create=True)
                 with os.fdopen(os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'wb') as stream:
                     paths.append(path)
                     if source:
@@ -159,7 +159,7 @@ class ConversationResources:
                     extraction_status,created_at,origin,expires_at,animation_metadata,animation_digest,generated_message_id,
                     referenced,source_label,sha256,md5,description)
                     VALUES(?,?,?,?,?,?,'','rag_pending',?,?,datetime('now','+7 days'),?,?,?,0,?,?,?,?)''',
-                    (identifier,user_id,conversation_id,item['filename'],mime,size,now(),'reference' if source else 'generated',
+                    (identifier,storage_owner,conversation_id,item['filename'],mime,size,now(),'reference' if source else 'generated',
                      metadata,digest,message_id,'公开资料原件' if source else '分身生成',sha,md5 if source else '',
                      source['caption'] if source else ''))
             yield paths

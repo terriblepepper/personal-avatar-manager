@@ -38,24 +38,35 @@ class ChatFiles(ConversationResources):
     # 结果与约束：不能用子会话、协议会话或他人 ID 上传、管理附件；占用中的会话拒绝变更。
     @staticmethod
     def session(db, user_id, conversation_id, editable=False):
-        row=db.execute("SELECT * FROM chat_conversations WHERE id=? AND user_id=? AND parent_id IS NULL AND platform='web'",(conversation_id,user_id)).fetchone()
+        row=db.execute("SELECT * FROM chat_conversations WHERE id=? AND parent_id IS NULL AND platform='web'",(conversation_id,)).fetchone()
         if not row:raise HTTPException(404,'会话不存在')
+        shared = db.execute("SELECT scope,scope_id FROM agent_shared_workspaces WHERE conversation_id=?",(conversation_id,)).fetchone() if row['channel']=='peer' else None
+        if shared:
+            table,key=('agent_task_members','task_id') if shared['scope']=='task' else ('agent_session_members','session_id')
+            if not db.execute(f"SELECT 1 FROM {table} WHERE {key}=? AND user_id=? AND hidden=0",(shared['scope_id'],user_id)).fetchone():
+                raise HTTPException(404,'会话不存在')
+        elif row['user_id']!=user_id:
+            raise HTTPException(404,'会话不存在')
         if editable and row['lease_until']>time.time():raise HTTPException(409,'会话正在处理，请等待回答完成')
-        if row['channel']=='peer':
+        if shared and shared['scope']=='task':
+            task=db.execute("SELECT status,expires_at FROM agent_dialogues WHERE id=?",(shared['scope_id'],)).fetchone()
+        elif row['channel']=='peer' and not shared:
             task=db.execute("""SELECT d.status,d.expires_at FROM agent_task_members m
                 JOIN agent_dialogues d ON d.id=m.task_id WHERE m.resource_conversation_id=? AND m.user_id=?
                 AND d.delivery_mode<>'message' AND m.hidden=0
                 AND NOT EXISTS(SELECT 1 FROM agent_session_members s WHERE s.resource_conversation_id=m.resource_conversation_id)
                 ORDER BY d.expires_at DESC NULLS FIRST LIMIT 1""",
                 (conversation_id,user_id)).fetchone()
-            if task and task['status']=='ended':
-                if task['expires_at'] and db.execute("SELECT julianday(?)<=julianday('now')",(task['expires_at'],)).fetchone()[0]:
-                    raise HTTPException(410,'任务工作区已过期')
-                if editable:raise HTTPException(409,'已结束任务的工作区仅可查看或转存')
+        else:
+            task=None
+        if task and task['status']=='ended':
+            if task['expires_at'] and db.execute("SELECT julianday(?)<=julianday('now')",(task['expires_at'],)).fetchone()[0]:
+                raise HTTPException(410,'任务工作区已过期')
+            if editable:raise HTTPException(409,'已结束任务的工作区仅可查看或转存')
         return row
 
     def model_catalog(self, db, owner, conversation):
-        self.session(db, owner, conversation)
+        owner=self.session(db, owner, conversation)["user_id"]
         cards = []
         offset = 0
         while len(cards) < 20:
@@ -98,7 +109,7 @@ class ChatFiles(ConversationResources):
                 rows=db.execute(sql,(*params,term,11,max(0,cursor-len(staged)))).fetchall()
                 for row in rows:
                     present = (self.attachments.directory.available(owner,row['id'],row['size']) if row['source']=='profile'
-                               else self.directory.available_in(owner,conversation,row['id'],row['size']))
+                               else self.directory.available_in(storage_owner,conversation,row['id'],row['size']))
                     if present:
                         if len(items)==10:
                             return {'items':items,'next_offset':cursor}
@@ -107,8 +118,8 @@ class ChatFiles(ConversationResources):
                 if len(rows)<11:
                     return {'items':items,'next_offset':None}
         with self.database.connect() as db:
-            self.session(db,owner,conversation)
-            params=(owner,conversation)
+            storage_owner=self.session(db,owner,conversation)['user_id']
+            params=(storage_owner,conversation)
             if grants is None:
                 originals=chat_rows+shared_rows
                 params+=owner,conversation,owner
@@ -122,7 +133,7 @@ class ChatFiles(ConversationResources):
             if outputs:
                 ids=tuple(item['id'] for item in outputs)
                 rows=db.execute(f"SELECT id FROM chat_files WHERE user_id=? AND conversation_id=? AND id IN ({','.join('?' for _ in ids)})",
-                                (owner,conversation,*ids))
+                                (storage_owner,conversation,*ids))
                 committed={row['id'] for row in rows}
             result=page(db,query.strip(),offset)
             if query.strip() and offset==0 and not result['items']:
@@ -135,22 +146,22 @@ class ChatFiles(ConversationResources):
     # 结果与约束：不输出提取全文、原件路径或其他会话内容；提供解析状态、发送状态和转存结果。
     def list(self, user_id, conversation_id):
         with self.database.connect() as db:
-            self.session(db,user_id,conversation_id)
+            storage_owner=self.session(db,user_id,conversation_id)['user_id']
             rows = db.execute("""SELECT f.id,f.conversation_id,f.filename,f.content_type,f.size,f.extraction_status,f.created_at,
                 f.description,f.origin,f.source_label,f.expires_at,f.referenced,f.animation_metadata,
                 length(f.extracted_text)>0 AS text_available,
                 EXISTS(SELECT 1 FROM chat_file_usages u WHERE u.file_id=f.id) AS sent,
-                CASE WHEN f.content_type=? THEN (SELECT a.id FROM attachments a WHERE a.user_id=f.user_id
+                CASE WHEN f.content_type=? THEN (SELECT a.id FROM attachments a WHERE a.user_id=?
                         AND a.animation_digest<>'' AND a.animation_digest=f.animation_digest AND a.saved_at IS NOT NULL
                         ORDER BY a.id LIMIT 1)
-                     ELSE coalesce(f.promoted_id,(SELECT a.id FROM attachments a WHERE a.user_id=f.user_id
+                     ELSE coalesce((SELECT id FROM attachments WHERE id=f.promoted_id AND user_id=?),(SELECT a.id FROM attachments a WHERE a.user_id=?
                         AND a.sha256=f.sha256 AND f.sha256<>'' ORDER BY a.created_at,a.id LIMIT 1)) END AS promoted_id
                 FROM chat_files f WHERE f.user_id=? AND f.conversation_id=?
                   AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now')) ORDER BY f.created_at,f.id""",
-                (ANIMATION_MIME,user_id,conversation_id))
+                (ANIMATION_MIME,user_id,user_id,user_id,storage_owner,conversation_id))
             items = []
             for row in rows:
-                if not self.directory.available_in(user_id,row['conversation_id'],row['id'],row['size']):
+                if not self.directory.available_in(storage_owner,row['conversation_id'],row['id'],row['size']):
                     continue
                 item = dict(row)
                 item.pop('conversation_id')
@@ -178,9 +189,9 @@ class ChatFiles(ConversationResources):
         if html_animation:
             metadata['html_mode'] = html_mode
         with self.database.connect() as db:
-            self.session(db,user['id'],conversation_id,editable=True)
+            storage_owner=self.session(db,user['id'],conversation_id,editable=True)['user_id']
         identifier=str(uuid.uuid4())
-        path=self.directory.path(user['id'],conversation_id,identifier+'.blob',create=True)
+        path=self.directory.path(storage_owner,conversation_id,identifier+'.blob',create=True)
         preview=path.with_suffix('.jpg')
         sha = write_original(path,data)
         try:
@@ -192,16 +203,17 @@ class ChatFiles(ConversationResources):
                 status='vision_ready'
             md5=hashlib.md5(data,usedforsecurity=False).hexdigest()
             with self.database.connect(write=True) as db:
-                self.session(db,user['id'],conversation_id,editable=True)
+                if self.session(db,user['id'],conversation_id,editable=True)['user_id']!=storage_owner:
+                    raise HTTPException(409,'文件工作区已改变，请重试')
                 if source_animation_id is not None and not db.execute(
                         "SELECT 1 FROM attachments WHERE id=? AND user_id=? AND sha256=?",
                         (source_animation_id,user['id'],sha)).fetchone():
                     raise HTTPException(404,'动画资料不存在')
-                candidates=db.execute("SELECT id,sha256,md5 FROM chat_files WHERE user_id=? AND conversation_id=? AND (sha256=? OR sha256='') AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))",(user['id'],conversation_id,sha)).fetchall()
+                candidates=db.execute("SELECT id,sha256,md5 FROM chat_files WHERE user_id=? AND conversation_id=? AND (sha256=? OR sha256='') AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))",(storage_owner,conversation_id,sha)).fetchall()
                 for candidate in candidates:
                     old_md5=candidate['md5']
                     if not old_md5 or not candidate['sha256'] or old_md5!=md5:
-                        original=self.directory.path(user['id'],conversation_id,candidate['id']+'.blob')
+                        original=self.directory.path(storage_owner,conversation_id,candidate['id']+'.blob')
                         if not original.exists():continue
                         with original.open('rb') as previous:
                             if hashlib.file_digest(previous,'sha256').hexdigest()!=sha:continue
@@ -213,7 +225,7 @@ class ChatFiles(ConversationResources):
                 if not temporary and not referenced and origin=='reference':
                     raise HTTPException(413,'同时引用文件最多五个，请先关闭不需要的引用')
                 db.execute('INSERT INTO chat_files(id,user_id,conversation_id,filename,content_type,size,extracted_text,extraction_status,created_at,referenced) VALUES(?,?,?,?,?,?,?,?,?,?)',
-                           (identifier,user['id'],conversation_id,filename,TYPES[extension],len(data),extracted,status,now(),int(referenced)))
+                           (identifier,storage_owner,conversation_id,filename,TYPES[extension],len(data),extracted,status,now(),int(referenced)))
                 db.execute('UPDATE chat_files SET parse_checked=1,extraction_version=1,sha256=?,md5=?,animation_metadata=?,animation_digest=?,source_animation_id=? WHERE id=?',
                            (sha,md5,json.dumps(metadata,ensure_ascii=False),
                             hashlib.sha256(scene.canonical()).hexdigest() if scene else '',source_animation_id,identifier))
@@ -227,9 +239,9 @@ class ChatFiles(ConversationResources):
     # 输入：file_id 必须归属于 user_id 和 conversation_id。
     # 结果与约束：无权限与不存在均返回 404，不授予非所有人管理员读取权限。
     def owned(self, db, user_id, conversation_id, file_id):
-        self.session(db,user_id,conversation_id)
-        row=db.execute("SELECT * FROM chat_files WHERE id=? AND user_id=? AND conversation_id=? AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))",(file_id,user_id,conversation_id)).fetchone()
-        if not row or not self.directory.available_in(user_id,conversation_id,file_id,row['size']):raise HTTPException(404,'会话附件不存在')
+        storage_owner=self.session(db,user_id,conversation_id)['user_id']
+        row=db.execute("SELECT * FROM chat_files WHERE id=? AND user_id=? AND conversation_id=? AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))",(file_id,storage_owner,conversation_id)).fetchone()
+        if not row or not self.directory.available_in(storage_owner,conversation_id,file_id,row['size']):raise HTTPException(404,'会话附件不存在')
         return dict(row)
 
     # 职责：在调用方事务期间移除选中文件，并在事务失败时恢复原件。
@@ -261,7 +273,7 @@ class ChatFiles(ConversationResources):
             row=await asyncio.to_thread(owned)
             filename=row['filename'] if new_name is None else renamed_filename(row['filename'],new_name)
             try:
-                original = self.directory.path(user['id'],conversation_id,file_id+'.blob').open('rb')
+                original = self.directory.path(row['user_id'],row['conversation_id'],file_id+'.blob').open('rb')
             except FileNotFoundError:
                 raise HTTPException(410,'会话原件已删除或过期') from None
             created=None

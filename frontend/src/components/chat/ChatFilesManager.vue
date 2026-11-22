@@ -15,7 +15,7 @@ import { readAnimation } from '../../utils/readAnimation'
 import { submitAnimationPromotion } from '../../utils/animationPromotion'
 
 const FilePreview = defineAsyncComponent(() => import('../FilePreview.vue'))
-const props=defineProps<{conversationId:string;busy?:boolean;readOnly?:boolean;temporary?:boolean;includeConversationFiles?:boolean;selectedIds?:string[]}>()
+const props=defineProps<{conversationId:string;busy?:boolean;readOnly?:boolean;temporary?:boolean;includeConversationFiles?:boolean;selectedIds?:string[];label?:string}>()
 const emit=defineEmits<{selected:[ids:string[]];uploading:[value:boolean]}>()
 interface ChatFile {id:string;filename:string;content_type:string;size:number;description:string;referenced:boolean;download_url:string;origin?:string;source_label?:string;expires_at?:string;promoted_id?:string|null}
 interface LibraryFile extends AnimationMetadata {id:string;filename:string;source:'folder'|'profile';path?:string;relative_path?:string;description:string;size:number;sha256?:string;already_referenced?:boolean}
@@ -174,7 +174,7 @@ async function promote(value:FilePromotion) {
   })
 }
 </script>
-<template><details class="composer-menu composer-tool"><summary :title="temporary ? '添加和预览发送附件' : '上传、引用和管理会话文件'"><AppIcon name="folder" :size="14"/><span>文件</span><small>{{ active.length }}</small></summary><div class="composer-popover chat-file-menu"><h3>{{ temporary ? '本次发送附件' : '会话文件' }}</h3><div class="actions">
+<template><details class="composer-menu composer-tool"><summary :title="label || (temporary ? '添加和预览发送附件' : '上传、引用和管理会话文件')"><AppIcon name="folder" :size="14"/><span>{{ label || '文件' }}</span><small>{{ active.length }}</small></summary><div class="composer-popover chat-file-menu"><h3>{{ label || (temporary ? '本次发送附件' : '会话文件') }}</h3><div class="actions">
   <button v-if="!readOnly" type="button" class="button small" :disabled="busy||working||!conversationId" @click="uploadInput?.click()">上传本地文件</button>
   <button v-if="!readOnly" type="button" class="button small" :disabled="busy||working||!conversationId" @click="openLibrary">{{ temporary ? '从资料库添加' : '从资料库引用' }}</button>
   <button v-if="uploadController" type="button" class="button small" @click="uploadController.abort()">取消上传</button>

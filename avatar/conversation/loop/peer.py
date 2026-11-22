@@ -50,6 +50,7 @@ class PeerTurn:
         self.validate_session_files = None
         with service.database.connect(write=True) as db:
             self.workspace = service.resources.workspace(db, owner, task['session_id'], task['id'])
+            self.settings_workspace = service.resources.settings_workspace(db, owner, task['session_id'], task['id'])
             self.source = self.authority(db)
 
     def authority(self, db):
@@ -66,10 +67,14 @@ class PeerTurn:
     @staticmethod
     def source_version(service, db, task, owner, workspace):
         side = 'initiator' if owner == task['user_id'] else 'target'
+        table,key=('agent_session_members','session_id') if task['delivery_mode']=='message' else ('agent_task_members','task_id')
+        scope_id=task['session_id'] if key=='session_id' else task['id']
+        settings = db.execute(f'SELECT resource_conversation_id FROM {table} WHERE {key}=? AND user_id=? AND hidden=0',
+                              (scope_id,owner)).fetchone()
         row = db.execute('SELECT c.tools_config,m.cleared_through,md5(model.model_config),md5(embedding.config) FROM chat_conversations c JOIN agent_session_members m '
                          'ON m.user_id=c.user_id AND m.session_id=? LEFT JOIN model_settings model ON model.user_id=c.user_id '
                          'LEFT JOIN embedding_settings embedding ON embedding.user_id=c.user_id WHERE c.id=? AND c.user_id=?',
-                         (task['session_id'], workspace, owner)).fetchone()
+                         (task['session_id'], settings[0] if settings else workspace, owner)).fetchone()
         if row is None:
             raise HTTPException(409, '分身会话资料授权已失效')
         own, target = service.participants(db, task['user_id'], task['target_aic'])

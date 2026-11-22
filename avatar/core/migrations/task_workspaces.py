@@ -1,6 +1,30 @@
 """Independent task workspaces share the task's completion-based deadline."""
 
 def install_task_workspaces(connection):
+    connection.execute("""CREATE TABLE IF NOT EXISTS agent_peer_auto_accept (
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        peer_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        PRIMARY KEY(user_id,peer_user_id), CHECK(user_id<>peer_user_id))""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS agent_shared_workspaces (
+        scope TEXT NOT NULL CHECK(scope IN ('task','session')), scope_id TEXT NOT NULL,
+        conversation_id TEXT NOT NULL UNIQUE REFERENCES chat_conversations(id) ON DELETE CASCADE,
+        PRIMARY KEY(scope,scope_id))""")
+    connection.execute("""CREATE OR REPLACE FUNCTION avatar_trigger_peer_file_scope() RETURNS trigger
+        LANGUAGE plpgsql AS $body$ BEGIN
+          IF NOT EXISTS(SELECT 1 FROM agent_dialogues d JOIN chat_files f ON f.id=NEW.file_id
+              WHERE d.id=NEW.task_id AND NEW.source_user_id IN (d.user_id,d.target_user_id)
+              AND (EXISTS(SELECT 1 FROM agent_shared_workspaces w JOIN chat_conversations c ON c.id=w.conversation_id
+                      WHERE w.conversation_id=f.conversation_id AND c.user_id=f.user_id
+                      AND ((w.scope='session' AND w.scope_id=d.session_id AND d.delivery_mode='message')
+                        OR (w.scope='task' AND w.scope_id=d.id AND d.delivery_mode<>'message')))
+                OR EXISTS(SELECT 1 FROM agent_session_members m
+                      JOIN agent_task_members t ON t.task_id=d.id AND t.user_id=m.user_id
+                      WHERE m.session_id=d.session_id AND f.user_id=m.user_id AND f.conversation_id=
+                        CASE WHEN d.delivery_mode='message' THEN m.resource_conversation_id ELSE t.resource_conversation_id END))) THEN
+            RAISE EXCEPTION USING ERRCODE='23514', MESSAGE='peer file scope mismatch';
+          END IF;
+          RETURN NEW;
+        END $body$""")
     connection.execute("ALTER TABLE agent_task_members ADD COLUMN IF NOT EXISTS expired_files TEXT NOT NULL DEFAULT '[]'")
     connection.execute("""CREATE INDEX IF NOT EXISTS agent_task_members_workspace
         ON agent_task_members(resource_conversation_id,user_id) WHERE resource_conversation_id IS NOT NULL""")
@@ -8,8 +32,15 @@ def install_task_workspaces(connection):
         ON agent_dialogues(expires_at) WHERE delivery_mode<>'message' AND status='ended' AND expires_at IS NOT NULL""")
     connection.execute("""CREATE OR REPLACE FUNCTION avatar_task_workspace_expiry() RETURNS trigger
         LANGUAGE plpgsql AS $body$
-        DECLARE supplied_deadline text := NEW.expires_at;
+        DECLARE
+            supplied_deadline text := NEW.expires_at;
+            shared_scope text;
         BEGIN
+            SELECT w.scope,d.expires_at INTO shared_scope,NEW.expires_at
+            FROM agent_shared_workspaces w
+            LEFT JOIN agent_dialogues d ON w.scope='task' AND d.id=w.scope_id
+            WHERE w.conversation_id=NEW.conversation_id;
+            IF shared_scope IS NOT NULL THEN RETURN NEW; END IF;
             SELECT d.expires_at INTO NEW.expires_at
             FROM agent_task_members m JOIN agent_dialogues d ON d.id=m.task_id
             JOIN chat_conversations c ON c.id=m.resource_conversation_id AND c.user_id=m.user_id AND c.channel='peer'

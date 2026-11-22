@@ -1467,7 +1467,9 @@ def install_schema(connection):
     install_task_workspaces(connection)
     connection.execute("""UPDATE chat_files SET expires_at=to_char(
         (created_at::timestamptz AT TIME ZONE 'UTC') + interval '7 days','YYYY-MM-DD HH24:MI:SS')
-        WHERE origin='generated' AND expires_at IS NULL AND NOT EXISTS (
+        WHERE origin='generated' AND expires_at IS NULL
+        AND NOT EXISTS(SELECT 1 FROM agent_shared_workspaces w WHERE w.conversation_id=chat_files.conversation_id)
+        AND NOT EXISTS (
             SELECT 1 FROM agent_task_members m WHERE m.resource_conversation_id=chat_files.conversation_id
             AND m.user_id=chat_files.user_id)""")
 
