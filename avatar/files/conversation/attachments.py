@@ -41,6 +41,17 @@ class ChatFiles(ConversationResources):
         row=db.execute("SELECT * FROM chat_conversations WHERE id=? AND user_id=? AND parent_id IS NULL AND platform='web'",(conversation_id,user_id)).fetchone()
         if not row:raise HTTPException(404,'会话不存在')
         if editable and row['lease_until']>time.time():raise HTTPException(409,'会话正在处理，请等待回答完成')
+        if row['channel']=='peer':
+            task=db.execute("""SELECT d.status,d.expires_at FROM agent_task_members m
+                JOIN agent_dialogues d ON d.id=m.task_id WHERE m.resource_conversation_id=? AND m.user_id=?
+                AND d.delivery_mode<>'message' AND m.hidden=0
+                AND NOT EXISTS(SELECT 1 FROM agent_session_members s WHERE s.resource_conversation_id=m.resource_conversation_id)
+                ORDER BY d.expires_at DESC NULLS FIRST LIMIT 1""",
+                (conversation_id,user_id)).fetchone()
+            if task and task['status']=='ended':
+                if task['expires_at'] and db.execute("SELECT julianday(?)<=julianday('now')",(task['expires_at'],)).fetchone()[0]:
+                    raise HTTPException(410,'任务工作区已过期')
+                if editable:raise HTTPException(409,'已结束任务的工作区仅可查看或转存')
         return row
 
     def model_catalog(self, db, owner, conversation):
