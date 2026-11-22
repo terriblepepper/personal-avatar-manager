@@ -25,8 +25,8 @@ const actions: Record<string, string> = {
   send_public_material: '准备公开原件',
   find_animation: '查找已保存动画',
   send_animation: '准备动画原件',
-  create_html: '制作网页',
-  create_animation: '制作动画',
+  create_html: '生成 HTML',
+  create_animation: '生成 HTML',
   list_avatars: '查询公开分身目录',
   contact_avatar: '准备分身联络草稿',
   continue_answer: '确认由当前分身回答',
@@ -94,6 +94,7 @@ function activityName(event: ToolEvent) {
     return typeof input.query === 'string' && input.query ? `${name}「${input.query}」` : name
   }
   if (input.operation === 'check_file_receipt') {
+    if (output.decision === 'html') return '核对后补做 HTML'
     if (output.decision === 'webpage') return '核对后补做网页'
     if (output.decision === '2d' || output.decision === '3d') return '核对后补做动画'
     return output.decision === 'plain_answer' ? '已确认本轮可用文字回答' : '核对本轮文件交付'

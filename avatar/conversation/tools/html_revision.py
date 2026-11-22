@@ -27,11 +27,11 @@ _PLAYER = re.compile(r'<script type="module">\n(?:[^\n]*\n)?function installAnim
 
 
 def revision_tool(tool):
-    if tool['name'] not in ('create_html','create_animation'):
+    if tool['name']!='create_html':
         return tool
     form = tool['parameters']
     properties = {**form['properties'], 'revision':{k:v for k,v in REVISION_SCHEMA.items() if k!='$defs'}}
-    return {**tool, 'description':tool['description']+' 修订已读取的旧作品可只提交 filename 和 revision，使用 read_session_file 的 ID、SHA-256 和准确原文。系统另存为新文件。',
+    return {**tool, 'description':tool['description']+' 支持按已读原件进行局部修改并另存。',
             'parameters':{**form,'properties':properties,'$defs':{**form.get('$defs',{}),**REVISION_SCHEMA['$defs']},'required':['filename']}}
 
 
@@ -76,17 +76,14 @@ def apply_edits(text, edits):
     return ''.join(parts)
 
 
-def expand_revision(tool, args, load_source):
+def expand_revision(args, load_source, *, legacy_animation=False):
     from avatar.conversation.tools.html import checked_args
-    animation = tool=='create_animation'
-    allowed = {'revision','filename'} | ({'mode','duration_seconds'} if animation else set())
+    allowed = {'revision','filename'} | ({'mode','duration_seconds'} if legacy_animation else set())
     if not load_source or set(args)-allowed:
         raise ValueError('修订需使用已读取的当前会话原件，完整源码与局部修改不可混用')
     change=checked_args(Revision,args['revision'])
     _,source,mode=load_source(change.file_id,change.sha256)
-    if animation != (mode in ('2d','3d')):
-        raise ValueError('原件类型与作品工具不一致')
-    original=author_fields(source,mode)
+    original=author_fields(source,mode) if legacy_animation else {'html':source}
     result=dict(original)
     for field in dict.fromkeys(edit.field for edit in change.edits):
         if field not in result:

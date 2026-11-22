@@ -1090,7 +1090,7 @@ def test_model_direct_first_fallback_never_replays_submitted_requests():
     asyncio.run(check())
 
 
-def test_html_modes_and_legacy_animation_setting(context):
+def test_unified_html_and_legacy_animation_setting(context):
     app,user,_=context
     created=user.post('/api/conversations',json={'channel':'assistant','title':'drawing-default'})
     assert created.status_code==201,created.text
@@ -1107,13 +1107,12 @@ def test_html_modes_and_legacy_animation_setting(context):
     updated = user.patch('/api/conversations/'+cid+'/tools', json={'tools': {'animation': True}})
     assert switches(updated) == {'python': True, 'animation': True}
     assert switches(user.get('/api/conversations/'+cid+'/tools')) == switches(updated)
-    from avatar.conversation.tools.html import CREATE_HTML, animation_tool
-    page = CREATE_HTML['parameters']
-    assert CREATE_HTML['name']=='create_html' and set(page['properties'])==set(page['required'])=={'filename','html'}
-    animation = animation_tool()
-    assert animation['name']=='create_animation' and animation['parameters']['properties']['mode']['enum']==['2d','3d']
-    assert animation['parameters']['properties']['mode']['default']=='2d'
-    assert animation_tool('3d')['parameters']['properties']['mode']['enum']==['3d']
+    from avatar.conversation.loop.planning import available_tools
+    tools = available_tools({'_html_enabled':True},'')
+    assert 'create_animation' not in tools
+    html = tools['create_html']
+    assert html['description'].startswith('工具用于生成基于html的网页、2d动画和3d动画')
+    assert set(html['parameters']['properties'])==set(html['parameters']['required'])=={'filename','html'}
     assert user.patch('/api/conversations/'+cid+'/tools',json={'tools':{'mermaid':False}}).status_code==422
     assert user.patch('/api/conversations/'+cid+'/tools',json={'tools':{'python':True}}).status_code==200
     from avatar.conversation.tools.builtin import MERMAID_INSTRUCTIONS

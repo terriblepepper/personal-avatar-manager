@@ -325,7 +325,7 @@ def create_app(settings=None, provider=None, run_worker=True, model_client=None)
             response.headers["Referrer-Policy"] = "no-referrer"
             response.headers["Content-Security-Policy"] = (
                 "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline' data:; worker-src 'none'; "
-                "style-src 'unsafe-inline'; img-src data: blob:; font-src data:; media-src data: blob:; "
+                "style-src 'unsafe-inline'; img-src data: blob:; font-src data:; media-src data: blob:; connect-src 'none'; "
                 "frame-ancestors 'self'; base-uri 'none'; form-action 'none'"
             )
         return response

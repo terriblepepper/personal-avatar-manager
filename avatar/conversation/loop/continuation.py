@@ -9,7 +9,7 @@ from fastapi import HTTPException
 
 from avatar.conversation.loop.artifact_prefix import edit_signature, revision_evidence, salvage_object
 from avatar.conversation.loop.store import OWNER_STORAGE_BYTES, RAW_ARGUMENT_PREFIX, RunCapacity, draft_byte_limit
-from avatar.conversation.tools.html import ANIMATION_INPUT, ARTIFACT_TOOLS, OFFLINE_ANIMATION, repaired_html_arguments
+from avatar.conversation.tools.html import ANIMATION_INPUT, ARTIFACT_TOOLS, LEGACY_ANIMATION_TOOL, OFFLINE_ANIMATION, repaired_html_arguments
 from avatar.core.execution import run_blocking
 from avatar.models.tools import IncompleteModelString, load_model_json
 from avatar.files.parsing.animation import MAX_SOURCE_BYTES
@@ -285,12 +285,11 @@ class SegmentedDraft:
 
     @staticmethod
     def _fields(meta):
-        return _FIELDS if meta['tool'] == 'create_animation' else {'filename','html','revision'}
+        return _FIELDS if meta.get('legacy_animation') else {'filename','html','revision'}
 
     @staticmethod
     def _matches(meta, step):
-        return (meta.get('tool') == step.get('tool') and
-                (not step.get('html_mode') or meta.get('mode') in (None,step['html_mode'])))
+        return meta.get('tool') == step.get('tool')
 
     def align(self, pending, *, artifact_ready=True):
         """Park a later artifact until the corresponding goal is eligible."""
@@ -367,7 +366,7 @@ class SegmentedDraft:
             return False
         if prefix == '{' and not recovery['fields'] and not recovery['partial'] and meta.get('rebuilt'):
             return False
-        updated = {k:meta[k] for k in ('kind','tool','mode','filename','goal_no','html_contract') if k in meta}
+        updated = {k:meta[k] for k in ('kind','tool','mode','filename','goal_no','legacy_animation') if k in meta}
         updated.update(name=RAW_ARGUMENT_PREFIX+uuid.uuid4().hex, offset=0,misses=0,finished=False,
             json_scan=[0,False,False,False,None,''],recovery_digest=digest,recovered=recovery,
             field_boundary=not recovery['partial'],source_draft=meta.get('source_draft') or meta['name'],
@@ -406,11 +405,19 @@ class SegmentedDraft:
                 meta['repair']['reads'] = 0
                 meta['repair']['seen_views'] = []
 
-    async def migrate_animation(self):
-        """An unsubmitted legacy storyboard needs a new free-HTML body for the same goal."""
-        meta = self.state.get('draft') or {}
-        if meta.get('kind') != 'artifact' or meta.get('tool') != 'create_animation' or meta.get('html_contract'):
-            return False
+    async def migrate_html_drafts(self):
+        changed = False
+        for meta in (self.state.get('draft') or {}, *(self.state.get('parked_drafts') or ())):
+            if meta.get('tool')==LEGACY_ANIMATION_TOOL:
+                await self._migrate_animation(meta)
+                changed=True
+        return changed
+
+    async def _migrate_animation(self, meta):
+        meta['tool']='create_html'
+        if meta.pop('html_contract',False):
+            meta['legacy_animation']=True
+            return
         legacy = {'template','scenes','title'}
         scan = meta.get('json_scan') or [None]
         found = scan[-1] in legacy
@@ -438,12 +445,13 @@ class SegmentedDraft:
             except (ValueError,RecursionError):
                 pass
         if found:
-            self.state['draft'] = {'kind':'artifact','tool':'create_animation','mode':meta.get('mode'),
-                'filename':meta.get('filename','index.html'),'name':RAW_ARGUMENT_PREFIX+uuid.uuid4().hex,
-                'json_scan':[0,False,False,False,None,''], 'offset':0,'misses':0,'html_contract':1}
+            filename=meta.get('filename','index.html')
+            goal_no=meta.get('goal_no')
+            meta.clear()
+            meta.update(kind='artifact',tool='create_html',filename=filename,goal_no=goal_no,
+                name=RAW_ARGUMENT_PREFIX+uuid.uuid4().hex,json_scan=[0,False,False,False,None,''],offset=0,misses=0)
         else:
-            meta['html_contract'] = 1
-        return True
+            meta['legacy_animation']=True
 
     @property
     def exhausted(self):
@@ -459,10 +467,10 @@ class SegmentedDraft:
         meta.update(finished=False, misses=0, streak=0)
         return True
 
-    async def start(self, result, *, tool=None, mode=None, filename='index.html', decision=False):
-        await run_blocking(self._start, result, tool, mode, filename, decision)
+    async def start(self, result, *, tool=None, filename='index.html', decision=False):
+        await run_blocking(self._start, result, tool, filename, decision)
 
-    def _start(self, result, tool, mode, filename, decision):
+    def _start(self, result, tool, filename, decision):
         calls = tuple(getattr(result, 'partial_tool_calls', ()) or getattr(result, 'tool_calls', ()))
         text = result.text or ''
         evidence = None
@@ -500,10 +508,8 @@ class SegmentedDraft:
         if not calls and not text.strip() and getattr(result,'stop_reason',None) == 'output_limit':
             meta['empty_limit'] = True
         if kind == 'artifact':
-            meta.update(tool=tool, mode=mode, filename=filename)
-            if tool == 'create_animation':
-                meta['html_contract'] = 1
-            if tool != 'create_html' or not text.lstrip().startswith('<'):
+            meta.update(tool=tool, filename=filename)
+            if not text.lstrip().startswith('<'):
                 meta['json_scan'] = [0, False, False, False, None, '']
         if 'json_scan' in meta or kind == 'decision' and calls:
             meta['name'] = RAW_ARGUMENT_PREFIX + token
@@ -605,7 +611,7 @@ class SegmentedDraft:
                       '"sha256":原件SHA256,"edits":[按原顺序保留已写改动并补完]}}}。')
         else:
             target = '为已选工具 ' + meta['tool'] + ' 续写参数。'
-            if meta['tool'] == 'create_animation':
+            if meta.get('legacy_animation'):
                 if not compact and (not misses or not meta['offset']):
                     target += ANIMATION_INPUT + OFFLINE_ANIMATION
                 else:
@@ -668,7 +674,7 @@ class SegmentedDraft:
             if not source.strip():
                 raise ValueError()
             return 'answer', source
-        args = repaired_html_arguments(source, meta['tool'], meta['filename'])
+        args = repaired_html_arguments(source,meta['filename'],legacy_animation=bool(meta.get('legacy_animation')))
         if meta.get('local_revision') and ('revision' not in args or 'html' in args or 'render_frame' in args):
             raise ValueError('本草稿仅能交付原件局部修订')
         for edit in meta.get('repair', {}).get('edits', []):
@@ -787,7 +793,7 @@ class SegmentedDraft:
     def _reissue_revision(self, meta, args):
         from avatar.conversation.tools.html_revision import Revision
 
-        allowed = {'filename','revision'} | ({'mode','duration_seconds'} if meta['tool']=='create_animation' else set())
+        allowed = {'filename','revision'} | ({'mode','duration_seconds'} if meta.get('legacy_animation') else set())
         if not isinstance(args,dict) or set(args)-allowed or not isinstance(args.get('filename'),str):
             raise ValueError()
         change = Revision.model_validate(args.get('revision'))
@@ -802,7 +808,7 @@ class SegmentedDraft:
         if (signatures[:len(confirmed)]!=confirmed or partial and
                 (len(signatures)==len(confirmed) or not partial.items()<=signatures[len(confirmed)].items())):
             return self._miss('重新提交须按原顺序保留此前完整改动和已确认的字段')
-        updated = {k:meta[k] for k in ('kind','tool','filename','goal_no','mode','html_contract') if k in meta}
+        updated = {k:meta[k] for k in ('kind','tool','filename','goal_no','mode','legacy_animation') if k in meta}
         updated.update(name=RAW_ARGUMENT_PREFIX+uuid.uuid4().hex,offset=0,misses=0,finished=True,
                        local_revision=True,source_draft=meta.get('source_draft') or meta['name'])
         self._append(updated,json.dumps(args,ensure_ascii=False,separators=(',',':'),allow_nan=False))

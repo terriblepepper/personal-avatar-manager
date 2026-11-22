@@ -23,7 +23,7 @@ def directory_allowed(system):
 
 def available_tools(config, system):
     from avatar.conversation.collaboration.intent import TOOLS
-    from avatar.conversation.tools.html import CREATE_HTML, animation_tool
+    from avatar.conversation.tools.html import CREATE_HTML
     from avatar.conversation.tools.material_delivery import DELIVERY_TOOLS
     from avatar.conversation.loop.context import READ_STEP_RECEIPT
 
@@ -35,7 +35,7 @@ def available_tools(config, system):
     if owner:
         allowed.update((tool['name'], tool) for tool in DELIVERY_TOOLS)
     if config.get('_html_enabled'):
-        allowed.update(create_html=CREATE_HTML, create_animation=animation_tool())
+        allowed['create_html'] = CREATE_HTML
     for tool in TOOLS:
         name = tool['name']
         if ((name == 'list_avatars' and directory_allowed(system))
@@ -56,9 +56,6 @@ def available_tools(config, system):
 
 def disclosure_catalog(config, system):
     catalog = {name:' '.join(tool['description'].split())[:220] for name,tool in available_tools(config, system).items()}
-    if 'create_html' in catalog:
-        catalog.update(create_html='创建独立的普通 HTML 网页。',
-                       create_animation='自由绘制并交付可播放、暂停、拖动时间轴的离线二维或三维 HTML 动画。')
     catalog.update({t['id']:t['name']+'（已关闭）' for t in config.get('_conversation_tools', ())
                     if t['id'] != 'animation' and not t['enabled']})
     return catalog
@@ -86,6 +83,25 @@ def migrate_session_tool(state):
         state['disclosed_tools']=list(dict.fromkeys(current if n==old else n for n in state['disclosed_tools']))
 
 
+def migrate_html_goals(state):
+    from avatar.conversation.tools.html import LEGACY_ANIMATION_TOOL
+    old = LEGACY_ANIMATION_TOOL
+    for key in ('plan','remaining'):
+        for step in state.get(key) or ():
+            if step.get('tool')==old:
+                step['tool']='create_html'
+            if (dimension:=step.pop('html_mode',None)) in ('2d','3d'):
+                step['goal'] += f'（原目标：{dimension.upper()} 动画）'
+            for field in ('tools','support'):
+                if old in step.get(field,()):
+                    step[field]=list(dict.fromkeys('create_html' if n==old else n for n in step[field]))
+    for receipt in state.get('receipts',()):
+        if receipt.get('tool')==old:
+            receipt['tool']='create_html'
+    if old in state.get('disclosed_tools',()):
+        state['disclosed_tools']=list(dict.fromkeys('create_html' if n==old else n for n in state['disclosed_tools']))
+
+
 def final_reply_step(step):
     return step.get('tool')=='continue_answer' and all(name=='continue_answer' for name in step.get('tools',()))
 
@@ -101,7 +117,7 @@ def validate_disclosure(value, choices, *, revise=False):
     steps=[]
     text_parts=[]
     for source in value['steps']:
-        if not isinstance(source,dict) or set(source)-{'goal','tool','tools','criterion','lookup','html_mode','segmented','file_access'}:
+        if not isinstance(source,dict) or set(source)-{'goal','tool','tools','criterion','lookup','segmented','file_access'}:
             raise ValueError('子目标结构无效')
         s=dict(source)
         if not isinstance(s.get('goal'),str) or not s['goal'].strip():
@@ -117,9 +133,7 @@ def validate_disclosure(value, choices, *, revise=False):
             raise ValueError('需先完成准备步骤，再单独提交终态或通信动作')
         if tools:
             s['tools']=list(dict.fromkeys(([primary] if primary else [])+tools))
-        if 'html_mode' in s and (primary!='create_animation' or s['html_mode'] not in ('2d','3d')):
-            raise ValueError('动画维度不合法')
-        if 'segmented' in s and (type(s['segmented']) is not bool or primary not in ('create_html','create_animation')):
+        if 'segmented' in s and (type(s['segmented']) is not bool or primary!='create_html'):
             raise ValueError('只有作品子目标支持分段写作')
         if 'file_access' in s and (primary!='read_session_file' or s['file_access'] not in ('directory','content')):
             raise ValueError('会话文件目标须选择查目录或读原件')
@@ -154,7 +168,6 @@ async def disclose_tools(model, settings, key, system, history, question, catalo
         'goal':{'type':'string','minLength':1,'description':TEXT_LIMIT},
         'criterion':{'type':'string','minLength':1,'description':TEXT_LIMIT},
         'tool':name,'tools':names,'segmented':{'type':'boolean','description':'大型作品从第一段起以游标分片写作'},'lookup':{'anyOf':[FindMaterial.model_json_schema(),SessionFileRequest.model_json_schema()]},
-        'html_mode':{'type':'string','enum':['2d','3d']},
         'file_access':{'type':'string','enum':['directory','content'],'description':'会话文件目标：查目录或读原件'}},'required':['goal'],'additionalProperties':False}}
     properties={'tools':names,'steps':steps}
     if revise:
@@ -169,7 +182,7 @@ async def disclose_tools(model, settings, key, system, history, question, catalo
             '通信、提交发言、等待用户、结束任务属于终态；应作为独立的最后一步。'
             '普通网页或动画如涉及复杂场景、交互或较长源码，可选 segmented=true 从第一段开始分段写作。'
             '简单单次动作可只写 goal 和 tool。资料检索若已确定参数可填 lookup；有依赖时等前一结果再选。'
-            '每个独立作品单列交付条件和维度；多个步骤服务于同一作品时只为最终作品列一项。'
+            '每个独立作品只列一项生成目标。生成回执已经证明文件存在，无需另列目录查询或交付确认。只有用户要求检查内容时才规划复查。'
             '当前授权目录只列摘要；不可选择目录外工具。已关闭的能力如确实需要，可选择其 ID 以提示用户。'
             '只返回 plan_task 或相同结构的 JSON。'+json.dumps(catalog,ensure_ascii=False))
     if 'read_session_file' in catalog:
@@ -237,13 +250,13 @@ def needs_confirmation(step):
     # A single saved artifact is already verified by the artifact tool. Composite goals need their own result.
     names=step.get('tools',())
     return (not step['tool'] or len(names)>1 or
-            bool(step.get('criterion') and step['tool'] not in ('create_html','create_animation','deliver_material',
+            bool(step.get('criterion') and step['tool'] not in ('create_html','deliver_material',
                                                                   'send_material','send_animation','contact_avatar',
                                                                   'end_task','send_message','wait_for_user','ask_user')))
 
 
 # These actions require a concrete file or a validated handoff before the goal can close.
-DELIVERABLES = {'create_html','create_animation','deliver_material','send_material','send_animation',
+DELIVERABLES = {'create_html','deliver_material','send_material','send_animation',
                 'send_public_material','contact_avatar'}
 
 
