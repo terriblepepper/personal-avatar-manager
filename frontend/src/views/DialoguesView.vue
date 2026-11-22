@@ -33,7 +33,7 @@ const IntentDialog = defineAsyncComponent(() => import('../components/collaborat
 interface Session { session_id:string; peer_name:string; messages?: Pick<Message, 'speaker_role' | 'content'>[] }
 interface Message { dialogue_id:string; turn:number; speaker_name:string; speaker_role:string; speaker_user_id?:string; content:string; state?:string; state_detail?:string; task_action?:string; tool_activity?:ToolEvent[]; is_own:boolean }
 interface TaskFile extends ChatFile {message_id:number|null;sender_user_id:string}
-interface Task { expires_at?:string | null; workspace_expired?:boolean; user_question?:AgentQuestion; can_supplement?:boolean; revision?:number; files?:TaskFile[];id:string; objective:string; status:string; can_accept?:boolean; needs_confirmation?:boolean; delivery_mode:string; can_retry?:boolean; auto_retrying?:boolean; error?:string; rounds_done?:number; round_limit?:number;tool_activity?:ToolEvent[];skill_commands?:string;created_at?:string;ended_at?:string;returned_summary?:string;waiting_reason?:string;waiting_for_other?:boolean; end_reason?:string; reason?:string; message_delivered?:boolean; active_speaker?:string; active_speaker_is_own?:boolean }
+interface Task { rejected?:boolean; expires_at?:string | null; workspace_expired?:boolean; user_question?:AgentQuestion; can_supplement?:boolean; revision?:number; files?:TaskFile[];id:string; objective:string; status:string; can_accept?:boolean; needs_confirmation?:boolean; delivery_mode:string; can_retry?:boolean; auto_retrying?:boolean; error?:string; rounds_done?:number; round_limit?:number;tool_activity?:ToolEvent[];skill_commands?:string;created_at?:string;ended_at?:string;returned_summary?:string;waiting_reason?:string;waiting_for_other?:boolean; end_reason?:string; reason?:string; message_delivered?:boolean; active_speaker?:string; active_speaker_is_own?:boolean }
 interface Intent {id:string;conversation_id:string;target_query:string;target_aic:string;objective:string;shared_content:string}
 interface Detail { auto_accept?:boolean; auto_accept_available?:boolean; settings_conversation_id?:string|null; legacy_file_conversation_id?:string|null; summary_through?:number; history_revision?:string; task_page?:Page<Task>; embedding_status?:{configured?:boolean;peerConfigured?:boolean}; resource_conversation_id:string | null; current_transport_mode?:string; chat?:Task; peer_name:string; messages:Message[]; message_tasks?:Task[]; tasks:Task[]; task?:Task; has_more:boolean }
 interface Skill {id:string;name:string;enabled:boolean}
@@ -66,6 +66,7 @@ const transport=computed(()=>detail.value?.current_transport_mode==='acps'?'ACPS
 const progress=computed(()=>{
   const task=activeTask.value
   if (!task) return { label:'主会话',tone:'neutral',note:'' }
+  if (task.rejected) return {label:'任务已拒绝',tone:'error',note:''}
   if (task.auto_retrying || task.status==='awaiting_identity') return {label:'正在自动重试',tone:'waiting',note:task.error || task.waiting_reason || ''}
   if (task.can_retry) return {label:'重试已超时',tone:'error',note:task.error || ''}
   if (task.status==='awaiting_input' && typeof task.can_supplement === 'boolean') return {label:task.can_supplement?'等待本人补充信息':'等待对方补充信息',tone:'waiting',note:task.waiting_reason || ''}
@@ -458,7 +459,7 @@ onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
 
   <div class="peer-task-list">
     <button v-for="task in detail?.tasks || []" :key="task.id" type="button" :aria-current="task.id===taskId" :title="task.objective" @click="selectTask(task.id)">
-      <strong>{{ task.objective }}</strong><small>{{ taskStatuses[task.status] || task.status }}</small>
+      <strong>{{ task.objective }}</strong><small>{{ task.rejected ? '已拒绝' : taskStatuses[task.status] || task.status }}</small>
     </button>
     <p v-if="detail && !detail.tasks.length" class="sub">暂无任务</p>
   </div>
@@ -466,8 +467,15 @@ onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
 </aside><main class="peer-chat-pane" :aria-busy="switching">
   <section v-if="detail?.task" :key="shownTask" class="peer-task-context">
     <h3 :title="detail.task.objective">{{ detail.task.objective }}</h3>
-    <div v-if="progress.note || detail.task.can_accept" class="peer-feedback" :data-tone="progress.tone" role="status">
-      <strong>{{ detail.task.can_accept ? '收到任务请求' : progress.label }}</strong>
+    <div v-if="detail.task.can_accept" class="peer-request-bar" role="group" aria-label="处理任务请求">
+      <strong>收到任务请求</strong>
+      <div class="peer-request-actions">
+        <button type="button" class="button danger" :disabled="commandsDisabled" @click="taskAction('reject')">拒绝任务</button>
+        <button type="button" class="button primary" :disabled="commandsDisabled" @click="taskAction('accept')">同意任务</button>
+      </div>
+    </div>
+    <div v-else-if="progress.note || detail.task.rejected" class="peer-feedback" :data-tone="progress.tone" role="status">
+      <strong>{{ progress.label }}</strong>
       <span v-if="progress.note">{{ progress.note }}</span>
     </div>
     <p v-if="detail.task.workspace_expired" class="sub" role="status">任务文件已过期。聊天记录可继续查看。</p>
@@ -540,7 +548,6 @@ onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
       </div>
     </details>
     <span v-if="writeState==='sending'" role="status">正在发送…</span>
-    <button v-if="detail?.task?.can_accept" type="button" class="button chat-command" :disabled="commandsDisabled" @click="taskAction('accept')">确认任务请求</button>
     <button v-if="detail?.task?.needs_confirmation" type="button" class="button chat-command" :disabled="commandsDisabled" @click="taskAction('confirm')">确认并补充意图</button>
     <div v-if="!taskClosed" class="composer-primary-actions">
       <EffortPicker :conversation-id="settingsId" :busy="!!runningTask" @saving="effortPending=$event"/>

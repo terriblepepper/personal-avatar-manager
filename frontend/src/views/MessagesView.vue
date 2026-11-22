@@ -9,7 +9,7 @@ import { request, notifyError } from '../api/client'
 import { useNotificationInbox } from '../composables/useNotificationInbox'
 import { usePolling } from '../composables/usePolling'
 import { date } from '../utils/format'
-interface Notice { id:number; title:string; content:string; kind:string; read_at:string|null; created_at:string; session_id?:string; task_id?:string; target_page?:string; admin_only?:boolean }
+interface Notice { id:number; title:string; content:string; kind:string; read_at:string|null; created_at:string; session_id?:string; task_id?:string; task_request_state?:'pending'|'accepted'|'rejected'; target_page?:string; admin_only?:boolean }
 const props = withDefaults(defineProps<{ management?: boolean }>(), { management: true })
 const emit = defineEmits<{ opened: [] }>()
 const router = useRouter(), items = ref<Notice[]>([]), total = ref(0), offset = ref(0), status = ref('all'), category = ref('all'), search = ref(''), selected = ref<number[]>([]), detail = ref<Notice | null>(null), busy = ref(false), failure = ref('')
@@ -57,6 +57,19 @@ async function deleteAll() {
     offset.value = 0
     await inbox.refreshLists()
   } catch (error) { notifyError(error) } finally { busy.value = false }
+}
+async function resolveTaskRequest(item:Notice, decision:'accept'|'reject') {
+  if (busy.value || item.task_request_state !== 'pending' || !item.task_id) return
+  busy.value = true
+  try {
+    await request('/agent-dialogues/' + encodeURIComponent(item.task_id) + '/' + decision, 'POST', undefined, controller.signal)
+    if (!controller.signal.aborted) item.task_request_state = decision === 'accept' ? 'accepted' : 'rejected'
+  } catch (error) {
+    if (!controller.signal.aborted) notifyError(error)
+  } finally {
+    busy.value = false
+    if (!controller.signal.aborted) await inbox.refreshLists()
+  }
 }
 async function open(item:Notice) {
   try {
@@ -118,7 +131,11 @@ watch([status,category],()=>{offset.value=0;selected.value=[];void poll.restart(
       <article v-for="item in items" :key="item.id" class="notification-row ui-record-row" tabindex="-1" @contextmenu="showMenu($event,item)" @keydown="showMenu($event,item)" :class="{unread: !item.read_at}">
         <input v-if="management" type="checkbox" :checked="selected.includes(item.id)" :aria-label="'选择：'+item.title" @change="toggle(item.id)">
         <button type="button" class="notification-line" aria-haspopup="menu" @click="open(item)"><strong>{{ item.title }}</strong><span class="notification-summary">{{ item.content }}</span></button>
-        <small class="notification-state">{{ date(item.created_at) }} · {{ item.read_at ? '已读' : '未读' }}</small>
+        <div v-if="item.task_request_state === 'pending'" class="notification-request-actions peer-request-actions" role="group" aria-label="处理任务请求">
+          <button type="button" class="button small danger" :disabled="busy" @click="resolveTaskRequest(item,'reject')">拒绝</button>
+          <button type="button" class="button small primary" :disabled="busy" @click="resolveTaskRequest(item,'accept')">同意</button>
+        </div>
+        <small class="notification-state">{{ date(item.created_at) }} · {{ item.read_at ? '已读' : '未读' }}<template v-if="item.task_request_state === 'accepted'"> · 已同意</template><template v-else-if="item.task_request_state === 'rejected'"> · 已拒绝</template></small>
       </article>
     </div>
     <RecordPagination class="notification-pagination" :offset="offset" :total="total" :search="search" label="消息分页" @update:offset="goPage" @update:search="search=$event;goPage(0)"/>

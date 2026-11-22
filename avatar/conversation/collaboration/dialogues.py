@@ -284,6 +284,7 @@ class AgentDialogues:
         result['active_speaker_is_own'] = (row['next_speaker'] == 0) == (row['user_id'] == user['id'])
         result.update(is_initiator=row['user_id']==user['id'],confirmed_by_me=bool(row['confirmation_acknowledged']&(1 if row['user_id']==user['id'] else 2)),expires_at=row['expires_at'] if row['delivery_mode']!='message' and row['status']=='ended' else None,
                       workspace_expired=expired,other_deleted=False)
+        result['rejected']=bool(row['rejected'])
         result['message_delivered']=False
         if row['delivery_mode']=='message' and row['status']=='ended':
             with self.database.connect() as db:
@@ -532,12 +533,35 @@ class AgentDialogues:
             if row['delivery_mode']=='message':raise HTTPException(409,'普通聊天无需同意')
             if row['status']=='ended':raise HTTPException(409,'任务已结束')
             if not row['accepted']:
+                if row['status']!='awaiting_acceptance':
+                    raise HTTPException(409,'当前任务无需同意')
                 self.apply_inputs(db,row['id'])
                 db.execute("UPDATE agent_dialogues SET accepted=1,status='queued',next_speaker=0,updated_at=? WHERE id=?",(now(),row['id']))
                 db.execute('UPDATE agent_peer_sessions SET accepted=1,updated_at=? WHERE id=?',(now(),identifier))
                 notify(db,row['user_id'],'accepted',identifier,row['id'],'对方已确认任务','双方分身将自动开始处理本任务。','accept:'+row['id'])
+                self.mark_task_request_read(db,user['id'],row['id'])
         if transaction is None:
             return self.get(user,row['id'])
+
+    @staticmethod
+    def mark_task_request_read(db,user_id,identifier):
+        db.execute("UPDATE agent_notifications SET read_at=? WHERE user_id=? AND task_id=? AND kind='request' AND read_at IS NULL",
+                   (now(),user_id,identifier))
+
+    def reject(self,user,identifier):
+        with self.database.connect(write=True) as db:
+            row=self.owned(db,user,identifier)
+            if row['target_user_id']!=user['id']:
+                raise HTTPException(403,'只有任务接收方可以拒绝')
+            if not row['rejected']:
+                if row['delivery_mode']=='message' or row['status']!='awaiting_acceptance' or row['accepted']:
+                    raise HTTPException(409,'当前任务已处理或无需拒绝')
+                self.close_record(db,identifier,'接收方拒绝了任务请求','cancel',remember=False,rejected=True)
+                db.execute('UPDATE agent_dialogues SET revision=revision+1 WHERE id=?',(identifier,))
+                db.execute('DELETE FROM agent_pending_inputs WHERE task_id=? AND applied=0',(identifier,))
+                db.execute('UPDATE agent_peer_sessions SET updated_at=? WHERE id=?',(now(),row['session_id']))
+                self.mark_task_request_read(db,user['id'],identifier)
+        return self.get(user,identifier)
 
     async def approve(self,user,identifier,body=None,initial=False):
         """补充要求与文件先持久入队；仅待确认方可同意，再一起放行给分身。"""
@@ -827,18 +851,20 @@ class AgentDialogues:
         await self.flush_controls(identifier)
         return {'deleted':True,'memory_retained':row['status']=='ended'}
 
-    def close_record(self,db,identifier,reason,action='complete',remember=True):
+    def close_record(self,db,identifier,reason,action='complete',remember=True,*,rejected=False):
         stamp=now()
         deadline=(datetime.fromisoformat(stamp)+timedelta(days=7)).isoformat(timespec='microseconds').replace('+00:00','Z') if action=='complete' else None
         task=db.execute("""UPDATE agent_dialogues SET status='ended',agent_checkpoint=NULL,ended_at=?,end_reason=?,
             expires_at=CASE WHEN delivery_mode='message' THEN NULL ELSE ? END,active_speaker='',error='',
-            waiting_reason='',confirmation_required=0,updated_at=? WHERE id=? AND status!='ended' RETURNING *""",
-            (stamp,reason,deadline,stamp,identifier)).fetchone()
+            waiting_reason='',confirmation_required=0,rejected=?,updated_at=? WHERE id=? AND status!='ended' RETURNING *""",
+            (stamp,reason,deadline,rejected,stamp,identifier)).fetchone()
         if not task:return
         for owner in (task['user_id'],task['target_user_id']):
             PeerTurn.clear(db, identifier, owner)
         db.execute('UPDATE agent_dialogues SET pending_file_delivery=NULL WHERE id=?', (identifier,))
         result_title=('消息已送达' if action=='complete' else '消息已取消') if task['delivery_mode']=='message' else ('任务已完成' if action=='complete' else '任务已终止')
+        if rejected:
+            result_title='任务已拒绝'
         db.execute('INSERT OR IGNORE INTO agent_protocol_controls(task_id,action) VALUES(?,?)',(identifier,action))
         if task['delivery_mode']=='message':return
         if deadline:
