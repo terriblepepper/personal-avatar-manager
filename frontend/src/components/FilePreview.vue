@@ -339,9 +339,9 @@ onUnmounted(cleanup)
 .preview-sheet > canvas, .preview-sheet > img { display: block; width: 100%; height: auto; max-width: none; }
 .preview-reader { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
 .preview-document > audio { display: block; width: 100%; }
-.preview-document > video { display: block; width: 100%; height: 100%; object-fit: contain; }
+.preview-document > :is(video, .html-frame) { display: block; inline-size: 100%; block-size: 100%; }
+.preview-document > video { object-fit: contain; }
 .preview-document > :is(.animation-card, .mermaid-card) { margin: 0; }
-.preview-document > .html-frame { block-size: min(66dvh, 780px); }
 .html-source { white-space: pre-wrap; overflow-wrap: anywhere; }
 .manual-layout { display: grid; grid-template-columns: minmax(0, 1fr) 3rem; grid-template-rows: minmax(0,1fr); min-height: 0; }
 .manual-layout:has(details[open]) { grid-template-columns: minmax(0, 1fr) min(30%, 12rem); }
