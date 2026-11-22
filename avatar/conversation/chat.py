@@ -538,7 +538,8 @@ class AvatarChat:
                     yield {'type':'status','stage':'intent_analysis','message':'正在分析本轮请求的意图…'}
                 route_records, route_events = [], []
                 if held:
-                    overview,context,session,request=pauses.continue_task(self,user,request,parent,held)
+                    yield {'type':'status','stage':'resuming','message':'正在恢复上次任务的目标和回执'}
+                    overview,context,session,request=await asyncio.to_thread(pauses.continue_task,self,user,request,parent,held)
                     local_reply=None
                     config = context[0]
                     if held.get('retry_dispatch'):

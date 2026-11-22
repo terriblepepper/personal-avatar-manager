@@ -2,6 +2,7 @@
 """Provider-neutral text generation over OpenAI, Anthropic and Gemini APIs."""
 import asyncio
 from contextlib import aclosing
+from contextvars import ContextVar
 import ipaddress
 import json
 import socket
@@ -10,7 +11,10 @@ import httpx
 from fastapi import HTTPException
 from avatar.core.http_pool import HttpTransportPool
 from avatar.models.effort import apply_effort
-from avatar.models.diagnostics import transport_error, transport_failure
+from avatar.models.diagnostics import PURPOSES, transport_error, transport_failure
+
+
+collected_model_status = ContextVar('collected_model_status', default=None)
 
 
 # 职责：表示不同模型平台统一后的完整回答结果。
@@ -275,7 +279,7 @@ class ModelClient:
 
     # 职责：在总超时范围内生成完整模型回答。
     # 输入：config、api_key、system、history、message 分别为已审核配置、凭据、身份提示、历史和问题。
-    # 结果与约束：返回 ModelResult；通常 180 秒，HTML 制作与动画分镜 600 秒，超时返回 504 并提示可能计费，不自动重试。
+    # 结果与约束：返回 ModelResult；完整响应等待通常为 180 秒，HTML 为 600 秒；SSE 按有效输出续期。
     async def generate(self, config, api_key, system, history, message):
         from avatar.core.execution import check_execution_async
         await check_execution_async()
@@ -372,7 +376,7 @@ class ModelClient:
 
     # 职责：在总超时内转发统一格式的上游流式事件。
     # 输入：参数与 generate 一致，实际解析委托 model_stream.stream_response。
-    # 结果与约束：异步 yield 状态、可见文本及用量；通常总时限 180 秒，HTML 制作与动画分镜最多 600 秒，aclosing 保证取消时关闭上游生成器。
+    # 结果与约束：异步 yield 状态、可见文本及用量；普通 SSE 有效输出间隔上限 180 秒，HTML 制作与动画分镜为 600 秒，aclosing 保证取消时关闭上游生成器。
     async def stream(self, config, api_key, system, history, message):
         from avatar.core.execution import check_execution_async
         await check_execution_async()
@@ -417,8 +421,17 @@ class ModelClient:
     # 结果与约束：保留原 Host/SNI，不跟随重定向、不继承代理；响应按输出预算限制为 2–64 MiB，连接与读超时分别设置，错误映射为脱敏 HTTPException。
     async def _generate(self, config, api_key, system, history, message):
         from avatar.models.model_stream import stream_response
+        report = collected_model_status.get()
+        purpose = PURPOSES.get(config.get('_call_purpose', 'answer'), '模型调用')
+        attempt = ''
         async with aclosing(stream_response(self,config,api_key,system,history,message,collect=True)) as events:
             async for event in events:
                 if event['type']=='result':
                     return event['result']
+                if report and event.get('stage') in ('waiting', 'processing', 'model_progress', 'stream_retry'):
+                    message = f"{purpose}{attempt} · {event['message']}"
+                    if event['stage'] == 'stream_retry':
+                        attempt = f"（重试 {event['retry']}/5）"
+                        message = f"{purpose} · {event['message']}"
+                    await report(message)
         raise HTTPException(502,'模型流缺少完成回执')

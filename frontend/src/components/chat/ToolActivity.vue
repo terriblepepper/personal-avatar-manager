@@ -5,7 +5,7 @@ import type { ToolEvent } from '../../types'
 import { date } from '../../utils/format'
 import { workspaceDebugKey } from '../../composables/useWorkspaceGuide'
 
-const props = defineProps<{ items: ToolEvent[]; pending?: string; awaitingInput?: boolean }>()
+const props = defineProps<{ items: ToolEvent[]; pending?: string; modelProgress?: boolean; awaitingInput?: boolean }>()
 const debug = inject(workspaceDebugKey, null)
 const oldPhases: Record<string, string> = {
   感知: 'perceive', 推理: 'reason', 行动: 'act', 观察: 'observe', 完成检查: 'check', 最终输出: 'final',
@@ -102,6 +102,7 @@ const activities = computed(() => {
 })
 const currentStatus = computed(() => {
   if (!props.pending || props.awaitingInput) return ''
+  if (props.modelProgress) return props.pending
   const active = activities.value.filter(item => item.status === 'running').at(-1)
   return active ? activityName(active) || props.pending : props.pending
 })
@@ -127,7 +128,7 @@ const text = (value: unknown) => typeof value === 'string' ? value : JSON.string
       <span v-if="currentStatus" class="activity-name activity-live" :title="currentStatus">{{ currentStatus }}</span>
       <span class="activity-heading">执行过程<span v-if="activities.length"> · {{ activities.length }} 项</span></span>
     </summary>
-    <p v-if="!activities.length && pending" class="activity-row" data-status="running">
+    <p v-if="pending && (!activities.length || modelProgress)" class="activity-row" data-status="running">
       <span class="activity-dot" aria-hidden="true"/>{{ pending }}
     </p>
     <details v-for="item in activities" :key="item.id" class="tool-activity" :data-status="item.status">
