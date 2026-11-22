@@ -15,14 +15,14 @@ from fastapi import HTTPException
 from avatar.core.db import now
 from avatar.core.execution import finish_on_cancel
 from avatar.files.library.attachments import AttachmentService, TYPES
-from avatar.files.conversation.resources import ConversationResources, check_chat_quota
+from avatar.files.conversation.resources import ConversationResources, reference_count
 from avatar.files.uploads.buffer import upload_buffer, upload_work, write_original
 from avatar.files.parsing.animation import ANIMATION_MIME
 
 
 # 职责：管理本人 Web 会话的文件及发送关联，不把临时文件混入个人资料库。
 # 输入：database 为业务库，attachments 为可复用的个人资料文件服务。
-# 结果与约束：按登录用户和会话双重授权；每会话 20 文件、普通文件合计 50 MiB，每账户会话原件共 100 MiB。
+# 结果与约束：按登录用户和会话双重授权；最多同时引用五份。
 class ChatFiles(ConversationResources):
     # 职责：保存依赖并确定私有文件目录。
     # 输入：attachments 可省略，仅清理路径时无需共享解析器。
@@ -159,8 +159,8 @@ class ChatFiles(ConversationResources):
             return await upload_work(self._store,user,conversation_id,filename,data,extension,origin,description,source_label,temporary,scene,source_animation_id,html_mode)
 
     # 职责：保存会话原件并解析文字，图片生成有尺寸限制的 JPEG 视觉输入副本。
-    # 输入：格式已校验，最终事务再次核对会话与配额，处理并发删除或上传。
-    # 结果与约束：原件 0600/目录 0700；失败清除本次文件；未发送最多五份，上传不计模型费用。
+    # 输入：格式已校验，最终事务再次核对会话与引用槽，处理并发删除或上传。
+    # 结果与约束：原件 0600/目录 0700；失败清除本次文件；引用槽满时，本地上传仍可保存。
     def _store(self, user, conversation_id, filename, data, extension, origin='upload', description='', source_label='本地上传',temporary=False,scene=None,source_animation_id=None,html_mode=None):
         html_animation = extension in ('.html','.htm') and html_mode in ('2d','3d')
         metadata = scene.metadata() if scene else {}
@@ -168,7 +168,6 @@ class ChatFiles(ConversationResources):
             metadata['html_mode'] = html_mode
         with self.database.connect() as db:
             self.session(db,user['id'],conversation_id,editable=True)
-            check_chat_quota(db,user['id'],conversation_id,1,len(data),0 if scene or TYPES[extension]=='text/html' else len(data))
         identifier=str(uuid.uuid4())
         path=self.directory.path(user['id'],conversation_id,identifier+'.blob',create=True)
         preview=path.with_suffix('.jpg')
@@ -199,9 +198,11 @@ class ChatFiles(ConversationResources):
                             old_md5=hashlib.file_digest(previous,lambda: hashlib.md5(usedforsecurity=False)).hexdigest()
                         db.execute('UPDATE chat_files SET sha256=?,md5=? WHERE id=?',(sha,old_md5,candidate['id']))
                     if old_md5==md5:raise HTTPException(409,'该文件已在当前会话中，无需重复引用或上传')
-                pending = check_chat_quota(db,user['id'],conversation_id,1,len(data),0 if scene or TYPES[extension]=='text/html' else len(data))
-                if not temporary and pending>=5:raise HTTPException(413,'同时引用文件最多五个，请先关闭不需要的引用')
-                db.execute('INSERT INTO chat_files(id,user_id,conversation_id,filename,content_type,size,extracted_text,extraction_status,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(identifier,user['id'],conversation_id,filename,TYPES[extension],len(data),extracted,status,now()))
+                referenced = not temporary and reference_count(db,conversation_id)<5
+                if not temporary and not referenced and origin=='reference':
+                    raise HTTPException(413,'同时引用文件最多五个，请先关闭不需要的引用')
+                db.execute('INSERT INTO chat_files(id,user_id,conversation_id,filename,content_type,size,extracted_text,extraction_status,created_at,referenced) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                           (identifier,user['id'],conversation_id,filename,TYPES[extension],len(data),extracted,status,now(),int(referenced)))
                 db.execute('UPDATE chat_files SET parse_checked=1,extraction_version=1,sha256=?,md5=?,animation_metadata=?,animation_digest=?,source_animation_id=? WHERE id=?',
                            (sha,md5,json.dumps(metadata,ensure_ascii=False),
                             hashlib.sha256(scene.canonical()).hexdigest() if scene else '',source_animation_id,identifier))
@@ -316,8 +317,8 @@ class ChatFiles(ConversationResources):
             self.session(db,user_id,conversation_id,editable=True)
             row=self.owned(db,user_id,conversation_id,file_id)
             if row['origin']=='attachment':raise HTTPException(409,'发送附件不能设置为持续引用，请先转存到资料库')
-            count=db.execute("SELECT count(*) FROM chat_files WHERE conversation_id=? AND referenced=1 AND origin!='attachment'",(conversation_id,)).fetchone()[0]
-            if enabled and not row['referenced'] and count>=5:raise HTTPException(413,'同时引用文件最多五个')
+            if enabled and not row['referenced'] and reference_count(db,conversation_id)>=5:
+                raise HTTPException(413,'同时引用文件最多五个')
             db.execute('UPDATE chat_files SET referenced=? WHERE id=?',(int(enabled),file_id))
         return self.list(user_id,conversation_id)
 

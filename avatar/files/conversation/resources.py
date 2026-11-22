@@ -8,12 +8,11 @@ import uuid
 from fastapi import HTTPException
 from avatar.core.db import now
 from avatar.files.library.attachments import TYPES, chat_file_limit
-from avatar.files.parsing.animation import ANIMATION_MIME, MAX_SOURCE_BYTES
+from avatar.files.parsing.animation import MAX_SOURCE_BYTES
 from avatar.files.uploads.buffer import upload_buffer, upload_work
 
 OUTPUT_TYPES={suffix: mime for suffix, mime in TYPES.items() if suffix != '.avanim'}
 OUTPUT_TYPES['.zip'] = 'application/zip'
-CHAT_ACCOUNT_BYTES = 100*1024*1024
 
 
 def original_hashes(path, size, destination=None):
@@ -36,23 +35,10 @@ def original_hashes(path, size, destination=None):
     return sha.hexdigest(), md5.hexdigest()
 
 
-def remaining_chat_bytes(db,user_id):
-    used = db.execute('SELECT coalesce(sum(size),0) FROM chat_files WHERE user_id=?',(user_id,)).fetchone()[0]
-    return max(0, CHAT_ACCOUNT_BYTES-int(used))
-
-
-def ordinary_chat_bytes(row):
-    return 0 if row['content_type'] in (ANIMATION_MIME,'text/html') else row['size']
-
-
-def check_chat_quota(db, user_id, conversation_id, added_count, added_bytes, ordinary_bytes):
-    count, ordinary, pending = db.execute("""SELECT count(*) FILTER (WHERE origin!='generated'),
-        coalesce(sum(size) FILTER (WHERE content_type NOT IN (?, 'text/html')),0),
-        count(*) FILTER (WHERE referenced=1 AND origin!='attachment')
-        FROM chat_files WHERE conversation_id=?""", (ANIMATION_MIME,conversation_id)).fetchone()
-    if count + added_count > 20 or ordinary + ordinary_bytes > 50*1024*1024 or added_bytes > remaining_chat_bytes(db,user_id):
-        raise HTTPException(413,'会话最多上传或引用 20 份文件，普通文件合计 50 MiB，账户会话原件合计 100 MiB')
-    return pending
+def reference_count(db, conversation_id):
+    return db.execute("""SELECT count(*) FROM chat_files
+        WHERE conversation_id=? AND referenced=1 AND origin!='attachment'
+        AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))""",(conversation_id,)).fetchone()[0]
 
 
 # 职责：校验沙箱回传的新文件，路径只用于命名，宿主保存路径始终由服务端 UUID 决定。
@@ -103,12 +89,10 @@ class ConversationResources:
                 if row:
                     from avatar.files.library.folders import with_folder_caption
                     row=with_folder_caption(db,row)
-                    check_chat_quota(db,user['id'],conversation_id,1,row['size'],
-                                     ordinary_chat_bytes(row))
             if not row:raise HTTPException(404,'文件不存在')
             return row,directory
         row,directory=await upload_work(source_row)
-        # 原件只按数据库 ID 定位；读取仍有大小限制，不能借引用绕过上传配额。
+        # 原件只按数据库 ID 定位；复制前验证大小及 SHA-256。
         try:
             original = directory.new(user['id'],row['id']+'.blob').open('rb')
         except FileNotFoundError:
@@ -122,7 +106,7 @@ class ConversationResources:
                 source_animation_id=row['id'] if row['animation_digest'] and not temporary else None)
 
     # 职责：与成功回答共用事务保存生成文件；提交失败或取消时删除本次原件和预览。
-    # 结果与约束：生成文件计入会话及账户字节配额；原上传文件不被覆盖。
+    # 结果与约束：生成文件保留单轮处理边界，原上传文件不被覆盖。
     @contextmanager
     def storing_outputs(self,db,user_id,conversation_id,message_id,outputs):
         paths=[]
@@ -135,9 +119,6 @@ class ConversationResources:
             if ordinary>20*1024*1024 or total>MAX_SOURCE_BYTES:
                 raise HTTPException(413,'普通生成文件合计 20 MiB，生成文件总计 100 MiB')
             sources={item['id']:PublicMaterials.validate(db,user_id,item) for item in outputs if item.get('public_material_id')}
-            new_sources=[sources[item['id']] for item in outputs if item.get('public_material_id') and not item.get('reuse')]
-            check_chat_quota(db,user_id,conversation_id,len(new_sources),total+sum(row['size'] for row in new_sources),
-                             ordinary+sum(ordinary_chat_bytes(row) for row in new_sources))
             for item in outputs:
                 source=sources.get(item['id'])
                 if source and item.get('reuse'):

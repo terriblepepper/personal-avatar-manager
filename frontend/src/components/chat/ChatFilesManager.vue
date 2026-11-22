@@ -73,8 +73,8 @@ async function upload(event:Event) {
   if (!(target instanceof HTMLInputElement) || !target.files?.length) return
   const list = Array.from(target.files)
   target.value = ''
-  if (active.value.length + list.length > 5) {
-    status.value = props.temporary ? '一次最多发送五份附件' : '最多同时引用五份文件'
+  if (props.temporary && active.value.length + list.length > 5) {
+    status.value = '一次最多发送五份附件'
     return
   }
   const sizeError = animationUploadError(list)
@@ -95,7 +95,7 @@ async function upload(event:Event) {
         update(result.items, ticket, result.file_id)
         done++
       }
-      if (ticket === generation) status.value = `已添加 ${done} 个文件` + (props.temporary ? '到本次附件' : '并开启持续引用')
+      if (ticket === generation) status.value = `已添加 ${done} 个文件` + (props.temporary ? '到本次附件' : '到会话')
     } catch (error) {
       if (sessionSignal.aborted || ticket !== generation) return
       if (!transfer.signal.aborted) throw new Error(`已添加 ${done} 个文件；${error instanceof Error ? error.message : '上传失败'}`)
@@ -180,7 +180,7 @@ async function promote(value:FilePromotion) {
   <button v-if="uploadController" type="button" class="button small" @click="uploadController.abort()">取消上传</button>
   <input ref="uploadInput" hidden type="file" multiple accept=".png,.jpg,.jpeg,.webp,.gif,.bmp,.txt,.md,.mmd,.avanim,.html,.htm,.csv,.tsv,.xlsx,.json,.log,.pdf,.docx,.pptx,.mp3,.wav,.m4a,.ogg,.flac,.webm,.mp4,.mov" :disabled="busy||working||!conversationId" @change="upload">
 </div>
-<p class="sub">{{ temporary?'发送选中的原件副本，最多五份。':'引用持续用于后续提问，最多同时五份。其他会话临时文件需先转存为资料；索引与检索使用模型额度。' }} HTML 与动画单件最多 100 MiB，其他会话原件合计最多 50 MiB，账户会话原件合计最多 100 MiB。</p>
+<p class="sub">{{ temporary?'发送选中的原件副本，最多五份。':'后续提问最多同时引用五份，超过时可继续上传。其他会话临时文件需先转存为资料；索引与检索使用模型额度。' }} HTML 与动画单件最多 100 MiB。</p>
 <p v-if="status" class="sub" role="status">{{ status }}</p>
 <article v-for="file in page" :key="file.id" class="chat-file compact-chat-file"><label><input v-if="!temporary" type="checkbox" :checked="included(file)" :disabled="busy||working" @change="toggle(file,$event)"><MaterialTypeIcon :filename="file.filename"/> {{ file.filename }}</label><div class="actions"><el-button @click="preview=file">{{ /\.(mmd|avanim)$/i.test(file.filename) ? '预览与下载' : '预览' }}</el-button>
     <el-button v-if="temporary" :disabled="busy||working" @click="toggleAttachment(file)">{{ included(file) ? '移除附件' : '添加为附件' }}</el-button>

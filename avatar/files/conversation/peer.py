@@ -7,7 +7,7 @@ import uuid
 from contextlib import ExitStack
 from fastapi import HTTPException
 from avatar.core.db import now
-from avatar.files.conversation.resources import check_chat_quota, ordinary_chat_bytes, original_hashes
+from avatar.files.conversation.resources import original_hashes, reference_count
 from avatar.files.library.attachments import MAX_FILE
 
 
@@ -93,7 +93,6 @@ class PeerResources:
                                 raise HTTPException(409,'接收方已有副本校验失败，未重复引用')
                     else:
                         origin='attachment' if attachments else 'generated' if generated and row['origin']=='generated' else 'reference'
-                        check_chat_quota(db,uid,destination,int(origin!='generated'),row['size'],ordinary_chat_bytes(row))
                         identifier=str(uuid.uuid4())
                         for suffix, source_path in (('.blob',original),('.jpg',preview_path)):
                             if suffix=='.jpg' and not source_path.is_file():continue
@@ -106,7 +105,7 @@ class PeerResources:
                                 copied = original_hashes(source_path,size,stream)
                                 if suffix == '.blob' and copied != (digest,md5):
                                     raise HTTPException(409,'原件在发送期间发生变化')
-                        active=attachments or db.execute("SELECT count(*) FROM chat_files WHERE conversation_id=? AND referenced=1 AND origin!='attachment'",(destination,)).fetchone()[0]<5
+                        active=attachments or reference_count(db,destination)<5
                         db.execute('''INSERT INTO chat_files(id,user_id,conversation_id,filename,content_type,size,extracted_text,extraction_status,created_at,origin,description,source_label,sha256,referenced,parse_checked,extraction_version,animation_metadata,animation_digest)
                           VALUES(?,?,?,?,?,?,?,?,?,?,?,'分身会话授权文件',?,?,?,?,?,?)''',(identifier,uid,destination,row['filename'],row['content_type'],row['size'],row['extracted_text'],row['extraction_status'],now(),origin,row['description'],digest,int(active),row['parse_checked'],row['extraction_version'],row['animation_metadata'],row['animation_digest']))
                         if row['expires_at']:db.execute('UPDATE chat_files SET expires_at=CASE WHEN julianday(?)<julianday(expires_at) THEN ? ELSE expires_at END WHERE id=?',(row['expires_at'],row['expires_at'],identifier))
@@ -114,7 +113,7 @@ class PeerResources:
                         db.execute('UPDATE chat_files SET referenced=1 WHERE id=? AND referenced=0',(identifier,))
                     if row['id'] in authorize_ids:
                         current=db.execute('SELECT referenced FROM chat_files WHERE id=?',(identifier,)).fetchone()
-                        if not current['referenced'] and db.execute("SELECT count(*) FROM chat_files WHERE conversation_id=? AND referenced=1 AND origin!='attachment'",(destination,)).fetchone()[0]>=5:
+                        if not current['referenced'] and reference_count(db,destination)>=5:
                             raise HTTPException(413,'会话已授权文件达到五份上限，请先关闭不需要的引用')
                         db.execute('UPDATE chat_files SET referenced=1,md5=? WHERE id=?',(md5,identifier))
                     db.execute('INSERT OR IGNORE INTO agent_task_files(task_id,file_id,source_user_id,source_file_id) VALUES(?,?,?,?)',(task_id,identifier,user['id'],row['id']))
