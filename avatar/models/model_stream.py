@@ -9,7 +9,7 @@ import httpx
 from fastapi import HTTPException
 from avatar.models.tools import invalid_tool_call, load_model_json
 from avatar.models.client import parse_response, tokens, response_limit, generation_http_timeout, generation_deadline
-from avatar.models.diagnostics import transport_failure, unconfirmed_response
+from avatar.models.diagnostics import check_terminal, stop_reason, transport_failure, unconfirmed_response
 
 
 def check_size(kind, size, limit):
@@ -92,6 +92,7 @@ def usage_summary(usage, fmt):
 def interrupted():
     error = unconfirmed_response(502,'模型响应流在完成前中断')
     error.stream_interrupted = True
+    error.stop_reason = 'interrupted'
     return error
 
 
@@ -124,6 +125,7 @@ class ToolFragments:
         self.anthropic = {}
         self.open_blocks = set()
         self.gemini = []
+        self.pending_gemini = {}
 
     @staticmethod
     def check_count(calls):
@@ -137,7 +139,8 @@ class ToolFragments:
         check_size('有效输出',self.size,self.limit)
 
     def add_openai(self, delta):
-        for part in delta.get('tool_calls') or ():
+        tools = delta.get('tool_calls') or ([{'function':delta['function_call']}] if delta.get('function_call') else ())
+        for part in tools:
             index = part.get('index',0)
             if type(index) is not int or index < 0:
                 raise ValueError('Invalid tool index')
@@ -173,16 +176,35 @@ class ToolFragments:
         elif kind=='content_block_stop':
             self.open_blocks.discard(index)
 
+    def add_gemini(self, function):
+        self.account(function)
+        key = function.get('id') or function.get('name')
+        if key is None and len(self.pending_gemini) == 1:
+            key = next(iter(self.pending_gemini))
+        pending = self.pending_gemini.get(key)
+        if pending is None:
+            self.check_count(self.gemini)
+            if 'partialArgs' not in function and not function.get('willContinue'):
+                self.gemini.append({'functionCall':function})
+                return
+            pending = {'name':function.get('name',''), 'argumentChunks':[]}
+            self.gemini.append({'functionCall':pending})
+        pending['argumentChunks'].append({k:function[k] for k in ('args','partialArgs','willContinue') if k in function})
+        if function.get('willContinue'):
+            self.pending_gemini[key] = pending
+        else:
+            self.pending_gemini.pop(key, None)
+
     def response(self, fmt, text, usage, reason, thinking, refusal):
         if fmt=='openai':
-            tools=[{'function':{'name':name.getvalue(),'arguments':args.getvalue()}} for _,(name,args) in sorted(self.openai.items())]
+            tools=[{'index':index,'function':{'name':name.getvalue(),'arguments':args.getvalue()}} for index,(name,args) in sorted(self.openai.items())]
             message={'content':text,'tool_calls':tools,'reasoning_content':thinking,'refusal':refusal}
             return {'choices':[{'message':message,'finish_reason':reason}],'usage':usage}
         if fmt=='anthropic':
             blocks=[{'type':'text','text':text}]
             if thinking: blocks.append({'type':'thinking'})
-            for _,(name,initial,parts) in sorted(self.anthropic.items()):
-                blocks.append({'type':'tool_use','name':name,'input':parts.getvalue() if parts.tell() else initial})
+            for index,(name,initial,parts) in sorted(self.anthropic.items()):
+                blocks.append({'type':'tool_use','index':index,'name':name,'input':parts.getvalue() if parts.tell() else initial})
             return {'content':blocks,'stop_reason':reason,'usage':usage}
         parts=[{'text':text},*self.gemini]
         if thinking: parts.append({'thought':True})
@@ -204,6 +226,7 @@ async def stream_response(model, config, api_key, system, history, message, *, c
         except TimeoutError:
             error = unconfirmed_response(504, '本步模型调用已用完总等待时间，仍未收到完整结果。可重试或结束任务。')
             error.stream_exhausted = True
+            error.stop_reason = 'interrupted'
             raise error from None
         except HTTPException as error:
             if not getattr(error,'stream_interrupted',False):
@@ -217,6 +240,16 @@ async def stream_response(model, config, api_key, system, history, message, *, c
         yield {'type':'status','stage':'stream_retry','reset_reply':True,'retry':attempt+1,
                'message':f'模型响应流中断，正在进行第 {attempt+1}/5 次重试'}
         await asyncio.sleep(min(2**attempt,4))
+
+
+def usage_event(result, config):
+    event = {'type':'usage', 'usage':result.usage}
+    if config.get('_avatar_agent') or config.get('_retain_turn_fragments'):
+        event['finish_reason'] = result.finish_reason
+    if config.get('_retain_turn_fragments'):
+        event.update(stop_reason=result.stop_reason, partial_tool_calls=result.partial_tool_calls,
+                     tool_calls=result.tool_calls)
+    return event
 
 
 # 职责：请求上游模型并解析为平台无关的可见事件。
@@ -253,15 +286,18 @@ async def _stream_once(model, config, api_key, system, history, message, collect
                     if collect:
                         yield {'type':'result','result':result}
                         return
-                    yield {'type': 'delta', 'text': result.text}
-                    yield {'type': 'usage', 'usage': result.usage, **({'finish_reason': result.finish_reason} if config.get('_avatar_agent') else {})}
+                    if result.text: yield {'type': 'delta', 'text': result.text}
+                    yield usage_event(result, config)
                     return
                 started = last_update = loop.time()
                 chunks = StringIO()
                 fragments = ToolFragments(content_limit)
+                assemble = collect or config.get('_retain_turn_fragments')
                 usage, finished, thinking, action = {}, False, False, False
                 reason,refusal,visible=None,False,False
-                async for event, raw in response_frames(response,response_limit(config,True),content_limit,lambda: finished and not fragments.open_blocks):
+                def complete():
+                    return finished and (not fragments.open_blocks or stop_reason(reason) == 'output_limit')
+                async for event, raw in response_frames(response,response_limit(config,True),content_limit,complete):
                     if raw == '[DONE]':
                         finished = finished or (fmt=='openai' and not action)
                         break
@@ -282,7 +318,7 @@ async def _stream_once(model, config, api_key, system, history, message, collect
                             if isinstance(text, list):
                                 refusal |= any(p.get('type')=='refusal' for p in text)
                                 text = ''.join(p.get('text', '') for p in text if p.get('type') == 'text')
-                            if collect: fragments.add_openai(delta)
+                            if assemble: fragments.add_openai(delta)
                             action |= bool(delta.get('tool_calls') or delta.get('function_call'))
                             thought = bool(delta.get('reasoning_content'))
                             reason=choice.get('finish_reason') or reason
@@ -290,10 +326,15 @@ async def _stream_once(model, config, api_key, system, history, message, collect
                             finished |= choice.get('finish_reason') is not None
                     elif fmt == 'anthropic':
                         kind = data.get('type', event)
-                        if collect: fragments.add_anthropic(kind,data)
+                        if assemble: fragments.add_anthropic(kind,data)
                         action |= (data.get('content_block') or {}).get('type')=='tool_use' or (data.get('delta') or {}).get('type')=='input_json_delta'
                         if kind == 'message_start':
                             usage.update(data.get('message', {}).get('usage') or {})
+                        elif kind == 'content_block_start':
+                            block = data.get('content_block') or {}
+                            if block.get('type') == 'text':
+                                text = block.get('text') or ''
+                            thought = block.get('type') == 'thinking' and bool(block.get('thinking'))
                         elif kind == 'message_delta':
                             reason=(data.get('delta') or {}).get('stop_reason') or reason
                             usage.update(data.get('usage') or {})
@@ -311,14 +352,10 @@ async def _stream_once(model, config, api_key, system, history, message, collect
                         if candidates:
                             parts = candidates[0].get('content', {}).get('parts') or []
                             text = ''.join(p.get('text', '') for p in parts if not p.get('thought'))
-                            if collect:
+                            if assemble:
                                 for part in parts:
                                     if 'functionCall' in part and not part.get('thought'):
-                                        if 'partialArgs' in part['functionCall'] or part['functionCall'].get('willContinue'):
-                                            raise ValueError('Unexpected partial function call')
-                                        fragments.check_count(fragments.gemini)
-                                        fragments.account(part['functionCall'])
-                                        fragments.gemini.append({'functionCall':part['functionCall']})
+                                        fragments.add_gemini(part['functionCall'])
                             action |= any('functionCall' in p for p in parts)
                             thought = any(p.get('thought') and p.get('text') for p in parts)
                             reason=candidates[0].get('finishReason') or reason
@@ -338,20 +375,21 @@ async def _stream_once(model, config, api_key, system, history, message, collect
                             raise ValueError('Invalid text delta')
                         fragments.account(text)
                         visible|=bool(text.strip())
-                        if collect: chunks.write(text)
-                        else: yield {'type': 'delta', 'text': text}
+                        if assemble: chunks.write(text)
+                        if not collect: yield {'type': 'delta', 'text': text}
                 if refusal and not finished:
                     raise empty_response(fmt,reason=reason,refusal=True,usage=usage,request_id=request_id(response.headers),config=config)
-                has_final_limit = collect and config.get('_avatar_agent') and config.get('_call_purpose') in ('goal_decision','html_generation','task_planning') and str(reason or '').lower() in ('length','max_tokens','max_output_tokens')
-                if not finished or (fragments.open_blocks and not has_final_limit):
+                if not complete():
                     raise interrupted()
-                if collect:
+                if assemble:
                     data = fragments.response(fmt,chunks.getvalue(),usage,reason,thinking,refusal)
                     result = parse_response(fmt,data,config=config,request_id=request_id(response.headers),api_key=api_key)
-                    yield {'type':'result','result':result}
+                    yield {'type':'result','result':result} if collect else usage_event(result, config)
                     return
+                model_usage = usage_summary(usage, fmt)
+                check_terminal(reason, model_usage)
                 if not visible:raise empty_response(fmt,reason=reason,thinking=thinking and not action,refusal=refusal,usage=usage,request_id=request_id(response.headers),config=config)
-                yield {'type': 'usage', 'usage': usage_summary(usage, fmt), **({'finish_reason': reason} if config.get('_avatar_agent') else {})}
+                yield {'type': 'usage', 'usage': model_usage, **({'finish_reason': reason} if config.get('_avatar_agent') else {})}
     except TimeoutError as error:
         if receiving: raise interrupted() from None
         raise transport_failure(error,total_timeout=generation_deadline(config)) from None

@@ -42,5 +42,8 @@ def tool_budget(config):
 def check_context(config,system,history,message):
     window=config.get('context_tokens') or (limits(config.get('provider'),config.get('model')) or {}).get('context_tokens',128000)
     used=tool_budget(config)+estimate(system)+estimate(message)+sum(estimate(m['content'])+16 for m in history)+config.get('max_tokens',1024)+512
-    if used>window:raise HTTPException(422,'当前输入与输出预算超过模型上下文窗口，请缩短输入、降低输出上限或新建会话')
+    if used>window:
+        error = HTTPException(422,'当前输入与输出预算超过模型上下文窗口，请缩短输入、降低输出上限或新建会话')
+        error.stop_reason = 'context_overflow'
+        raise error
     return window-used

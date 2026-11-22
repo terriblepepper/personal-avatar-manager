@@ -44,16 +44,28 @@ def raw_tool_calls(fmt, data):
         message = (data.get('choices') or [{}])[0].get('message') or {}
         raw = message.get('tool_calls')
         if raw is None:
-            raw = []
+            raw = [{'function':message['function_call']}] if message.get('function_call') else []
         if not isinstance(raw,list):
             raise ValueError()
-        calls = [c['function'] for c in raw]
+        calls = [{'index': c.get('index', i), 'name': (c.get('function') or {}).get('name', ''),
+                  'arguments': (c.get('function') or {}).get('arguments', {})} for i, c in enumerate(raw)]
     elif fmt == 'anthropic':
-        calls = [{'name':c.get('name'),'arguments':c.get('input')} for c in data.get('content',[]) if c.get('type')=='tool_use']
+        calls = [{'index': c.get('index', i), 'name': c.get('name',''), 'arguments': c.get('input',{})}
+                 for i, c in enumerate(data.get('content',[])) if c.get('type')=='tool_use']
     else:
         parts = ((data.get('candidates') or [{}])[0].get('content') or {}).get('parts',[])
-        calls = [{'name':p['functionCall'].get('name'),'arguments':p['functionCall'].get('args',{})}
-                 for p in parts if 'functionCall' in p and not p.get('thought')]
+        calls = []
+        for p in parts:
+            if 'functionCall' in p and not p.get('thought'):
+                function = p['functionCall']
+                call = {'index': len(calls), 'name': function.get('name',''), 'arguments': function.get('args',{})}
+                # Custom Gemini gateways can stream typed JSONPath updates instead of args.
+                if 'argumentChunks' in function or 'partialArgs' in function or function.get('willContinue'):
+                    chunks = function.get('argumentChunks')
+                    if chunks is None:
+                        chunks = [{k:function[k] for k in ('args','partialArgs','willContinue') if k in function}]
+                    call.update(arguments={'chunks':chunks}, argument_format='gemini_partial_args')
+                calls.append(call)
     return calls
 
 
@@ -72,6 +84,9 @@ def parse_tools(fmt, data, tools, *, required=True, batch=False):
         allowed = {tool['name'] for tool in tools}
         parsed = []
         for call in calls:
+            if call.get('argument_format') == 'gemini_partial_args':
+                issue = '工具参数尚未传输完整'
+                raise ValueError()
             name = call.get('name')
             if not isinstance(name,str) or name not in allowed:
                 issue = '选择了本步未提供的工具'
