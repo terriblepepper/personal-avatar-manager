@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from contextlib import nullcontext,ExitStack
 from fastapi import HTTPException
 from avatar.core.db import now,dump
+from avatar.models.effort import with_chat_effort
 from avatar.core.schemas import ChatRequest
 from avatar.core.execution import AgentNeedsInput,sandbox_checkpoint
 from avatar.conversation.collaboration.inbox import AgentInbox,notify
@@ -883,6 +884,10 @@ class AgentDialogues:
             if not rows:return {'message':'没有新的消息需要压缩。'}
         overview,context=self.chat.context(user,ChatRequest(channel='avatar',message='/compact'))
         speaker=overview['agent']
+        workspace = memory['resource_conversation_id']
+        if workspace:
+            override = self.chat.tools.get(uid, workspace).get('reasoning_effort')
+            context = (with_chat_effort(context[0], override), *context[1:])
         history=[{'role':'assistant' if r['speaker_role']=='agent' and r['speaker_aic']==speaker['aic'] else 'user','content':r['speaker_name']+'：'+r['content']} for r in rows]
         result=await self.billed({'user_id':uid},speaker,context[0],self.chat.memory.summarize(context,memory['summary'],history,self.chat.model_client,focus=focus),'agent_dialogue_memory')
         with self.database.connect(write=True) as db:
@@ -938,7 +943,9 @@ class AgentDialogues:
             db.execute("UPDATE agent_dialogues SET tool_activity='[]',waiting_reason='',pending_file_delivery=NULL WHERE id=? AND revision=?",(job['id'],job['revision']))
         _,context=self.chat.context(actor,ChatRequest(channel='avatar',message=job['objective']),speaker,private_access=False)
         config,key,system,_=context
-        tools=self.chat.tools.get(speaker_id,workspace)['items']
+        preferences = self.chat.tools.get(speaker_id, workspace)
+        config = with_chat_effort(config, preferences.get('reasoning_effort'))
+        tools = preferences['items']
         settings={item['id']:item['enabled'] for item in tools}
         prefix,raw=system.split('\n',1)
         config={**config,'_mermaid_enabled':True,'_avatar_agent':True,'_conversation_tools':tools,'_html_enabled':True,

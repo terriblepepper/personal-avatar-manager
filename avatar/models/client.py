@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 import httpx
 from fastapi import HTTPException
 from avatar.core.http_pool import HttpTransportPool
+from avatar.models.effort import apply_effort
 from avatar.models.diagnostics import transport_error, transport_failure
 
 
@@ -323,7 +324,7 @@ class ModelClient:
             body = {"model": config["model"], "messages": [{"role": "system", "content": system}]+conversation,
                     limit_field: config["max_tokens"], "stream": streaming}
             if (config.get('_recover_thinking') or config.get('_brief_visual_parse') or config.get('_call_purpose') in ('skill_execution','task_planning','material_selection','agent_intent','delivery_review')
-                    or (config.get('_tools') and config.get('_call_purpose') in ('file_read','rag_query_construction'))) and config['provider']=='custom' and config['model'].split('/')[-1].lower().startswith('qwen'):
+                    or (config.get('_tools') and config.get('_call_purpose') in ('file_read','rag_query_construction'))) and not config.get('reasoning_effort') and config['provider']=='custom' and config['model'].split('/')[-1].lower().startswith('qwen'):
                 body['enable_thinking']=False
                 body['chat_template_kwargs']={'enable_thinking':False}
             if config['provider']=='deepseek':
@@ -348,6 +349,7 @@ class ModelClient:
             if audio:body["contents"][-1]["parts"].extend({"inline_data":{"mime_type":item["mime_type"],"data":item["data"]}} for item in audio)
         else:
             raise HTTPException(422, "不支持的模型接口格式")
+        apply_effort(config, body)
         if streaming and fmt == "openai":
             body["stream_options"] = {"include_usage": True}
         if config.get('_tools'):

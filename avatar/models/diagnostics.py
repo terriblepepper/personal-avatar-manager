@@ -66,6 +66,8 @@ def contextual(error,config):
     purpose=PURPOSES.get(config.get('_call_purpose','answer'),'回答生成')
     suffix='步骤='+purpose
     if identifier(config.get('model')):suffix+='；模型='+identifier(config['model'])
+    if config.get('reasoning_effort'):
+        suffix += '；推理强度='+config['reasoning_effort']
     result=HTTPException(error.status_code,str(error.detail)+'（'+suffix+'）')
     result.model_diagnostic=True
     result.retryable=getattr(error,'retryable',False)

@@ -7,6 +7,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, TypeAdapter, ValidationError
 from starlette.formparsers import MultiPartParser, MultiPartException
 from avatar.files.uploads.buffer import upload_buffer
+from avatar.models.effort import Effort
 from avatar.accounts.auth import current_user
 from avatar.files.parsing.animation import ANIMATION_MIME
 from avatar.files.conversation.resources import remaining_chat_bytes
@@ -30,6 +31,21 @@ def tools(conversation_id: str,request: Request,user=Depends(current_user)):
 @router.patch('/{conversation_id}/tools')
 def set_tools(conversation_id: str,body: ToolSettings,request: Request,user=Depends(current_user)):
     return request.app.state.chat.tools.update(user['id'],conversation_id,body.tools)
+
+
+class EffortSetting(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    reasoning_effort: Effort | None
+
+
+@router.get('/{conversation_id}/reasoning-effort')
+def chat_effort(conversation_id: str, request: Request, user=Depends(current_user)):
+    return request.app.state.chat.tools.effort(user['id'], conversation_id)
+
+
+@router.patch('/{conversation_id}/reasoning-effort')
+def set_chat_effort(conversation_id: str, body: EffortSetting, request: Request, user=Depends(current_user)):
+    return request.app.state.chat.tools.effort(user['id'], conversation_id, selected=body.reasoning_effort)
 
 
 # 职责：分页浏览本人文件库，供输入区选择引用，文件正文不在目录接口返回。
