@@ -9,6 +9,8 @@ from contextlib import nullcontext
 from pathlib import Path
 from fastapi import HTTPException
 from avatar.core.db import now, dump
+from avatar.core.tokens import estimate
+from avatar.conversation.working_context import fit_turn, input_budget, json_text_view
 from avatar.skills.packages import unpack_skills, MAX_SKILLS, MAX_STORAGE
 
 
@@ -182,7 +184,7 @@ class UserSkills:
     # 职责：在身份读取事务中只生成可用技能目录，不把所有正文加入模型上下文。
     # 输入：user_id 是目标分身所有人，question 保留调用兼容，db 固定读取快照。
     # 结果与约束：返回本人启用技能的名称、简介和文本资源路径；正文在后续任务选择后加载。
-    def context(self, user_id, question, db):
+    def context(self, user_id, question, db, *, config=None):
         from avatar.skills.loading import TEXT_SUFFIXES
         rows=db.execute('SELECT id,name,description,manifest FROM agent_skills WHERE user_id=? AND enabled=1 ORDER BY created_at,id', (user_id,)).fetchall()
         from avatar.conversation.jobs.pipeline import current_generation,authorization
@@ -192,17 +194,21 @@ class UserSkills:
             current={row['id']:row['updated_at'] for row in db.execute('SELECT id,updated_at FROM agent_skills WHERE user_id=?',(user_id,))}
             rows=[row for row in rows if row['id'] in permitted and current[row['id']]==permitted[row['id']]]
         revision=db.execute('SELECT updated_at FROM agent_skill_collections WHERE user_id=?', (user_id,)).fetchone()
-        catalog=[];path_budget=24000
+        catalog=[];room=input_budget(config or {})
         for row in rows:
             resources=[f['path'] for f in json.loads(row['manifest']) if f['path']!='SKILL.md' and Path(f['path']).suffix.lower() in TEXT_SUFFIXES]
-            listed=[]
+            description=json_text_view(row['description'],room)
+            item={'id':row['id'],'name':row['name'],'description':description,
+                  'description_truncated':description!=row['description'],'files':[],'resource_paths_truncated':False}
+            room=max(0,room-estimate(dump(item)))
             for path in resources:
-                if len(listed)>=64 or len(path)>path_budget:
-                    break
-                listed.append(path);path_budget-=len(path)
-            catalog.append({'id':row['id'],'name':row['name'],'description':row['description'][:1200],
-                            'description_truncated':len(row['description'])>1200,
-                            'files':listed,'resource_paths_truncated':len(listed)<len(resources)})
+                cost=estimate(dump(path)+', ')
+                if cost>room:
+                    item['resource_paths_truncated']=True
+                    continue
+                item['files'].append(path)
+                room-=cost
+            catalog.append(item)
         return catalog, revision['updated_at'] if revision else ''
 
     # 职责：统一校验显式技能命令，不调用模型。
@@ -240,7 +246,7 @@ class UserSkills:
     # 输入：context 为目标模型配置/Key/系统背景/历史；user_id 为已核验目标所有人。
     # 结果与约束：最多三个已授权技能，不调用模型自动选择；禁用/卸载并发变化拒绝旧上下文。
     async def load_context(self, user_id, context, message, model_client, caller_id=None, *, authorized_ids=()):
-        from avatar.skills.loading import instruction_excerpt, load_resources, INSTRUCTION_BUDGET, RESOURCE_BUDGET
+        from avatar.skills.loading import instruction_excerpt, load_resources
         config,key,system,history=context
         prefix,raw=system.split('\n',1)
         background=json.loads(raw)
@@ -255,27 +261,41 @@ class UserSkills:
         permitted={item['id'] for item in catalog}
         persistent=[identifier for identifier in background.pop('_session_skill_ids',[]) if identifier in permitted]
         identifiers=list(dict.fromkeys(explicit+persistent+[i for i in authorized_ids if i in permitted]))[:3]
-        background['available_skills']=[item for item in catalog if item['id'] in identifiers]
+        background['available_skills']=[{'id':item['id'],'name':item['name']} for item in catalog if item['id'] in identifiers]
         if not identifiers:
             background.pop('installed_skills',None)
             background['skill_loading_rules']='上传技能仅在用户主动引入本会话后可使用。当前未授权任何上传技能，不得自动选择或依据历史恢复技能；资料文件仍可按需检索读取。'
             return {**config,'_used_skills':[]},key,prefix+'\n'+json.dumps(background,ensure_ascii=False),history
         if self.collection_date(user_id)!=revision:
             raise HTTPException(409,'技能设置已变更，请重新发送问题；系统未自动重试')
-        loaded=[];instruction_budget=INSTRUCTION_BUDGET;resource_budget=RESOURCE_BUDGET
-        for identifier in identifiers:
-            row=self.get(user_id,identifier)
-            if not row['enabled']:
-                raise HTTPException(409,'技能已停用，请重新发送问题')
-            instructions,truncated=instruction_excerpt(row['instructions'],message,min(instruction_budget,48000))
-            instruction_budget-=len(instructions)
-            resources,omitted,resource_budget=load_resources(self,user_id,row,instructions,requested.get(identifier,[]),resource_budget)
-            loaded.append({'id':identifier,'name':row['name'],'description':row['description'],'instructions':instructions,
-                           'instructions_truncated':truncated,'resources':resources,'unavailable_resources':omitted})
+        rows=[self.get(user_id,identifier) for identifier in identifiers]
+        if any(not row['enabled'] for row in rows):
+            raise HTTPException(409,'技能已停用，请重新发送问题')
+        loaded=[{'id':row['id'],'name':row['name'],'description':row['description'],'instructions':'',
+                 'instructions_truncated':False,'resources':[],'unavailable_resources':[]} for row in rows]
+        background['installed_skills']=loaded
+        background['skill_loading_rules']='仅 installed_skills 中正文和资源已经加载；目录中的其他技能尚未读取。省略或不可用资源不能声称已读，需要计算时由独立 Python 沙箱工作流决定是否运行包内脚本；只有成功执行结果才能引用，不伪造联网、系统命令或永久文件结果。'
+        room=max(0,input_budget(config)-estimate(prefix+'\n'+dump(background))-estimate(message))
+        costs=[estimate(dump(row['instructions'])) for row in rows]
+        total=sum(costs)
+        for row,item,cost in zip(rows,loaded,costs):
+            text=row['instructions']
+            share=min(cost,room*cost//max(1,total))
+            limit=len(text) if cost<=share else len(text)*share//max(1,cost)
+            excerpt,truncated=instruction_excerpt(text,message,limit)
+            if estimate(dump(excerpt))>share:
+                excerpt=json_text_view(excerpt,share)
+                truncated=True
+            item.update(instructions=excerpt,instructions_truncated=truncated)
+            room=max(0,room-estimate(dump(excerpt)))
+            total-=cost
+        for row,item in zip(rows,loaded):
+            resources,omitted,room=load_resources(self,user_id,row,item['instructions'],requested.get(row['id'],[]),room)
+            item.update(resources=resources,unavailable_resources=omitted)
         if self.collection_date(user_id)!=revision:
             raise HTTPException(409,'技能设置已变更，请重新发送问题；系统未自动重试')
         config={**config,'_used_skills':[{'id':item['id'],'name':item['name']} for item in loaded]}
         if background.get('skill_selection_notice'):config={**config,'_workflow_notices':config.get('_workflow_notices',[])+[background['skill_selection_notice']]}
-        if loaded:background['installed_skills']=loaded
-        background['skill_loading_rules']='仅 installed_skills 中正文和资源已经加载；目录中的其他技能尚未读取。省略或不可用资源不能声称已读，需要计算时由独立 Python 沙箱工作流决定是否运行包内脚本；只有成功执行结果才能引用，不伪造联网、系统命令或永久文件结果。'
-        return config,key,prefix+'\n'+json.dumps(background,ensure_ascii=False),history
+        system=prefix+'\n'+dump(background)
+        history,_=fit_turn(config,system,history,message,[])
+        return config,key,system,history

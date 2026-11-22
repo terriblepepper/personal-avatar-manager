@@ -47,6 +47,7 @@ class PeerTurn:
         self.writer = uuid.uuid4().hex
         self.active = None
         self.charges = {}
+        self.validate_session_files = None
         with service.database.connect(write=True) as db:
             self.workspace = service.resources.workspace(db, owner, task['session_id'], task['id'])
             self.source = self.authority(db)
@@ -81,15 +82,17 @@ class PeerTurn:
         if self.authority(db) != self.source:
             raise HTTPException(409, '分身资料或工具授权已改变，原草稿已停止使用')
 
-    def commit(self, db):
+    def commit(self, db, *, files=True):
         if self.active is None:
             self.validate(db)
         else:
             self.active.check_in(db)
+        if files and self.validate_session_files:
+            self.validate_session_files(db,lock=True)
 
     def check(self):
         with self.service.database.connect() as db:
-            self.commit(db)
+            self.commit(db,files=False)
 
     def open(self, run_id='turn'):
         store = RunStore(self.service.database, self.owner, 'dialogue', self.task['id'], run_id, self.writer, self.validate)

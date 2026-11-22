@@ -13,8 +13,60 @@
     async function readDocument(event) {
       if (event.source !== parent || !(event.data instanceof Blob)) return;
       window.removeEventListener('message', readDocument);
-      const source = await event.data.text();
+      let source = await event.data.text();
+      const animation = source.includes('function installAnimationClock(host, duration, renderFrame)') &&
+                        source.includes('installAnimationClock(host,');
+      if (animation) {
+        // Older outputs sometimes wrapped a single window delegate inside the installed frame.
+        const wrapper = /(installAnimationClock\(host,\s*[\d.eE+-]+,\s*function\(time,\s*duration,\s*state\)\s*\{\s*)function\s+(?:render_frame|renderFrame)\s*\(\s*time(?:\s*,\s*(?:duration|state))*\s*\)\s*\{\s*if\s*\(\s*window\.([A-Za-z_]\w*)\s*\)\s*(?:\{\s*)?window\.\2\s*\(\s*time\s*\)\s*;?\s*(?:\}\s*)?\}\s*;?(\s*\}\);)/;
+        const match = wrapper.exec(source);
+        if (match) {
+          const hook = match[2];
+          source = source.replace(wrapper, (_, start, name, end) => start + 'window.' + name + '(time);' + end);
+          // Repair only a self-export of an undeclared name with a single explicit Three renderer.
+          const exports = source.matchAll(/\bwindow\.([A-Za-z_]\w*)\s*=\s*function\s*\(\s*time\s*\)\s*\{/g);
+          const exported = exports.next().value;
+          const bound = new RegExp('(?<![\\w$])' + hook + '(?![\\w$])');
+          const tail = new RegExp('\\bwindow\\.' + hook + '\\s*=\\s*' + hook + '\\s*;\\s*' + hook + '\\s*\\(\\s*0\\s*\\)\\s*;?\\s*(?=<\\/script\\s*>)');
+          const broken = tail.exec(source);
+          if (exported && exports.next().done && broken && exported.index < broken.index &&
+              exported[1] !== hook && !bound.test(source.slice(0, broken.index))) {
+            const implementation = source.slice(exported.index, broken.index);
+            const render = /\b([A-Za-z_]\w*)\.render\s*\(\s*([A-Za-z_]\w*)\s*,\s*([A-Za-z_]\w*)\s*\)\s*;?\s*\}\s*;?\s*$/.exec(implementation);
+            const module = source.slice(source.lastIndexOf('<script', exported.index), exported.index);
+            const three = /\bimport\s+\*\s+as\s+([A-Za-z_]\w*)\s+from\s*['"]three['"]/.exec(module);
+            const types = ['WebGLRenderer', 'Scene', '(?:Perspective|Orthographic)Camera'];
+            if (three && render && !/<\/script\b/i.test(implementation) && types.every((type, i) =>
+                new RegExp('\\b' + render[i + 1] + '\\s*=\\s*new\\s+' + three[1] + '\\.' + type + '\\s*\\(').test(module))) {
+              // Preserve the author's own final scene draw if one of its optional updates throws.
+              const body = exported[0].length;
+              const guarded = implementation.slice(0, body) + 'try {\n' + implementation.slice(body, render.index) +
+                '\n} catch { if (!window.' + exported[1] + '.previewWarning) { window.' + exported[1] +
+                '.previewWarning = true; window.dispatchEvent(new Event("avatar-animation-incomplete")); } }\n' + render[0];
+              source = source.slice(0, exported.index) + guarded + source.slice(broken.index);
+              source = source.replace(tail, () => 'window.' + hook + ' = window.' + exported[1] + ';window.' + hook + '(0);\n');
+            }
+          }
+        }
+      }
       document.open();
+      if (animation) {
+        const showError = (partial = false) => {
+          if (!document.body) {
+            document.addEventListener('DOMContentLoaded', () => showError(partial), {once: true});
+            return;
+          }
+          const alert = document.getElementById('avatar-animation-error') || document.createElement('div');
+          alert.id = 'avatar-animation-error';
+          alert.setAttribute('role', 'alert');
+          alert.style.cssText = 'position:fixed;z-index:2147483647;inset:8px 8px auto;padding:8px 12px;background:#532426;color:white;font:14px system-ui';
+          alert.textContent = partial ? '作品的部分效果运行失败，当前显示可绘制的场景。' : '动画脚本运行失败，无法完整绘制画面。';
+          document.body.append(alert);
+        };
+        window.addEventListener('error', event => { if (event instanceof ErrorEvent) showError(); });
+        window.addEventListener('unhandledrejection', () => showError());
+        window.addEventListener('avatar-animation-incomplete', () => showError(true), {once: true});
+      }
       document.write(source);
       document.close();
     }

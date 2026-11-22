@@ -9,7 +9,7 @@ from typing import Annotated, Literal, TypedDict
 from fastapi import HTTPException
 from langgraph.graph import StateGraph, START, END
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints, ValidationError, model_validator
-from avatar.core.text_budget import AgentText, TEXT_LIMIT, fits_text_budget
+from avatar.core.text_budget import AgentText, fits_text_budget, budget_error
 from avatar.core.db import dump, now
 from avatar.core.tokens import estimate
 from avatar.files.library.catalog import fit_catalog, model_animation_metadata
@@ -38,7 +38,7 @@ class MaterialArguments(BaseModel):
     @model_validator(mode='after')
     def has_target(self):
         if not fits_text_budget(self.query, *self.queries):
-            raise ValueError(TEXT_LIMIT)
+            raise ValueError(budget_error())
         if not self.query and not self.queries:
             raise ValueError('至少提供一个资料检索目标')
         return self
@@ -67,14 +67,15 @@ class AnswerArguments(BaseModel):
         return self
 
 
-def delivery_history(db, owner, conversation):
+def delivery_history(db, owner, conversation, directory):
     """同一会话近期的主题和真实交付记录，供指代和排除已发项使用。"""
     rows=db.execute("""SELECT m.role,left(m.content,800) AS content,
-        ARRAY(SELECT a.attachment_id FROM chat_message_materials a WHERE a.message_id=m.id
+        ARRAY(SELECT a.attachment_id FROM chat_message_materials a JOIN attachments f ON f.id=a.attachment_id AND f.user_id=m.user_id WHERE a.message_id=m.id
               ORDER BY a.position,a.attachment_id) AS delivered
         FROM chat_messages m WHERE m.user_id=? AND m.conversation_id=? AND m.role IN ('assistant','user')
         ORDER BY m.id DESC LIMIT 12""",(owner,conversation)).fetchall()
-    return [dict(row) for row in reversed(rows)]
+    return [{**dict(row),'delivered':[identifier for identifier in row['delivered'] if directory.available(owner,identifier)]}
+            for row in reversed(rows)]
 
 
 class QueryArguments(BaseModel):
@@ -96,7 +97,7 @@ def declaration(name, description, parameters):
 FIND_CONVERSATION_FILES = declaration('find_conversation_files',
     '查询当前本人会话中的原件，包括上传、气泡中的资料原件、历史生成或刚创建的所有类型，如 HTML 动画。'
     '返回真实文件 ID、名称和说明。query 为可选名称片段、类型或说明，留空按最近顺序浏览，每页十项。'
-    '资料库与会话原件分别存放。查到文件不表示已发送。', CatalogArguments.model_json_schema())
+    '已知 ID 可直接用 read_session_file。can_read=false 的 staged 文件交付后才可读取。目录仅含元数据。', CatalogArguments.model_json_schema())
 CONTACT_REPLY='需要调用分身通信。请选择发送消息或任务，也可以取消；确认发送前不会联系对方。'
 
 TOOLS=[
@@ -196,12 +197,13 @@ class DialogueIntent:
                 own=db.execute('SELECT profile FROM avatar_records WHERE user_id=?',(uid,)).fetchone()
                 files=[]
                 if state['personal']:
-                    files=[dict(r) for r in db.execute("SELECT id,filename,relative_path,caption AS description,content_type,animation_metadata,'profile' AS source FROM attachments WHERE user_id=? ORDER BY created_at DESC LIMIT 100",(uid,))]
+                    files=[dict(r) for r in db.execute("SELECT id,size,filename,relative_path,caption AS description,content_type,animation_metadata,'profile' AS source FROM attachments WHERE user_id=? ORDER BY created_at DESC LIMIT 100",(uid,))
+                           if service.attachments.directory.available(uid,r['id'],r['size'])]
                     files.extend(self.dialogues.chat.chat_files.model_catalog(db,uid,state['parent']['id']))
                 for file in files:
                     file.update(json.loads(file.pop('animation_metadata')))
                 rows=db.execute("SELECT role,content FROM chat_messages WHERE user_id=? AND (conversation_id=? OR conversation_id IN (SELECT id FROM chat_conversations WHERE parent_id=? AND user_id=?)) ORDER BY id DESC LIMIT 12",(uid,state['parent']['id'],state['parent']['id'],uid)).fetchall()
-                deliveries = [item for row in delivery_history(db, uid, state['parent']['id']) for item in row['delivered']]
+                deliveries = [item for row in delivery_history(db, uid, state['parent']['id'],service.attachments.directory) for item in row['delivered']]
             return config,own,files,rows,deliveries
         config,own,files,rows,deliveries=await asyncio.to_thread(load_context)
         from avatar.models.effort import with_chat_effort

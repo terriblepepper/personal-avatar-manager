@@ -1,6 +1,7 @@
 """Private per-user storage; old files are moved once before services open them."""
 import hashlib
 import re
+import stat
 from pathlib import Path
 
 
@@ -21,6 +22,19 @@ class UserBlobs:
     def new(self,owner,name):
         if Path(name).name!=name:raise ValueError('Invalid original name')
         return self.folder(owner)/name
+    def available(self, owner, identifier, size=None):
+        """Check the authorized blob without creating directories or reading its contents."""
+        if not identifier or Path(identifier).name != identifier:
+            return False
+        try:
+            folder = user_root(self.database.data_dir, owner) / self.kind
+            if folder.is_symlink():
+                return False
+            info = (folder / (identifier + '.blob')).lstat()
+        except (FileNotFoundError, NotADirectoryError, ValueError):
+            return False
+        return stat.S_ISREG(info.st_mode) and (size is None or info.st_size == size)
+
     def mkdir(self,**kwargs):pass
     def chmod(self,*args):pass
     def glob(self,pattern):return (self.database.data_dir/'users').glob('*/'+self.kind+'/'+pattern)

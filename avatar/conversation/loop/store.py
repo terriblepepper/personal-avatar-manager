@@ -250,7 +250,7 @@ class RunStore:
             return b''.join(row[0] for row in rows).decode('utf-8', errors='ignore' if start else 'strict')
 
     def read_range(self, name, start, limit):
-        if type(start) is not int or type(limit) is not int or start < 0 or not 0 < limit <= 4096:
+        if type(start) is not int or type(limit) is not int or start < 0 or not 0 < limit <= draft_byte_limit(self._draft(name)):
             raise ValueError('无效的回执读取范围')
         end = start + limit
         with self._read() as db:

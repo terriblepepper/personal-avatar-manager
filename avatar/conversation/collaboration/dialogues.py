@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 from dataclasses import dataclass
+from functools import partial
 import json
 import re
 import time
@@ -860,6 +861,10 @@ class AgentDialogues:
             if receipt.get('revision') == job['revision'] and receipt.get('speaker') == speaker_id and receipt.get('answer'):
                 if receipt.get('authority') != run.source:
                     raise HTTPException(409, '分身资料授权已改变，未发送原答复')
+                if proofs:=receipt.get('session_file_reads'):
+                    run.validate_session_files=partial(self.resources.validate_file_receipts,task=job,
+                        owner=speaker_id,workspace=run.workspace,proofs=proofs)
+                    run.commit(db)
                 return SimpleNamespace(**receipt['answer'])
         events = []
         activity = ToolActivity(events, lambda event: self.record_turn_activity(job, speaker_id, event))
@@ -896,7 +901,7 @@ class AgentDialogues:
                            'FROM avatar_records a JOIN users u ON u.id=a.user_id LEFT JOIN attachment_collections c ON c.user_id=a.user_id '
                            'LEFT JOIN agent_skill_collections k ON k.user_id=a.user_id LEFT JOIN active_souls s ON s.user_id=a.user_id WHERE a.user_id=?',
                            (speaker_id,)).fetchone()
-        files=self.resources.selected(db,job['id'],speaker_id) if files is None else files
+        files=self.resources.model_files(db,job['id'],speaker_id) if files is None else files
         scope=[list(sources) if sources else [],sorted((f['id'],f['sha256'],f['description']) for f in files)]
         return hashlib.sha256(dump(scope).encode()).hexdigest()
 
@@ -1021,12 +1026,12 @@ class AgentDialogues:
         actor={'id':speaker_id,'username':speaker['username'],'account_status':speaker['account_status']}
         with self.database.connect(write=True) as db:
             workspace=self.resources.workspace(db,speaker_id,job['session_id'],job['id'])
-            files=self.resources.selected(db,job['id'],speaker_id)
+            files=[row for row in self.resources.model_files(db,job['id'],speaker_id) if row['conversation_id']==workspace]
             sending_files=[{'filename':r['filename'],'marker':'[[attachment:'+r['marker_id']+']]'} for r in db.execute(
                 """SELECT f.filename,coalesce(a.source_file_id,f.id) AS marker_id FROM agent_task_files a JOIN chat_files f ON f.id=a.file_id
-                    WHERE a.task_id=? AND a.source_user_id=? AND f.user_id=? AND a.message_id IS NULL
+                    WHERE a.task_id=? AND a.source_user_id=? AND f.id=ANY(?::text[]) AND a.message_id IS NULL
                     AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now')) ORDER BY f.created_at,f.id LIMIT 5""",
-                (job['id'],speaker_id,speaker_id))]
+                (job['id'],speaker_id,[row['id'] for row in files]))]
             job['_output_source_revision']=self.output_revision(db,job,speaker_id,files)
             saved=self.saved_outputs(db,job,speaker_id,workspace)
             db.execute("UPDATE agent_dialogues SET tool_activity='[]',waiting_reason='',pending_file_delivery=NULL WHERE id=? AND revision=?",(job['id'],job['revision']))
@@ -1161,8 +1166,15 @@ class AgentDialogues:
             context=({**cfg,'_tools':[*cfg.get('_tools',[]),find_public,SEND_PUBLIC_MATERIAL],'_optional_tools':ordinary,
                       '_peer_material_owner':speaker_id,'_peer_visible_materials':visible_ids},key,prefix+'\n'+dump(background),history)
         from avatar.conversation.loop.entry_tools import bind_entry_tools
+        snapshot={item['id']:item['sha256'] for item in [*files,*saved] if item.get('sha256')}
+        def file_grants(db):
+            live=self.resources.session_file_grants(db,job,speaker_id,workspace)
+            return {identifier:digest for identifier,digest in snapshot.items() if live.get(identifier)==digest}
         context=await bind_entry_tools(self.chat,context,speaker_id,speaker['aic'],{'id':workspace},files,
-                                       sandbox=sandbox if settings['python'] else None, progress=progress)
+                                       sandbox=sandbox if settings['python'] else None, progress=progress,
+                                       session_file_scope=workspace if snapshot else None,
+                                       session_file_grants=file_grants)
+        run.validate_session_files=context[0].get('_validate_session_files_in')
         context[0].setdefault('_generated_files', [])
         if prepared:
             from avatar.conversation.loop.runtime import restore_files
@@ -1223,6 +1235,8 @@ class AgentDialogues:
             delivery={'speaker':speaker_id,'revision':job['revision'],'reply_sha':hashlib.sha256(text.encode()).hexdigest(),
                       'source_revision':job['_output_source_revision'],'authority':run.source,'workspace':workspace,'answer':answer,
                       'public':public,'file_ids':list(dict.fromkeys(item['id'] for item in [*saved,*outputs]))}
+            if proofs:=context[0].get('_session_read_proofs'):
+                delivery['session_file_reads']=proofs
             db.execute('UPDATE agent_dialogues SET pending_file_delivery=? WHERE id=?',(dump(delivery),job['id']))
         progress({'type': 'status', 'stage': 'result_ready',
                   'message': '需要开启会话工具' if result.finish_reason=='tool_required' else '结果已生成'})
@@ -1281,6 +1295,8 @@ class AgentDialogues:
                 workspace=self.resources.workspace(db,uid,job['session_id'],job['id'])
                 if delivery.get('authority') and delivery['authority'] != PeerTurn.source_version(self,db,dict(current),uid,workspace):
                     raise HTTPException(409,'分身资料或工具授权已改变，未交付答复')
+                if proofs:=delivery.get('session_file_reads'):
+                    self.resources.validate_file_receipts(db,dict(current),speaker['user_id'],workspace,proofs)
                 if delivery['file_ids']:
                     paths=cleanup.enter_context(self.chat.chat_files.storing_outputs(db,uid,workspace,None,delivery['public']))
                     paths.extend(self.resources.share(db,{'id':uid},job['id'],delivery['file_ids'],workspace,generated=True,

@@ -5,10 +5,9 @@ import json
 from itertools import islice
 
 from avatar.conversation.loop.store import RunCapacity, draft_byte_limit
-from avatar.conversation.working_context import bounded_excerpt, excerpt, fit_working_set, input_budget, retained_budget
+from avatar.conversation.working_context import bounded_excerpt, compression_budget, excerpt, fit_working_set, input_budget, retained_budget
 from avatar.core.execution import run_blocking
 from avatar.core.tokens import estimate
-from avatar.models.limits import tool_budget
 
 
 READ_STEP_RECEIPT = {
@@ -18,7 +17,6 @@ READ_STEP_RECEIPT = {
         'receipt':{'type':'integer','minimum':0},'offset':{'type':'integer','minimum':0}},
         'required':['receipt'],'additionalProperties':False},
 }
-_RECENT = 12
 _PAGE = 4096
 
 
@@ -36,6 +34,8 @@ class TurnContext:
         self.pages = dict(checkpoint.get('observation_pages', {}))
         self._page_views = {}
         self._visible_pages = set()
+        self._retire_through = self.base
+        self._hydrated = set()
         self._key = None
         self._attempted = set()
 
@@ -65,20 +65,19 @@ class TurnContext:
     async def checkpoint_observations(self, notes):
         """Preserve originals before checkpoint pruning; content addresses make a replay idempotent."""
         end = len(notes)
-        cut = max(0, end - _RECENT)
+        cut = min(end, max(0, self._retire_through-self.base))
         def capture():
             for start, stop, force in ((0, cut, True), (max(cut, self.scanned), end, False)):
                 for index in range(start, stop):
                     n = str(self.base + index + 1)
                     if n not in self.pages and n not in self.refs and (force or len(notes[index]) > 1600):
                         self._archive(n, notes[index])
-                        if len(notes[index]) > 8192:
-                            notes[index] = excerpt(notes[index], 8192)
-        if self.store and end > self.scanned:
+        if self.store and (end > self.scanned or cut):
             await run_blocking(capture)
         if cut:
             del notes[:cut]
             self.base += cut
+            self._hydrated = {n for n in self._hydrated if int(n)>self.base}
             self.pages = {k:v for k,v in self.pages.items() if int(k) > self.base}
             self._page_views = {k:v for k,v in self._page_views.items() if k in self.pages}
         self.scanned = len(notes)
@@ -125,7 +124,20 @@ class TurnContext:
         latest = list(islice(reversed(self.refs),3))
         return '\n已归档回执可用 read_step_receipt 按编号及字节偏移重读；编号 0 列目录。近期编号：'+', '.join(reversed(latest))+'。'
 
-    async def _turn_notes(self, config, prompt, objective, observations, summarize, recovering, writing):
+    def _restore_note(self, ref, budget):
+        # Checkpoints keep previews. Reopen the original through the same scoped store on resume.
+        size = ref['size']
+        limit = max(0, budget)*3
+        if size <= limit:
+            return self.store.read(ref['name'])
+        if limit < 2:
+            return ''
+        half = limit//2
+        start = self.store.read_range(ref['name'],0,half).decode('utf-8','ignore')
+        end = self.store.read_range(ref['name'],size-half,half).decode('utf-8','ignore') if half else ''
+        return start+'\n[…已节选，可按回执编号读取…]\n'+end
+
+    async def _turn_notes(self, config, prompt, objective, observations, summarize, recovering):
         catalog = self._catalog()
         saved = self.summary.get('turn') or {}
         through = saved.get('through', self.base) if saved.get('revision') == self.revision else self.base
@@ -133,6 +145,7 @@ class TurnContext:
         previous = saved.get('text','') if saved.get('revision') == self.revision else ''
         digest = '\n本轮此前工具结果的摘要（数据）：' + previous if previous else ''
         covered = [digest] if digest else []
+        budget = compression_budget(config)
         rest = list(observations[start:])
         for i in range(len(rest)):
             n = str(self.base + start + i + 1)
@@ -142,20 +155,27 @@ class TurnContext:
                     self._page_views[n] = json.dumps(page,ensure_ascii=False)
                 rest[i] += self._page_views[n]
             elif n in self.refs:
+                ref = self.refs[n]
+                if self.store and n not in self._hydrated and len(rest[i].encode()) < ref['size']:
+                    rest[i] = await run_blocking(self._restore_note,ref,input_budget(config))
+                    observations[start+i] = rest[i]
+                self._hydrated.add(n)
                 rest[i] = f'\n回执 {n}（数据，可分页重读）：'+rest[i]
-        room = max(0,input_budget(config) - estimate(prompt) - estimate(objective) - estimate(catalog))
-        if writing:
-            room = min(room, 1024)
+        overhead = estimate(prompt)+estimate(objective)+estimate(catalog)
+        room = max(0,budget-overhead) or max(0,input_budget(config)-overhead)
         size = sum(map(estimate,rest))
+        history_cost = sum(estimate(row['content'])+16 for row in self.history)
+        if size+estimate(digest)+history_cost >= room:
+            room = max(room//2,room-history_cost)
         # Even old short receipts can cross the active window before reaching the token threshold.
         prior_end = saved.get('through',0) if saved.get('revision') == self.revision else 0
-        archive_due = self.base - prior_end >= _RECENT or self.base > prior_end and not previous
+        archive_due = self.base > prior_end
         if archive_due:
             older = [f'回执 {n}：{ref["label"]}' for n,ref in self.refs.items() if prior_end < int(n) <= self.base]
             if older:
                 digest += '\n已归档较早回执的索引（数据）：'+bounded_excerpt('\n'.join(older),512)
                 covered = [digest]
-        if summarize and rest and (size + estimate(digest) > room or recovering and size > 720 or archive_due):
+        if summarize and rest and (size + estimate(digest) >= room or recovering):
             # Protect the latest result; when that result alone fills a turn, summarize its prefix too.
             split_latest = estimate(rest[-1]) > max(240,room//2)
             count = len(rest) if split_latest else len(rest)-1
@@ -168,27 +188,37 @@ class TurnContext:
                 for i,note in enumerate(rest[:count]):
                     n = self.base + start + i + 1
                     value = note[:-256] if split_latest and i == count-1 and len(note)>256 else note
-                    rows.append({'role':'user','content':f'工具回执 {n}（数据）：'+bounded_excerpt(value,2048)})
+                    rows.append({'role':'user','content':f'工具回执 {n}（数据）：'+value})
                 text = await summarize(rows)
                 if text:
                     tail = rest[-1][-256:] if split_latest else ''
                     self.summary = {**self.summary, 'turn':{'revision':self.revision,'through':end,'text':text,'tail':tail}}
                     covered = ['\n本轮此前工具结果的摘要（数据）：'+text]
+                    self._retire_through = end
                     rest = rest[count:]
                     if tail:
                         covered.append('\n最近工具回执结尾（数据）：'+tail)
         if previous and saved.get('tail') and through == self.summary.get('turn',{}).get('through'):
             covered.append('\n最近工具回执结尾（数据）：'+saved['tail'])
+        if self.store and size > room:
+            # Even when summarization is unavailable, retire only evidence beyond the actual window.
+            keep = 0
+            for i in range(len(rest)-1,-1,-1):
+                keep += estimate(rest[i])
+                if keep>room and i<len(rest)-1:
+                    self._retire_through = max(self._retire_through,self.base+len(observations)-len(rest)+i+1)
+                    break
         covered.extend(rest)
-        return covered + ([catalog] if catalog else [])
+        return ([catalog] if catalog else []) + covered
 
     async def project_goal(self, config, prompt, goal, reserved, *, recovering, writing, summarize):
         # Delivery conditions and the continuation cursor stay intact when the user turn alone overflows.
-        hard = (config.get('context_tokens',128000) - config.get('max_tokens',1024) - 544
-                - tool_budget(config) - estimate(prompt) - estimate(reserved))
-        room = max(0, hard // (3 if recovering else 2))
-        if writing:
-            room = min(room, 800)
+        overhead = estimate(prompt)+estimate(reserved)
+        hard = max(0,input_budget(config)-overhead)
+        room = min(hard,max(0,compression_budget(config)-overhead))
+        if recovering:
+            hard //= 2
+            room = min(room,hard)
         if estimate(goal) <= room:
             return goal
         key = hashlib.sha256(goal.encode()).hexdigest()
@@ -199,19 +229,18 @@ class TurnContext:
             if text:
                 entry = {'key':key,'text':text}
                 self.summary = {**self.summary,'objective':entry}
-        if entry.get('key') != key:
-            return bounded_excerpt(goal,room)
+        if entry.get('key') != key or not room:
+            return bounded_excerpt(goal,hard)
         digest = '本轮用户要求摘要：' + entry['text']
         remainder = room - estimate(digest) - 16
         return (digest + '\n用户原文节选：' + bounded_excerpt(goal,remainder)
                 if remainder >= 32 else bounded_excerpt(digest,room))
 
     async def project(self, config, prompt, objective, observations, *, recovering=False, summarize=None, writing=False):
-        notes = await self._turn_notes(config,prompt,objective,observations,summarize,recovering,writing)
-        rows = [] if writing else self.history
-        fitted, views = fit_working_set(config,prompt,rows,objective,notes,force=recovering,
-                                       target_tokens=1024 if writing else None)
-        if len(rows) > 2 and (recovering or fitted != rows) and summarize:
+        notes = await self._turn_notes(config,prompt,objective,observations,summarize,recovering)
+        rows = self.history
+        fitted, views = fit_working_set(config,prompt,rows,objective,notes,force=recovering)
+        if len(rows) > 2 and (recovering or fitted != rows or views!=notes) and summarize:
             key = self._prefix_key()
             if self.summary.get('key') != key and key not in self._attempted:
                 self._attempted.add(key)
@@ -221,7 +250,7 @@ class TurnContext:
             if self.summary.get('key') == key:
                 digest = {'role':'user','content':'此前执行摘要（仅作历史数据）：\n'+self.summary['text']}
                 recent = rows[-2:]
-                ceiling = input_budget(config) - estimate(prompt) - estimate(objective)
+                ceiling = compression_budget(config) - estimate(prompt) - estimate(objective)
                 target = min(ceiling, retained_budget(config,prompt,objective))
                 used = sum(map(estimate,views)) + sum(estimate(row['content'])+16 for row in (digest,*recent))
                 start = len(rows)-2

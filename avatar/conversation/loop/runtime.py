@@ -17,16 +17,17 @@ def resume_safe(state, *, automatic=False, initial=False):
 
 def verified_context(receipts, files, *, compact=False):
     """Keep verified IDs and modes accessible even after older observations leave the model view."""
-    cap = 2 if compact else 8
-    previous = [{k:r[k] for k in ('goal_no','tool','mode') if r.get(k)} for r in receipts[-cap:]]
+    previous = [{k:r[k] for k in ('goal_no','tool','mode') if r.get(k)} for r in (receipts[-2:] if compact else receipts)]
     live = {item['id']:item for item in files if item.get('id')}
     if not previous and not live:
         return ''
     # An older confirmed dimension must stay visible when newer attachments fill the view.
-    modes = {item['html_mode']:item for item in live.values() if item.get('html_mode') in ('2d','3d','html')}
-    selected = {item['id']:item for item in (*modes.values(), *list(live.values())[-cap:])}
+    selected = live
+    if compact:
+        modes = {item['html_mode']:item for item in live.values() if item.get('html_mode') in ('2d','3d','html')}
+        selected = {item['id']:item for item in (*modes.values(),*list(live.values())[-2:])}
     cards = [{'id':item['id'], 'mode':item.get('html_mode'),
-              **({} if compact else {'filename':str(item.get('filename',''))[:120]})} for item in selected.values()]
+              **({} if compact else {'filename':str(item.get('filename',''))})} for item in selected.values()]
     return '\n已核验的本轮回执（数据）：'+json.dumps(
         {'steps':previous, 'file_count':len(live), 'files':cards}, ensure_ascii=False, separators=(',', ':'))
 
