@@ -21,7 +21,7 @@ class HtmlFile(BaseModel):
 
 
 class WebPage(HtmlFile):
-    html: str = Field(min_length=1, max_length=MAX_SOURCE_BYTES, description='完整网页源码，内联样式和脚本。')
+    html: str = Field(min_length=1, max_length=MAX_SOURCE_BYTES, description='HTML 源码。')
 
 
 class Animation(WebPage):
@@ -30,9 +30,11 @@ class Animation(WebPage):
     render_frame: str = Field(min_length=1, max_length=MAX_SOURCE_BYTES, description='JavaScript 函数体，按绝对秒数 time 绘制当前帧，可用 duration 和跨帧对象 state。')
 
 
-CREATE_HTML = {'name':'create_html','description':'创建独立网页，例如个人主页。提交 filename 和完整 html；系统保存并预览。',
-               'parameters':WebPage.model_json_schema()}
-ANIMATION_PARAMETERS = Animation.model_json_schema()
+CREATE_HTML = {
+    'name':'create_html',
+    'description':'工具用于生成基于html的网页、2d动画和3d动画。作品在隔离环境中运行，无联网或宿主文件访问权限，可使用内置 Three.js。',
+    'parameters':WebPage.model_json_schema(),
+}
 OFFLINE_ANIMATION = ('动画必须完全离线，严禁使用任何网络资源，包括 CDN、远程脚本、字体、纹理、图片、音视频、接口和联网兜底。'
                      '内联 HTML/CSS/JS 和数据，图形自行绘制。Three.js 只用 <script type="module"> 与 '
                      'import * as THREE from "three"，由预览器提供本地核心模块；不要使用插件、外部 importmap 或全局 THREE。')
@@ -40,26 +42,12 @@ ANIMATION_INPUT = ('自由编写完整 html，提供 duration_seconds 和 render
                    'html 定义场景和一次性初始化，render_frame 按绝对秒数 time 从任意位置重绘，可用 duration、state。'
                    'Three.js 在 html 模块中初始化。render_frame 直接执行绘制语句，或调用同名的 window 绘制函数；不要再包一层函数声明。场景、相机、网格及每一项更新引用的对象都须先定义。'
                    '平台提供播放、暂停和可拖动的进度条。所有运动由 time 驱动，勿另起计时、动画循环或独立播放的 CSS 动画。')
-CREATE_ANIMATION = {
-    'name':'create_animation',
-    'description':'创建有时间变化的 HTML 动画，按意图选择二维或三维，默认二维。'+ANIMATION_INPUT+OFFLINE_ANIMATION,
-    'parameters':ANIMATION_PARAMETERS,
-}
-ARTIFACT_TOOLS = ('create_html','create_animation')
+ARTIFACT_TOOLS = ('create_html',)
+LEGACY_ANIMATION_TOOL = 'create_animation'
 
 
-def animation_tool(mode=None):
-    if mode not in ('2d','3d'):
-        return CREATE_ANIMATION
-    properties = {**ANIMATION_PARAMETERS['properties'],'mode':{'type':'string','enum':[mode],'default':mode}}
-    return {**CREATE_ANIMATION,'parameters':{**ANIMATION_PARAMETERS,'properties':properties,'required':[*ANIMATION_PARAMETERS['required'],'mode']}}
-
-
-def html_repair_prompt(tool, mode):
-    if tool == 'create_html':
-        return '直接输出完整 HTML 网页，以 <html> 或 <!doctype html> 开头，以 </html> 结束。内联样式和脚本。'
-    dimension = 'mode 必须为 '+mode+'。' if mode in ('2d','3d') else ''
-    return '返回完整动画工具参数 JSON，包含 filename（.html）。'+dimension+ANIMATION_INPUT+OFFLINE_ANIMATION
+def html_repair_prompt():
+    return '输出修正后的 HTML 源码，预览无联网权限。'
 
 
 def _artifact_fields(pairs):
@@ -71,15 +59,13 @@ def _artifact_fields(pairs):
     return result
 
 
-def repaired_html_arguments(text, tool, filename):
+def repaired_html_arguments(text, filename, *, legacy_animation=False):
     source = text.strip()
     if source.startswith('```') and source.endswith('```'):
         header, newline, body = source.partition('\n')
         if newline and header.strip().lower() in ('```','```json','```html'):
             source = body[:-3].strip()
-    if tool == 'create_html' and re.match(r'<(?:!doctype\s+html\b|html(?=[\s>]))',source,re.I):
-        if source[-7:].lower() != '</html>':
-            raise ValueError('修复结果缺少网页结束标签')
+    if not legacy_animation and source.lstrip('﻿').startswith('<'):
         try:
             if validate_output(filename,b'') != 'text/html':
                 filename = 'index.html'
@@ -200,7 +186,7 @@ def custom_animation(artifact):
     return source[:offset]+script+source[offset:]
 
 
-def create_animation(args, outputs, *, expected_mode=None):
+def restore_legacy_animation(args, outputs, *, expected_mode=None):
     artifact = checked_args(Animation,args)
     if expected_mode in ('2d','3d') and artifact.mode != expected_mode:
         raise ValueError('mode 应为 '+expected_mode)
@@ -211,8 +197,6 @@ def store_html(filename, source, mode, outputs):
     data = source.encode('utf-8')
     if b'\x00' in data:
         raise HTTPException(422, 'HTML 必须为有效文本')
-    if not source.lstrip().startswith('<') or '>' not in source:
-        raise HTTPException(422, '请提交包含 HTML 标记的完整页面')
     if len(data) > MAX_SOURCE_BYTES:
         raise HTTPException(413, 'HTML 文件不能超过 100 MiB')
     validate_output(filename, data)

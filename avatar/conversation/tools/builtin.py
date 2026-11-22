@@ -13,7 +13,6 @@ MERMAID_INSTRUCTIONS = (
 )
 
 HTML_INSTRUCTIONS = (
-    '会话中创建网页调用 create_html，创建 2D 或 3D 动画调用 create_animation，交付独立 HTML 文件。'
-    '动画默认 2D，需要立体演示时按用户意图选 3D。通用网页按需自动生成。2D 可用 SVG、Canvas 或 CSS，3D 可用 Three.js。所有动画均用 HTML 编写。'
+    'create_html 可生成基于 HTML 的网页、2D 动画和 3D 动画。作品预览无联网权限，支持内置 Three.js。'
     '仅在用户转存后才可声称已存入资料库。'
 )
