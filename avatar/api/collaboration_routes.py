@@ -266,6 +266,11 @@ def agent_session(identifier: str, request: Request, before: int|None=None, afte
         task_offset: int=Query(0,ge=0), task_search: str=Query('',max_length=200), user=Depends(current_user)):
     return request.app.state.dialogues.session(user,identifier,before=before,after=after,task_paging=(task_offset,task_search))
 
+@router.put('/agent-sessions/{identifier}/auto-accept')
+def set_auto_accept(identifier: str, body: SkillToggle, request: Request, user=Depends(current_user)):
+    return request.app.state.dialogues.auto_accept(user,identifier,body.enabled)
+
+
 @router.post('/agent-dialogues/{identifier}/accept')
 async def accept_agent_task(identifier:str,request:Request,body:DialogueResume|None=None,user=Depends(current_user)):
     """只由目标方接受当前任务，补充要求与附件随同意一起放行。"""

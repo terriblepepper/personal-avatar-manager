@@ -32,13 +32,15 @@ class SessionFiles:
         self.staged_digests = {}
 
     def _rows(self, db, ids, *, lock=False):
-        self.files.session(db, self.owner, self.conversation)
+        storage_owner=self.files.session(db, self.owner, self.conversation)['user_id']
         slots = ','.join('?' for _ in ids)
         rows = db.execute(f"""SELECT id,filename,sha256,size,content_type,animation_metadata,origin,'chat' AS source
             FROM chat_files WHERE id IN ({slots}) AND user_id=? AND conversation_id=?
             AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))"""
-            + (' ORDER BY id FOR SHARE' if lock else ''), (*ids, self.owner, self.conversation))
+            + (' ORDER BY id FOR SHARE' if lock else ''), (*ids, storage_owner, self.conversation))
         result = {row['id']: dict(row) for row in rows}
+        if storage_owner!=self.owner:
+            for row in result.values():row['file_owner']=storage_owner
         if self.grants is not None:
             granted = self.grants(db)
             return {key:row for key,row in result.items() if key in granted and row['sha256']==granted[key]}
@@ -59,13 +61,13 @@ class SessionFiles:
     def _available(self, row):
         if row['source']=='profile':
             return self.files.attachments.directory.available(self.owner,row['id'],row['size'])
-        return self.files.directory.available_in(self.owner,self.conversation,row['id'],row['size'])
+        return self.files.directory.available_in(row.get('file_owner',self.owner),self.conversation,row['id'],row['size'])
 
     def _original(self, row):
         identifier = row['id']
         name = identifier+'.blob'
         path = (self.files.attachments.directory.new(self.owner,name) if row['source']=='profile'
-                else self.files.directory.path(self.owner,self.conversation,name))
+                else self.files.directory.path(row.get('file_owner',self.owner),self.conversation,name))
         try:
             info = path.lstat()
             stamp = (info.st_dev, info.st_ino, info.st_size, info.st_ctime_ns)
@@ -84,10 +86,11 @@ class SessionFiles:
         return path
 
     def _referenced(self, db, identifiers):
+        storage_owner=self.files.session(db,self.owner,self.conversation)['user_id']
         slots = ','.join('?' for _ in identifiers)
         return {row['id'] for row in db.execute(f"""SELECT id FROM chat_files
             WHERE user_id=? AND conversation_id=? AND referenced=1 AND id IN ({slots})""",
-            (self.owner,self.conversation,*identifiers))}
+            (storage_owner,self.conversation,*identifiers))}
 
     def validate(self):
         if self.proofs:
