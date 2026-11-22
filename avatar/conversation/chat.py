@@ -396,7 +396,6 @@ class AvatarChat:
             if overview.get('_material_delivery') and '_material_outputs' not in overview:
                 raise HTTPException(502,'本轮缺少资料工具回执，未发送附件')
             materials=overview.get('_material_outputs',())
-            if len(outputs)+len(materials)>5:raise HTTPException(413,'每轮最多交付五份附件')
             if outputs:resources.enter_context(self.chat_files.storing_outputs(db,user['id'],overview.get('_parent_id',request.conversation_id),cursor.lastrowid,outputs))
             used=overview.get('_used_skills',[])
             db.execute('UPDATE chat_messages SET used_skills=? WHERE id=?',(dump(used),cursor.lastrowid))
@@ -546,7 +545,7 @@ class AvatarChat:
                         overview,context,session,local_reply=await self.dispatch(user,request,parent)
                         overview['_prior_tool_events']=held.get('activity', [])
                     elif (not config.get('_answer_route') and self.dialogues and overview.get('_private_context') and overview['agent'].get('identity_status')=='active'
-                            and not session.get('parent_id') and not config.get('_agent_saved_files')
+                            and not session.get('parent_id') and (not config.get('_agent_saved_files') or bool(original.message.strip()))
                             and not config.get('_agent_checkpoint',{}).get('sandbox_attempted')):
                         steps = AgentSteps(ToolActivity(route_records, route_events.append).emit)
                         with steps.step('reason', {'stage':'resume_route'}) as trace:

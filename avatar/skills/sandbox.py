@@ -132,7 +132,6 @@ class LocalPythonSandbox:
                 '        for name in names:\n'
                 '            path=os.path.join(root,name)\n'
                 '            if not os.path.isfile(path): raise ValueError("输出必须为普通文件")\n'
-                '            if len(files)>=5: raise ValueError("输出最多五份")\n'
                 '            if os.stat(path).st_size>10*1024*1024: raise ValueError("输出文件超过容量限制")\n'
                 '            body=Path(path).read_bytes(); total+=len(body)\n'
                 '            if len(body)>10*1024*1024 or total>20*1024*1024: raise ValueError("输出文件超过容量限制")\n'
@@ -203,7 +202,7 @@ class LocalPythonSandbox:
         if len(json.dumps([value.get('stdout',[]),value.get('stderr',[])],ensure_ascii=False).encode())>1024*1024:
             raise RuntimeError('沙箱文字输出超过 1 MiB，执行已中止')
         files=value.get('files',[]) if value['success'] else []
-        if not isinstance(files,list) or len(files)>5:raise RuntimeError('沙箱生成文件清单无效')
+        if not isinstance(files,list):raise RuntimeError('沙箱生成文件清单无效')
         from avatar.files.conversation.resources import validate_output
         decoded=[]
         for item in files:

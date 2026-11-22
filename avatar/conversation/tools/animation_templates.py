@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 TEMPLATES = {
     '2d': {'timeline':'时间线','flow':'流程节点','wave':'叠加波形','orbits':'轨道周期','bars':'动态柱形',
            'packet':'网络传输','tree':'树遍历','spring':'弹簧振动','pendulum':'单摆','radar':'雷达扫描'},
-    '3d': {'cube':'旋转立方体','layers':'分层爆炸图','helix':'双螺旋','surface':'波动曲面','solar':'行星系统',
+    '3d': {'process':'三维流程节点与状态转换','cube':'旋转立方体（仅明确指定）','layers':'分层爆炸图（仅明确指定）','helix':'双螺旋','surface':'波动曲面','solar':'行星系统',
            'lattice':'晶格网络','vortex':'粒子涡旋','torus':'环面网格','globe':'经纬球','arms':'机械臂关节'}
 }
 

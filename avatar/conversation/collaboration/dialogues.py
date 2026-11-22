@@ -818,8 +818,6 @@ class AgentDialogues:
                     raise HTTPException(409,'任务状态已变化，未保存本轮输出') from None
                 workspace=self.resources.workspace(db,speaker_id,job['session_id'],job['id'])
                 prior=self.saved_outputs(db,task,speaker_id,workspace)
-                if len(prior)+len(outputs)>5:
-                    raise HTTPException(413,'本任务累计生成的文件超过五份，请清理后重试') from None
                 if outputs:
                     cleanup.enter_context(self.chat.chat_files.storing_outputs(db,speaker_id,workspace,None,outputs))
                 checkpoint={**pause.checkpoint,'speaker_id':speaker_id,'file_ids':[item['id'] for item in [*prior,*outputs]],
@@ -1088,7 +1086,6 @@ class AgentDialogues:
                 except (HTTPException,ValueError) as error:
                     receipts.append({'error':str(error.detail) if isinstance(error,HTTPException) else '发送参数无效'})
             exports=list(by_source.values())
-            if len(exports)+len(context[0].get('_generated_files',[]))>5:raise HTTPException(413,'本轮附件最多五份')
             context[0].setdefault('_generated_files',[]).extend(exports)
             cfg,key,system,history=context
             cfg={**cfg,'_tools':[tool for tool in cfg.get('_tools',[]) if tool['name'] not in ('find_public_material','send_public_material')],'_optional_tools':ordinary}
@@ -1113,7 +1110,6 @@ class AgentDialogues:
                         raise HTTPException(409,'工具输入授权已改变，未交付生成文件')
                     public=[item for item in outputs if item.get('public_material_id')]
                     generated=[item for item in outputs if not item.get('public_material_id')]
-                    if len(saved)+len(outputs)>5:raise HTTPException(413,'本轮附件最多五份')
                     if generated:
                         stack.enter_context(self.chat.chat_files.storing_outputs(db,speaker_id,workspace,None,generated))
                     # Wait for the transport receipt before publishing either viewer's message grants.

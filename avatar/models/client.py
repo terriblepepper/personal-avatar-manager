@@ -26,6 +26,7 @@ class ModelResult:
     # None = ordinary reply, empty tuple = explicit clarification, otherwise verified originals.
     material_delivery: tuple | None = None
     contact_draft: dict | None = None
+    partial_tool_calls: tuple = ()
 
 
 def accumulate_usage(total, usage):
@@ -123,6 +124,18 @@ def parse_response(fmt, data, *, config=None, request_id=None, api_key=''):
     reason=((data.get('choices') or [{}])[0].get('finish_reason') if fmt=='openai' else
             data.get('stop_reason') if fmt=='anthropic' else (data.get('candidates') or [{}])[0].get('finishReason'))
     calls=()
+    if (config or {}).get('_avatar_agent') and (config or {}).get('_call_purpose') in ('goal_decision','html_generation','task_planning') and str(reason or '').lower() in ('length','max_tokens','max_output_tokens'):
+        from avatar.models.tools import raw_tool_calls
+        allowed = {tool['name'] for tool in config.get('_tools', ())}
+        try:
+            drafts = raw_tool_calls(fmt, data)
+        except (ValueError, TypeError, KeyError, IndexError, AttributeError):
+            drafts = []
+        fragments = tuple({'name': call['name'], 'arguments': call['arguments']} for call in drafts
+                          if isinstance(call, dict) and isinstance(call.get('name'), str) and call['name'] in allowed
+                          and isinstance(call.get('arguments'), (str, dict)))
+        if fragments or text:
+            return ModelResult(text or '', model_usage, finish_reason=reason, partial_tool_calls=fragments)
     # Distinguish a missing action after private reasoning from a malformed proposed action.
     if config and config.get('_tools'):
         from avatar.models.tools import parse_tools

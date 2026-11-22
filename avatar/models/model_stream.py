@@ -325,7 +325,8 @@ async def _stream_once(model, config, api_key, system, history, message, collect
                         else: yield {'type': 'delta', 'text': text}
                 if refusal and not finished:
                     raise empty_response(fmt,reason=reason,refusal=True,usage=usage,request_id=request_id(response.headers),config=config)
-                if not finished or fragments.open_blocks:
+                has_final_limit = collect and config.get('_avatar_agent') and config.get('_call_purpose') in ('goal_decision','html_generation','task_planning') and str(reason or '').lower() in ('length','max_tokens','max_output_tokens')
+                if not finished or (fragments.open_blocks and not has_final_limit):
                     raise interrupted()
                 if collect:
                     data = fragments.response(fmt,chunks.getvalue(),usage,reason,thinking,refusal)

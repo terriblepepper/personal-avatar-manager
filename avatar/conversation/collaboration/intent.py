@@ -44,7 +44,7 @@ class MaterialArguments(BaseModel):
 class AnswerArguments(BaseModel):
     model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
     mode: Literal['agent','answer','search','read','html'] = 'answer'
-    html_mode: Literal['2d','3d','html',''] = Field('',description='创建作品时按本轮要求选维度，通用网页用 html。')
+    html_mode: Literal['2d','3d','both','html',''] = Field('',description='创建作品时按本轮要求选维度。明确要求同时交付二维和三维时填 both，通用网页用 html。')
     needs_python: StrictBool = Field(False,description='必须实际运行代码才能得到数值、转换文件或生成数据图时为 true。解释、资料问答、写代码示例或制作 HTML 动画通常为 false。')
     query: str = Field(default='',max_length=2000)
     folder: str = Field(default='', max_length=512, description='仅按用户明确要求选择已知逻辑目录。')
@@ -110,7 +110,7 @@ TOOLS=[
 
 ANSWER_TOOL = declaration('continue_answer',
                '优先用当前信息直接完成。仅缺已授权资料时搜一次，够用即停止。问候、闲聊、已有知识能回答的问题选 answer。只有本轮确实依赖代码执行或技能脚本才填 needs_python=true；开关、已加载技能和历史任务均不构成调用理由。需要计算时用 agent 并填 needs_python=true。answer 直接回答；search 按 query 和可选 folder 混合检索后回答；'
-               'read 先选择并读原文；html 独立生成网页或动画，同时填写 html_mode：普通网页选 html，动画选 2d 或 3d，不需资料检索或 Python；agent 用于真实计算或组合多项操作。'
+               'read 先选择并读原文；html 独立生成网页或动画，同时填写 html_mode：普通网页选 html，动画选 2d、3d 或 both，不需资料检索或 Python；多个不同主题的动画或组合操作可用 agent 并逐项规划。'
                '交付本人资料库原件用 deliver_material；查找本会话原件用 find_conversation_files；发给他人用 contact_avatar。', AnswerArguments.model_json_schema())
 
 

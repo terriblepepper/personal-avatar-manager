@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import re
 import uuid
 import time
 from contextlib import aclosing
@@ -12,7 +13,7 @@ from itertools import count
 from fastapi import HTTPException
 from avatar.core.tokens import estimate
 
-from avatar.conversation.working_context import fit_turn, fit_working_set, retained_budget
+from avatar.conversation.working_context import excerpt, fit_turn, fit_working_set, retained_budget
 from avatar.conversation.tools.activity import AgentSteps, without_false_tool_footer
 from avatar.conversation.tools.html import (ARTIFACT_TOOLS, CREATE_HTML, animation_tool, create_animation,
                                            create_html, html_repair_prompt, repaired_html_arguments)
@@ -71,7 +72,7 @@ async def _plan_checks(model, settings, key, system, history, question, choices,
         'parameters': {'type': 'object', 'properties': {'steps': {'type': 'array', 'maxItems': 8, 'items': {
             'type': 'object', 'properties': {'goal': {'type': 'string', 'minLength': 1, 'maxLength': 160},
                                              'tool': {'type': 'string', 'enum': sorted(choices)},
-                                             'lookup': FindMaterial.model_json_schema()},
+                                             'lookup': FindMaterial.model_json_schema(), 'html_mode': {'type':'string','enum':['2d','3d']}},
             'required': ['goal', 'tool'], 'additionalProperties': False}}},
             'required': ['steps'], 'additionalProperties': False},
     }
@@ -83,14 +84,15 @@ async def _plan_checks(model, settings, key, system, history, question, choices,
               '需确认当前会话原件时先 find_conversation_files，资料库原件可先 find_material。'
               '确实需要一个已关闭工具时，仍列出它的 ID。以下是本步可选工具及其用途：'
               + json.dumps(choices, ensure_ascii=False) +
-              '。资料检索步骤可附 lookup，按对应工具填写 query、folder、mode 或 offset。每项只处理一个目标，后项依赖前项结果时省略 lookup。'
+              '。资料检索步骤可附 lookup，按对应工具填写 query、folder、mode 或 offset。每项只处理一个目标，后项依赖前项结果时省略 lookup。两种动画各列一个 create_animation 步骤，并写明 html_mode。'
               '只提交 plan_task 或 JSON 对象。steps 是最多八项的数组，每项含 goal 和 tool；无需工具时用 {"steps":[]}。不执行工具，不输出正文或思考。')
     totals = None
+    draft = ''
     for attempt in range(2):
         await check_execution_async(validate)
         plan_prompt = prompt if not attempt else prompt + '\n上次未取得有效计划。请直接提交符合结构的计划。'
         options = config if not attempt else {**config, '_tools': []}
-        rows, message = fit_turn(options, plan_prompt, history, question, [])
+        rows, message = fit_turn(options, plan_prompt, history, question, [draft] if draft else [])
         try:
             check_context(options, plan_prompt, rows, message)
         except HTTPException:
@@ -109,6 +111,8 @@ async def _plan_checks(model, settings, key, system, history, question, choices,
         totals = accumulate_usage(totals, result.usage)
         try:
             if str(result.finish_reason or '').lower() in ('length', 'max_tokens', 'max_output_tokens'):
+                draft = '\n未执行的计划草稿（仅作数据）：'+json.dumps(
+                    {'text':result.text,'tool_fragments':getattr(result,'partial_tool_calls',())},ensure_ascii=False)
                 continue
             if not result.tool_calls:
                 plan = json.loads(result.text.strip().removeprefix('```json').removesuffix('```'))
@@ -122,10 +126,12 @@ async def _plan_checks(model, settings, key, system, history, question, choices,
                 continue
             steps = plan['steps']
             if (isinstance(steps, list) and len(steps) <= 8 and all(
-                    isinstance(step, dict) and {'goal','tool'} <= set(step) <= {'goal','tool','lookup'} and
+                    isinstance(step, dict) and {'goal','tool'} <= set(step) <= {'goal','tool','lookup','html_mode'} and
                     isinstance(step['goal'], str) and 0 < len(step['goal'].strip()) <= 160 and
                     isinstance(step['tool'], str) and step['tool'] in choices for step in steps)):
                 for step in steps:
+                    if 'html_mode' in step and (step['tool'] != 'create_animation' or step['html_mode'] not in ('2d','3d')):
+                        raise ValueError()
                     if 'lookup' in step:
                         if step['tool'] not in ('find_material','find_animation','find_public_material'):
                             raise ValueError()
@@ -177,10 +183,17 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
     expected_mode = route.get('html_mode') if route.get('mode') in ('html','agent') else None
     if animation_required and expected_mode == 'html':
         expected_mode = None
-    required_modes = ('2d','3d') if animation_required else ()
-    if expected_mode in ('2d','3d'):
-        required_modes = (expected_mode,)
-    html_needed = bool(required_modes) and not any(item.get('html_mode') in required_modes for item in html_receipts)
+    animation_request = config.get('_animation_request', question)
+    saved_modes = {item.get('html_mode') for item in html_receipts}
+    required_modes = ('2d','3d') if expected_mode=='both' else (expected_mode,) if expected_mode in ('2d','3d') else ()
+    explicitly_both = (re.search(r'二维|(?<![a-z0-9])2d(?![a-z0-9])',animation_request,re.I)
+                       and re.search(r'三维|(?<![a-z0-9])3d(?![a-z0-9])',animation_request,re.I)
+                       and not re.search(r'不要|不用|不做|不需要|无需|只要|只做|仅需|改成',animation_request))
+    if explicitly_both and (animation_required or required_modes or saved_modes.intersection(('2d','3d'))
+                            or (config.get('_html_enabled') and '动画' in animation_request and re.search(r'制作|生成|做成|绘制',animation_request))):
+        required_modes = ('2d','3d')
+    missing_modes = [mode for mode in required_modes if mode not in saved_modes]
+    html_needed = bool(missing_modes or not required_modes and animation_required and not saved_modes.intersection(('2d','3d')))
     if config.get('_html_enabled'):
         allowed['create_html'] = CREATE_HTML
         allowed['create_animation'] = animation_tool(expected_mode)
@@ -230,7 +243,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                    '使用 require_conversation_tool，停止本轮。不要猜测结果、换一种方式计算或绘图、'
                    '交付替代产物，或用 continue_answer 绕过提示。仅转达对方请求时无需本方工具。')
     settings = {**config, '_tools': list(allowed.values()), '_optional_tools': not required}
-    route_mode = route.get('mode')
+    route_mode = 'html' if required_modes and route.get('mode') in ('answer',None) and config.get('_html_enabled') else route.get('mode')
     ready_to_answer = route_mode=='answer' or (route_mode in ('search','read') and
                       (config.get('_material_sources') or not personal_conversation))
     if ready_to_answer and not domain and not html_needed and (route_mode=='answer' or not config.get('_used_skills')):
@@ -260,7 +273,9 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
         usage = accumulate_usage(usage,value)
 
     def pause(reason):
-        return AgentNeedsInput.from_context(reason + '。可以补充目标、范围或所需资料后继续。', config, usage)
+        paused = AgentNeedsInput.from_context(reason + '。可以补充目标、范围或所需资料后继续。', config, usage)
+        paused.answer_route = route
+        return paused
 
     def validate():
         rag.validate(context)
@@ -293,16 +308,16 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
     pending = []
     plan = []
     saved_html = [item for item in config.get('_agent_saved_files',()) if item.get('html_mode') in ('2d','3d','html')]
-    if route_mode=='html' and not domain and not html_needed and any(not expected_mode or item['html_mode']==expected_mode for item in saved_html):
+    if route_mode=='html' and not domain and not html_needed and (required_modes or any(not expected_mode or item['html_mode']==expected_mode for item in saved_html)):
         settings = {**settings,'_tools':[]}
         prompt += '已有本任务的 HTML 原件，直接交付，勿重复制作。'
     elif route_mode=='html' and not domain and 'create_html' in allowed:
-        selected = 'create_animation' if html_needed or expected_mode in ('2d','3d') else 'create_html' if expected_mode=='html' else None
-        if selected:
-            goal = '制作 HTML 动画' if selected=='create_animation' else '制作普通网页'
-            plan = [{'tool':selected,'goal':goal}]
-            pending = [dict(plan[0],goal_no=1)]
-        # Older intent records can lack a dimension. Let the model choose between the two contracts.
+        selected = 'create_animation' if html_needed or required_modes else 'create_html' if expected_mode=='html' else None
+        if missing_modes:
+            plan = [{'tool':'create_animation','goal':'制作 '+mode.upper()+' 动画','html_mode':mode} for mode in missing_modes]
+        elif selected:
+            plan = [{'tool':selected,'goal':'制作 HTML 动画' if selected=='create_animation' else '制作普通网页'}]
+        pending = [dict(step, goal_no=index) for index,step in enumerate(plan,1)]
         settings = {**settings,'_tools':[allowed[name] for name in ((selected,) if selected else ARTIFACT_TOOLS)],'_optional_tools':False}
     elif settings['_tools']:
         checked = {'ask_user', 'deliver_material', 'find_material', 'find_animation', 'send_material', 'send_animation',
@@ -328,24 +343,31 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                 await check_execution_async(validate)
                 trace.point('check', step, {'decision': '需要开启工具'})
                 return tool_required(step['tool'])
-        pending = [dict(step, goal_no=index) for index,step in enumerate(plan or [],1)]
-        if html_needed and not any(step['tool'] == 'create_animation' for step in pending):
-            pending.append({'tool': 'create_animation', 'goal': '制作 HTML 动画，默认 2D，根据用户意图选择维度'})
+        planned = list(plan or ())
+        if missing_modes:
+            planned = [step for step in planned
+                       if step['tool']!='create_animation' or step.get('html_mode') in missing_modes]
+            requested = {step.get('html_mode') for step in planned if step['tool']=='create_animation'}
+            planned.extend({'tool':'create_animation','goal':'制作 '+mode.upper()+' 动画','html_mode':mode}
+                           for mode in missing_modes if mode not in requested)
+        elif html_needed and not any(step['tool'] == 'create_animation' for step in planned):
+            planned.append({'tool': 'create_animation', 'goal': '制作 HTML 动画，默认 2D，根据用户意图选择维度'})
+        pending = [dict(step, goal_no=index) for index,step in enumerate(planned,1)]
         if html_needed and all(step['tool'] == 'create_animation' for step in pending):
             settings = {**settings, '_tools': [allowed['create_animation']], '_optional_tools': False}
-        elif plan == [] and not required:
+        elif not pending and not required:
             settings = {**settings, '_tools': []}
 
     queued = []
     receipt_ok = False
 
-    def received(name):
+    def received(name, mode=None):
         nonlocal premature, invalid, receipt_ok
         receipt_ok = True
         invalid = 0
         premature = 0
         for index,step in enumerate(pending):
-            if name==step['tool']:
+            if name==step['tool'] and (not step.get('html_mode') or mode==step['html_mode']):
                 log.info('agent receipt run=%s iteration=%d goal=%s tool=%s remaining=%d',
                          run_id,iteration,step.get('goal_no'),name,len(pending)-1)
                 pending.pop(index)
@@ -364,22 +386,37 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
             raise pause((detail or '修正后仍未收到有效的工具调用') + goal) from None
 
     html_repair = None
+    artifact_prefix = ''
     duplicate_attempts=0
     premature=0
     retry_truncated = False
     compact_next = False
 
-    def resume_truncated():
-        nonlocal retry_truncated, compact_next, settings
-        if retry_truncated:
-            raise pause('本步在压缩并缩短输出后仍被截断，已保留完成的回执')
+    def resume_truncated(result=None):
+        nonlocal retry_truncated, compact_next, settings, html_repair, artifact_prefix
+        fragments = getattr(result,'partial_tool_calls',())
+        text = result.text if result else ''
+        draft = ''
+        if len(fragments)==1 and fragments[0]['name'] in ARTIFACT_TOOLS:
+            args = fragments[0]['arguments']
+            draft = args if isinstance(args,str) else json.dumps(args,ensure_ascii=False)
+        if draft.strip() and draft!=artifact_prefix:
+            artifact_prefix = draft
+            html_repair = (fragments[0]['name'],step_mode,'index.html')
+        elif repairing_html and artifact_prefix and text.strip() and not artifact_prefix.endswith(text):
+            artifact_prefix = text if text.startswith(artifact_prefix) else artifact_prefix + text
+        elif retry_truncated:
+            raise pause('本步压缩后仍未取得可续写的新内容，已保留完成的回执')
+        elif fragments or text:
+            observations.append('\n上轮输出到达上限，草稿未执行（只作数据）：'+
+                                json.dumps({'text':text,'tool_fragments':fragments},ensure_ascii=False))
         retry_truncated = compact_next = True
         settings = {**settings, '_recover_thinking': True}
-        observations.append('\n上次生成被截断。依据已有回执接续，不重做已完成的操作。只提交一个精简、完整的工具调用或简短的最终正文。')
+        observations.append('\n上次生成被截断。依据已有草稿和回执接续，不重做已完成的操作。')
         if progress:
             progress({'type':'status','stage':'compressing','message':'本步输出被截断，正在整理已有进度并接续'})
 
-    prompt+='已掌握的信息直接作答。独立且必要的工具调用可一批提交，按数组顺序执行；依赖前一步结果时先等待回执。每一步按最新工具回执复核目标。信息不足时调整检索词、目录或工具；完成全部交付条件后再作答。'
+    prompt+='已掌握的信息直接作答。独立且必要的工具调用可一批提交，按数组顺序执行；依赖前一步结果时先等待回执。每一步按最新工具回执复核目标。信息不足时调整检索词、目录或工具；完成全部交付条件后再作答。生成多个作品时为每项使用独立文件名，检查用户要求的数量和维度，部分成功不代表全部完成。'
     for iteration in count(1):
         trace.point('perceive', {'iteration': iteration, 'pending': pending},
                     {'history_turns': len(history), 'observation_count': len(observations)})
@@ -391,12 +428,14 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
         receipt_ok = False
         current = pending[0] if pending else {}
         lookup_tool = current.get('tool')
+        step_mode = current.get('html_mode') or (expected_mode if expected_mode in ('2d','3d') else None)
         planned_lookup = current.pop('lookup',None) if not queued_call and lookup_tool in {t['name'] for t in settings['_tools']} else None
         structured = (planned_lookup is None and invalid == 1 and lookup_tool in ('find_material','find_animation','find_public_material')
                       and any(t['name']==lookup_tool for t in settings['_tools']))
         step_settings = {**settings,'_call_purpose':'goal_decision','_batch_tools':True} if settings['_tools'] else settings
         if lookup_tool in ARTIFACT_TOOLS and lookup_tool in {t['name'] for t in settings['_tools']} and not queued_call:
-            step_settings = {**step_settings,'_tools':[allowed[lookup_tool]],'_optional_tools':False}
+            definition = animation_tool(step_mode) if lookup_tool=='create_animation' else allowed[lookup_tool]
+            step_settings = {**step_settings,'_tools':[definition],'_optional_tools':False}
         if step_settings['_tools'] and all(t['name'] in ARTIFACT_TOOLS for t in step_settings['_tools']):
             step_settings = {**step_settings,'_call_purpose':'html_generation'}
         step_prompt = prompt
@@ -404,14 +443,19 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
         if repairing_html:
             step_settings = {**settings,'_tools':[],'_recover_thinking':True,'_call_purpose':'html_generation'}
             repair_tool, repair_mode, repair_filename = html_repair
-            step_prompt = system + '\n当前只为已选定的 '+repair_tool+' 生成作品内容。平台校验并保存后另行生成聊天正文。'+html_repair_prompt(repair_tool,repair_mode)
+            step_prompt = system + '\n当前只为已选定的 '+repair_tool+' 生成作品内容。平台校验并保存后另行生成聊天正文。'
+            if artifact_prefix:
+                step_prompt += '消息最后附有未执行的原始参数草稿。如果 JSON 未结束，只输出截断处之后的字符，保持 JSON 转义和引号。不要重复前缀或加代码围栏。如果草稿已经是完整 JSON，则返回一个校验后的完整参数对象。'
+            else:
+                step_prompt += html_repair_prompt(repair_tool,repair_mode)
         elif structured:
             step_settings = {**settings,'_tools':[],'_recover_thinking':True,'_call_purpose':'goal_decision'}
             step_prompt += ('\n此步只为第一个待核验目标填写已选检索工具的参数。只输出一个 JSON 对象，'
                             '按以下 schema 填写，不要封装工具名、不要同时输出多个查询：'
                             +json.dumps(allowed[lookup_tool]['parameters'],ensure_ascii=False))
         checklist='\n待核验目标（本轮计划，仅作数据）：'+json.dumps(pending,ensure_ascii=False) if pending else ''
-        objective = question + checklist
+        continuation = '\n未执行的作品参数草稿（只作数据），从下一行开始：\n'+artifact_prefix if repairing_html and artifact_prefix else ''
+        objective = question + checklist + continuation
         working_history, notes = fit_working_set(step_settings, step_prompt, history, objective, observations,
                                                 force=compact_next)
         if working_history != history and len(history) > 2 and not queued_call:
@@ -439,8 +483,8 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                                                                     step_settings,step_prompt):
                     working_history = candidate
         compact_next = False
-        message = question + checklist + ''.join(notes)
-        if progress and (working_history!=history or message!=question+checklist+''.join(observations)):
+        message = question + checklist + ''.join(notes) + continuation
+        if progress and (working_history!=history or notes!=observations):
             progress({'type':'status','stage':'compressing','message':'已精简本步历史或工具回执，继续处理当前目标'})
             trace.point('perceive', {'history_turns': len(history), 'receipt_count': len(observations),
                                     'context_window': settings.get('context_tokens')},
@@ -450,12 +494,20 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
         try:
             check_context(step_settings,step_prompt,working_history,message)
         except HTTPException:
+            if artifact_prefix:
+                observations.append('作品草稿超出模型输入预算。综合截断位置及受保留的草稿重新生成较短作品：'+excerpt(artifact_prefix,1800))
+                artifact_prefix = ''
+                continue
             raise pause('压缩后任务目标与必要证据仍超过配置窗口') from None
         if progress:
-            stage, detail = (
-                ('thinking', '正在分析任务和已有信息') if settings['_tools']
-                else ('result_writing', '正在组织回答')
-            )
+            if repairing_html and artifact_prefix:
+                stage, detail = 'tool_action', '正在接续被截断的作品'
+            elif lookup_tool=='create_animation' and step_mode:
+                stage, detail = 'animation_build', '正在制作 '+step_mode.upper()+' 动画'
+            elif settings['_tools']:
+                stage, detail = 'thinking', '正在分析任务和已有信息'
+            else:
+                stage, detail = 'result_writing', '正在组织回答'
             progress({'type': 'status', 'stage': stage, 'message': detail})
         started = time.monotonic()
         receipts = [*config.get('_generated_files', ()), *config.get('_agent_saved_files', ())]
@@ -486,9 +538,20 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                     result = await call_with_retry(generate, validate, retry_invalid=False)
                     if repairing_html and str(result.finish_reason or '').lower() not in ('length','max_tokens','max_output_tokens'):
                         try:
-                            args = repaired_html_arguments(result.text,repair_tool,repair_filename)
+                            source = artifact_prefix + result.text if artifact_prefix and not result.text.startswith(artifact_prefix) else result.text
+                            try:
+                                args = repaired_html_arguments(source,repair_tool,repair_filename)
+                            except ValueError:
+                                if not artifact_prefix:
+                                    raise
+                                args = repaired_html_arguments(result.text,repair_tool,repair_filename)
                         except ValueError:
-                            raise pause('网页修复未返回完整 HTML 文档或有效参数，作品尚未生成' if repair_tool=='create_html' else 'HTML 参数修复仍未返回有效 JSON 对象，作品尚未生成') from None
+                            if artifact_prefix:
+                                artifact_prefix = ''
+                                observations.append('草稿续写未闭合成有效 JSON。请生成较短的完整作品参数，适合模板的主题优先使用模板。')
+                                continue
+                            raise pause('作品参数仍未形成有效 JSON 或完整网页') from None
+                        artifact_prefix = ''
                         result = replace(result,text='',tool_calls=({'name':repair_tool,'arguments':args},))
                     if structured and str(result.finish_reason or '').lower() not in ('length','max_tokens','max_output_tokens'):
                         try:
@@ -547,8 +610,8 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
         calls = getattr(result, 'tool_calls', ())
         reason = str(getattr(result, 'finish_reason', '') or '').lower()
         if reason in ('length', 'max_tokens', 'max_output_tokens'):
-            if pending or required or calls or not result.text.strip():
-                resume_truncated()
+            if repairing_html or pending or required or calls or getattr(result,'partial_tool_calls',()) or not result.text.strip():
+                resume_truncated(result)
                 continue
             if result.text in partial:
                 raise pause('模型续写重复了上一段，已停止重复生成')
@@ -687,16 +750,15 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                 return ModelResult(CONTACT_REPLY,usage,contact_draft=document)
             if name in ARTIFACT_TOOLS:
                 outputs = config.setdefault('_generated_files', [])
-                capacity = 5 - len(config.get('_agent_saved_files', ())) - (len(delivery.prepared) if delivery else 0)
                 await check_execution_async(validate)
                 with trace.step('act', {'tool': name, 'filename': args.get('filename'), 'html_mode':args.get('mode'),
                                         'source_chars':len(args['html']) if isinstance(args.get('html'),str) else 0,
                                         'has_template':bool(args.get('template')), 'has_scenes':bool(args.get('scenes'))}) as output:
                     try:
                         if name == 'create_html':
-                            item = create_html(args,outputs,capacity)
+                            item = create_html(args,outputs)
                         else:
-                            item = create_animation(args,outputs,capacity,expected_mode=expected_mode)
+                            item = create_animation(args,outputs,expected_mode=step_mode,objective=animation_request)
                     except (ValueError, HTTPException) as error:
                         detail = str(error.detail) if isinstance(error, HTTPException) else str(error)
                         output.update(error=detail, retry_required=True)
@@ -709,17 +771,17 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                         pending.append({'tool':name,'goal':'生成选定的作品','goal_no':1})
                     repair_call(detail)
                     observations.append(detail)
-                    html_repair = (name,expected_mode or args.get('mode'),args.get('filename') or 'index.html')
+                    html_repair = (name,step_mode or args.get('mode'),args.get('filename') or 'index.html')
                     continue
                 html_repair = None
                 if name == 'create_animation':
                     expected_mode = None
-                    html_needed = False
+                    if item['html_mode'] in missing_modes:
+                        missing_modes.remove(item['html_mode'])
+                    html_needed = bool(missing_modes)
                     allowed[name] = animation_tool()
-                received(name)
+                received(name,item.get('html_mode'))
                 settings = {**config, '_tools': list(allowed.values()), '_optional_tools': not required}
-                if plan is not None and not pending and not required and not queued:
-                    settings.update(_tools=[], _recover_thinking=True)
                 observations.append('HTML 已创建并随最终回复附上：'+json.dumps({'id':item['id'],'filename':item['filename']},ensure_ascii=False)+'。系统将自动预览。继续本轮剩余任务，不输出源码或生成脚本。')
                 trace.point('observe', {'tool': name}, {'filename': item['filename']})
                 if progress:
