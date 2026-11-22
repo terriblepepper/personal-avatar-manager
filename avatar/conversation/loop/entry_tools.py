@@ -50,12 +50,6 @@ async def bind_entry_tools(chat, context, owner, aic, session, files, *, include
     if revisions:
         config.update(_rag_access={'originals':True,'scope':scope,'revisions':list(revisions.items())}, _material_sources=sources)
         await run_blocking(chat.rag.validate, context)
-    def remaining_output_bytes():
-        from avatar.files.conversation.resources import remaining_chat_bytes
-        with chat.chat_files.database.connect() as db:
-            return remaining_chat_bytes(db,owner)
-
-    config['_remaining_output_bytes'] = remaining_output_bytes
     outputs = config.setdefault('_generated_files', [])
     tools = []
     lookup_types = {}

@@ -10,7 +10,6 @@ from avatar.core.text_budget import TEXT_BYTES
 from avatar.core.config import ROOT, Settings, application_version, require_database_url
 from avatar.runtime.wit_runtime import AvatarRuntime
 from avatar.files.library.attachments import MAX_STORED_SIZE
-from avatar.files.conversation.resources import CHAT_ACCOUNT_BYTES
 from avatar.files.parsing.animation import MAX_ENVELOPE_BYTES
 from avatar.knowledge.media import MAX_ASSET
 from avatar.api.routes import router
@@ -245,20 +244,11 @@ def create_app(settings=None, provider=None, run_worker=True, model_client=None)
             limit = (
                 MAX_UPLOAD + 65536
                 if request.url.path == "/api/me/skills"
-                else (
-                    CHAT_ACCOUNT_BYTES + 65536
-                    if request.url.path.startswith("/api/conversations/")
-                    and request.url.path.endswith("/files")
-                    else (
-                        MAX_STORED_SIZE
-                        if request.url.path == "/api/me/attachments"
-                        else (
-                            256 * 1024
-                            if request.url.path == "/api/me/profile"
-                            else 65536
-                        )
-                    )
-                )
+                else MAX_STORED_SIZE
+                if request.url.path == "/api/me/attachments"
+                else 256 * 1024
+                if request.url.path == "/api/me/profile"
+                else 65536
             )
             if request.url.path.startswith(
                 "/api/me/knowledge/builds/"
@@ -292,7 +282,10 @@ def create_app(settings=None, provider=None, run_worker=True, model_client=None)
                 limit = 7 * TEXT_BYTES
                 if request.url.path.startswith("/api/agent-intents/"):
                     limit += 12 * 60000  # Optional legacy shared_content, up to 60k Unicode characters.
-            if size > limit:
+            if request.method == "POST" and re.fullmatch(r"/api/conversations/[^/]+/files", request.url.path):
+                # The multipart endpoint spools originals and validates each file type.
+                limit = None
+            if limit is not None and size > limit:
                 return JSONResponse({"detail": "请求内容过大"}, status_code=413)
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"

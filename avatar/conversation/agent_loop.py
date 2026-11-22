@@ -1000,11 +1000,6 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                                                        expected_mode=state['draft'].get('mode'))
                     else:
                         item = await asyncio.to_thread(create_html,creation,candidates)
-                    if 'revision' in args and config.get('_remaining_output_bytes'):
-                        available = await asyncio.to_thread(config['_remaining_output_bytes'])
-                        needed = sum(len(file.get('data',b'')) for file in candidates if not file.get('public_material_id'))
-                        if needed > available:
-                            raise HTTPException(413,f'修订版与本轮文件需 {needed:,} 字节，账户会话空间剩余 {available:,} 字节。')
                     if saved:
                         from avatar.files.parsing.animation import MAX_SOURCE_BYTES
                         sizes = {old['id']: old.get('size', 0) for old in saved}

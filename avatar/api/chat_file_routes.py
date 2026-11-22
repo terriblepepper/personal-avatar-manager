@@ -10,7 +10,6 @@ from avatar.files.uploads.buffer import upload_buffer
 from avatar.models.effort import Effort
 from avatar.accounts.auth import current_user
 from avatar.files.parsing.animation import ANIMATION_MIME
-from avatar.files.conversation.resources import remaining_chat_bytes
 
 router=APIRouter(prefix='/api/conversations',tags=['会话附件'])
 
@@ -99,7 +98,7 @@ def files(conversation_id: str, request: Request, user=Depends(current_user)):
     return request.app.state.chat.chat_files.list(user['id'],conversation_id)
 
 
-# 职责：上传受限大小的会话文件并等待解析结果。
+# 职责：上传会话文件并等待解析结果。
 # 输入：file 为单份 Multipart，conversation_id 必须属于当前用户。
 # 结果与约束：解析前后均检查会话归属，始终关闭上传句柄，不放入个人资料清单。
 @router.post('/{conversation_id}/files',status_code=201,openapi_extra={
@@ -108,24 +107,15 @@ def files(conversation_id: str, request: Request, user=Depends(current_user)):
         'temporary':{'type':'boolean','default':False}}}}}}})
 async def upload(conversation_id: str, request: Request, user=Depends(current_user)):
     files = request.app.state.chat.chat_files
-    def remaining():
+    def require_editable():
         with files.database.connect() as db:
             files.session(db,user['id'],conversation_id,editable=True)
-            return remaining_chat_bytes(db,user['id'])
 
-    available = await asyncio.to_thread(remaining)
-
-    async def limited_stream():
-        total = 0
-        async for chunk in request.stream():
-            total += len(chunk)
-            if total > available + 65536:
-                raise MultiPartException('会话上传超过大小限制')
-            yield chunk
+    await asyncio.to_thread(require_editable)
     try:
-        form = await MultiPartParser(request.headers,limited_stream(),max_files=1,max_fields=1,max_part_size=65536).parse()
+        form = await MultiPartParser(request.headers,request.stream(),max_files=1,max_fields=1,max_part_size=65536).parse()
     except MultiPartException:
-        raise HTTPException(413,'上传超过大小、字段或文件数量限制') from None
+        raise HTTPException(413,'上传超过字段或文件数量限制') from None
     try:
         file = form.get('file')
         if not hasattr(file,'file') or not file.filename:
