@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, inject } from 'vue'
+import { computed, inject, ref } from 'vue'
+import ModelCallDetails from './ModelCallDetails.vue'
 import AppIcon from '../AppIcon.vue'
 import type { ToolEvent } from '../../types'
 import { date } from '../../utils/format'
@@ -37,21 +38,49 @@ const actions: Record<string, string> = {
   end_task: '提交任务结果',
   send_message: '提交本轮任务发言',
 }
-function meaningful(event: ToolEvent) {
-  if (event.group !== 'agent_trace') return ['sandbox', 'memory', 'animation'].includes(event.group || '')
-  const input = record(event.input)
-  return phase(event) === 'final'
-    || (phase(event) === 'act' && event.status !== 'skipped' && !!input.tool && input.tool !== 'deliver_material')
+function meaningfulLegacy(event: ToolEvent) {
+  if (event.group !== 'agent_trace') return ['sandbox', 'memory', 'animation', 'files', 'reading'].includes(event.group || '')
+  const input = record(event.input), output = record(event.output)
+  return event.status === 'error' || phase(event) === 'final'
+    || (phase(event) === 'act' && !!input.tool)
     || (phase(event) === 'reason' && (!!input.stage || !!input.operation || !!input.tools || input.tool === 'python'))
+    || (phase(event) === 'check' && !!output.decision && output.decision !== '完成')
+}
+function modelName(event: ToolEvent) {
+  const output = record(event.output)
+  if (typeof output.reason === 'string' && output.reason) return event.name + ' · ' + output.reason
+  const calls = Array.isArray(output.tool_calls) ? output.tool_calls : []
+  const names = calls.map(call => record(call).name).filter(name => typeof name === 'string')
+  const parts = [event.name]
+  if (names.length) parts.push(names.join('、'))
+  if (!names.length && output.kind === 'text' && typeof output.text === 'string') {
+    const line = output.text.trim().split('\n', 1)[0]
+    if (line && !/[<>{}`]/.test(line) && !line.startsWith('[')) parts.push(line.slice(0, 120))
+  }
+  if (event.status === 'running') {
+    if (typeof output.received_bytes === 'number' && output.received_bytes > 0)
+      parts.push('已接收 ' + output.received_bytes.toLocaleString() + ' 字节参数')
+    else if (parts.length === 1 && typeof output.text_chars === 'number' && output.text_chars > 0)
+      parts.push('已接收 ' + output.text_chars.toLocaleString() + ' 字')
+  }
+  return parts.join(' · ')
 }
 function activityName(event: ToolEvent) {
+  if (event.group === 'model_io') return modelName(event)
+  if (event.group === 'tool_io') {
+    const result = record(record(event.output).result)
+    const label = actions[event.name] || event.name
+    return typeof result.filename === 'string' ? label + ' · ' + result.filename : label
+  }
   if (event.group !== 'agent_trace') return event.steps?.at(-1)?.message || event.name
   const input = record(event.input), output = record(event.output)
   if (phase(event) === 'final') return '整理回答与附件'
   if (phase(event) === 'act') {
     if (input.tool === 'find_material' && Array.isArray(input.queries)) return `检索 ${input.queries.length} 个资料目标`
     if (input.tool === 'select_materials' && Array.isArray(output.files)) return `核验 ${output.files.length} 份原件`
-    const name = actions[String(input.tool)] || '执行已选工具'
+    const name = actions[String(input.tool)] || String(input.tool || event.name)
+    const detail = output.reason || output.issue || output.filename
+    if (typeof detail === 'string') return name + ' · ' + detail
     return typeof input.query === 'string' && input.query ? `${name}「${input.query}」` : name
   }
   if (input.operation === 'check_file_receipt') {
@@ -88,24 +117,53 @@ function activityName(event: ToolEvent) {
   if (tools.length) return actions[String(tools[0])] || '选择本轮工具'
   if (output.finish_reason) return '组织已有信息并生成答复'
   if (Array.isArray(input.tools) && input.tools.includes('read_material')) return '确定需要读取的文件与范围'
-  return phase(event) === 'reason' ? '核对目标和回执后决定下一步' : event.name
+  if (typeof output.planned_steps === 'number') return '已规划工具步骤 · ' + output.planned_steps + ' 项'
+  const detail = output.issue || output.reason || output.decision || input.operation || input.mode
+  return typeof detail === 'string' ? detail : event.name
 }
-const diagnostics = computed(() => debug?.value ? props.items.filter(item => item.group === 'agent_trace' && !meaningful(item)) : [])
+const hasModel = computed(() => props.items.some(item => item.group === 'model_io'))
 const activities = computed(() => {
-  const hasTrace = debug?.value && props.items.some(row => row.group === 'agent_trace')
-  const items = props.items.filter(item => hasTrace ? meaningful(item) : item.group !== 'notice' && item.group !== 'agent_trace')
+  const hasLegacyTrace = !hasModel.value && debug?.value && props.items.some(row => row.group === 'agent_trace')
+  const latest = new Map<string, ToolEvent>()
+  for (const item of props.items) {
+    if (item.group === 'notice' || item.group === 'agent_receipt') continue
+    if (item.group === 'tool_io') {
+      latest.set(item.id, item)
+      continue
+    }
+    if (hasModel.value) {
+      if (item.group === 'agent_trace') {
+        if (phase(item) !== 'act' || !record(item.input).tool) continue
+      } else if (!['model_io', 'sandbox', 'memory', 'files', 'reading'].includes(item.group || '')) continue
+    } else if (hasLegacyTrace ? !meaningfulLegacy(item) : item.group === 'agent_trace') continue
+    latest.set(item.id, item)
+  }
+  const items: ToolEvent[] = []
+  for (const item of latest.values()) {
+    const last = items.at(-1)
+    // New receipts supersede the adjacent legacy acknowledgement of the same tool.
+    if (item.group === 'tool_io' && last?.group === 'agent_trace' && phase(last) === 'act' &&
+        last.status === 'completed' && record(last.input).tool === item.name) items.pop()
+    items.push(item)
+  }
   const last = items.at(-1)
   // Older waiting snapshots marked their active step interrupted or still running.
-  if (props.awaitingInput && last && ['interrupted', 'running'].includes(last.status))
+  if (props.awaitingInput && last && (last.status === 'running' || (!hasModel.value && last.status === 'interrupted')))
     items[items.length - 1] = { ...last, status: 'paused' }
   return items
 })
 const currentStatus = computed(() => {
   if (!props.pending || props.awaitingInput) return ''
-  if (props.modelProgress) return props.pending
+  if (props.modelProgress && !hasModel.value) return props.pending
   const active = activities.value.filter(item => item.status === 'running').at(-1)
-  return active ? activityName(active) || props.pending : props.pending
+  return active ? activityName(active) : props.pending
 })
+const expanded = ref(new Set<string>())
+const panelOpen = ref(!!props.pending)
+function toggleItem(id: string, event: Event) {
+  if ((event.currentTarget as HTMLDetailsElement).open) expanded.value.add(id)
+  else expanded.value.delete(id)
+}
 const sandboxCode = (event: ToolEvent) => {
   const code = record(event.input).code
   return event.group === 'sandbox' && typeof code === 'string' ? code : ''
@@ -118,55 +176,62 @@ function inputDetails(event: ToolEvent) {
 const states: Record<string, string> = {
   running: '进行中', paused: '已暂停', completed: '已完成', error: '失败', interrupted: '已中止', skipped: '已跳过',
 }
+function stateLabel(item: ToolEvent) {
+  if (item.group === 'model_io' && item.status === 'completed' && record(item.output).finish_reason === 'output_limit') return '输出截断'
+  return states[item.status] || item.status
+}
 const text = (value: unknown) => typeof value === 'string' ? value : JSON.stringify(value, null, 2)
 </script>
 
 <template>
-  <details v-if="activities.length || diagnostics.length || pending || $slots.default" class="tool-activities" :open="!!pending">
+  <details v-if="activities.length || pending || $slots.default" class="tool-activities" :open="!!pending" @toggle.self="panelOpen = ($event.currentTarget as HTMLDetailsElement).open">
     <summary class="activity-row" :class="{ 'has-live-status': currentStatus }">
       <AppIcon name="chevron" :size="12"/>
       <span v-if="currentStatus" class="activity-name activity-live" :title="currentStatus">{{ currentStatus }}</span>
       <span class="activity-heading">执行过程<span v-if="activities.length"> · {{ activities.length }} 项</span></span>
     </summary>
-    <p v-if="pending && (!activities.length || modelProgress)" class="activity-row" data-status="running">
+    <p v-if="pending && (!activities.length || (modelProgress && !hasModel))" class="activity-row" data-status="running">
       <span class="activity-dot" aria-hidden="true"/>{{ pending }}
     </p>
-    <details v-for="item in activities" :key="item.id" class="tool-activity" :data-status="item.status">
+    <details v-for="item in activities" :key="item.id" class="tool-activity" :data-status="item.status" @toggle.self="toggleItem(item.id, $event)">
       <summary class="activity-row">
         <AppIcon name="chevron" :size="12"/>
         <span class="activity-dot" aria-hidden="true"/>
         <span class="activity-name" :title="activityName(item)">{{ activityName(item) }}</span>
         <template v-if="item.group !== 'result' || item.status !== 'running'">
-          <span class="activity-state">{{ states[item.status] || item.status }}</span>
+          <span class="activity-state">{{ stateLabel(item) }}</span>
         </template>
       </summary>
-      <div class="activity-content">
-        <template v-if="item.input != null">
-          <strong v-if="debug">输入</strong>
-          <pre>{{ text(inputDetails(item)) }}</pre>
-          <details v-if="sandboxCode(item)" class="sandbox-source">
-            <summary>沙箱代码</summary>
-            <pre><code>{{ sandboxCode(item) }}</code></pre>
-          </details>
+      <div v-if="!item.group || (panelOpen && expanded.has(item.id))" class="activity-content">
+        <ModelCallDetails v-if="item.group === 'model_io'" :input="record(item.input)" :output="record(item.output)" :debug="!!debug"/>
+        <template v-else-if="item.group === 'tool_io'">
+          <template v-if="debug && record(item.input).arguments != null">
+            <strong>工具输入</strong><pre>{{ text(record(item.input).arguments) }}</pre>
+          </template>
+          <template v-if="record(item.output).result != null">
+            <strong>工具返回</strong><pre>{{ text(record(item.output).result) }}</pre>
+          </template>
         </template>
-        <ol v-if="item.steps?.length">
-          <li v-for="(step, index) in item.steps" :key="index">
-            <time v-if="step.time" :datetime="step.time">{{ date(step.time) }}</time> {{ step.message }}
-          </li>
-        </ol>
-        <template v-if="item.output != null">
-          <strong v-if="debug">输出</strong>
-          <pre>{{ text(item.output) }}</pre>
+        <template v-else>
+          <template v-if="item.input != null && (item.group !== 'agent_trace' || debug)">
+            <strong v-if="debug">输入</strong>
+            <pre>{{ text(inputDetails(item)) }}</pre>
+            <details v-if="sandboxCode(item)" class="sandbox-source">
+              <summary>沙箱代码</summary>
+              <pre><code>{{ sandboxCode(item) }}</code></pre>
+            </details>
+          </template>
+          <ol v-if="item.steps?.length">
+            <li v-for="(step, index) in item.steps" :key="index">
+              <time v-if="step.time" :datetime="step.time">{{ date(step.time) }}</time> {{ step.message }}
+            </li>
+          </ol>
+          <template v-if="item.output != null && (item.group !== 'agent_trace' || debug)">
+            <strong v-if="debug">输出</strong>
+            <pre>{{ text(item.output) }}</pre>
+          </template>
         </template>
       </div>
-    </details>
-    <details v-if="diagnostics.length" class="tool-activity">
-      <summary class="activity-row"><AppIcon name="chevron" :size="12"/>阶段快照 · {{ diagnostics.length }} 条</summary>
-      <details v-for="item in diagnostics" :key="item.id" class="activity-content">
-        <summary class="activity-row">{{ item.name }} · {{ states[item.status] || item.status }}</summary>
-        <template v-if="item.input != null"><strong>输入</strong><pre>{{ text(item.input) }}</pre></template>
-        <template v-if="item.output != null"><strong>输出</strong><pre>{{ text(item.output) }}</pre></template>
-      </details>
     </details>
     <slot/>
   </details>

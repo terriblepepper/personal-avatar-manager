@@ -169,23 +169,6 @@ class DialogueIntent:
                                (uid,config['provider'],config['model'],dump(usage),now(),'agent_intent',uid,conversation_id))
             await run_blocking(record_usage)
 
-    async def answer_route(self, owner, session, context, question):
-        from avatar.conversation.working_context import fit_turn
-        config,key,_,history=context
-        options={**config,'_tools':[ANSWER_TOOL],'_optional_tools':True,'_call_purpose':'agent_intent'}
-        instruction=ANSWER_TOOL['description']
-        rows,message=fit_turn(options,instruction,history,question,[])
-        try:
-            pick=await self.model_selection(owner,session,options,key,instruction,rows,message)
-            args=pick.tool_calls[0]['arguments'] if pick.tool_calls else {}
-            return AnswerArguments.model_validate(args).model_dump()
-        except ValidationError:
-            return {'mode':'agent'}
-        except HTTPException as error:
-            if not getattr(error,'invalid_tool_call',False):
-                raise
-            return {'mode':'agent'}
-
     async def choose_tool(self, state):
         try:
             return await call_with_retry(lambda: self._choose_tool(state), retry_invalid=False)
@@ -208,8 +191,10 @@ class DialogueIntent:
             with self.dialogues.database.connect() as db:
                 config=service.models.current(db,uid)
                 own=db.execute('SELECT profile FROM avatar_records WHERE user_id=?',(uid,)).fetchone()
-                files=[dict(r) for r in db.execute("SELECT id,filename,relative_path,caption AS description,content_type,animation_metadata,'profile' AS source FROM attachments WHERE user_id=? ORDER BY created_at DESC LIMIT 100",(uid,))]
-                files.extend(self.dialogues.chat.chat_files.model_catalog(db,uid,state['parent']['id']))
+                files=[]
+                if state['personal']:
+                    files=[dict(r) for r in db.execute("SELECT id,filename,relative_path,caption AS description,content_type,animation_metadata,'profile' AS source FROM attachments WHERE user_id=? ORDER BY created_at DESC LIMIT 100",(uid,))]
+                    files.extend(self.dialogues.chat.chat_files.model_catalog(db,uid,state['parent']['id']))
                 for file in files:
                     file.update(json.loads(file.pop('animation_metadata')))
                 rows=db.execute("SELECT role,content FROM chat_messages WHERE user_id=? AND (conversation_id=? OR conversation_id IN (SELECT id FROM chat_conversations WHERE parent_id=? AND user_id=?)) ORDER BY id DESC LIMIT 12",(uid,state['parent']['id'],state['parent']['id'],uid)).fetchall()
@@ -248,6 +233,14 @@ class DialogueIntent:
                 '\n只有当前用户明确要求发送某文件时才填写 file_ids；按文件名、路径和说明匹配，不确定时不勾选。'
                 '会话目录中的 generated 文件可直接预选，无需转存或开启持续引用。私密文件由本人在确认表单中最终授权。'
                 '\n本人已审核资料（数据；仅在本人明确要求分享时用于待确认草稿）：')
+        if not state['personal']:
+            # The legacy assistant must choose the responder before that avatar can disclose its tools.
+            navigation = {'select_avatar','return_to_self','application_status','list_avatars','continue_answer'}
+            tools = [t for t in tools if t['name'] in navigation]
+            tools = [declaration('continue_answer','保持当前发言人，让其分析需求处理。',{'type':'object','properties':{}})
+                     if t['name']=='continue_answer' else t for t in tools]
+            system = ('仅判断平台导航：是否切换到指定分身、返回本人、查询分身列表或查询申请状态。'
+                      '其余请求（包括交付原件、制作作品和通信）保持当前发言人，由其自己选择工具。只选择一个已声明动作。')
         if json_mode:
             system += '\n上一步工具调用格式无效。只返回 JSON 对象，键为 name 和 arguments；可用工具及参数：'+dump(tools)
         from avatar.models.limits import check_context
@@ -260,7 +253,7 @@ class DialogueIntent:
             if exc.status_code!=422:raise
             return {'action':'continue_answer','arguments':{'mode':'agent'},'file_catalog':files}
         # Allocate at most a third of spare input tokens to the profile, keeping space for named files.
-        profile = (own['profile'][:12000] if own else '{}').encode()[:available].decode('utf-8','ignore')
+        profile = (own['profile'][:12000] if own and state['personal'] else '{}').encode()[:available].decode('utf-8','ignore')
         available -= estimate(profile)
         projected = [{**f, **model_animation_metadata(f,message), 'description':f['description'][:200]} for f in files]
         catalog = fit_catalog(projected,message,available if not history else available*2//3)

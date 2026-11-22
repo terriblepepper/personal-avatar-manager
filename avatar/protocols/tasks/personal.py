@@ -442,13 +442,20 @@ class PersonalTaskService:
                                     caller_id=caller, platform=platform, title='小镇公开访客对话' if principal else '小镇分身对话', create=True)
         claim(conversation_id)
         try:
-            model = await memory.prepare(conversation, overview['agent']['last_modified_at'], model, question,
-                                         self.chat.model_client, user['id'], progress=progress)
-            if principal is None:
-                model = await self.chat.skills.load_context(user['id'],model,question,self.chat.model_client,caller)
-                model = await self.chat.skill_execution.enrich(user['id'],model,question,self.chat.model_client,caller_id=caller,conversation_id=conversation['id'],progress=progress)
-            model=await self.chat.rag.enrich(user['id'],target['aic'],conversation,[],model,question,include_private=bool(overview.get('_private_context')),progress=progress)
-            result = await self.chat.rag.answer(model, question, progress=progress)
+            from avatar.conversation.loop.entry_tools import background, bind_entry_tools
+            from avatar.models.trace import model_io_scope
+            with model_io_scope(progress,private=False):
+                model = await memory.prepare(conversation, overview['agent']['last_modified_at'], model, question,
+                                             self.chat.model_client, user['id'], progress=progress)
+                if principal is None:
+                    model = await self.chat.skills.load_context(user['id'],model,question,self.chat.model_client,caller)
+                async def run_skill(context, objective):
+                    return await self.chat.skill_execution.enrich(user['id'],context,objective,self.chat.model_client,
+                        caller_id=caller,conversation_id=conversation['id'],progress=progress)
+                skills = principal is None and background(model[2]).get('installed_skills')
+                model = await bind_entry_tools(self.chat,model,user['id'],target['aic'],conversation,[],
+                    include_private=bool(overview.get('_private_context')),sandbox=run_skill if skills else None,progress=progress)
+                result = await self.chat.rag.answer(model, question, progress=progress)
             if not result.text.strip():
                 raise HTTPException(502, '模型未返回有效回答')
             validate_sandbox = model[0].get('_validate_sandbox')

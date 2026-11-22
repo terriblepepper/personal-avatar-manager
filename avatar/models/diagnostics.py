@@ -5,7 +5,7 @@ import ssl
 import httpx
 from fastapi import HTTPException
 
-PURPOSES={'agent_intent':'会话意图分析','task_planning':'任务分解','goal_decision':'目标核对与工具选择','delivery_review':'交付回执核验','html_generation':'HTML 作品生成','material_selection':'资料原件筛选','animation':'动画分镜','skill_execution':'技能脚本规划','memory':'记忆压缩','skill_selection':'自动技能选择','file_embedding':'向量嵌入','file_search':'资料判断/检索','file_read':'资料原文读取','answer':'回答生成'}
+PURPOSES={'segmented_writing':'接续未完成的输出','agent_intent':'会话意图分析','task_planning':'拆分目标并选择所需工具','goal_decision':'目标核对与工具选择','delivery_review':'交付回执核验','html_generation':'HTML 作品生成','material_selection':'资料原件筛选','animation':'动画分镜','skill_execution':'技能脚本规划','memory':'记忆压缩','skill_selection':'自动技能选择','file_embedding':'向量嵌入','file_search':'资料判断/检索','file_read':'资料原文读取','answer':'回答生成'}
 
 
 def stop_reason(reason, tool_calls=()):

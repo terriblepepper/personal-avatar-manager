@@ -1,6 +1,7 @@
 """受控查询构建 + PostgreSQL 余弦/BM25 混合检索；原件读取与文件权限统一复核。"""
 import asyncio
 import base64
+import hashlib
 import json
 import re
 from dataclasses import replace
@@ -67,7 +68,8 @@ class MaterialRag(MaterialReading,FileRag):
 
     async def answer(self,context,message,*,progress=None,on_delta=None):
         self.validate(context)
-        context,message=await self.answer_context(context,message,progress=progress) if progress else await self.answer_context(context,message)
+        if '_entry_tools' not in context[0]:
+            context,message=await self.answer_context(context,message,progress=progress) if progress else await self.answer_context(context,message)
         if progress:
             for notice in dict.fromkeys(context[0].get('_workflow_notices',[])):
                 if not notice.startswith('会话记忆已压缩，'):
@@ -90,14 +92,17 @@ class MaterialRag(MaterialReading,FileRag):
             write=get_stream_writer()
             if agent:
                 delivered = 0
+                digest = hashlib.sha256()
                 def emit(text):
                     nonlocal delivered
                     delivered += len(text)
+                    digest.update(text.encode('utf-8','surrogatepass'))
                     write({'type':'delta','text':text})
                 def report(event):
-                    nonlocal delivered
+                    nonlocal delivered, digest
                     if event.get('reset_reply'):
                         delivered = 0
+                        digest = hashlib.sha256()
                         write(event)
                     elif progress:
                         progress(event)
@@ -110,8 +115,17 @@ class MaterialRag(MaterialReading,FileRag):
                     write({'type':'contact_draft','document':result.contact_draft})
                 if result.material_delivery is not None:
                     write({'type':'material_delivery','items':result.material_delivery})
-                if result.text[delivered:]:
-                    write({'type':'delta','text':result.text[delivered:]})
+                # Validate the provisional prefix without retaining every streamed token.
+                confirmed = hashlib.sha256()
+                chunk_chars = 8192
+                if delivered <= len(result.text):
+                    for start in range(0,delivered,chunk_chars):
+                        confirmed.update(result.text[start:min(start+chunk_chars,delivered)].encode('utf-8','surrogatepass'))
+                if delivered > len(result.text) or confirmed.digest()!=digest.digest():
+                    write({'type':'status','stage':'result_ready','message':'已核实最终答复','reset_reply':True})
+                    delivered = 0
+                for start in range(delivered,len(result.text),chunk_chars):
+                    write({'type':'delta','text':result.text[start:start+chunk_chars]})
                 write({'type':'usage','usage':result.usage})
             else:
                 async with aclosing(self.chat.model_client.stream(*context,state['message'])) as source:

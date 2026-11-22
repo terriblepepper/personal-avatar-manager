@@ -149,14 +149,19 @@ class AgentSteps:
     PHASES = {'perceive': '感知', 'reason': '推理', 'act': '行动',
               'observe': '观察', 'check': '完成检查', 'final': '最终输出'}
 
-    def __init__(self, progress):
+    def __init__(self, progress, *, model_key=''):
         self.progress = progress
+        self._model_key = model_key
 
     def point(self, phase, inputs, output, *, status='completed'):
         if self.progress:
             self.progress({'type': 'tool', 'id': uuid.uuid4().hex, 'group': 'agent_trace',
                            'name': self.PHASES[phase], 'phase': phase, 'status': status,
                            'input': _trace_value(inputs), 'output': _trace_value(output)})
+
+    def tool_result(self, name, arguments, result):
+        from avatar.models.trace import emit_tool_result
+        emit_tool_result(name, arguments, result, secret=self._model_key)
 
     def receipt(self, text):
         if self.progress:

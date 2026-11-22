@@ -127,7 +127,7 @@ class SkillExecution:
             if state.get('count',0)>=4:
                 background['sandbox_stop_reason']='已达到本轮操作上限，请依据真实回执回答并注明未完成部分。'
                 return {'stopped':True}
-            if results and config.get('_resume_results_only'):
+            if config.get('_restore_only') or (results and config.get('_resume_results_only')):
                 return {'stopped':True}
             prompt=('你是技能脚本规划器。仅在用户任务需要实际计算/脚本时执行当前已加载技能；解释、资料阅读、比较、写作和示例代码优先用现有信息直接完成，返回 finish。开关表示许可，不能作为运行理由。'
                     '实际计算、数据分析和生成数据图表须使用沙箱回执。先检查 results：若已成功得到所求值或文件，立即返回 finish；不要更换代码重复验证。尚缺计算结果时再调用沙箱。'

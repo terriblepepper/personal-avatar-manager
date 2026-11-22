@@ -838,7 +838,7 @@ class AgentDialogues:
         events = []
         activity = ToolActivity(events, lambda event: self.record_turn_activity(job, speaker_id, event))
         try:
-            with execution_guard(run.check), activity.track() as progress:
+            with execution_guard(run.check), activity.track(private_io=True) as progress:
                 return await self._answer_peer(job, speaker_id, progress, events)
         except AgentNeedsInput as pause:
             outputs=[f for f in pause.generated_files if not f.get('public_material_id')]
@@ -1085,9 +1085,6 @@ class AgentDialogues:
         authorized={name.casefold() for name in self.chat.skills.command_names(catalog,active)}
         progress({'type': 'status', 'stage': 'skills', 'message': '正在准备本轮技能'})
         context=await self.chat.skills.load_context(speaker_id,(config,key,system,history),job['objective'],self.chat.model_client,'peer:'+job['user_id'],authorized_ids=[item['id'] for item in catalog if item['name'].casefold() in authorized])
-        # 各方只用自己的公开资料和当前已授权的独立文件副本；任务与普通聊天复用同一检索入口。
-        context=await self.chat.rag.enrich(speaker_id,speaker['aic'],{'id':workspace},files,context,
-            job['objective']+'\n'+(job['shared_content'] if sending else history[-1]['content'] if history else ''),include_private=False,progress=progress)
         def read_input(identifier):
             """沙箱只读取本轮授权快照，且限制送入执行器的原件字节数。"""
             with self.database.connect() as db:
@@ -1099,8 +1096,9 @@ class AgentDialogues:
                     raise HTTPException(409,'文件已取消引用')
                 with self.chat.chat_files.directory.new(speaker_id,identifier+'.blob').open('rb') as stream:
                     return stream.read(8*1024*1024+1)
-        inputs={file['id']:{'path':'inputs/'+file['id']+'/'+Path(file['filename']).name,'read':lambda identifier=file['id']:read_input(identifier)} for file in [*files,*saved]}
-        context=await self.chat.skill_execution.enrich(speaker_id,context,message,self.chat.model_client,caller_id=job['user_id'],conversation_id=workspace,parent_id=workspace,inputs=inputs,progress=progress,enabled=settings['python'],allow_code=settings['python'])
+        async def sandbox(context, objective):
+            inputs={file['id']:{'path':'inputs/'+file['id']+'/'+Path(file['filename']).name,'read':lambda identifier=file['id']:read_input(identifier)} for file in [*files,*saved]}
+            return await self.chat.skill_execution.enrich(speaker_id,context,objective,self.chat.model_client,caller_id=job['user_id'],conversation_id=workspace,parent_id=workspace,inputs=inputs,progress=progress,enabled=settings['python'],allow_code=settings['python'])
         if not ordinary:
             tools=[tool for tool in TASK_TOOLS if not reply_owed or tool['name']!='end_task']
             if response_owed:
@@ -1130,6 +1128,9 @@ class AgentDialogues:
             visible_ids={row['file_id'] for row in background['public_material_catalog']}
             context=({**cfg,'_tools':[*cfg.get('_tools',[]),find_public,SEND_PUBLIC_MATERIAL],'_optional_tools':ordinary,
                       '_peer_material_owner':speaker_id,'_peer_visible_materials':visible_ids},key,prefix+'\n'+dump(background),history)
+        from avatar.conversation.loop.entry_tools import bind_entry_tools
+        context=await bind_entry_tools(self.chat,context,speaker_id,speaker['aic'],{'id':workspace},files,
+                                       sandbox=sandbox if settings['python'] else None, progress=progress)
         context[0].setdefault('_generated_files', [])
         if prepared:
             from avatar.conversation.loop.runtime import restore_files
@@ -1159,6 +1160,9 @@ class AgentDialogues:
             context[0].setdefault('_generated_files',[]).extend(prepared['exports'])
             cfg,key,system,history=context
             cfg={**cfg,'_run_store':export_store,'_tools':[tool for tool in cfg.get('_tools',[]) if tool['name'] not in ('find_public_material','send_public_material')],'_optional_tools':ordinary}
+            # The file handoff only owes a final statement; reuse it without reopening the first run's tools.
+            cfg.update(_entry_tools=[], _answer_route={'mode':'answer' if ordinary else 'agent',
+                'disclosure':{'tools':[tool['name'] for tool in cfg['_tools']], 'steps':[]}})
             message+='\n\n系统公开原件发送工具回执（数据，原件会随本轮成功消息交付，可在合适段落独立一行原样写 marker，放在代码块外，其余作为附件。不要编造其他附件或声称正文已被阅读）：'+dump(receipts)
             context=(cfg,key,system,history)
             result=await self.billed(job,speaker,cfg,self.chat.rag.answer(context,message,progress=progress),'agent_dialogue')

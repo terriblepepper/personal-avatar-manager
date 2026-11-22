@@ -2,9 +2,14 @@
 import json
 import re
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from avatar.core.db import now
 from avatar.core.execution import AgentNeedsInput, AgentSteps
+from avatar.models.trace import model_io_scope
+
+# Request/response previews belong to the executor's display, outside the model's future memory.
+IO_GROUPS = {'model_io','tool_io'}
+_INDEPENDENT = {'agent_trace','agent_receipt', *IO_GROUPS}
 
 
 def without_false_tool_footer(text):
@@ -23,7 +28,7 @@ def had_successful_sandbox(records):
 def memory_evidence(events):
     records = [{key: item[key] for key in ('name', 'phase', 'status', 'input', 'output') if key in item}
                for item in events
-               if item.get('status') != 'running' and
+               if item.get('status') != 'running' and item.get('group') not in IO_GROUPS and
                (item.get('group') in ('agent_trace', 'agent_receipt') or 'output' in item)]
     if not records:
         return ''
@@ -61,10 +66,11 @@ class ToolActivity:
         self.records, self.progress = records, progress
 
     @contextmanager
-    def track(self):
+    def track(self, *, private_io=None):
         status = 'interrupted'
         try:
-            yield self.emit
+            with model_io_scope(self.emit, private=private_io) if private_io is not None else nullcontext():
+                yield self.emit
             status = 'completed'
         except AgentNeedsInput:
             status = 'paused'
@@ -82,7 +88,7 @@ class ToolActivity:
         if event['type'] == 'tool':
             item = next((item for item in self.records if item['id'] == event['id']), None)
             if item is None:
-                if event.get('group') not in ('agent_trace', 'agent_receipt'):
+                if event.get('group') not in _INDEPENDENT:
                     self.finish('completed', include_trace=False)
                 item = {'id': event['id'], 'started_at': now()}
                 self.records.append(item)
@@ -94,7 +100,7 @@ class ToolActivity:
         if event['type'] != 'status' or stage not in self.GROUPS:
             return
         group, name = self.GROUPS[stage]
-        item = next((entry for entry in reversed(self.records) if entry.get('group') not in ('agent_trace', 'agent_receipt')), None)
+        item = next((entry for entry in reversed(self.records) if entry.get('group') not in _INDEPENDENT), None)
         if item is None or item.get('group') != group or item['status'] != 'running':
             self.finish('completed', include_trace=False)
             item = {'id': str(uuid.uuid4()), 'group': group, 'name': name, 'started_at': now(), 'steps': []}
@@ -114,6 +120,6 @@ class ToolActivity:
     # 职责：准备阶段结束时收束未完成状态；异常和取消均不得显示为成功。
     def finish(self, status, *, include_trace=True):
         for item in self.records:
-            if item['status']=='running' and (include_trace or item.get('group') != 'agent_trace'):
+            if item['status']=='running' and (include_trace or item.get('group') not in _INDEPENDENT):
                 item['status'] = status
                 self.publish(item)

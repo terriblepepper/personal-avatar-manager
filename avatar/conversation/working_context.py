@@ -70,16 +70,19 @@ def fit_turn(config, prompt, history, question, observations):
     return rows, question + ''.join(notes)
 
 
-def fit_working_set(config, prompt, history, question, observations, *, force=False):
+def fit_working_set(config, prompt, history, question, observations, *, force=False, target_tokens=None):
     # Protect the original objective and sourced material. Old tool chatter and assistant prose go first.
     floor = retained_budget(config, prompt, question)
     budget = max(0, input_budget(config) - estimate(prompt) - estimate(question))
+    if target_tokens is not None:
+        budget = min(budget, target_tokens)
     floor = min(floor, budget)
     rows=[dict(row) for row in history]
     notes=list(observations)
     used=sum(estimate(r['content'])+16 for r in rows)+sum(estimate(n) for n in notes)
     if force:
-        budget = max(floor, min(budget, used * 4 // 5))
+        budget = min(budget, used // 2)
+        floor = min(floor, budget)
     if used < budget:
         return rows, notes
     compacted = list(dict.fromkeys(notes))
@@ -163,7 +166,7 @@ def fit_working_set(config, prompt, history, question, observations, *, force=Fa
 def bounded_excerpt(text, tokens):
     """Fit a textual view by UTF-8 bytes, keeping both ends at character boundaries."""
     data = text.encode('utf-8')
-    room = tokens * 3
+    room = max(0, tokens) * 3
     if len(data) <= room:
         return text
     mark = '\n[…已节选…]\n'.encode()

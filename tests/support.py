@@ -215,6 +215,13 @@ def completion(request):
         return httpx.Response(200, json={'data':[]})
     body=json.loads(request.content)
     if body.get('stream'):
+        if body.get('tools'):
+            calls = fake_completion(request).json()['choices'][0]['message'].get('tool_calls')
+            if calls:
+                delta = {'tool_calls':[{**call, 'index':i} for i,call in enumerate(calls)]}
+                event = {'choices':[{'delta':delta,'finish_reason':'tool_calls'}]}
+                return httpx.Response(200, headers={'content-type':'text/event-stream'},
+                                      content='data: '+json.dumps(event)+'\n\ndata: [DONE]\n\n')
         return httpx.Response(200, headers={'content-type':'text/event-stream'}, stream=DelayedStream())
     return fake_completion(request)
 

@@ -23,7 +23,7 @@ _SCOPE_ACCESS = {
 _UNSEEN = object()
 RAW_ARGUMENT_PREFIX = 'draft-arguments-'
 # Provider fragments, assembled arguments and a repaired base may coexist with visible text and a finished artifact.
-_OWNER_BYTES = 4 * MAX_ENVELOPE_BYTES + 2 * MAX_SOURCE_BYTES
+OWNER_STORAGE_BYTES = 4 * MAX_ENVELOPE_BYTES + 2 * MAX_SOURCE_BYTES
 _CHUNK_OVERHEAD = 256
 
 
@@ -210,7 +210,7 @@ class RunStore:
             charge = len(data) + len(name.encode()) + _CHUNK_OVERHEAD
             used = db.execute('SELECT COALESCE(sum(storage_bytes),0) FROM agent_loop_runs WHERE owner=?',
                               (self.owner,)).fetchone()[0]
-            if used + charge > _OWNER_BYTES:
+            if used + charge > OWNER_STORAGE_BYTES:
                 raise RunCapacity('账户临时草稿存储空间不足')
             db.execute('INSERT INTO agent_loop_chunks(run,draft,start_byte,content,is_binary) VALUES(?,?,?,?,?::int::boolean)',
                        (self._id, name, offset, data, int(binary)))
@@ -248,6 +248,19 @@ class RunStore:
                 ORDER BY start_byte''', (start, self._id, draft_id, self._id, draft_id, start))
             # Every chunk is valid UTF-8; a byte-limited tail can start inside one character.
             return b''.join(row[0] for row in rows).decode('utf-8', errors='ignore' if start else 'strict')
+
+    def read_range(self, name, start, limit):
+        if type(start) is not int or type(limit) is not int or start < 0 or not 0 < limit <= 4096:
+            raise ValueError('无效的回执读取范围')
+        end = start + limit
+        with self._read() as db:
+            rows = db.execute('''SELECT substring(content FROM greatest(0,?-start_byte)::int+1
+                    FOR (?-greatest(?,start_byte))::int)
+                FROM agent_loop_chunks WHERE run=? AND draft=? AND NOT is_binary AND start_byte < ?
+                AND start_byte >= (SELECT max(start_byte) FROM agent_loop_chunks
+                    WHERE run=? AND draft=? AND start_byte<=?) ORDER BY start_byte''',
+                (start,end,start,self._id,self._draft(name),end,self._id,name,start))
+            return b''.join(row[0] for row in rows)
 
     def read(self, draft_id):
         return self._text(draft_id, None)
