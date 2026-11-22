@@ -100,6 +100,11 @@ const activities = computed(() => {
     items[items.length - 1] = { ...last, status: 'paused' }
   return items
 })
+const currentStatus = computed(() => {
+  if (!props.pending || props.awaitingInput) return ''
+  const active = activities.value.filter(item => item.status === 'running').at(-1)
+  return active ? activityName(active) || props.pending : props.pending
+})
 const sandboxCode = (event: ToolEvent) => {
   const code = record(event.input).code
   return event.group === 'sandbox' && typeof code === 'string' ? code : ''
@@ -117,7 +122,11 @@ const text = (value: unknown) => typeof value === 'string' ? value : JSON.string
 
 <template>
   <details v-if="activities.length || diagnostics.length || pending || $slots.default" class="tool-activities" :open="!!pending">
-    <summary class="activity-row"><AppIcon name="chevron" :size="12"/>执行过程<span v-if="activities.length"> · {{ activities.length }} 项</span></summary>
+    <summary class="activity-row" :class="{ 'has-live-status': currentStatus }">
+      <AppIcon name="chevron" :size="12"/>
+      <span v-if="currentStatus" class="activity-name activity-live" :title="currentStatus">{{ currentStatus }}</span>
+      <span class="activity-heading">执行过程<span v-if="activities.length"> · {{ activities.length }} 项</span></span>
+    </summary>
     <p v-if="!activities.length && pending" class="activity-row" data-status="running">
       <span class="activity-dot" aria-hidden="true"/>{{ pending }}
     </p>
@@ -186,6 +195,8 @@ summary.activity-row:hover, summary.activity-row:focus-visible { background: var
 .activity-name { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .activity-name { color: var(--text); }
 .activity-state { flex: none; }
+.tool-activities[open] > summary .activity-live,
+.tool-activities:not([open]) > .has-live-status .activity-heading { display: none; }
 .activity-content {
   border-inline-start: 1px solid var(--border);
   margin: .1rem 0 .25rem .54rem;
