@@ -461,17 +461,17 @@ class AgentDialogues:
                     if author:item['speaker_name']=json.loads(author['profile'] or '{}').get('name') or author['username']
                 messages.append(item)
         if after is None:messages.reverse()
-        page=self.task_page(user,identifier,*(task_paging or (0,'')))
+        page=self.task_page(user,identifier,*(task_paging or (0,'')),from_task=separate)
         if task_paging is not None:snapshot['task_page']=page
         return {'auto_accept':auto_accept,'current_transport_mode':protocol,'embedding_status':embedding_status,'viewer_user_id':user['id'],'session_id':identifier,'id':identifier,'resource_conversation_id':workspace,'settings_conversation_id':settings_id,'legacy_file_conversation_id':settings_id if legacy_files else None,'accepted':bool(pair['accepted']),'can_accept':bool(task_id and any(t['id']==task_id and t['target_user_id']==user['id'] and t['status']=='awaiting_acceptance' for t in tasks)),
                 'peer_name':json.loads(avatar['profile']).get('avatar_name','分身') if avatar else '分身','peer_aic':avatar['aic'] if avatar else '',
                 'messages':messages,'has_more':len(rows)==10,'chat':self.view(dict(chat),user) if chat else None,'message_tasks':[self.view(dict(r),user) for r in message_tasks],
                 'tasks':[self.view(dict(r),user) for r in tasks],'task_total':page['total'],**snapshot}
 
-    def task_page(self,user,identifier,offset=0,search=''):
+    def task_page(self,user,identifier,offset=0,search='',*,from_task=False):
         if not 0<=offset<=2**63-1:raise HTTPException(422,'任务分页偏移无效')
         with self.database.connect() as db:
-            member=self.member(db,user,identifier)
+            member=self.member(db,user,identifier,hidden=from_task)
             clause="session_id=? AND delivery_mode!='message' AND NOT EXISTS(SELECT 1 FROM agent_task_members v WHERE v.task_id=d.id AND v.user_id=? AND v.hidden=1) AND (status!='ended' OR ?='' OR julianday(COALESCE(ended_at,updated_at))>julianday(?) OR EXISTS(SELECT 1 FROM agent_dialogue_messages WHERE dialogue_id=d.id AND id>?))"
             args=(identifier,user['id'],member['cleared_at'],member['cleared_at'],member['cleared_through'])
             if search:
