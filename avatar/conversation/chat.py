@@ -199,7 +199,14 @@ class AvatarChat:
             from avatar.models.embedding import EmbeddingSettings
             embedding_configured=EmbeddingSettings.configured(db,row['user_id'])
             from avatar.knowledge.service import approved_style
-            soul=approved_style(db,row['user_id']) if embedding_configured else None
+            soul=None
+            if embedding_configured:
+                if run_parent:
+                    version=overview['_run_sources']['identity']['soul']
+                    if version:
+                        soul=approved_style(db,row['user_id'],build_id=version)
+                else:
+                    soul=approved_style(db,row['user_id'])
             if soul:background['approved_soul_style']=soul
             if not embedding_configured:
                 background['file_search_rules']='尚未配置嵌入模型，本轮不使用向量检索或 soul。明确要求分析文件时可读取已授权原件；只根据实际取得的正文或图像回答。'

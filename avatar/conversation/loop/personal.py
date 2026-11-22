@@ -6,6 +6,10 @@ from fastapi import HTTPException
 
 from avatar.conversation.jobs.pipeline import validate_authorization
 from avatar.conversation.loop.store import RunStore
+from avatar.knowledge.learning import auto_style_advance
+
+
+STYLE_FIELDS = ('soul', 'soul_version')
 
 
 def source_snapshot(db, user_id, parent_id, owner, aic):
@@ -38,17 +42,22 @@ def source_snapshot(db, user_id, parent_id, owner, aic):
             'tools':sorted(k for k,v in json.loads(parent['tools_config']).items() if v is True)}
 
 
-def check_sources(expected, actual):
-    if (expected['identity'] != actual['identity']
+def check_sources(db, owner, expected, actual):
+    prior, current = expected['identity'], actual['identity']
+    def stable(identity):
+        return {key:value for key,value in identity.items() if key not in STYLE_FIELDS}
+
+    if (stable(prior) != stable(current)
             or not set(expected['tools']).issubset(actual['tools'])
             or any(actual[group].get(key) != value for group in ('files','skills','materials','folders')
-                   for key,value in expected[group].items())):
+                   for key,value in expected[group].items())
+            or (prior != current and not auto_style_advance(db,owner,prior['soul'],prior['soul_version'],current['soul']))):
         raise HTTPException(409,'原任务资料、文件或工具授权已改变，不能使用原草稿')
 
 
 def validate_sources_in(db, user_id, parent_id, binding, sources):
     current = source_snapshot(db,user_id,parent_id,binding['owner'],binding['aic'])
-    check_sources(sources,current)
+    check_sources(db,binding['owner'],sources,current)
     if not db.execute("""SELECT 1 FROM chat_conversations WHERE id=? AND user_id=?
         AND (id=? OR parent_id=?)""",(binding['session_id'],user_id,parent_id,parent_id)).fetchone():
         raise HTTPException(409,'原分身会话已变更，无法继续此任务')
@@ -60,7 +69,7 @@ def source_guard(user_id,parent_id,binding,sources):
         nonlocal stamp
         # Tuple revisions cover direct updates too. The common path reads no file bodies or JSON payloads.
         row=db.execute("""SELECT a.xmin::text,u.account_status,t.account_status,p.tools_config,p.skills_updated_at,
-            m.xmin::text,e.xmin::text,s.xmin::text,b.xmin::text,ac.updated_at,sc.updated_at,
+            m.xmin::text,e.xmin::text,s.xmin::text,b.xmin::text,pinned.xmin::text,ac.updated_at,sc.updated_at,
             (SELECT bit_xor(hashtextextended(id||':'||xmin::text,0)) FROM attachments WHERE user_id=a.user_id),
             (SELECT bit_xor(hashtextextended(path||':'||xmin::text,0)) FROM material_folders WHERE user_id=a.user_id),
             (SELECT bit_xor(hashtextextended(id||':'||xmin::text,0)) FROM agent_skills WHERE user_id=a.user_id),
@@ -74,9 +83,10 @@ def source_guard(user_id,parent_id,binding,sources):
             LEFT JOIN model_settings m ON m.user_id=a.user_id LEFT JOIN embedding_settings e ON e.user_id=a.user_id
             LEFT JOIN active_souls s ON s.user_id=a.user_id
             LEFT JOIN soul_builds b ON b.id=s.build_id AND b.user_id=a.user_id AND b.status='approved'
+            LEFT JOIN soul_builds pinned ON pinned.id=? AND pinned.user_id=a.user_id
             LEFT JOIN attachment_collections ac ON ac.user_id=a.user_id
             LEFT JOIN agent_skill_collections sc ON sc.user_id=a.user_id
-            WHERE p.user_id=? AND p.id=?""",(binding['session_id'],binding['owner'],binding['aic'],user_id,parent_id)).fetchone()
+            WHERE p.user_id=? AND p.id=?""",(binding['session_id'],binding['owner'],binding['aic'],sources['identity']['soul'],user_id,parent_id)).fetchone()
         if row is None:
             raise HTTPException(409,'原任务会话或身份已改变')
         current=tuple(row)
@@ -119,17 +129,35 @@ def attach(chat, user, original, parent, session, overview, context, job, held, 
     model = owner.get('model_config') or context[0]
     binding.update(provider=model.get('provider'),model=model.get('model'))
     sources = overview['_run_sources']
+    prior = None
     if held and held.get('sources'):
         if any(held[key]!=binding[key] for key in ('owner','aic','session_id')):
             raise HTTPException(409,'原暂停任务的发言人或会话已改变')
-        check_sources(held['sources'],sources)
+        prior = held['sources']
     if previous and previous.get('binding'):
         old = previous['binding']
         if any(old[key]!=binding[key] for key in ('owner','aic','session_id')):
             raise HTTPException(409,'原任务发言人或会话已改变')
-        check_sources(previous['sources'],sources)
         if previous.get('phase') in ('effect_unknown','external_handoff') or previous.get('sandbox',{}).get('in_flight'):
             raise HTTPException(409,'上次操作结果未确认，请核对已有结果后结束任务')
+        prior = previous['sources']
+    if prior:
+        with chat.service.database.connect() as db:
+            if held and held.get('sources') and held['sources'] != prior:
+                check_sources(db,binding['owner'],held['sources'],sources)
+            check_sources(db,binding['owner'],prior,sources)
+            old_style = prior['identity']['soul']
+            if old_style != sources['identity']['soul']:
+                prefix, raw = context[2].split('\n',1)
+                background = json.loads(raw)
+                if 'approved_soul_style' in background:
+                    from avatar.knowledge.service import approved_style
+                    if old_style:
+                        background['approved_soul_style'] = approved_style(db,binding['owner'],build_id=old_style)
+                    else:
+                        background.pop('approved_soul_style')
+                    context = (context[0],context[1],prefix+'\n'+json.dumps(background,ensure_ascii=False),context[3])
+                sources = {**sources,'identity':prior['identity']}
     check=source_guard(user['id'],parent['id'],binding,sources)
     def validate(db):
         validate_authorization(db,job)
@@ -142,7 +170,6 @@ def attach(chat, user, original, parent, session, overview, context, job, held, 
     state = store.acquire(expected=previous)
     config = dict(context[0])
     if state.get('binding'):
-        check_sources(state['sources'],sources)
         for key in ('answer_route','material_delivery'):
             if original.agent_control=='continue' and original.message.strip():
                 continue

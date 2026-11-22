@@ -11,6 +11,23 @@ from avatar.models.embedding import EmbeddingSettings,require_embedding
 from avatar.knowledge.style_traits import extract_style,style_evidence,StyleTraits,contextual_document
 
 
+def auto_style_advance(db, owner, previous, checksum, current):
+    """Allow only approved automatic descendants of the original, intact style."""
+    return bool(db.execute("""WITH RECURSIVE lineage AS (
+        SELECT id,document,parent_build,origin FROM soul_builds
+        WHERE id=? AND user_id=? AND status='approved'
+        UNION
+        SELECT b.id,b.document,b.parent_build,b.origin FROM lineage head
+        JOIN style_learning_runs r ON r.build_id=head.id AND r.user_id=? AND r.mode='auto'
+        JOIN soul_builds b ON b.id=head.parent_build AND b.user_id=r.user_id AND b.status='approved'
+        WHERE head.origin='learning' AND head.id IS DISTINCT FROM ?::text
+    )
+    SELECT 1 FROM lineage b WHERE (b.id=? AND md5(b.document)=?)
+       OR (?::text IS NULL AND b.parent_build='' AND b.origin='learning' AND EXISTS (
+           SELECT 1 FROM style_learning_runs r WHERE r.build_id=b.id AND r.user_id=? AND r.mode='auto'))
+    LIMIT 1""",(current,owner,owner,previous,previous,checksum,previous,owner)).fetchone())
+
+
 class StyleLearning:
     def __init__(self,knowledge):self.knowledge=knowledge;self.database=knowledge.database;self.checked=0
 
