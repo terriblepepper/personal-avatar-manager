@@ -29,7 +29,6 @@ const actions: Record<string, string> = {
   create_animation: '制作动画',
   list_avatars: '查询公开分身目录',
   contact_avatar: '准备分身联络草稿',
-  find_conversation_files: '查找当前会话原件',
   continue_answer: '确认由当前分身回答',
   require_conversation_tool: '检查所需工具是否开启',
   python: '规划 Python 沙箱操作',
@@ -37,6 +36,14 @@ const actions: Record<string, string> = {
   wait_for_user: '等待任务参与者补充信息',
   end_task: '提交任务结果',
   send_message: '提交本轮任务发言',
+}
+function sessionFileLabel(name: unknown, args?: unknown) {
+  if (name === 'find_conversation_files') return '查找会话文件'
+  if (name !== 'read_session_file') return undefined
+  const { file_id, query, file_access } = record(args)
+  if (file_access === 'content' || typeof file_id === 'string') return '读取会话原件'
+  if (file_access === 'directory' || typeof query === 'string') return '查找会话文件'
+  return '会话文件'
 }
 function meaningfulLegacy(event: ToolEvent) {
   if (event.group !== 'agent_trace') return ['sandbox', 'memory', 'animation', 'files', 'reading'].includes(event.group || '')
@@ -50,7 +57,10 @@ function modelName(event: ToolEvent) {
   const output = record(event.output)
   if (typeof output.reason === 'string' && output.reason) return event.name + ' · ' + output.reason
   const calls = Array.isArray(output.tool_calls) ? output.tool_calls : []
-  const names = calls.map(call => record(call).name).filter(name => typeof name === 'string')
+  const names = calls.map(call => {
+    const { name, arguments: args } = record(call)
+    return sessionFileLabel(name, args) || name
+  }).filter(name => typeof name === 'string')
   const parts = [event.name]
   if (names.length) parts.push(names.join('、'))
   if (!names.length && output.kind === 'text' && typeof output.text === 'string') {
@@ -69,7 +79,7 @@ function activityName(event: ToolEvent) {
   if (event.group === 'model_io') return modelName(event)
   if (event.group === 'tool_io') {
     const result = record(record(event.output).result)
-    const label = actions[event.name] || event.name
+    const label = sessionFileLabel(event.name, record(event.input).arguments) || actions[event.name] || event.name
     return typeof result.filename === 'string' ? label + ' · ' + result.filename : label
   }
   if (event.group !== 'agent_trace') return event.steps?.at(-1)?.message || event.name
@@ -78,7 +88,7 @@ function activityName(event: ToolEvent) {
   if (phase(event) === 'act') {
     if (input.tool === 'find_material' && Array.isArray(input.queries)) return `检索 ${input.queries.length} 个资料目标`
     if (input.tool === 'select_materials' && Array.isArray(output.files)) return `核验 ${output.files.length} 份原件`
-    const name = actions[String(input.tool)] || String(input.tool || event.name)
+    const name = sessionFileLabel(input.tool, input) || actions[String(input.tool)] || String(input.tool || event.name)
     const detail = output.reason || output.issue || output.filename
     if (typeof detail === 'string') return name + ' · ' + detail
     return typeof input.query === 'string' && input.query ? `${name}「${input.query}」` : name
@@ -92,7 +102,7 @@ function activityName(event: ToolEvent) {
     if (output.action === 'deliver_material') return '识别索件意图并进入原件交付'
     if (output.mode === 'search') return '确认先检索正文再回答'
     if (output.mode === 'read') return '确认先读取原文再回答'
-    return actions[String(output.action)] || (input.stage === 'resume_route' ? '判断如何继续当前任务' : '识别本轮目标与所需工具')
+    return sessionFileLabel(output.action) || actions[String(output.action)] || (input.stage === 'resume_route' ? '判断如何继续当前任务' : '识别本轮目标与所需工具')
   }
   if (input.operation === 'select_materials' || Array.isArray(input.tools) && input.tools.includes('select_materials')) {
     if (typeof output.issue === 'string') return `核对原件选择 · ${output.issue}`
@@ -114,7 +124,7 @@ function activityName(event: ToolEvent) {
   if (output.decision === 'inspect_originals') return '确认需要读取原文'
   if (output.decision === 'finish_reading') return '确认当前资料已足够'
   const tools = Array.isArray(output.tool_names) ? output.tool_names : []
-  if (tools.length) return actions[String(tools[0])] || '选择本轮工具'
+  if (tools.length) return sessionFileLabel(tools[0]) || actions[String(tools[0])] || '选择本轮工具'
   if (output.finish_reason) return '组织已有信息并生成答复'
   if (Array.isArray(input.tools) && input.tools.includes('read_material')) return '确定需要读取的文件与范围'
   if (typeof output.planned_steps === 'number') return '已规划工具步骤 · ' + output.planned_steps + ' 项'

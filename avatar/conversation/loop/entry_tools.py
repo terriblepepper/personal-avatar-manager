@@ -22,8 +22,8 @@ class SessionFileRequest(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
     file_id: str | None = Field(default=None, min_length=1, max_length=80)
     query: AgentText | None = Field(default=None, description='没有 ID 时查目录；空串浏览。与 file_id 二选一。')
-    offset: int = Field(default=0, ge=0, le=2**31-1)
-    page: int = Field(default=1, ge=1, le=2**31-1)
+    offset: int = Field(default=0, ge=0, le=2**31-1, description='目录分页偏移、文本字节偏移或文档页内字符偏移。')
+    page: int = Field(default=1, ge=1, le=2**31-1, description='文档页码，按返回的 next.start 续读。')
 
     @model_validator(mode='after')
     def selection(self):
@@ -107,10 +107,10 @@ async def bind_entry_tools(chat, context, owner, aic, session, files, *, include
     def tool(name, description, schema=ToolQuestion):
         tools.append({'name':name, 'description':description, 'parameters':schema.model_json_schema()})
 
-    tool('search_materials', '按自然语言问题混合检索本会话已授权资料的正文片段。可指定逻辑目录。', SearchQuestion)
-    tool('read_material', '按问题从本会话有权读取的资料目录选择原件并读取指定内容，可按文件名或说明定位。')
+    tool('search_materials', '混合检索已授权资料的正文片段，可指定目录。', SearchQuestion)
+    tool('read_material', '按文件名、说明或问题定位授权资料并读取原文。')
     if session_files:
-        tool('read_session_file', '用真实 ID 读取当前会话获准的原件（上传、生成或已分享资料）。已知 ID 直接读取；未知 ID 用 query 查目录，空串浏览，再按 can_read=true 项读取。文本/HTML 返回原文，按 next_offset 字节翻页；文档按 next.start 页和 next.offset 字符继续；二进制可交给获准的 Python 处理。', SessionFileRequest)
+        tool('read_session_file', '查找或读取本会话已授权的上传、生成或分享文件。query 查目录（空串浏览），file_id 读原件。按 next_offset 或 next 续读。', SessionFileRequest)
     if status:
         tools.append({'name':'application_status','description':'查看本人的分身申请与审核状态。',
                       'parameters':{'type':'object','properties':{},'additionalProperties':False}})

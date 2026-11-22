@@ -486,8 +486,6 @@ class AvatarChat:
             observation=self.assistant_router.catalog_reply(arguments.get('query',''),arguments.get('offset',0)) if action=='list_avatars' else self.assistant_reply(overview,'查询我的申请状态')
             if not overview['agent'] or (not request.personal and not declared):
                 return overview,None,parent,observation
-        if action=='find_conversation_files':
-            observation=await asyncio.to_thread(self.chat_files.discover,user['id'],parent['id'],arguments['query'],arguments['offset'])
         if action=='return_to_self':
             with self.service.database.connect(write=True) as db:db.execute('UPDATE chat_conversations SET selected_aic=NULL WHERE id=?',(parent['id'],))
             parent['selected_aic']=None
@@ -499,7 +497,7 @@ class AvatarChat:
                 overview=await asyncio.to_thread(self.service.overview,user['id'])
                 return overview,None,parent,'请明确目标分身的名称或 AIC。'+self.assistant_router.catalog_reply(arguments.get('query',''))
             target=matches[0]
-        elif action not in ('answer_self','deliver_material','find_conversation_files') and not request.personal and request.channel=='assistant' and parent.get('selected_aic'):
+        elif action not in ('answer_self','deliver_material') and not request.personal and request.channel=='assistant' and parent.get('selected_aic'):
             target=next((t for t in self.assistant_router.catalog() if t['aic']==parent['selected_aic']),None)
         if target:
             overview,context=await asyncio.to_thread(self.context,user,request,target['row'],private_access=True,run_parent=parent['id'])
