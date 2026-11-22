@@ -58,8 +58,7 @@ async function stop() {
     busy.value = false
     unconfirmed.delete(id)
     snapshot(result)
-    await loadMessages(id, controller.signal)
-    if (id === conversationId.value && pending.value?.request_id === rid && result.done) pending.value = null
+    await loadMessages(id, controller.signal, result.done ? rid : undefined)
   } catch (e) { notifyError(e) }
   finally { if (stopping.value === rid) stopping.value = '' }
 }
@@ -88,7 +87,9 @@ async function scrollBottom(force=false) {
   if (el && el===log.value && id===conversationId.value) el.scrollTop=el.scrollHeight
 }
 function snapshot(value:GenerationSnapshot){pending.value=value;busy.value=!value.done&&!value.error&&!['failed','cancelled','indeterminate','awaiting_input'].includes(value.state||'');void scrollBottom()}
-async function loadMessages(id:string, signal:AbortSignal) {
+async function loadMessages(id:string, signal:AbortSignal, completedRequest?:string) {
+  const completed = completedRequest && pending.value?.done && !pauseId.value &&
+    (!pending.value.request_id || pending.value.request_id === completedRequest) ? pending.value : undefined
   const rows = await request<ChatMessage[]>('/chat?'+new URLSearchParams({personal:'true',channel:'assistant',limit:'20',conversation_id:id}),'GET',undefined,signal)
   if (signal.aborted || id !== conversationId.value) return
   const tail = new Set(rows.map(row=>row.id))
@@ -97,6 +98,8 @@ async function loadMessages(id:string, signal:AbortSignal) {
     ? messages.value.filter(row=>row.id<first.id) : []
   const follow = !messages.value.length || nearBottom()
   const restore = follow ? undefined : captureAnchor()
+  // Replace the live bubble and its persisted copy in the same render.
+  if (completed && pending.value === completed) pending.value = null
   messages.value = [...retained,...rows]
   if (!retained.length) hasOlder.value = rows.length===20
   await nextTick()
@@ -112,8 +115,7 @@ async function observe(value:GenerationSnapshot,id:string){
     const result = await observeGeneration(value.request_id, event=>{if (current()) snapshot(event)}, active.signal)
     if (!current()) return
     snapshot(result)
-    await loadMessages(id, active.signal)
-    if (current() && result.done) pending.value=null
+    await loadMessages(id, active.signal, result.done ? value.request_id : undefined)
   } catch (e) {
     if (current()) { error.value=e instanceof Error?e.message:'暂时无法查询生成状态'; busy.value=false }
   }
@@ -221,10 +223,9 @@ async function send(control: NonNullable<GenerationRequest['agent_control']> = '
         error.value = value.error
       }
     }
-    await loadMessages(id, active.signal)
+    await loadMessages(id, active.signal, value.done ? command.request_id : undefined)
     if (active.signal.aborted || id!==conversationId.value) return
     if (value.done && !pauseId.value) {
-      pending.value = null
       const data = await request<{items: Conversation[]}>('/conversations?channel=assistant&personal=true', 'GET', undefined, active.signal)
       if (!active.signal.aborted) conversations.value = data.items
     }

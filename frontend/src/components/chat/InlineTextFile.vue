@@ -3,9 +3,9 @@ import { computed, defineAsyncComponent, onMounted, onUnmounted, ref, watch } fr
 import type { ChatFile } from '../../types'
 import { MAX_ANIMATION_BYTES } from '../../utils/animation'
 import { decodePreviewText, readPreviewBytes, TEXT_PREVIEW_LIMIT } from '../../utils/previewFile'
-import MarkdownContent from '../MarkdownContent.vue'
 import MermaidDiagram from '../MermaidDiagram.vue'
 
+const MarkdownContent = defineAsyncComponent(() => import('../MarkdownContent.vue'))
 const HtmlFrame = defineAsyncComponent(() => import('../HtmlFrame.vue'))
 const props = defineProps<{file:ChatFile; url:string; mode:'mermaid'|'text'|'html'; saved?:boolean}>()
 const emit = defineEmits<{preview:[file:ChatFile]; promote:[file:ChatFile]}>()
@@ -13,16 +13,21 @@ const host = ref<HTMLElement>(), visible = ref(false), text = ref(''), note = re
 const running = ref(props.mode === 'html' && props.file.origin === 'generated')
 const markdown = computed(() => /\.(?:md|markdown)$/i.test(props.file.filename))
 let observer: IntersectionObserver | undefined
+let releaseTimer: ReturnType<typeof setTimeout> | undefined
 onMounted(() => {
   if (!host.value || !('IntersectionObserver' in window)) { visible.value = true; return }
   observer = new IntersectionObserver(entries => {
     const near = entries.some(entry => entry.isIntersecting)
-    if (props.mode === 'html') visible.value = near
-    else if (near) { visible.value = true; observer?.disconnect() }
+    if (props.mode === 'html') {
+      clearTimeout(releaseTimer)
+      // Keep a playing frame through brief reversals at the edge of the scrollport.
+      if (near || !text.value) visible.value = near
+      else releaseTimer = setTimeout(() => { visible.value = false }, 600)
+    } else if (near) { visible.value = true; observer?.disconnect() }
   },{rootMargin:'160px'})
   observer.observe(host.value)
 })
-onUnmounted(() => observer?.disconnect())
+onUnmounted(() => { observer?.disconnect(); clearTimeout(releaseTimer) })
 watch([visible,() => props.url,() => props.file.size,() => props.mode,running], async ([near,url,size,mode,activeHtml],_,cleanup) => {
   text.value = ''; note.value = ''
   if (!near || (mode === 'html' && !activeHtml)) return
@@ -51,10 +56,13 @@ watch([visible,() => props.url,() => props.file.size,() => props.mode,running], 
       <button v-if="file.origin !== 'material' && !file.promoted_id && !saved" type="button" class="button small"
         @click="emit('promote',file)">转存资料</button>
     </div>
-    <small v-if="note" class="sub">{{ note }}</small>
-    <HtmlFrame v-if="mode === 'html' && text" :source="text" :filename="file.filename"/>
+    <div v-if="mode === 'html' && running" class="html-viewport">
+      <HtmlFrame v-if="text" :source="text" :filename="file.filename"/>
+      <small v-else-if="note || visible" class="sub">{{ note || '正在加载预览…' }}</small>
+    </div>
+    <small v-else-if="note" class="sub">{{ note }}</small>
     <MermaidDiagram v-else-if="text && mode === 'mermaid'" :source="text" :filename="file.filename"/>
-    <div v-else-if="text" class="inline-text">
+    <div v-else-if="text && mode === 'text'" class="inline-text">
       <MarkdownContent v-if="markdown" :source="text" :diagrams="false" document-mode/>
       <pre v-else>{{ text }}</pre>
     </div>
@@ -64,6 +72,9 @@ watch([visible,() => props.url,() => props.file.size,() => props.mode,running], 
 <style scoped>
 .inline-document { min-width:0; margin-block:.4rem; }
 .html-actions { display:flex; flex-wrap:wrap; gap:.35rem; margin-block:.35rem; }
+/* Reserve the frame before loading and while the offscreen document is released. */
+.html-viewport { block-size:clamp(230px, 49svh, 480px); overflow:hidden; }
+.html-viewport :deep(.html-frame) { block-size:100%; box-sizing:border-box; }
 .inline-document small { display:block; }
 .inline-text { overflow:auto; max-height:24rem; overscroll-behavior:contain; }
 .inline-text pre { white-space:pre-wrap; overflow-wrap:anywhere; }
