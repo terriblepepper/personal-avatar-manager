@@ -174,7 +174,7 @@ class MaterialReading:
         readings=[];requested=set()
         agent = config.get('_avatar_agent')
         def no_progress():
-            raise AgentNeedsInput.from_context('资料工具未取得新内容。请选择结束任务，或补充文件、页码或关键词后继续。', config)
+            raise AgentNeedsInput.from_context('资料工具未取得新内容。可补充文件、页码或关键词后继续。', config)
 
         evidence=data.pop('file_evidence',[])
         def has_content():

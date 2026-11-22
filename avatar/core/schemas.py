@@ -336,7 +336,7 @@ class ReviewRequest(BaseModel):
 class ChatRequest(BaseModel):
     request_id: str | None = Field(default=None, max_length=80)
     personal: StrictBool = False
-    message: str = Field(min_length=1, max_length=2000)
+    message: str = Field(max_length=2000)
     channel: str = Field(default="assistant", pattern="^(assistant|avatar)$")
     conversation_id: str | None = Field(default=None, max_length=80)
     attachment_ids: list[str] = Field(default_factory=list,max_length=5)
@@ -345,6 +345,8 @@ class ChatRequest(BaseModel):
 
     @model_validator(mode='after')
     def validate_agent_control(self):
+        if not self.message and self.agent_control != 'continue':
+            raise ValueError('请填写消息')
         if bool(self.agent_pause_id) != bool(self.agent_control) or self.agent_control and not self.conversation_id:
             raise ValueError('控制暂停任务需同时指定会话、暂停标识和操作')
         return self

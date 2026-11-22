@@ -83,7 +83,7 @@ class SkillExecution:
         # 职责：默认只接受已加载脚本；allow_code 仅由本人 Web 工具授权开启，允许 Python 代码，仍不接受宿主命令。
         def pause(reason):
             from avatar.core.execution import AgentNeedsInput
-            pending=AgentNeedsInput(reason+'。请选择结束任务，或补充要求后继续。',checkpoint=checkpoint)
+            pending=AgentNeedsInput(reason+'。可以继续，或补充要求后继续。',checkpoint=checkpoint)
             pending.generated_files=list(outputs)
             return pending
 

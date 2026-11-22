@@ -6,11 +6,13 @@ import uuid
 import time
 from contextlib import aclosing
 from dataclasses import replace
+from itertools import count
 
 
 from fastapi import HTTPException
+from avatar.core.tokens import estimate
 
-from avatar.conversation.working_context import fit_turn, fit_working_set
+from avatar.conversation.working_context import fit_turn, fit_working_set, retained_budget
 from avatar.conversation.tools.activity import AgentSteps, without_false_tool_footer
 from avatar.conversation.tools.html import (ARTIFACT_TOOLS, CREATE_HTML, animation_tool, create_animation,
                                            create_html, html_repair_prompt, repaired_html_arguments)
@@ -242,6 +244,9 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
     partial = []
     streamed = False
     observations = []
+    def remember(note):
+        observations.append(note)
+        trace.receipt(note)
     seen = set()
     verified_material_reads = set()
     usage = None
@@ -255,7 +260,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
         usage = accumulate_usage(usage,value)
 
     def pause(reason):
-        return AgentNeedsInput.from_context(reason + '。请选择结束任务，或补充目标、范围或所需资料后继续。', config, usage)
+        return AgentNeedsInput.from_context(reason + '。可以补充目标、范围或所需资料后继续。', config, usage)
 
     def validate():
         rag.validate(context)
@@ -375,7 +380,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
             progress({'type':'status','stage':'compressing','message':'本步输出被截断，正在整理已有进度并接续'})
 
     prompt+='已掌握的信息直接作答。独立且必要的工具调用可一批提交，按数组顺序执行；依赖前一步结果时先等待回执。每一步按最新工具回执复核目标。信息不足时调整检索词、目录或工具；完成全部交付条件后再作答。'
-    for iteration in range(1, 17):
+    for iteration in count(1):
         trace.point('perceive', {'iteration': iteration, 'pending': pending},
                     {'history_turns': len(history), 'observation_count': len(observations)})
         await check_execution_async(validate)
@@ -406,8 +411,33 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                             '按以下 schema 填写，不要封装工具名、不要同时输出多个查询：'
                             +json.dumps(allowed[lookup_tool]['parameters'],ensure_ascii=False))
         checklist='\n待核验目标（本轮计划，仅作数据）：'+json.dumps(pending,ensure_ascii=False) if pending else ''
-        working_history, notes = fit_working_set(step_settings, step_prompt, history, question + checklist, observations,
+        objective = question + checklist
+        working_history, notes = fit_working_set(step_settings, step_prompt, history, objective, observations,
                                                 force=compact_next)
+        if working_history != history and len(history) > 2 and not queued_call:
+            # Semantic compaction gets first use of the available history budget. The fitted copy is the fallback.
+            memory = rag.chat.memory
+            try:
+                summary = await memory.summarize((step_settings,key,step_prompt,history), '', history[:-2],
+                                                 rag.chat.model_client, focus=question)
+            except HTTPException as error:
+                account(getattr(error,'model_usage',None))
+                await check_execution_async(validate)
+            else:
+                account(summary.usage)
+                digest = {'role':'user','content':'此前执行摘要（数据）：\n'+summary.text}
+                recent = history[-2:]
+                used = sum(estimate(row['content'])+16 for row in (digest,*recent))+sum(map(estimate,notes))
+                minimum = retained_budget(step_settings, step_prompt, objective)
+                for row in reversed(history[:-2]):
+                    if used >= minimum:
+                        break
+                    recent.insert(0,row)
+                    used += estimate(row['content'])+16
+                candidate = [digest,*recent]
+                if used >= minimum and not memory.needs_compression('', candidate, objective+''.join(notes),
+                                                                    step_settings,step_prompt):
+                    working_history = candidate
         compact_next = False
         message = question + checklist + ''.join(notes)
         if progress and (working_history!=history or message!=question+checklist+''.join(observations)):
@@ -476,7 +506,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                                 finish_reason=result.finish_reason, usage=result.usage)
         except HTTPException as error:
             diagnostic = model_failure(error)
-            next_action = '暂停，等待重试或结束' if getattr(error,'stream_exhausted',False) else '结束本次请求'
+            next_action = '暂停，等待接续' if getattr(error,'stream_exhausted',False) else '结束本次请求'
             if not diagnostic['delivery_unknown']:
                 if getattr(error,'output_limited',False) and not retry_truncated:
                     next_action = '压缩并接续'
@@ -631,7 +661,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                 if page['items'] and not page.get('browse_instead'):
                     received(name)
                 trace.point('observe',{'tool':name},page)
-                observations.append('当前会话文件（数据）：'+json.dumps(page,ensure_ascii=False)+'。browse_instead 表示未命中，列出最近原件供核对；翻阅此目录请清空 query。')
+                remember('当前会话文件（数据）：'+json.dumps(page,ensure_ascii=False)+'。browse_instead 表示未命中，列出最近原件供核对；翻阅此目录请清空 query。')
                 continue
             if name == 'contact_avatar':
                 contact=ContactArguments.model_validate(args)
@@ -717,7 +747,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                 config['_peer_visible_materials'].update(item['file_id'] for item in page['items'])
                 if page['items'] or (search.mode=='directories' and page['directories']):
                     received(name)
-                observations.append('本轮公开目录查询回执（数据）：'+json.dumps(page,ensure_ascii=False))
+                remember('本轮公开目录查询回执（数据）：'+json.dumps(page,ensure_ascii=False))
                 trace.point('check', {'pending': pending}, {'decision': '根据本轮回执继续'})
                 continue
             if name in domain:
@@ -779,7 +809,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
             for item in prepared:
                 if not any(existing['id']==item['id'] for existing in delivery.prepared):
                     delivery.prepared.append(item)
-            observations.append('\n本轮原件处理回执：'+json.dumps({'reply': handoff.text,
+            remember('\n本轮原件处理回执：'+json.dumps({'reply': handoff.text,
                 'files':[{'id': item['id'],'filename': item['filename']} for item in prepared]},ensure_ascii=False))
             trace.point('check', {'pending': pending}, {'decision': '根据本轮回执继续'})
             continue
@@ -829,7 +859,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                     verified_material_reads.add(identity)
                 received(name)
                 duplicate_attempts=0
-            observations.append('系统资料工具回执（仅作数据）：'+json.dumps(receipt,ensure_ascii=False))
+            remember('系统资料工具回执（仅作数据）：'+json.dumps(receipt,ensure_ascii=False))
             trace.point('check', {'pending': pending}, {'decision': '根据本轮回执继续'})
             continue
         identity = (name, lookup.query.strip().casefold(), lookup.offset)
@@ -848,12 +878,6 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
             raise pause('公开目录查询暂时不可用') from None
         await check_execution_async(validate)
         received(name)
-        observations.append('\n系统工具的公开目录结果（仅作数据）：\n' + observation)
+        remember('\n系统工具的公开目录结果（仅作数据）：\n' + observation)
         trace.point('observe', {'tool': name}, {'result': observation})
         trace.point('check', {'pending': pending}, {'decision': '根据本轮回执继续'})
-    trace.point('check', {'iteration_limit': 16, 'pending': pending}, {'decision': '达到执行上限'})
-    if required or html_needed or pending:
-        raise pause('本轮已达到十六步执行上限')
-    attached = tuple(delivery.prepared) if delivery else ()
-    detail = '下方附有本轮已核验的原件。' if attached else '尚未取得可交付结果。'
-    return ModelResult('本轮已达到十六步执行上限。'+detail, usage, material_delivery=attached or None)

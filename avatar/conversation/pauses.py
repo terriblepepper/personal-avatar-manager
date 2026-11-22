@@ -4,7 +4,7 @@ import re
 import json
 import time
 import uuid
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 
 from fastapi import HTTPException
 
@@ -27,7 +27,7 @@ def checked(db, user_id, request):
         if request.agent_control=='retry' and not task['snapshot'].get('stream_retryable'):
             raise HTTPException(409,'该任务需要补充信息才能继续')
     elif task:
-        raise HTTPException(409,'分身正在等待补充信息或结束任务，请刷新会话')
+        raise HTTPException(409,'分身已暂停，请刷新后继续任务')
     return task
 
 
@@ -61,13 +61,14 @@ def continue_task(chat, user, request, parent, task):
             AND (id=? OR parent_id=?)""",(task['session_id'],user['id'],parent['id'],parent['id'])).fetchone()
         receipts=numeric_receipts(db,user['id'],parent['id'],task)
         artifacts = available_outputs(chat,db,user['id'],parent['id'],task['outputs'])
-    if not target or not session:raise HTTPException(409,'原分身或会话已变更，请结束任务后重新提问')
-    message = task['objective'] if request.agent_control=='retry' else task['objective']+'\n\n用户补充：'+request.message
-    if len(message)>16000:raise HTTPException(422,'本任务累计输入已达上限，请结束后重新提问')
-    files = task.get('attachment_ids',[]) if request.agent_control=='retry' else request.attachment_ids
+    if not target or not session:raise HTTPException(409,'原分身或会话已变更，无法继续此任务')
+    supplement = request.message.strip() if request.agent_control == 'continue' else ''
+    message = task.get('goal', task['objective']) + '\n\n用户补充：' + supplement if supplement else task['objective']
+    files = request.attachment_ids if supplement or request.attachment_ids else task.get('attachment_ids', [])
     work = request.model_copy(update={'message':message,'attachment_ids':files})
     overview, context = chat.context(user,work,target,private_access=True)
     overview['_parent_id']=parent['id']
+    overview['_prior_tool_events']=task.get('activity', [])
     overview['_target']={'aic':target['aic'],'name':overview['agent']['profile'].get('avatar_name','我的分身')}
     cfg,key,system,history=context
     if request.agent_control=='retry' and task.get('answer_route'):
@@ -77,7 +78,11 @@ def continue_task(chat, user, request, parent, task):
         background=json.loads(raw)
         background['last_clarification']=task['snapshot']['reply']
         system=prefix+' last_clarification 是上一轮你向用户提出的问题，只用于理解本轮补充。\n'+dump(background)
-    context=({**cfg,'_agent_checkpoint':task['checkpoint'],'_agent_saved_files':artifacts,'_sandbox_receipts':receipts,
+    from avatar.conversation.tools.activity import memory_evidence
+    evidence = memory_evidence(task.get('activity', []))
+    if evidence:
+        history = [*history, {'role':'assistant','content':evidence}]
+    context=({**cfg,'_resume_history':history,'_agent_checkpoint':task['checkpoint'],'_agent_saved_files':artifacts,'_sandbox_receipts':receipts,
               '_resume_results_only':bool(receipts) and request.message.strip() in ('继续','继续。','continue') and '相同的沙箱操作' in task['snapshot']['status']},key,system,history)
     return overview,context,dict(session),work
 
@@ -117,28 +122,34 @@ def finish(chat, db, user_id, parent_id, pause_id, message_id):
     return files
 
 
-def pause(chat, user, request, work, parent, session, overview, error, previous):
+def pause(chat, user, request, work, parent, session, overview, error, previous, *, db=None, job=None):
     pause_id=uuid.uuid4().hex
-    job=current_generation.get()
+    job=job or current_generation.get()
+    transaction = db
     result={'state':'awaiting_input','done':False,'reply':error.question or '','status':str(error),'usage':error.usage,
             'agent_pause_id':pause_id,'conversation_id':parent['id'],'message':request.message,'stage':'awaiting_input'}
     result['stream_retryable'] = bool(getattr(error,'stream_retryable',False))
     if job:result.update(request_id=job['request_id'],task_id=job['task_id'])
     owner=overview['agent']
-    with ExitStack() as resources, chat.service.database.connect(write=True) as db:
-        validate_authorization(db,job)
+    with ExitStack() as resources, (nullcontext(transaction) if transaction is not None else chat.service.database.connect(write=True)) as db:
+        if transaction is None:
+            validate_authorization(db,job)
         checked(db,user['id'],request)
-        message_id=db.execute("""INSERT INTO chat_messages(user_id,channel,role,content,created_at,
-            profile_modified_at,conversation_id) VALUES(?,?,?,?,?,?,?)""",
-            (user['id'],session['channel'],'user',request.message,now(),'',session['id'])).lastrowid
-        for file_id in overview.get('_attachment_ids',[]):
-            db.execute('INSERT OR IGNORE INTO chat_file_usages(message_id,file_id) VALUES(?,?)',(message_id,file_id))
+        if request.message.strip() and request.agent_control != 'retry':
+            message_id=db.execute("""INSERT INTO chat_messages(user_id,channel,role,content,created_at,
+                profile_modified_at,conversation_id) VALUES(?,?,?,?,?,?,?)""",
+                (user['id'],session['channel'],'user',request.message,now(),owner.get('last_modified_at',''),session['id'])).lastrowid
+            for file_id in overview.get('_attachment_ids',[]):
+                db.execute('INSERT OR IGNORE INTO chat_file_usages(message_id,file_id) VALUES(?,?)',(message_id,file_id))
         files=list({item['id']:item for item in [*overview.get('_generated_files',[]),*getattr(error,'generated_files',[])]}.values())
         if files:resources.enter_context(chat.chat_files.storing_outputs(db,user['id'],parent['id'],None,files))
         outputs=list(dict.fromkeys([*(previous['outputs'] if previous else []),*(item['id'] for item in files)]))
         document={'aic':owner['aic'],'owner':owner['user_id'],'session_id':session['id'],
                   'retry_dispatch':getattr(error,'retry_dispatch',False),'answer_route':getattr(error,'answer_route',None),
-                  'checkpoint':error.checkpoint,'objective':work.message,'attachment_ids':work.attachment_ids,'snapshot':result,'outputs':outputs}
+                  'checkpoint':error.checkpoint,'objective':work.message,
+                  'goal':previous.get('goal',previous['objective']) if previous else work.message,
+                  'attachment_ids':work.attachment_ids,'snapshot':result,'outputs':outputs,
+                  'activity': [*(previous.get('activity', []) if previous else []), *overview.get('_tool_events', ())]}
         db.execute('INSERT OR REPLACE INTO chat_agent_pauses(conversation_id,pause_id,document) VALUES(?,?,?)',
                    (parent['id'],pause_id,dump(document)))
         db.execute('UPDATE chat_conversations SET updated_at=? WHERE id=?',(now(),parent['id']))

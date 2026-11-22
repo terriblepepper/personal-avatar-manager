@@ -26,15 +26,12 @@ class ConversationTools:
 
     def effort(self, user_id, conversation_id, *, selected=...):
         with self.files.database.connect(write=selected is not ...) as db:
-            row = self.files.session(db, user_id, conversation_id, editable=selected is not ...)
+            row = self.files.session(db, user_id, conversation_id)
             model = db.execute('SELECT model_config FROM model_settings WHERE user_id=?', (user_id,)).fetchone()
             config = json.loads(model[0]) if model else {}
             available = levels(config)
             saved = json.loads(row['tools_config'])
             if selected is not ...:
-                if db.execute("SELECT 1 FROM chat_generation_jobs WHERE conversation_id=? AND state IN ('queued','running')",
-                              (conversation_id,)).fetchone():
-                    raise HTTPException(409, '会话正在处理，请等待回答完成')
                 if selected is not None and selected not in available:
                     raise HTTPException(422, '当前模型不支持所选推理强度，请刷新后重试')
                 saved['reasoning_effort'] = selected

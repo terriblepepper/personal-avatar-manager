@@ -30,7 +30,10 @@ def capture_authorization(db,user_id,body):
     for table,column in (('model_settings','model_config'),('embedding_settings','config')):
         row=db.execute(f'SELECT {column} FROM {table} WHERE user_id=?',(user_id,)).fetchone()
         versions[table]=hashlib.sha256((row[0] if row else '{}').encode()).hexdigest()
-    return dict(skills=skills,files=files,materials=materials,versions=versions)
+    conversation = db.execute('SELECT tools_config FROM chat_conversations WHERE id=? AND user_id=?',
+                              (body.conversation_id,user_id)).fetchone()
+    effort = json.loads(conversation[0]).get('reasoning_effort') if conversation else None
+    return dict(skills=skills,files=files,materials=materials,versions=versions,reasoning_effort=effort)
 
 
 def validate_versions(db,user_id,scope):

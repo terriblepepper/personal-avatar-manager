@@ -116,7 +116,8 @@ class AvatarChat:
             if row['role']=='assistant':
                 row['content']=visible_delivery_reply(row['content'],row['attachments'])
             row['used_skills']=json.loads(row.get('used_skills') or '[]')
-            row['tool_events']=json.loads(row.get('tool_events') or '[]')
+            row['tool_events']=[item for item in json.loads(row.get('tool_events') or '[]')
+                                if item.get('group') != 'agent_receipt']
             if row['role']=='assistant' and had_successful_sandbox(row['tool_events']):
                 row['content']=without_false_tool_footer(row['content'])
         by_intent={r['message_id']:{'id':r['id'],'conversation_id':r['conversation_id'],'status':r['status'],'task_id':r['task_id'],**json.loads(r['document'])} for r in intents}
@@ -231,7 +232,7 @@ class AvatarChat:
         summary = session['summary'] if session['summary_profile_modified_at'] == revision else ''
         through = session['summary_through'] if summary else 0
         with self.service.database.connect() as db:
-            size = db.execute("""SELECT COALESCE(SUM((octet_length(content)+2)/3 + 16),0)
+            size = db.execute("""SELECT COALESCE(SUM((octet_length(content)+octet_length(tool_events)+2)/3 + 16),0)
                 FROM chat_messages WHERE conversation_id=? AND profile_modified_at=? AND id>?""",
                 (identifier,overview['agent']['last_modified_at'],through)).fetchone()[0]
         return self.memory.usage(context[0],context[2],summary,int(size))
@@ -333,7 +334,8 @@ class AvatarChat:
             overview['_generated_files'] = context[0].setdefault('_generated_files', [])
             # Enrichment can add evidence after memory.prepare. Fit this working copy without reloading the old turns.
             from avatar.conversation.working_context import fit_turn
-            working_history,_=fit_turn(context[0],context[2],context[3],request.message,[])
+            history=[*context[3], *context[0].get('_resume_history', ())]
+            working_history,_=fit_turn(context[0],context[2],history,request.message,[])
             if progress and working_history!=context[3]:
                 progress({'type':'status','stage':'compressing','message':'已精简本步历史，保留当前任务和工具结果'})
             context=(*context[:3],working_history)
@@ -383,6 +385,8 @@ class AvatarChat:
             validate_authorization(db,job)
             # 完整问答对同事务保存，避免只记录问题或半段回答；调度问答记录目标来源。
             for role, content in [('user', request.message), ('assistant', reply)]:
+                if role == 'user' and (not content.strip() or request.agent_control == 'retry'):
+                    continue
                 cursor=db.execute('INSERT INTO chat_messages(user_id,channel,role,content,created_at,profile_modified_at,conversation_id,responder_aic,responder_name) VALUES(?,?,?,?,?,?,?,?,?)',
                            (user['id'], request.channel, role, content, now(), overview['agent']['last_modified_at'] if model or overview.get('_intent') else '',request.conversation_id,target['aic'] if target else None,target['name'] if target else None))
                 if role=='user':
@@ -396,7 +400,8 @@ class AvatarChat:
             if outputs:resources.enter_context(self.chat_files.storing_outputs(db,user['id'],overview.get('_parent_id',request.conversation_id),cursor.lastrowid,outputs))
             used=overview.get('_used_skills',[])
             db.execute('UPDATE chat_messages SET used_skills=? WHERE id=?',(dump(used),cursor.lastrowid))
-            db.execute('UPDATE chat_messages SET tool_events=? WHERE id=?',(dump(overview.get('_tool_events',[])),cursor.lastrowid))
+            activity = [*overview.get('_prior_tool_events', ()), *overview.get('_tool_events', ())]
+            db.execute('UPDATE chat_messages SET tool_events=? WHERE id=?',(dump(activity),cursor.lastrowid))
             if overview.get('_contact_draft'):
                 overview['_intent']=self.dialogues.intent.save_draft(db,user['id'],request.conversation_id,overview['_contact_draft'],cursor.lastrowid)
             elif overview.get('_intent'):
@@ -504,6 +509,8 @@ class AvatarChat:
     # 结果与约束：依次 yield 状态、文本、用量和 done；失败转换为脱敏 error，未完成片段不保存，退出始终释放租约与上游资源。
     async def stream(self, user, request):
         lock = self.locks.setdefault(request.conversation_id or user['id'], asyncio.Lock())
+        from avatar.core.execution import authorization, current_generation
+        job = current_generation.get()
         acquired = None
         overview = context = session = prepared = None
         failure_stage='lookup'
@@ -535,8 +542,9 @@ class AvatarChat:
                     overview,context,session,request=pauses.continue_task(self,user,request,parent,held)
                     local_reply=None
                     config = context[0]
-                    if request.agent_control=='retry' and held.get('retry_dispatch'):
+                    if held.get('retry_dispatch'):
                         overview,context,session,local_reply=await self.dispatch(user,request,parent)
+                        overview['_prior_tool_events']=held.get('activity', [])
                     elif (not config.get('_answer_route') and self.dialogues and overview.get('_private_context') and overview['agent'].get('identity_status')=='active'
                             and not session.get('parent_id') and not config.get('_agent_saved_files')
                             and not config.get('_agent_checkpoint',{}).get('sandbox_attempted')):
@@ -588,8 +596,11 @@ class AvatarChat:
                 if context:
                     config = context[0]
                     if overview['agent']['user_id'] == user['id']:
-                        config = with_chat_effort(config, json.loads(parent['tools_config']).get('reasoning_effort'))
+                        effort = (authorization() or {}).get('reasoning_effort', json.loads(parent['tools_config']).get('reasoning_effort'))
+                        config = with_chat_effort(config, effort)
                     context=({**config,'_avatar_agent':True},*context[1:])
+                if job:
+                    job['_pause_state'] = (session, request, overview, context)
                 if request.personal and context is None and local_reply:request=request.model_copy(update={'attachment_ids':[]})
                 request = request.model_copy(update={'conversation_id':session['id']})
                 if overview.get('_target'):
@@ -602,6 +613,8 @@ class AvatarChat:
                         nonlocal prepared
                         try:
                             prepared = await self.prepare(user, request, overview, context, session, events.put_nowait)
+                            if job:
+                                job['_pause_state'] = (session, request, overview, prepared)
                             await check_execution_async()
                             events.put_nowait({'type': 'skills', 'items': overview.get('_used_skills', [])})
                             events.put_nowait({'type': 'tools', 'mermaid': prepared[0].get('_mermaid_enabled', True)})
@@ -617,6 +630,8 @@ class AvatarChat:
                             if event['type'] == 'status':
                                 failure_stage = event['stage']
                                 if event.get('reset_reply'): text.clear()
+                            elif event['type'] == 'tool' and event.get('group') == 'agent_receipt':
+                                continue
                             elif event['type'] == 'contact_draft':
                                 overview['_contact_draft']=event['document']
                                 continue

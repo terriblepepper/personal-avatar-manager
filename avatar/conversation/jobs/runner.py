@@ -19,11 +19,19 @@ class GenerationRunner:
         self.store = GenerationStore(database)
         self.concurrency = concurrency
         self.tasks = set()
+        self.active_jobs = {}
 
     async def cancel(self,actor,request_id):
-        return await asyncio.to_thread(self._cancel,actor,request_id,asyncio.get_running_loop())
+        snapshot = await asyncio.to_thread(self.store.get, actor['id'], request_id)
+        active = self.active_jobs.get(snapshot['task_id']) if snapshot else None
+        if active and snapshot['state'] == 'running':
+            row, task = active
+            row['_user_pause'] = True
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        return await run_blocking(self._cancel, actor, request_id, asyncio.get_running_loop(), active[0] if active else None)
 
-    def _cancel(self,actor,request_id,loop):
+    def _cancel(self,actor,request_id,loop,active=None):
         from avatar.conversation import pauses
         uid=actor['id']
         with self.database.connect(write=True) as db:
@@ -33,9 +41,35 @@ class GenerationRunner:
             payload=json.loads(row['payload'])
             parent=db.execute('SELECT * FROM chat_conversations WHERE id=? AND user_id=?',(row['conversation_id'],uid)).fetchone()
             result={'reply':'已停止本次任务。','conversation_id':parent['id']}
-            if payload.get('agent_pause_id'):
-                chat=getattr(getattr(self.chat,'services',None),'chat',self.chat)
-                result=pauses.end_paused_in(chat,db,actor,parent,payload['agent_pause_id'])
+            chat=getattr(getattr(self.chat,'services',None),'chat',self.chat)
+            if payload.get('personal') and hasattr(chat, 'service'):
+                from avatar.core.execution import AgentNeedsInput
+                request=ChatRequest.model_validate(payload).model_copy(update={'channel':parent['channel']})
+                previous=pauses.pending(db,uid,parent['id'])
+                state=(active or {}).get('_pause_state')
+                target=db.execute('SELECT user_id,aic,last_modified_at FROM avatar_records WHERE user_id=?',(uid,)).fetchone()
+                if (state and state[2].get('agent')) or target:
+                    if state and state[2].get('agent'):
+                        session,work,overview,context=state
+                    else:
+                        session,work,context=parent,request,None
+                        if previous:
+                            session=db.execute('SELECT * FROM chat_conversations WHERE id=? AND user_id=?',
+                                               (previous['session_id'],uid)).fetchone() or parent
+                            suffix='\n\n用户补充：'+request.message if request.message and request.agent_control=='continue' else ''
+                            objective=previous.get('goal',previous['objective']) if suffix else previous['objective']
+                            work=request.model_copy(update={'message':objective+suffix,
+                                                             'attachment_ids':request.attachment_ids or previous.get('attachment_ids',[])})
+                            target=db.execute('SELECT user_id,aic,last_modified_at FROM avatar_records WHERE user_id=? AND aic=?',
+                                              (previous['owner'],previous['aic'])).fetchone() or target
+                        overview={'agent':dict(target),'_tool_events':json.loads(row['snapshot']).get('tool_events',[])}
+                    config=context[0] if context else {'_agent_checkpoint':(previous or {}).get('checkpoint')}
+                    error=AgentNeedsInput.from_context('任务已暂停。点击继续，或补充信息后继续。',config)
+                    error.retry_dispatch=not state and bool((previous or {}).get('retry_dispatch', not previous))
+                    error.answer_route=config.get('_answer_route')
+                    pauses.pause(chat,actor,request,work,parent,session,overview,error,previous,db=db,job=row)
+                    return self.store.view(
+                        db.execute('SELECT * FROM chat_generation_jobs WHERE task_id=?',(row['task_id'],)).fetchone(),db)
             self.store.finish_in(db,uid,request_id,'cancelled',result)
         # Commit the durable stop before notifying the in-process task on its owning loop.
         loop.call_soon_threadsafe(self._interrupt,row['task_id'])
@@ -105,7 +139,8 @@ class GenerationRunner:
                     last_saved=time.monotonic()
             await run_blocking(self.store.finish,uid, rid, 'indeterminate', error='原请求未返回最终结果，不会自动重发')
         except asyncio.CancelledError:
-            await run_blocking(self.store.finish,uid, rid, 'indeterminate', error='服务已停止，原请求结果未确认；不会自动重发')
+            if not row.get('_user_pause'):
+                await run_blocking(self.store.finish,uid, rid, 'indeterminate', error='服务已停止，原请求结果未确认；不会自动重发')
             raise
         except HTTPException as error:
             await run_blocking(self.store.finish,uid,rid,'failed',error=str(error.detail))
@@ -137,6 +172,7 @@ class GenerationRunner:
                     for row in rows:
                         task = asyncio.create_task(self.execute(row), name='chat-' + row['task_id'])
                         self.tasks.add(task)
+                        self.active_jobs[row['task_id']] = (row, task)
                         task.add_done_callback(self.completed)
                 except Exception:
                     log.exception('Generation queue temporarily unavailable')
@@ -148,5 +184,6 @@ class GenerationRunner:
 
     def completed(self, task):
         self.tasks.discard(task)
+        self.active_jobs.pop(task.get_name().removeprefix('chat-'), None)
         if not task.cancelled() and task.exception():
             log.error('Generation cleanup failed', exc_info=task.exception())

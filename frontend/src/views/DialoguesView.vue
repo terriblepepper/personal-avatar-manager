@@ -46,7 +46,7 @@ const filePreview=ref<ChatFile|null>(null)
 const toolPending = ref(false), effortPending = ref(false)
 const toolsSaving = computed(() => toolPending.value || effortPending.value)
 const commandsDisabled = computed(() => busy.value || switching.value || resourceBusy.value || !detail.value)
-const sendDisabled = computed(() => commandsDisabled.value || toolsSaving.value || !message.value.trim() || (!/^\/compact(?:\s|$)/.test(message.value.trim()) && (detail.value?.task?.can_supplement === false ||
+const sendDisabled = computed(() => commandsDisabled.value || toolsSaving.value || (!message.value.trim() && !pausedTask.value) || (!/^\/compact(?:\s|$)/.test(message.value.trim()) && (detail.value?.task?.can_supplement === false ||
   detail.value?.task?.status === 'ended' || detail.value?.task?.status === 'awaiting_acceptance' || !!detail.value?.task?.needs_confirmation)))
 const activeTask=computed(()=>detail.value?.task || detail.value?.chat)
 const runningTask = computed(() => activeTask.value?.status === 'running' ? activeTask.value : undefined)
@@ -55,7 +55,7 @@ const activeStage = computed(() => {
   const stage = runningTask.value.tool_activity?.at(-1)
   return stage?.status === 'running' ? stage.steps?.at(-1)?.message || stage.name : stage?.name || '准备回答'
 })
-const pausedTask = computed(() => activeTask.value?.status === 'awaiting_input' && activeTask.value.can_supplement ? activeTask.value : undefined)
+const pausedTask = computed(() => activeTask.value && (activeTask.value.status === 'paused' || (activeTask.value.status === 'awaiting_input' && activeTask.value.can_supplement)) ? activeTask.value : undefined)
 const transport=computed(()=>detail.value?.current_transport_mode==='acps'?'ACPS'
   :detail.value?.current_transport_mode==='internal'?'平台内部传输':'')
 const progress=computed(()=>{
@@ -282,15 +282,13 @@ function removeSkill(skill:Skill) {
     {message:'', request_id:token, remove_skills:[skill.id]}, () => { if (pending === token) pending='' })
 }
 function taskAction(name:string) {
-  const pause = name === 'end' ? pausedTask.value : undefined
-  const target = pause?.id || taskId.value || (name === 'end' ? runningTask.value?.id : undefined)
+  const target = name === 'cancel' ? runningTask.value?.id || taskId.value : taskId.value
   if (!target || busy.value || switching.value || resourceBusy.value) return
   const confirms = name==='accept' || name==='confirm'
   if (confirms && !confirm('确认由分身继续处理本任务？所选文件和补充意图将一并发送。')) return
   const token = pending ||= id()
-  const query = pause?.revision !== undefined ? '?expected_revision=' + pause.revision : ''
-  return action('/agent-dialogues/'+encodeURIComponent(target)+'/'+name+query, 'POST',
-    confirms ? {message:message.value,file_ids:fileIds.value,request_id:token} : {}, () => finishMessage(token))
+  return action('/agent-dialogues/'+encodeURIComponent(target)+'/'+name, 'POST',
+    confirms ? {message:message.value,file_ids:fileIds.value,request_id:token} : {}, () => { if (confirms) finishMessage(token) })
 }
 async function loadDraft(path:string, body:Record<string,string>) {
   if (switching.value || drafting.value || intent.value) return
@@ -490,7 +488,6 @@ onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
       <div class="composer-popover chat-command-panel">
         <template v-if="taskId">
           <button type="button" class="chat-menu-item" :disabled="commandsDisabled || detail?.task?.status==='paused' || detail?.task?.status==='ended'" @click="taskAction('cancel')"><AppIcon name="clock" :size="16"/>暂停</button>
-          <button type="button" class="chat-menu-item" :disabled="commandsDisabled || detail?.task?.status==='ended'" @click="taskAction('end')"><AppIcon name="close" :size="16"/>结束任务</button>
           <button type="button" class="chat-menu-item danger" :disabled="commandsDisabled" @click="remove(`/agent-dialogues/${encodeURIComponent(taskId)}`,'删除任务记录？未完成任务将终止。','DELETE')"><AppIcon name="trash" :size="16"/>删除任务</button>
         </template>
         <button v-else type="button" class="chat-menu-item" :disabled="commandsDisabled" @click="remove(`/agent-sessions/${encodeURIComponent(current)}/clear`,'清空本方记录与记忆？')"><AppIcon name="rebuild" :size="16"/>清空本方记录与记忆</button>
@@ -501,9 +498,9 @@ onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
     <button v-if="detail?.task?.can_accept" type="button" class="button chat-command" :disabled="commandsDisabled" @click="taskAction('accept')">确认任务请求</button>
     <button v-if="detail?.task?.needs_confirmation" type="button" class="button chat-command" :disabled="commandsDisabled" @click="taskAction('confirm')">确认并补充意图</button>
     <div class="composer-primary-actions">
-      <EffortPicker :conversation-id="resourceId" :busy="busy || switching || resourceBusy || detail?.task?.status==='running'" @saving="effortPending=$event"/>
-      <ComposerAction v-if="runningTask || (pausedTask && !message.trim())" label="停止" stop :disabled="commandsDisabled" @click="taskAction('end')"/>
-      <ComposerAction v-else :label="pausedTask ? '补充并继续' : '发送'" :aria-busy="writeState==='sending'" :disabled="sendDisabled" @click="send"/>
+      <EffortPicker :conversation-id="resourceId" :busy="!!runningTask" @saving="effortPending=$event"/>
+      <ComposerAction v-if="runningTask" label="暂停任务" stop :disabled="commandsDisabled" @click="taskAction('cancel')"/>
+      <ComposerAction v-else :resume="!!pausedTask" :label="pausedTask ? (message.trim() ? '补充并继续' : '继续任务') : '发送'" :aria-busy="writeState==='sending'" :disabled="sendDisabled" @click="send"/>
     </div>
   </ComposerToolbar>
   </div>

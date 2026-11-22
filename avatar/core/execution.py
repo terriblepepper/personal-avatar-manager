@@ -71,7 +71,7 @@ def sandbox_checkpoint(raw):
     attempted = value.get('sandbox_attempted') is True
     result = {'v': 1, 'sandbox_attempted': attempted}
     actions = value.get('sandbox_actions')
-    if attempted and isinstance(actions, list) and 0 < len(actions) <= 16 and all(
+    if attempted and isinstance(actions, list) and actions and all(
         isinstance(action, str) and re.fullmatch(r'[0-9a-f]{64}', action) for action in actions
     ):
         result['sandbox_actions'] = list(dict.fromkeys(actions))
@@ -109,9 +109,12 @@ async def call_with_retry(call, validate=None, *, retry_invalid=True):
             await asyncio.sleep(0.2)
 
 
+_SECRET = re.compile('(?:Bearer\\s+\\S+|github_pat_|sk-[a-z0-9_-]{12,}|-----BEGIN [A-Z ]+KEY-----|(?:api[_ -]?key|password|token|secret)["\\\']?\\s*[:=]\\s*\\S+)', re.I)
+
+
 def _trace_value(value, depth=0):
     if isinstance(value, str):
-        if re.search(r'(?:Bearer\s+[^\s]+|github_pat_|sk-[a-z0-9_-]{12,}|-----BEGIN [A-Z ]+KEY-----)', value, re.I):
+        if _SECRET.search(value):
             return '[敏感内容已隐藏]'
         return value[:500] + ('…' if len(value) > 500 else '')
     if depth >= 5:
@@ -154,6 +157,12 @@ class AgentSteps:
             self.progress({'type': 'tool', 'id': uuid.uuid4().hex, 'group': 'agent_trace',
                            'name': self.PHASES[phase], 'phase': phase, 'status': status,
                            'input': _trace_value(inputs), 'output': _trace_value(output)})
+
+    def receipt(self, text):
+        if self.progress:
+            data = '[敏感内容已隐藏]' if _SECRET.search(text) else text
+            self.progress({'type': 'tool', 'id': uuid.uuid4().hex, 'group': 'agent_receipt',
+                           'name': '工具回执', 'status': 'completed', 'output': data})
 
     @contextmanager
     def step(self, phase, inputs):
