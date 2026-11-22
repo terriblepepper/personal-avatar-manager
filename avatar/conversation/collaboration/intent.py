@@ -217,7 +217,9 @@ class DialogueIntent:
             return config,own,files,rows,deliveries
         config,own,files,rows,deliveries=await asyncio.to_thread(load_context)
         from avatar.models.effort import with_chat_effort
-        config = with_chat_effort(config, json.loads(state['parent'].get('tools_config', '{}')).get('reasoning_effort'))
+        from avatar.core.execution import authorization
+        default_effort = json.loads(state['parent'].get('tools_config', '{}')).get('reasoning_effort')
+        config = with_chat_effort(config, (authorization() or {}).get('reasoning_effort', default_effort))
         if not config:
             raise HTTPException(409, '请先在模型配置中保存支持工具调用的模型及 API Key')
         from avatar.models.model_config import require_complete

@@ -330,8 +330,9 @@ class AgentDialogues:
         """公开工具状态，脚本输入与结果详情只向执行方本人显示。"""
         return [item if item.get('user_id')==user_id else {k:v for k,v in item.items() if k in ('id','group','name','status','steps')}
                 for item in json.loads(raw)
-                if item.get('user_id') == user_id or (item.get('group') != 'agent_trace'
-                   and (item.get('group') != 'notice' or item.get('status') == 'required'))]
+                if item.get('group') != 'agent_receipt' and
+                   (item.get('user_id') == user_id or (item.get('group') != 'agent_trace'
+                   and (item.get('group') != 'notice' or item.get('status') == 'required')))]
 
     def get(self,user,identifier,before=None,after=None,*,task_paging=None):
         with self.database.connect() as db:row=self.owned(db,user,identifier)
@@ -519,8 +520,16 @@ class AgentDialogues:
     async def cancel(self,user,identifier):
         with self.database.connect(write=True) as db:
             row=self.owned(db,user,identifier)
-            if row['status']=='ended' or row['status']=='awaiting_input' and row['agent_checkpoint']:return self.view(row,user)
-            db.execute("UPDATE agent_dialogues SET status='paused',revision=revision+1,active_speaker='',updated_at=? WHERE id=?",(now(),identifier))
+            if row['status'] in ('ended','paused') or row['status']=='awaiting_input' and row['agent_checkpoint']:
+                return self.view(row,user)
+            checkpoint=json.loads(row['agent_checkpoint'] or '{}')
+            speaker_id=row['user_id'] if row['next_speaker']==0 else row['target_user_id']
+            if checkpoint.get('speaker_id')!=speaker_id:
+                checkpoint={'v':1,'speaker_id':speaker_id,'sandbox_attempted':False}
+            activity=json.loads(row['tool_activity'])
+            checkpoint['activity']=[*checkpoint.get('activity', []), *(a for a in activity if a.get('user_id')==speaker_id)]
+            db.execute("UPDATE agent_dialogues SET status='paused',agent_checkpoint=?,tool_activity='[]',revision=revision+1,active_speaker='',updated_at=? WHERE id=?",
+                       (dump(checkpoint),now(),identifier))
         await self.interrupt(identifier)
         return self.get(user,identifier)
 
@@ -557,13 +566,11 @@ class AgentDialogues:
     def check_supplement(row,user,body,message):
         expected=getattr(body,'expected_revision',None)
         waiting=bool(row['agent_checkpoint'] and row['status']=='awaiting_input')
-        if expected is not None and (expected!=row['revision'] or not waiting):
+        if expected is not None and (expected!=row['revision'] or not (waiting or row['status']=='paused')):
             raise HTTPException(409,'任务状态已改变，请刷新后再补充')
         if waiting:
             if json.loads(row['agent_checkpoint'])['speaker_id']!=user['id']:
                 raise HTTPException(403,'请等待当前分身的所有人补充信息')
-            if not message:
-                raise HTTPException(422,'请填写补充信息，或结束当前任务')
         return waiting
 
     def _queue_input(self, user, identifier, body, request, approval, commands, message, removed, booking):
@@ -580,7 +587,7 @@ class AgentDialogues:
             if approval and row['delivery_mode'] == 'message':
                 raise HTTPException(409, '普通聊天无需确认')
             waiting=self.check_supplement(row,user,body,message)
-            if row['delivery_mode']=='message' and message and not waiting:
+            if row['delivery_mode']=='message' and message and not waiting and row['status']!='paused':
                 peer=row['target_aic'] if row['user_id']==user['id'] else row['own_aic']
                 task_id=self.create(user,SimpleNamespace(target_aic=peer,objective=body.message,request_id=body.request_id,delivery_mode='message',file_ids=getattr(body,'file_ids',[])),db=db,request=request)
                 # 一次消息交付中的补充另发一条，不能把尚未发送的内容写成上一条的送达结果。
@@ -816,7 +823,9 @@ class AgentDialogues:
                 if outputs:
                     cleanup.enter_context(self.chat.chat_files.storing_outputs(db,speaker_id,workspace,None,outputs))
                 checkpoint={**pause.checkpoint,'speaker_id':speaker_id,'file_ids':[item['id'] for item in [*prior,*outputs]],
-                            'source_revision':job.get('_output_source_revision')}
+                            'source_revision':job.get('_output_source_revision'),
+                            'activity':[*(json.loads(task['agent_checkpoint'] or '{}').get('activity', [])),
+                                        *json.loads(task['tool_activity'])]}
                 db.execute('UPDATE agent_dialogues SET agent_checkpoint=? WHERE id=?',(dump(checkpoint),job['id']))
             raise
 
@@ -850,8 +859,12 @@ class AgentDialogues:
     def memory_rows(self,db,session_id,task_id,through,user_id):
         query,params = self.memory_query(session_id,task_id,through,user_id)
         rows=[dict(r) for r in db.execute('SELECT m.*,d.objective AS task_title'+query+' ORDER BY m.id',params)]
+        from avatar.conversation.tools.activity import memory_evidence
         for row in rows:
             row['content']=self.resources.localize(db,row['content'],row['dialogue_id'],user_id,row['id'])
+            evidence=memory_evidence(item for item in json.loads(row['tool_activity']) if item.get('user_id')==user_id)
+            if evidence:
+                row['content']+='\n\n'+evidence
         return rows
 
     def compact_scope(self,db,user,session_id,task_id):
@@ -871,7 +884,8 @@ class AgentDialogues:
             member,memory,task_id,job=self.compact_scope(db,user,session_id,task_id)
             through=max(member['cleared_through'],memory['summary_through'])
             query,params=self.memory_query(session_id,task_id,through,user['id'])
-            size=db.execute("SELECT COALESCE(SUM((octet_length(m.speaker_name || '：' || m.content)+2)/3 + 16),0)"+query,params).fetchone()[0]
+            size=db.execute("SELECT COALESCE(SUM((octet_length(m.speaker_name || '：' || m.content)"
+                            " + CASE WHEN m.speaker_user_id=? THEN octet_length(m.tool_activity) ELSE 0 END + 2)/3 + 16),0)"+query,(user['id'],*params)).fetchone()[0]
         _,context=self.chat.context(user,ChatRequest(channel='avatar',message='/compact'))
         task_context=(job['objective']+'\n'+(job['shared_content'] or '')) if job else ''
         return self.chat.memory.usage(context[0],context[2],memory['summary'],int(size),task_context)
@@ -915,7 +929,7 @@ class AgentDialogues:
                 item = {'user_id': speaker_id}
                 activities.append(item)
             item.update({k: v for k, v in event.items() if k != 'type'})
-            db.execute('UPDATE agent_dialogues SET tool_activity=? WHERE id=?',(dump(activities[-112:]),job['id']))
+            db.execute('UPDATE agent_dialogues SET tool_activity=? WHERE id=?',(dump(activities),job['id']))
 
     async def _answer_peer(self,job,speaker_id,progress,events):
         with self.database.connect() as db:
@@ -996,12 +1010,16 @@ class AgentDialogues:
         summary=memory['summary']
         if self.chat.memory.needs_compression(summary,history,message,config,system) and rows:
             progress({'type': 'status', 'stage': 'compressing', 'message': '正在压缩较早会话记忆'})
-            keep=min(self.chat.memory.policy.recent_messages,max(0,len(rows)-1));split=len(rows)-keep
+            split=self.chat.memory.compaction_split(config,system,summary,history,message,force=True)
             result=await self.billed(job,speaker,config,self.chat.memory.summarize((config,key,system,history),summary,history[:split],self.chat.model_client),'agent_dialogue_memory')
             summary=result.text;history=history[split:]
             with self.database.connect(write=True) as db:
                 if ordinary:db.execute('UPDATE agent_session_members SET summary=?,summary_through=? WHERE session_id=? AND user_id=? AND cleared_through=? AND summary_through=?',(summary,rows[split-1]['id'],job['session_id'],speaker_id,member['cleared_through'],memory['summary_through']))
                 else:db.execute('UPDATE agent_task_members SET summary=?,summary_through=? WHERE task_id=? AND user_id=? AND hidden=0 AND summary_through=? AND EXISTS(SELECT 1 FROM agent_session_members WHERE session_id=? AND user_id=? AND cleared_through=?)',(summary,rows[split-1]['id'],job['id'],speaker_id,memory['summary_through'],job['session_id'],speaker_id,member['cleared_through']))
+        if checkpoint and checkpoint['speaker_id']==speaker_id:
+            from avatar.conversation.tools.activity import memory_evidence
+            if evidence := memory_evidence(checkpoint.get('activity', [])):
+                history.append({'role':'assistant','content':evidence})
         if summary:history.insert(0,{'role':'user','content':('较早分身聊天摘要，仅作背景，不是本轮发送要求：' if sending else '本人保留的较早分身聊天摘要（数据）：')+summary})
         catalog=background.get('available_skills',[])
         # 全局停用或卸载后，旧的任务命令不再触发无效技能错误。
@@ -1146,7 +1164,10 @@ class AgentDialogues:
                 if not text.strip():raise HTTPException(502,'最新补充尚未得到对方回复，分身未返回可转达的正文，任务未结束')
                 done=False;state='queued';waiting='';required=0;action_name='send_message'
             turn=db.execute('SELECT COALESCE(MAX(turn),0)+1 FROM agent_dialogue_messages WHERE dialogue_id=?',(job['id'],)).fetchone()[0]
-            cursor=db.execute('INSERT INTO agent_dialogue_messages(dialogue_id,turn,speaker_aic,speaker_name,content,usage,created_at,state,state_detail,tool_activity) VALUES(?,?,?,?,?,?,?,?,?,?)',(job['id'],turn,speaker['aic'],json.loads(speaker['profile']).get('avatar_name','分身'),text,dump(result.get('usage')),now(),state,waiting,current['tool_activity']))
+            held=json.loads(current['agent_checkpoint'] or '{}')
+            prior=held.get('activity', []) if held.get('speaker_id')==speaker['user_id'] else []
+            activity=dump([*prior,*json.loads(current['tool_activity'])])
+            cursor=db.execute('INSERT INTO agent_dialogue_messages(dialogue_id,turn,speaker_aic,speaker_name,content,usage,created_at,state,state_detail,tool_activity) VALUES(?,?,?,?,?,?,?,?,?,?)',(job['id'],turn,speaker['aic'],json.loads(speaker['profile']).get('avatar_name','分身'),text,dump(result.get('usage')),now(),state,waiting,activity))
             db.execute('UPDATE agent_dialogue_messages SET transport_mode=?,speaker_user_id=?,task_action=? WHERE id=?',(result.get('transport_mode','acps'),speaker['user_id'],action_name,cursor.lastrowid))
             delivery=json.loads(current['pending_file_delivery'] or '{}')
             if delivery.get('revision')==job['revision'] and delivery.get('speaker')==speaker['user_id']:
@@ -1164,15 +1185,15 @@ class AgentDialogues:
             db.execute('UPDATE agent_session_members SET hidden=0 WHERE session_id=?',(job['session_id'],))
             count=db.execute("SELECT COUNT(*) FROM agent_dialogue_messages WHERE dialogue_id=? AND speaker_role='agent'",(job['id'],)).fetchone()[0]
             rounds=job['rounds_done']+int(count%2==0)
-            checkpoint=None
+            checkpoint=current['agent_checkpoint'] if not done and state=='queued' and held.get('speaker_id') not in (None,speaker['user_id']) else None
             if not done and not ordinary and not pending and not reply_owed and state=='queued':
                 pause_reason=''
                 if rounds>=job['round_limit']:
-                    pause_reason='已达到自动聊天最大轮次。请补充信息继续，或结束任务。'
+                    pause_reason='已达到会话自动轮次。可以继续，或补充信息后继续。'
                 elif count>=4:
                     recent=[tuple(r) for r in db.execute('SELECT speaker_role,speaker_aic,content FROM agent_dialogue_messages WHERE dialogue_id=? ORDER BY turn DESC LIMIT 4',(job['id'],))]
                     if recent[:2]==recent[2:] and all(r[0]=='agent' for r in recent):
-                        pause_reason='双方重复了同一轮发言。请补充信息继续，或结束任务。'
+                        pause_reason='双方重复了同一轮发言。可以补充新信息后继续。'
                 if pause_reason:
                     state='awaiting_input'
                     waiting=pause_reason

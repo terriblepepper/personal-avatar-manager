@@ -50,6 +50,7 @@ async function stop() {
     const result = await request<GenerationSnapshot>('/chat/generations/'+encodeURIComponent(rid)+'/stop','POST')
     if (id !== conversationId.value || pending.value?.request_id !== rid) return
     generation?.abort()
+    busy.value = false
     unconfirmed.delete(id)
     snapshot(result)
     await loadMessages(id, controller.signal)
@@ -146,11 +147,11 @@ async function remove(clear:boolean){
   if(!confirm(clear?'清空当前会话聊天记录、记忆及附件？已转存资料与已学到的风格仍保留。':'删除当前会话、聊天、记忆及附件？已转存资料与已学到的风格仍保留。'))return
   try{await request(selectedURL(conversationId.value)+(clear?'/clear':'')+'?personal=true&channel=assistant',clear?'POST':'DELETE');selectedFiles.value=[];if(!clear)conversationId.value='';await load()}catch(e){notifyError(e)}
 }
-async function send(control: 'continue' | 'retry' | 'end' = 'continue') {
+async function send(control: 'continue' | 'retry' = 'continue') {
   const pause = pauseId.value ? pending.value : null
   const id = conversationId.value
-  const message = pause && control === 'end' ? '结束任务' : pause && control === 'retry' ? '重试' : draft.value.trim()
-  if (!message || !id || busy.value || uploading.value || toolsSaving.value || loading.value) return
+  const message = pause && control === 'retry' ? '重试' : draft.value.trim()
+  if ((!message && !pause) || !id || busy.value || uploading.value || toolsSaving.value || loading.value) return
   if (/^\/compact(?:\s|$)/.test(message)) {
     busy.value = true
     try {
@@ -293,14 +294,13 @@ onUnmounted(()=>{destroyed=true;olderRequest?.abort();controller.abort();generat
       <article :data-chat-message="message.id" :data-history-message="message.id" class="bubble" data-copy-message tabindex="0" aria-haspopup="menu" :class="{user:message.role==='user','intent-message':!!message.intent,'task-event-bubble':!!message.task_event?.kind}"><ToolActivity :items="message.tool_events||[]"><template v-if="message.used_skills?.length" #default><small class="stream-note">本轮技能：{{ message.used_skills.map(item=>item.name).join('、') }}</small></template></ToolActivity><small v-if="message.responder_name" class="reply-source">{{ message.responder_name }}</small><TaskEventCard v-if="message.task_event?.kind" :event="message.task_event" @opened="openSession"/><ChatIntent v-else-if="message.intent" :intent="message.intent" @updated="loadConversation(conversationId)" @opened="openSession"/><ChatMarkdown v-else :artifact-reply="message.role !== 'user'" :source="message.content" :events="message.tool_events" :attachments="message.attachments" :conversation-id="conversationId" @preview="previewAttachment"/><ChatNotices :items="message.tool_events"/></article>
       <ContextCompacted v-if="message.id === compactedAfter"/>
       </template>
-      <template v-if="pending"><article v-if="!pending.done && !pauseId && pending.result?.mode!=='agent_control'" class="bubble user pending-user" data-copy-message tabindex="0" aria-haspopup="menu"><MarkdownContent :source="pending.message||''"/></article><article class="bubble pending-answer" data-copy-message tabindex="0" aria-haspopup="menu" :class="{incomplete:!!pending.error && !pauseId}"><ToolActivity :items="pending.tool_events||[]" :awaiting-input="!!pauseId" :pending="busy ? pending.status || '正在执行' : undefined">
+      <template v-if="pending"><article v-if="pending.message && !pending.done && !pauseId && pending.result?.mode!=='agent_control'" class="bubble user pending-user" data-copy-message tabindex="0" aria-haspopup="menu"><MarkdownContent :source="pending.message||''"/></article><article class="bubble pending-answer" data-copy-message tabindex="0" aria-haspopup="menu" :class="{incomplete:!!pending.error && !pauseId}"><ToolActivity :items="pending.tool_events||[]" :awaiting-input="!!pauseId" :pending="busy ? pending.status || '正在执行' : undefined">
         <template v-if="pending.usage || pending.target || pending.used_skills?.length" #default>
           <small v-if="pending.target" class="stream-note">回答分身：{{ pending.target.name }}</small>
           <small v-if="pending.used_skills?.length" class="stream-note">本轮技能：{{ pending.used_skills.map(item=>item.name).join('、') }}</small>
           <small v-if="pending.usage" class="stream-note">本次用量：输入 {{ pending.usage.input_tokens ?? '未报告' }} / 输出 {{ pending.usage.output_tokens ?? '未报告' }} tokens</small>
         </template></ToolActivity><ChatMarkdown v-if="pending.reply || (!pauseId && completedFiles.length)" :source="pending.reply" :attachments="pauseId ? [] : completedFiles" @preview="previewAttachment" :events="pending.tool_events" :diagrams="pending.mermaid_enabled!==false" :conversation-id="conversationId"/><ChatNotices :items="pending.tool_events" :message="pauseId ? pending.status : pending.error" :tone="!pauseId && pending.error?'error':'info'"/><div v-if="pauseId && pending.stream_retryable" class="chat-retry-actions">
           <button type="button" class="button small primary" :disabled="busy||loading||uploading||toolsSaving" @click="send('retry')">重试</button>
-          <button type="button" class="button small" :disabled="busy||loading||uploading||toolsSaving" @click="send('end')">结束任务</button>
         </div></article></template>
     </div>
     <form id="personal-chat-compose" data-guide-target="chat" class="personal-compose" @submit.prevent="send()">
@@ -319,9 +319,8 @@ onUnmounted(()=>{destroyed=true;olderRequest?.abort();controller.abort();generat
         </template>
         <div class="composer-primary-actions">
           <EffortPicker :conversation-id="conversationId" :busy="busy||uploading" @saving="effortPending=$event"/>
-          <ComposerAction v-if="runningId" label="停止" stop :disabled="!!stopping || loading" @click="stop"/>
-          <ComposerAction v-else-if="pauseId && !draft.trim()" label="结束任务" stop :disabled="busy||uploading||toolsSaving||loading" @click="send('end')"/>
-          <ComposerAction v-else type="submit" form="personal-chat-compose" :label="busy?'回答中…':pauseId?'补充并继续':'发送'" :disabled="busy||uploading||toolsSaving||loading||!conversationId||!draft.trim()"/>
+          <ComposerAction v-if="runningId" label="暂停任务" stop :disabled="!!stopping || loading" @click="stop"/>
+          <ComposerAction v-else type="submit" form="personal-chat-compose" :resume="!!pauseId" :label="busy?'回答中…':pauseId?(draft.trim()?'补充并继续':'继续任务'):'发送'" :disabled="busy||uploading||toolsSaving||loading||!conversationId||(!pauseId&&!draft.trim())"/>
         </div>
       </ComposerToolbar>
     </div>
