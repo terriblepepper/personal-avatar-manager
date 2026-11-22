@@ -126,12 +126,18 @@ class AgentDialogues:
     def auto_accept_enabled(db,owner,peer):
         return bool(db.execute('SELECT 1 FROM agent_peer_auto_accept WHERE user_id=? AND peer_user_id=?',(owner,peer)).fetchone())
 
+    @staticmethod
+    def auto_accept_available(db,session_id):
+        return bool(db.execute('SELECT 1 FROM agent_dialogues WHERE session_id=? LIMIT 1',(session_id,)).fetchone())
+
     def auto_accept(self,user,session_id,enabled):
         owner=user['id']
         with self.database.connect(write=True) as db:
-            session=self.member(db,user,session_id)
+            session=self.member(db,user,session_id,hidden=True)
             peer=session['right_user_id'] if session['left_user_id']==owner else session['left_user_id']
             if enabled:
+                if not self.auto_accept_available(db,session_id):
+                    raise HTTPException(409,'发送一条消息或任务后可开启自动同意')
                 db.execute('INSERT INTO agent_peer_auto_accept(user_id,peer_user_id) VALUES(?,?) ON CONFLICT DO NOTHING',(owner,peer))
             else:
                 db.execute('DELETE FROM agent_peer_auto_accept WHERE user_id=? AND peer_user_id=?',(owner,peer))
@@ -434,6 +440,7 @@ class AgentDialogues:
             message_tasks=db.execute('SELECT * FROM agent_dialogues WHERE session_id=? AND id IN ('+','.join('?' for _ in message_ids)+')',(identifier,*message_ids)).fetchall() if message_ids else []
             peer=pair['right_user_id'] if pair['left_user_id']==user['id'] else pair['left_user_id']
             auto_accept=self.auto_accept_enabled(db,user['id'],peer)
+            auto_accept_available=self.auto_accept_available(db,identifier)
             from avatar.models.embedding import EmbeddingSettings
             embedding_status={'configured':EmbeddingSettings.configured(db,user['id']),'peerConfigured':EmbeddingSettings.configured(db,peer)}
             avatar=db.execute('SELECT aic,profile FROM avatar_records WHERE user_id=?',(peer,)).fetchone()
@@ -463,7 +470,7 @@ class AgentDialogues:
         if after is None:messages.reverse()
         page=self.task_page(user,identifier,*(task_paging or (0,'')),from_task=separate)
         if task_paging is not None:snapshot['task_page']=page
-        return {'auto_accept':auto_accept,'current_transport_mode':protocol,'embedding_status':embedding_status,'viewer_user_id':user['id'],'session_id':identifier,'id':identifier,'resource_conversation_id':workspace,'settings_conversation_id':settings_id,'legacy_file_conversation_id':settings_id if legacy_files else None,'accepted':bool(pair['accepted']),'can_accept':bool(task_id and any(t['id']==task_id and t['target_user_id']==user['id'] and t['status']=='awaiting_acceptance' for t in tasks)),
+        return {'auto_accept':auto_accept,'auto_accept_available':auto_accept_available,'current_transport_mode':protocol,'embedding_status':embedding_status,'viewer_user_id':user['id'],'session_id':identifier,'id':identifier,'resource_conversation_id':workspace,'settings_conversation_id':settings_id,'legacy_file_conversation_id':settings_id if legacy_files else None,'accepted':bool(pair['accepted']),'can_accept':bool(task_id and any(t['id']==task_id and t['target_user_id']==user['id'] and t['status']=='awaiting_acceptance' for t in tasks)),
                 'peer_name':json.loads(avatar['profile']).get('avatar_name','分身') if avatar else '分身','peer_aic':avatar['aic'] if avatar else '',
                 'messages':messages,'has_more':len(rows)==10,'chat':self.view(dict(chat),user) if chat else None,'message_tasks':[self.view(dict(r),user) for r in message_tasks],
                 'tasks':[self.view(dict(r),user) for r in tasks],'task_total':page['total'],**snapshot}

@@ -256,6 +256,9 @@ a.el-button { text-decoration:none; }
 .peer-task-nav { container-type: inline-size; }
 .peer-task-actions { flex-wrap: nowrap; }
 .peer-task-actions .button { white-space: nowrap; }
+.peer-auto-accept { display: flex; align-items: center; justify-content: space-between; gap: .5rem; font-size: .8125rem; }
+.peer-auto-accept[aria-checked="true"] { background: var(--accent-subtle); }
+.peer-auto-accept-hint { margin: 0; }
 .peer-delete-records { display: inline-flex; gap: .2rem; align-items: center; }
 @container (max-width: 15.5rem) {
   .peer-delete-records span:not(.app-icon) { display: none; }
