@@ -1063,7 +1063,7 @@ class AgentDialogues:
         background=json.loads(raw)
         if checkpoint and checkpoint['speaker_id']==speaker_id and (answer:=checkpoint.get('question_answer')):
             config['_agent_input_revision']=answer['id']
-            config['_run_supplement']=answer['answer']
+            config['_answered_question']=answer
             background['last_clarification']=answer['question']
         excluded=set(json.loads(job.get(side+'_excluded_skills','[]')))
         background['available_skills']=[s for s in background.get('available_skills',[]) if s['id'] not in excluded]
