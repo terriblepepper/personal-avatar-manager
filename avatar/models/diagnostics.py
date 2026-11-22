@@ -8,6 +8,35 @@ from fastapi import HTTPException
 PURPOSES={'agent_intent':'会话意图分析','task_planning':'任务分解','goal_decision':'目标核对与工具选择','delivery_review':'交付回执核验','html_generation':'HTML 作品生成','material_selection':'资料原件筛选','animation':'动画分镜','skill_execution':'技能脚本规划','memory':'记忆压缩','skill_selection':'自动技能选择','file_embedding':'向量嵌入','file_search':'资料判断/检索','file_read':'资料原文读取','answer':'回答生成'}
 
 
+def stop_reason(reason, tool_calls=()):
+    """Classify the provider's terminal marker independently of visible output."""
+    tag = str(reason or '').lower()
+    if tag in ('length', 'max_tokens', 'max_output_tokens', 'model_context_window_exceeded'):
+        return 'output_limit'
+    if tag in ('context_length_exceeded', 'context_window_exceeded', 'input_too_long'):
+        return 'context_overflow'
+    if tag in ('cancelled', 'canceled', 'aborted'):
+        return 'cancelled'
+    if tag == 'interrupted':
+        return 'interrupted'
+    if tag in ('tool_calls', 'tool_use', 'function_call', 'tool_required'):
+        return 'tool'
+    if tag in ('', 'stop', 'end_turn', 'stop_sequence'):
+        return 'tool' if tool_calls else 'stop'
+    return 'error'
+
+
+def check_terminal(reason, usage):
+    terminal = stop_reason(reason)
+    detail = {'context_overflow':'输入超过上游模型的上下文窗口', 'cancelled':'上游已取消模型响应',
+              'interrupted':'上游中断了模型响应'}
+    if terminal in detail:
+        error = HTTPException(499 if terminal == 'cancelled' else 502, detail[terminal])
+        error.stop_reason = terminal
+        error.model_usage = usage
+        raise error
+
+
 def connection_error(error,service='模型平台'):
     current=error;certificate=False
     for _ in range(6):
@@ -29,7 +58,8 @@ def identifier(value):
 # 职责：构造空响应的具体原因，仅输出终止标记和 Token 计数，不把输出预算误称为余额。
 def empty_response(fmt,*,reason=None,thinking=False,refusal=False,usage=None,request_id=None,config=None):
     tag=identifier(reason);usage=usage or {}
-    if tag.lower() in ('length','max_tokens','max_output_tokens'):
+    terminal = stop_reason(tag)
+    if terminal == 'output_limit':
         cause='达到本次生成的 Token 上限，未生成可见正文；这是单次输出预算限制，不代表账户余额不足'
     elif refusal or tag.lower() in ('content_filter','safety','recitation','blocklist','prohibited_content','spii','refusal'):
         cause='上游返回内容拦截或拒绝，未提供可见正文'
@@ -48,7 +78,8 @@ def empty_response(fmt,*,reason=None,thinking=False,refusal=False,usage=None,req
     if identifier(request_id):fields.append('请求编号='+identifier(request_id))
     error=HTTPException(502,cause+'（'+'；'.join(fields)+'）');error.empty_model_output=True
     error.thinking_only=bool(thinking and not refusal and tag.lower() in ('stop','end_turn','stop_sequence'))
-    error.output_limited=tag.lower() in ('length','max_tokens','max_output_tokens')
+    error.output_limited=terminal == 'output_limit'
+    error.stop_reason=terminal if terminal not in ('stop','tool') else 'error'
     error.invalid_tool_call=bool((config or {}).get('_tools') and not thinking and not refusal
                                  and tag.lower() in ('','stop','end_turn','stop_sequence'))
     number=lambda value:value if isinstance(value,int) and not isinstance(value,bool) and value>=0 else None
@@ -75,6 +106,7 @@ def contextual(error,config):
     result.delivery_unknown=getattr(error,'delivery_unknown',False)
     result.timeout_reason=getattr(error,'timeout_reason',None)
     result.stream_exhausted=getattr(error,'stream_exhausted',False)
+    result.stop_reason=getattr(error,'stop_reason','error')
     result.output_limited=getattr(error,'output_limited',False)
     result.thinking_only=getattr(error,'thinking_only',False)
     result.recovery_attempted=getattr(error,'recovery_attempted',False)
@@ -88,16 +120,6 @@ def contextual(error,config):
 
 # 职责：从响应头提取供应商请求编号，便于按编号联系供应商排查。
 def request_id(headers):return headers.get('x-request-id') or headers.get('request-id')
-
-
-# 职责：展示结构化错误附带的简短说明，去掉凭据，拒绝包含请求正文/思考内容的回显。
-def safe_message(value,secret=''):
-    if not isinstance(value,str):return ''
-    if re.search(r'(?i)(messages|prompt|reasoning_content|request.body)\s*[=:]',value):return '上游说明包含请求内容，已隐藏'
-    if secret:value=value.replace(secret,'[密钥已隐藏]')
-    value=re.sub(r'(?i)(bearer\s+)[^\s,;]+',r'\1[已隐藏]',value)
-    value=re.sub(r'\bsk-[A-Za-z0-9_-]+','[密钥已隐藏]',value)
-    return ' '.join(value.split())[:300]
 
 
 # 职责：读取有界错误对象，仅展示结构化 code/type，不回显可能包含正文或密钥的 error.message。
@@ -119,7 +141,19 @@ async def check_response(response,api_key=''):
 def provider_error(status,error,rid=None,api_key=''):
     error=error if isinstance(error,dict) else {}
     code=identifier(error.get('code'));kind=identifier(error.get('type'))
-    if status==401:cause='上游拒绝认证，请检查 API Key'
+    # Providers also return input overflows as generic invalid_argument errors.
+    # Inspect their description locally; it may quote user content and must never be logged.
+    description = error.get('message')
+    overflow = (status in (200,400,413,422) and (
+        stop_reason(code) == 'context_overflow' or stop_reason(kind) == 'context_overflow' or
+        isinstance(description,str) and re.match(
+            r"\s*(?:prompt is too long\b|(?:the )?(?:input|prompt) token count\b[^\n]{0,100}\bexceeds?\b|"
+            r"(?:this model['’]s )?maximum context length is \d+ tokens\b)",
+            description, re.I)))
+    cancelled = status == 499 or any(stop_reason(marker)=='cancelled' for marker in (code, kind, error.get('status')))
+    if cancelled:cause='上游已取消模型请求'
+    elif overflow:cause='输入超过上游模型的上下文窗口'
+    elif status==401:cause='上游拒绝认证，请检查 API Key'
     elif status==403:cause='上游拒绝访问，可能缺少模型权限或受到地区/策略限制'
     elif status==402 or code in ('insufficient_quota','insufficient_balance'):cause='上游明确报告账户配额或余额不足'
     elif status==429:cause='上游限制请求速率或并发；仅凭 HTTP 429 不能认定余额不足'
@@ -130,12 +164,11 @@ def provider_error(status,error,rid=None,api_key=''):
     if kind:fields.append('type='+kind)
     param=identifier(error.get('param'))
     if param:fields.append('参数='+param)
-    message=safe_message(error.get('message'),api_key) if code or kind or param else ''
-    if message:fields.append('上游说明='+message)
     rid=identifier(rid)
     if rid:fields.append('请求编号='+rid)
     result=HTTPException(502,cause+'（'+'；'.join(fields)+'）。系统未自动重试')
-    result.retryable=status in (408,429,500,502,503,504) and code not in ('insufficient_quota','insufficient_balance')
+    result.stop_reason = 'cancelled' if cancelled else 'context_overflow' if overflow else 'error'
+    result.retryable=not cancelled and status in (408,429,500,502,503,504) and code not in ('insufficient_quota','insufficient_balance')
     return result
 
 

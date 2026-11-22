@@ -73,7 +73,8 @@ def fit_turn(config, prompt, history, question, observations):
 def fit_working_set(config, prompt, history, question, observations, *, force=False):
     # Protect the original objective and sourced material. Old tool chatter and assistant prose go first.
     floor = retained_budget(config, prompt, question)
-    budget=max(floor,input_budget(config)-estimate(prompt)-estimate(question))
+    budget = max(0, input_budget(config) - estimate(prompt) - estimate(question))
+    floor = min(floor, budget)
     rows=[dict(row) for row in history]
     notes=list(observations)
     used=sum(estimate(r['content'])+16 for r in rows)+sum(estimate(n) for n in notes)
@@ -132,13 +133,42 @@ def fit_working_set(config, prompt, history, question, observations, *, force=Fa
                 if len(clipped) < len(note) and cost-estimate(note)+estimate(clipped) >= floor:
                     notes[i] = clipped
                     cost -= estimate(note) - estimate(clipped)
-    # Try the full configured window before discarding additional detail from the working copy.
-    hard=(config.get('context_tokens') or 128000)-config.get('max_tokens',1024)-512-tool_budget(config)-estimate(prompt)
-    cost=estimate(question+''.join(notes))+sum(estimate(r['content'])+16 for r in rows)
-    if cost>hard:
-        notes=[compact_observation(n,240,identifiers_only=True) for n in notes]
-        room=hard-estimate(question+''.join(notes))-16*len(rows)
-        for row in rows:
-            limit=max(96,room//max(1,len(rows)))
-            row['content']=excerpt(row['content'],limit)
+    if cost > budget:
+        # A directory can exceed the window on its identifiers alone. Limit the model view,
+        # keeping complete records in storage for a later read by ID or cursor.
+        row_cost = sum(estimate(row['content']) + 16 for row in rows)
+        note_cost = sum(map(estimate, notes))
+        note_room = min(note_cost, max(budget // 2, budget - row_cost))
+        row_room = budget - note_room
+        kept = []
+        for row in reversed(rows):
+            if row_room <= 16:
+                break
+            content = bounded_excerpt(row['content'], row_room - 16)
+            kept.append({**row, 'content': content})
+            row_room -= estimate(content) + 16
+        rows = kept[::-1]
+        kept = []
+        note_room += row_room
+        for note in reversed(notes):
+            if note_room <= 0:
+                break
+            view = bounded_excerpt(note, note_room)
+            kept.append(view)
+            note_room -= estimate(view)
+        notes = kept[::-1]
     return rows, notes
+
+
+def bounded_excerpt(text, tokens):
+    """Fit a textual view by UTF-8 bytes, keeping both ends at character boundaries."""
+    data = text.encode('utf-8')
+    room = tokens * 3
+    if len(data) <= room:
+        return text
+    mark = '\n[…已节选…]\n'.encode()
+    if room <= len(mark) + 6:
+        return data[:room].decode('utf-8', 'ignore')
+    prefix = (room - len(mark)) // 2
+    suffix = room - len(mark) - prefix
+    return data[:prefix].decode('utf-8', 'ignore') + mark.decode() + data[-suffix:].decode('utf-8', 'ignore')

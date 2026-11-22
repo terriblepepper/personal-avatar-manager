@@ -4,18 +4,21 @@ import json
 import logging
 import time
 import uuid
+from datetime import datetime, timezone
 from fastapi import HTTPException
 from avatar.core.db import dump, now
 from avatar.core.schemas import ChatRequest
-from avatar.core.execution import AgentNeedsInput
+from avatar.core.execution import AgentNeedsInput, execution_guard
+from avatar.conversation.loop.runtime import resume_safe
+from avatar.conversation.loop.store import RunConflict, RunStore
 from avatar.protocols.identity.ontology import AVATAR_SKILL_IDS
+from avatar.protocols.tasks import personal_turns as turns
 from avatar.protocols.tasks.store import ManagementTaskError
 from avatar.protocols.tasks.town_auth import TownUserAuthorization
 from avatar.protocols.tasks.town_public import TownPublicAuthorization
 
 
 WORKING_TIMEOUT = 480
-TIMEOUT_MESSAGE = '本轮达到分身执行时限，请缩小任务范围后再试'
 PROGRESS_INTERVAL = 8
 PUBLIC_STAGES = {
     'memory': '读取会话上下文', 'compressing': '整理会话上下文',
@@ -90,7 +93,7 @@ class PersonalTaskService:
 
     # 职责：恢复上次进程未完成的模型任务。
     # 输入：应用启动时调用一次。
-    # 结果与约束：中断任务记失败且不自动重新计费，已完成任务继续支持幂等查询。
+    # 结果与约束：只回收过期执行权，等原调用者重新鉴权后续跑。
     def recover(self):
         self.expire_guests()
         if getattr(self,'peer_dialogues',None):self.peer_dialogues.recover()
@@ -102,12 +105,10 @@ class PersonalTaskService:
                     document=json.loads(old['document']);document['id']=uuid.uuid4().hex;document['sentAt']=now()
                     db.execute('UPDATE avatar_aip_tasks SET document=? WHERE rowid=?',(dump(document),old['rowid']))
                 db.execute("INSERT OR REPLACE INTO protocol_message_versions VALUES('personal-task',1)")
-            for row in db.execute("SELECT rowid,document FROM avatar_aip_tasks WHERE json_extract(document,'$.status.state')='working'").fetchall():
-                result = json.loads(row['document'])
-                result.pop('_agent_resume', None)
-                result['status'] = {'state': 'failed', 'stateChangedAt': now(), 'dataItems': [{'type': 'text', 'text': '服务重启导致任务中断，请使用新任务重新提问'}]}
-                result['id']=uuid.uuid4().hex;result['sentAt']=now()
-                db.execute('UPDATE avatar_aip_tasks SET document=?,deadline=NULL WHERE rowid=?', (dump(result), row['rowid']))
+            for row in db.execute("""SELECT rowid,document FROM avatar_aip_tasks
+                WHERE json_extract(document,'$.status.state')='working' AND (deadline IS NULL OR deadline<=?)""",
+                (time.time(),)).fetchall():
+                turns.interrupt_in(db, row, json.loads(row['document']))
 
     # 职责：校验固定端点仍对应已激活的正式个人分身。
     # 输入：user_id/AIC 由已接纳监听器固定，不能从提问或 metadata 覆盖。
@@ -169,10 +170,17 @@ class PersonalTaskService:
         return rows[0] if rows else None
 
     def working_view(self, scope, result):
+        if result['status']['state']!='working':
+            return result
         progress = self.progress.get(scope)
-        if progress and progress.result_id==result['id'] and result['status']['state']=='working':
+        if progress and progress.result_id==result['id']:
             return progress.view(result)
-        return result
+        # Another worker can own the lease. Keep the leader connected while its status is checked.
+        tick = int(time.time()) // PROGRESS_INTERVAL * PROGRESS_INTERVAL
+        stamp = datetime.fromtimestamp(tick,timezone.utc).isoformat()
+        return {**result, 'id':uuid.uuid5(uuid.NAMESPACE_OID,f"{result['id']}:{tick}").hex,
+                'sentAt':max(result['sentAt'],stamp),'status':{**result['status'],'dataItems':[
+                    {'type':'text','text':'任务已受理，正在等待执行进度更新'}]}}
 
     # 职责：原子认领任务并处理幂等查询、完成及取消。
     # 输入：command、context 已由真实传输认证，aic/user_id 为固定端点身份。
@@ -200,79 +208,84 @@ class PersonalTaskService:
                 row = self.task_row(db, scope)
                 if not row:
                     raise ManagementTaskError(-32001, '当前调用者和会话中没有该任务')
-                if row['deadline'] is None or row['deadline'] > time.time():
-                    result = json.loads(row['document'])
-                    result.pop('_agent_resume', None)
-                    return self.working_view((*scope[:3],row['session_id'],scope[4]),result)
-        resume = None
+                document = json.loads(row['document'])
+                if (row['deadline'] is None or row['deadline'] > time.time()) and not document.get('_agent_resume', {}).get('restart'):
+                    return self.working_view((*scope[:3],row['session_id'],scope[4]),turns.public_result(document))
         with self.database.connect(write=True) as db:
-            # 空 session 的首次 start 也保存生成的会话 ID；允许调用者之后沿用该 ID 查询。
             row = self.task_row(db, scope)
+            run = {}
+            restarting = False
             if row:
-                result = json.loads(row['document'])
-                state = result['status']['state']
-                resume = result.pop('_agent_resume', None) if state == 'awaiting-input' else None
-                next_state = ('failed' if row['deadline'] is not None and row['deadline'] <= time.time() else
-                              'completed' if operation == 'complete' and state == 'awaiting-completion' else
-                              'canceled' if operation == 'cancel' and state in ('working', 'awaiting-completion', 'awaiting-input') else None)
-                if next_state:
-                    result['status'] = {'state': next_state, 'stateChangedAt': now()}
-                    if next_state == 'failed' and state == 'working':
-                        result['status']['dataItems'] = [{'type': 'text', 'text': TIMEOUT_MESSAGE}]
-                    result['id']=uuid.uuid4().hex;result['sentAt']=now()
-                    db.execute('UPDATE avatar_aip_tasks SET document=?,deadline=NULL WHERE rowid=?', (dump(result), row['rowid']))
-                    job=self.pending.get((aic,scope_peer,context.group_id or '',row['session_id'],scope[-1]))
-                    if job:job.cancel()
-                if operation != 'continue':
-                    return self.working_view((*scope[:3],row['session_id'],scope[4]),result)
-                # Use the stored session key, including the alias generated for an empty first session.
-                scope=(aic,scope_peer,context.group_id or '',row['session_id'],scope[-1])
-                seen=db.execute('SELECT task_id FROM avatar_aip_task_commands WHERE local_aic=? AND peer_aic=? AND group_id=? AND session_id=? AND command_id=?',(*scope[:4],command['id'])).fetchone()
-                if seen:
-                    if seen['task_id']!=scope[-1]:raise ManagementTaskError(-32602,'命令 id 已用于其他任务')
-                    return self.working_view(scope,result)
-                if next_state=='failed':return result
-                if state not in ('awaiting-input','awaiting-completion'):
-                    raise ManagementTaskError(-32009,'任务正在处理，请先查询状态' if state=='working' else '任务已结束，请使用新 taskId 并沿用 sessionId 继续对话')
-                session=result['sessionId']
+                scope = (*scope[:3], row['session_id'], scope[4])
+                document = json.loads(row['document'])
+                expired = row['deadline'] is not None and row['deadline'] <= time.time()
+                state = document['status']['state']
+                if expired and state == 'working' and operation != 'cancel':
+                    turns.interrupt_in(db, row, document)
+                    state = document['status']['state']
+                run = document.get('_agent_resume', {})
+                if (operation == 'cancel' and state in ('working','awaiting-completion','awaiting-input')
+                        or operation == 'complete' and state == 'awaiting-completion'
+                        or expired and state == 'awaiting-completion'):
+                    final = 'canceled' if operation == 'cancel' else 'failed' if expired else 'completed'
+                    result = turns.close_in(db,row,document,final)
+                    job = self.pending.get(scope)
+                    if job: job.cancel()
+                    return result
+                restarting = operation == 'get' and state == 'awaiting-input' and run.get('restart')
+                if restarting and public and self.visitor_busy(db,aic,scope_peer):
+                    return turns.public_result(document)
+                if not restarting:
+                    if operation != 'continue':
+                        return self.working_view(scope,turns.public_result(document))
+                    seen=db.execute('SELECT task_id FROM avatar_aip_task_commands WHERE local_aic=? AND peer_aic=? AND group_id=? AND session_id=? AND command_id=?',(*scope[:4],command['id'])).fetchone()
+                    if seen:
+                        if seen['task_id']!=scope[-1]:raise ManagementTaskError(-32602,'命令 id 已用于其他任务')
+                        return self.working_view(scope,turns.public_result(document))
+                    if state not in ('awaiting-input','awaiting-completion'):
+                        raise ManagementTaskError(-32009,'任务正在处理，请先查询状态' if state=='working' else '任务已结束，请使用新 taskId 并沿用 sessionId 继续对话')
+                session=document['sessionId']
             elif operation != 'start':
                 raise ManagementTaskError(-32001, '当前调用者和会话中没有该任务')
-            if db.execute('SELECT 1 FROM avatar_aip_task_commands WHERE local_aic=? AND peer_aic=? AND group_id=? AND session_id=? AND command_id=?',(*scope[:4],command['id'])).fetchone():
-                raise ManagementTaskError(-32602, '命令 id 已用于其他任务')
-            # 小镇负责发现及注册/登录引导；已认证请求直接进入对话，不提供 hello 握手。
-            selected = dict(resume.get('skills', {})) if resume else {}
-            question = self.question(command.get('dataItems'), self.approved_skills(target, selected), selected=selected)
-            if resume and sum(len(text) + 8 for text in [*resume['inputs'], question]) > 16000:
-                raise ManagementTaskError(-32602, '本任务补充内容已达上限，请结束后使用新任务整理要求')
-            if public:
-                day = now()[:10]
-                from datetime import datetime, timedelta, timezone
-                cutoff = (datetime.now(timezone.utc)-timedelta(days=7)).isoformat()
-                db.execute('DELETE FROM town_visitor_requests WHERE created_at<?', (cutoff,))
-                if (db.execute('SELECT COUNT(*) FROM town_visitor_requests WHERE owner_id=? AND visitor_id=? AND created_at>=?',
-                               (user_id, principal['visitor_id'], day)).fetchone()[0] >= self.settings.town_visitor_daily_limit
-                        or db.execute('SELECT COUNT(*) FROM town_visitor_requests WHERE owner_id=? AND created_at>=?',
-                                      (user_id, day)).fetchone()[0] >= self.settings.town_owner_daily_limit):
-                    raise ManagementTaskError(-32010, '今日公开对话额度已用完')
-                if db.execute("SELECT 1 FROM avatar_aip_tasks WHERE local_aic=? AND peer_aic=? AND json_extract(document,'$.status.state')='working' AND deadline>?",
-                              (aic, scope_peer, time.time())).fetchone():
-                    raise ManagementTaskError(-32010, '该访客已有请求正在处理')
-                db.execute('INSERT INTO town_visitor_requests VALUES(?,?,?)', (user_id, principal['visitor_id'], now()))
+            revision = turns.source_revision(db, user_id, aic)
+            if run.get('sources') and (run['sources'] != revision or run['owner'] != user_id):
+                return turns.close_in(db,row,document,'failed','原任务的资料或授权已改变，请重新发起任务')
+            if not restarting:
+                if db.execute('SELECT 1 FROM avatar_aip_task_commands WHERE local_aic=? AND peer_aic=? AND group_id=? AND session_id=? AND command_id=?',(*scope[:4],command['id'])).fetchone():
+                    raise ManagementTaskError(-32602,'命令 id 已用于其他任务')
+                selected = dict(run.get('skills', {}))
+                question = self.question(command.get('dataItems'), self.approved_skills(target, selected), selected=selected)
+                inputs = [*run.get('inputs', ()), question]
+                if sum(len(text) + 8 for text in inputs) > 16000:
+                    raise ManagementTaskError(-32602,'本任务补充内容已达上限，请结束后使用新任务整理要求')
+                if public:
+                    self.charge_visitor(db, user_id, aic, scope_peer, principal['visitor_id'])
+                run.update(run_id=run.get('run_id') or uuid.uuid4().hex, owner=user_id, sources=revision, skills=selected,
+                           inputs=inputs, input_id=command['id'], supplement=question if len(inputs)>1 else '')
+            run['automatic'] = bool(restarting)
+            run.pop('restart', None)
             result = {'type': 'task-result', 'id': uuid.uuid4().hex, 'sentAt': now(), 'senderRole': 'partner',
                       'senderId': aic, 'mentions': [context.peer_aic], 'taskId': scope[-1],
                       'sessionId': session or uuid.uuid4().hex, 'status': {'state': 'working', 'stateChangedAt': now()}, 'products': []}
             if context.group_id:
                 result['groupId'] = context.group_id
+            stored = dump({**result, '_agent_resume':run})
+            deadline = time.time()+turns.LEASE_SECONDS
             if row:
-                db.execute('UPDATE avatar_aip_tasks SET command_id=?,document=?,deadline=? WHERE rowid=?',(command['id'],dump(result),time.time()+WORKING_TIMEOUT,row['rowid']))
+                rowid = row['rowid']
+                db.execute('UPDATE avatar_aip_tasks SET command_id=?,document=?,deadline=? WHERE rowid=?',
+                           (row['command_id'] if restarting else command['id'],stored,deadline,rowid))
             else:
-                db.execute('INSERT INTO avatar_aip_tasks VALUES(?,?,?,?,?,?,?,?)', (*scope, command['id'], dump(result), time.time()+WORKING_TIMEOUT))
-            db.execute('INSERT INTO avatar_aip_task_commands VALUES(?,?,?,?,?,?)',(*scope,command['id']))
+                db.execute('INSERT INTO avatar_aip_tasks VALUES(?,?,?,?,?,?,?,?)', (*scope, command['id'], stored, deadline))
+                rowid = self.task_row(db, scope)['rowid']
+            if not restarting:
+                db.execute('INSERT INTO avatar_aip_task_commands VALUES(?,?,?,?,?,?)',(*scope,command['id']))
         # Return a status before a slow model outlives the caller's HTTP timeout.
-        working=json.loads(dump(result))
+        if restarting and scope in self.pending:
+            self.pending[scope].cancel()
         progress = WorkingProgress(result['id'])
         self.progress[scope] = progress
-        task=asyncio.create_task(self.generate(scope,result,target,context,question,principal,public,resume,selected,progress))
+        task=asyncio.create_task(self.generate(scope,rowid,result,context,principal,run,progress))
         self.pending[scope]=task
         def done(job):
             if self.pending.get(scope) is job:
@@ -282,7 +295,35 @@ class PersonalTaskService:
                 logging.getLogger(__name__).error('个人协议后台任务失败：%s',type(job.exception()).__name__)
         task.add_done_callback(done)
         try:return await asyncio.wait_for(asyncio.shield(task),timeout=1)
-        except TimeoutError:return progress.view(working)
+        except TimeoutError:return progress.view(result)
+        except asyncio.CancelledError:
+            if not task.cancelled() or asyncio.current_task().cancelling():
+                raise
+            with self.database.connect() as db:
+                row = self.task_row(db,scope)
+                if not row:
+                    raise ManagementTaskError(-32001,'原任务已删除')
+                return turns.public_result(json.loads(row['document']))
+
+    def charge_visitor(self, db, owner, aic, scope_peer, visitor):
+        from datetime import datetime, timedelta, timezone
+        day = now()[:10]
+        cutoff = (datetime.now(timezone.utc)-timedelta(days=7)).isoformat()
+        db.execute('DELETE FROM town_visitor_requests WHERE created_at<?', (cutoff,))
+        if (db.execute('SELECT COUNT(*) FROM town_visitor_requests WHERE owner_id=? AND visitor_id=? AND created_at>=?',
+                       (owner, visitor, day)).fetchone()[0] >= self.settings.town_visitor_daily_limit
+                or db.execute('SELECT COUNT(*) FROM town_visitor_requests WHERE owner_id=? AND created_at>=?',
+                              (owner, day)).fetchone()[0] >= self.settings.town_owner_daily_limit):
+            raise ManagementTaskError(-32010, '今日公开对话额度已用完')
+        if self.visitor_busy(db, aic, scope_peer):
+            raise ManagementTaskError(-32010, '该访客已有请求正在处理')
+        db.execute('INSERT INTO town_visitor_requests VALUES(?,?,?)', (owner, visitor, now()))
+
+    @staticmethod
+    def visitor_busy(db, aic, peer):
+        return db.execute("""SELECT 1 FROM avatar_aip_tasks WHERE local_aic=? AND peer_aic=?
+            AND json_extract(document,'$.status.state')='working' AND deadline>? LIMIT 1""",
+            (aic,peer,time.time())).fetchone() is not None
 
     async def stop(self):
         if getattr(self,'peer_dialogues',None):await self.peer_dialogues.stop()
@@ -290,77 +331,100 @@ class PersonalTaskService:
         for task in tasks:task.cancel()
         await asyncio.gather(*tasks,return_exceptions=True)
 
-    async def generate(self,scope,result,target,context,question,principal,public,resume=None,selected=None,progress=None):
-        user_id,aic=target['user_id'],scope[0]
+    async def generate(self,scope,rowid,result,context,principal,run,progress):
+        writer, owner = result['id'], run['owner']
+        def validate(db):
+            document = turns.current_in(db,rowid,writer,run)
+            lease = document['_agent_resume'].get('lease')
+            if lease and not db.execute('SELECT 1 FROM chat_conversations WHERE id=? AND lease_until=?',lease).fetchone():
+                raise RunConflict('原任务的会话执行权已变更')
+            if turns.source_revision(db,owner,scope[0])!=run['sources']:
+                raise HTTPException(409,'原任务资料或授权已变更，请重新发起任务')
+        def guard():
+            with self.database.connect() as db:
+                validate(db)
+        store = RunStore(self.database, owner, 'protocol', str(rowid), run['run_id'], writer, validate)
+        committed = None
+        def commit(db, reply, pause=None):
+            nonlocal committed
+            store.check_in(db)
+            if pause:
+                run.update(checkpoint=pause.checkpoint,clarification=pause.question)
+                if pause.usage:
+                    store.mark_usage_recorded_in(db)
+            committed = turns.finish_in(db,rowid,result,run,'awaiting-input' if pause else 'awaiting-completion',reply)
+        async def work():
+            async with asyncio.timeout(WORKING_TIMEOUT):
+                await self.limit.acquire()
+            try:
+                state = store.acquire()
+                if not resume_safe(state, initial=not run.get('claimed'), automatic=run['automatic']):
+                    raise HTTPException(409,'上次操作尚无确定回执，请核对已有结果后重新发起任务')
+                if not state.get('phase'):
+                    store.merge({'phase':'planning'})
+                active = self.target(owner, scope[0])
+                self.approved_skills(active,run['skills'])
+                with execution_guard(guard):
+                    return await self.answer(active,context,result['sessionId'],principal=principal,
+                                             resume=run,store=store,progress=progress.update,commit=commit,
+                                             claim=lambda cid:turns.renew(self.database,rowid,writer,run,cid))
+            finally:
+                self.limit.release()
+        task = asyncio.create_task(work())
         try:
-            async with asyncio.timeout(WORKING_TIMEOUT), self.limit:
-                # 等待全局并发槽后再次核对停用状态，不把请求正文当作身份来源。
-                target = self.target(user_id, aic)
-                if selected:
-                    self.approved_skills(target, selected)
-                options = {'principal': principal} if public else {}
-                if resume:
-                    options['resume'] = resume
-                if progress:
-                    options['progress'] = progress.update
-                reply = await self.answer(target, context, result['sessionId'], question, **options)
-            result['products'] = [{'id': uuid.uuid4().hex, 'dataItems': [{'type': 'text', 'text': reply}]}]
-            result['status'] = {'state': 'awaiting-completion', 'stateChangedAt': now()}
+            while not task.done():
+                completed, _ = await asyncio.wait((task,),timeout=turns.RENEW_INTERVAL)
+                if not completed:
+                    turns.renew(self.database,rowid,writer,run)
+            task.result()
+            if committed is None:
+                raise RunConflict('缺少本次回答的提交回执')
+            return committed
         except AgentNeedsInput as exc:
-            checkpoint = {'inputs': [*(resume['inputs'] if resume else []), question], 'checkpoint': exc.checkpoint,
-                          'skills': selected or {}, 'clarification': exc.question}
-            return self.finish(scope, result, 'awaiting-input', exc.question or str(exc), resume=checkpoint)
-        except TimeoutError:
-            return self.finish(scope, result, 'failed', TIMEOUT_MESSAGE)
+            run.update(checkpoint=exc.checkpoint,clarification=exc.question)
+            return turns.finish(self.database,rowid,result,run,'awaiting-input',exc.question or str(exc))
         except asyncio.CancelledError:
-            self.finish(scope, result, 'failed', '请求中断，请通过 get 核对任务后再决定是否重新提问')
+            # Fence the writer before draining an interrupted provider or a blocking tool.
+            with self.database.connect(write=True) as db:
+                row = self.task_row(db,scope)
+                if row:
+                    doc = json.loads(row['document'])
+                    if doc['id']==writer and doc['status']['state']=='working':
+                        turns.interrupt_in(db,row,doc)
             raise
-        except HTTPException as exc:
-            return self.finish(scope, result, 'failed', str(exc.detail))
-        except Exception:
-            logging.getLogger(__name__).exception('个人协议任务生成失败；未重试模型调用')
-            return self.finish(scope, result, 'failed', '模型问答失败，请检查目标分身的模型配置或稍后再试')
-        return self.finish(scope, result)
+        except (RunConflict, TimeoutError, HTTPException, ManagementTaskError) as exc:
+            message = (str(exc.detail) if isinstance(exc,HTTPException) else
+                       '等待模型并发资源超时，请稍后再试' if isinstance(exc,TimeoutError) else str(exc))
+            return turns.finish(self.database,rowid,result,run,'failed',message)
+        except Exception as exc:
+            logging.getLogger(__name__).error('个人协议任务生成失败：writer=%s type=%s',writer,type(exc).__name__)
+            return turns.finish(self.database,rowid,result,run,'failed','模型问答失败，请检查目标分身的模型配置或稍后再试')
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task,return_exceptions=True)
 
     # 控制命令没有 dataItems；只在已存在的配对任务中选择分身鉴权路径，随后仍核对 TLS peer。
     def is_peer_task(self,command):
         with self.database.connect() as db:
             return bool(db.execute('SELECT 1 FROM agent_dialogues WHERE id=? AND session_id=?',(command.get('taskId'),command.get('sessionId'))).fetchone())
 
-    # 职责：保存当前任务结果，保留并发取消或超时的终态。
-    # 输入：scope 为任务完整身份，result 为本次结果，可选固定失败提示。
-    # 结果与约束：只更新原任务，不覆盖已取消结果；成功等待 Leader 确认最多 300 秒。
-    def finish(self, scope, result, state=None, message=None, *, resume=None):
-        working_id = result['id']
-        if state:
-            result['status'] = {'state': state, 'stateChangedAt': now(), 'dataItems': [{'type': 'text', 'text': message}]}
-        result['id'] = uuid.uuid4().hex
-        result['sentAt'] = now()
-        with self.database.connect(write=True) as db:
-            row = db.execute('SELECT document FROM avatar_aip_tasks WHERE local_aic=? AND peer_aic=? AND group_id=? AND session_id=? AND task_id=?', scope).fetchone()
-            current = json.loads(row['document'])
-            if current['status']['state'] != 'working' or current['id'] != working_id:
-                current.pop('_agent_resume', None)
-                return current
-            stored = {**result, '_agent_resume': resume} if resume else result
-            db.execute('UPDATE avatar_aip_tasks SET document=?,deadline=? WHERE local_aic=? AND peer_aic=? AND group_id=? AND session_id=? AND task_id=?',
-                       (dump(stored), time.time()+300 if not state else None, *scope))
-        return result
-
     # 职责：使用已通过本人鉴权的所有者资料和模型配置生成个人回答。
     # 输入：target 为服务端固定目标，context 是认证 peer/group，session 来自协议会话。
     # 结果与约束：不创建或绑定小镇用户账号；协议会话不混入 Web 历史，计费和压缩费用归目标所有者。
-    async def answer(self, target, context, session, question, *, principal=None, resume=None, progress=None):
+    async def answer(self, target, context, session, *, principal=None, resume, store, progress, commit, claim):
         user = {'id': target['user_id'], 'username': target['username'], 'account_status': target['account_status']}
+        question = '\n\n用户补充：'.join(resume['inputs'])
         request = ChatRequest(channel='avatar', message=question)
-        if resume:
-            question = '\n\n用户补充：'.join([*resume['inputs'], question])
-            request = request.model_copy(update={'message': question})
         overview, model = self.chat.context(user, request, target, private_access=False)
-        model = ({**model[0], '_avatar_agent': True, '_agent_checkpoint': resume['checkpoint'] if resume else {}}, *model[1:])
+        run_state = store.load()
+        model = ({**model[0], '_avatar_agent': True, '_agent_checkpoint':resume.get('checkpoint',{}),
+                  '_run_store':store, '_run_input_id':resume['input_id'], '_run_supplement':resume['supplement'],
+                  '_auto_recover':resume['automatic'],
+                  '_resume_sandbox':bool(run_state.get('sandbox'))}, *model[1:])
         caller = context.peer_aic if principal is None else 'visitor:' + principal['visitor_id']
         platform = 'acps-direct' if principal is None else 'town-guest' if principal.get('anonymous') else 'town-public'
-        if principal is not None or (resume and resume.get('clarification')):
+        if principal is not None or resume.get('clarification'):
             config, key, system, history = model
             prefix, raw = system.split('\n', 1)
             background = json.loads(raw)
@@ -368,7 +432,7 @@ class PersonalTaskService:
                 for name in ('available_skills', '_skills_revision', 'platform_avatars', 'platform_directory_rules'):
                     background.pop(name, None)
                 prefix += ' 当前为公开访客问答，仅使用公开档案与公开附件；不得执行主人技能、私人工具、委派或管理操作。'
-            if resume and resume.get('clarification'):
+            if resume.get('clarification'):
                 background['last_clarification'] = resume['clarification']
                 prefix += ' last_clarification 是上一轮你向用户提出的问题，只用于理解本轮补充。'
             model = (config, key, prefix+'\n'+json.dumps(background,ensure_ascii=False), history)
@@ -376,7 +440,7 @@ class PersonalTaskService:
         memory = self.chat.memory
         conversation = memory.scope(user['id'], 'acps', target['aic'], conversation_id,
                                     caller_id=caller, platform=platform, title='小镇公开访客对话' if principal else '小镇分身对话', create=True)
-        memory.acquire(conversation_id)
+        claim(conversation_id)
         try:
             model = await memory.prepare(conversation, overview['agent']['last_modified_at'], model, question,
                                          self.chat.model_client, user['id'], progress=progress)
@@ -387,17 +451,18 @@ class PersonalTaskService:
             result = await self.chat.rag.answer(model, question, progress=progress)
             if not result.text.strip():
                 raise HTTPException(502, '模型未返回有效回答')
-            self.target(user['id'], target['aic'])
+            validate_sandbox = model[0].get('_validate_sandbox')
+            if validate_sandbox:
+                validate_sandbox()
             overview['_target'] = {'aic': target['aic'], 'name': overview['agent']['profile']['avatar_name']}
             self.chat.save(user, request.model_copy(update={'channel': 'acps', 'conversation_id': conversation_id}),
-                           overview, result.text, result.usage, caller_id=caller)
+                           overview, result.text, result.usage, caller_id=caller, commit_in=lambda db:commit(db,result.text))
             return result.text
         except AgentNeedsInput as exc:
-            if exc.usage:
-                config = overview['agent']['model_config']
-                with self.database.connect(write=True) as db:
+            with self.database.connect(write=True) as db:
+                store.check_in(db)
+                if exc.usage:
+                    config = overview['agent']['model_config']
                     db.execute('INSERT INTO model_calls(user_id,provider,model,usage,created_at,caller_id,conversation_id) VALUES(?,?,?,?,?,?,?)',
                                (user['id'], config['provider'], config['model'], dump(exc.usage), now(), caller, conversation_id))
-            raise
-        finally:
-            memory.release(conversation_id)
+                commit(db,exc.question or str(exc),pause=exc)

@@ -6,12 +6,12 @@ from contextvars import ContextVar
 import ipaddress
 import json
 import socket
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import httpx
 from fastapi import HTTPException
 from avatar.core.http_pool import HttpTransportPool
 from avatar.models.effort import apply_effort
-from avatar.models.diagnostics import PURPOSES, transport_error, transport_failure
+from avatar.models.diagnostics import PURPOSES, check_terminal, stop_reason, transport_error, transport_failure
 
 
 collected_model_status = ContextVar('collected_model_status', default=None)
@@ -30,15 +30,22 @@ class ModelResult:
     # None = ordinary reply, empty tuple = explicit clarification, otherwise verified originals.
     material_delivery: tuple | None = None
     contact_draft: dict | None = None
-    partial_tool_calls: tuple = ()
+    partial_tool_calls: tuple = field(default=(), repr=False)
+
+    @property
+    def stop_reason(self):
+        return stop_reason(self.finish_reason, self.tool_calls)
 
 
 def accumulate_usage(total, usage):
-    current = usage or {}
+    # A rejected step has no new receipt. A provider receipt with unknown fields is different.
+    if usage is None:
+        return total
+    current = usage
     fields = ('input_tokens', 'output_tokens', 'total_tokens')
     if total is None:
         return {key: current.get(key) for key in fields}
-    return {key: total[key] + current[key] if total[key] is not None and current.get(key) is not None else None
+    return {key: total[key] + current[key] if total.get(key) is not None and current.get(key) is not None else None
             for key in fields}
 
 
@@ -103,6 +110,9 @@ def tokens(value):
 # 输入：fmt 为接口格式，data 为上游 JSON；OpenAI、Anthropic、Gemini 各自读取对应字段。
 # 结果与约束：返回 ModelResult，过滤 Gemini 思考片段；空回答报错，用量优先采用上游总数，无总数时仅在输入输出齐全后求和。
 def parse_response(fmt, data, *, config=None, request_id=None, api_key=''):
+    config = config or {}
+    retain = config.get('_retain_turn_fragments', False)
+    separator = '' if retain else '\n'
     if data.get('error'):
         from avatar.models.diagnostics import provider_error,contextual
         raise contextual(provider_error(200,data['error'],request_id,api_key),config or {})
@@ -111,15 +121,15 @@ def parse_response(fmt, data, *, config=None, request_id=None, api_key=''):
         text=openai_message.get('content','')
         refused_part=isinstance(text,list) and any(p.get('type')=='refusal' for p in text)
         if isinstance(text, list):
-            text = "\n".join(p.get("text", "") for p in text if p.get("type") == "text")
+            text = separator.join(p.get("text", "") for p in text if p.get("type") == "text")
         usage = data.get("usage") or {}
         incoming, outgoing = tokens(usage.get("prompt_tokens")), tokens(usage.get("completion_tokens"))
     elif fmt == "anthropic":
-        text = "\n".join(p.get("text", "") for p in data.get("content",[]) if p.get("type") == "text")
+        text = separator.join(p.get("text", "") for p in data.get("content",[]) if p.get("type") == "text")
         usage = data.get("usage") or {}
         incoming, outgoing = tokens(usage.get("input_tokens")), tokens(usage.get("output_tokens"))
     else:
-        text = "\n".join(p.get("text", "") for p in ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts",[]) if not p.get("thought"))
+        text = separator.join(p["text"] for p in ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts",[]) if 'text' in p and not p.get("thought"))
         usage = data.get("usageMetadata") or {}
         incoming, outgoing = tokens(usage.get("promptTokenCount")), tokens(usage.get("candidatesTokenCount"))
     reported_total = tokens(usage.get("total_tokens", usage.get("totalTokenCount")))
@@ -128,18 +138,36 @@ def parse_response(fmt, data, *, config=None, request_id=None, api_key=''):
     reason=((data.get('choices') or [{}])[0].get('finish_reason') if fmt=='openai' else
             data.get('stop_reason') if fmt=='anthropic' else (data.get('candidates') or [{}])[0].get('finishReason'))
     calls=()
-    if (config or {}).get('_avatar_agent') and (config or {}).get('_call_purpose') in ('goal_decision','html_generation','task_planning') and str(reason or '').lower() in ('length','max_tokens','max_output_tokens'):
+    terminal = stop_reason(reason)
+    check_terminal(reason, model_usage)
+    if terminal == 'output_limit':
         from avatar.models.tools import raw_tool_calls
-        allowed = {tool['name'] for tool in config.get('_tools', ())}
         try:
-            drafts = raw_tool_calls(fmt, data)
+            fragments = tuple(raw_tool_calls(fmt, data))
+            if (text is not None and not isinstance(text,str) or len(fragments) > 8 or
+                    any(type(f['index']) is not int or f['index'] < 0 or not isinstance(f['name'],str)
+                        or not isinstance(f['arguments'], (str,dict)) for f in fragments)):
+                raise ValueError()
         except (ValueError, TypeError, KeyError, IndexError, AttributeError):
-            drafts = []
-        fragments = tuple({'name': call['name'], 'arguments': call['arguments']} for call in drafts
-                          if isinstance(call, dict) and isinstance(call.get('name'), str) and call['name'] in allowed
-                          and isinstance(call.get('arguments'), (str, dict)))
-        if fragments or text:
+            error = HTTPException(502, '模型输出已截断且片段格式无效，本批工具未执行')
+            error.stop_reason = terminal
+            error.output_limited = True
+            error.model_usage = model_usage
+            raise error from None
+        legacy_draft = config.get('_avatar_agent') and config.get('_call_purpose') in ('goal_decision','html_generation','task_planning')
+        if retain:
             return ModelResult(text or '', model_usage, finish_reason=reason, partial_tool_calls=fragments)
+        if legacy_draft:
+            allowed = {tool['name'] for tool in config.get('_tools', ())}
+            selected = tuple(call for call in fragments if call['name'] in allowed)
+            if text or selected:
+                return ModelResult(text or '', model_usage, finish_reason=reason, partial_tool_calls=selected)
+        if fragments and config.get('_tools'):
+            error = HTTPException(502,'模型工具调用达到单次输出上限，本批工具未执行')
+            error.stop_reason = terminal
+            error.output_limited = True
+            error.model_usage = model_usage
+            raise error
     # Distinguish a missing action after private reasoning from a malformed proposed action.
     if config and config.get('_tools'):
         from avatar.models.tools import parse_tools
@@ -147,8 +175,9 @@ def parse_response(fmt, data, *, config=None, request_id=None, api_key=''):
             calls=tuple(parse_tools(fmt,data,config['_tools'],required=bool(text and str(text).strip()) and not config.get('_optional_tools'),batch=bool(config.get('_batch_tools'))))
         except HTTPException as error:
             error.model_usage=model_usage
-            if str(reason or '').lower() in ('length','max_tokens','max_output_tokens'):
+            if terminal == 'output_limit':
                 error.output_limited = True
+                error.stop_reason = terminal
                 error.invalid_tool_call = False
             raise
     if not calls and (not isinstance(text, str) or not text.strip()):
@@ -179,7 +208,7 @@ def parse_response(fmt, data, *, config=None, request_id=None, api_key=''):
                     raise
             raise empty_response(fmt,reason=reason,thinking=thinking and not action,refusal=refusal,usage=usage,request_id=request_id,config=config)
     # 分身可能在下一次完整响应续写，保留两段交界处的空格、换行与代码缩进。
-    visible = (text or '') if (config or {}).get('_avatar_agent') else (text or '').strip()
+    visible = (text or '') if retain or config.get('_avatar_agent') else (text or '').strip()
     return ModelResult(visible, model_usage, calls, reason)
 
 
@@ -282,8 +311,8 @@ class ModelClient:
     # 结果与约束：返回 ModelResult；完整响应等待通常为 180 秒，HTML 为 600 秒；SSE 按有效输出续期。
     async def generate(self, config, api_key, system, history, message):
         from avatar.core.execution import check_execution_async
-        await check_execution_async()
         try:
+            await check_execution_async()
             try:
                 return await self._generate(config, api_key, system, history, message)
             except HTTPException as first:
@@ -298,6 +327,9 @@ class ModelClient:
                 error.recovery_attempted=True
                 raise
             return replace(result,usage=accumulate_usage(previous,result.usage))
+        except asyncio.CancelledError as exc:
+            exc.stop_reason = 'cancelled'
+            raise
         except HTTPException as exc:
             from avatar.models.diagnostics import contextual
             error=contextual(exc,config)
@@ -379,7 +411,6 @@ class ModelClient:
     # 结果与约束：异步 yield 状态、可见文本及用量；普通 SSE 有效输出间隔上限 180 秒，HTML 制作与动画分镜为 600 秒，aclosing 保证取消时关闭上游生成器。
     async def stream(self, config, api_key, system, history, message):
         from avatar.core.execution import check_execution_async
-        await check_execution_async()
         from avatar.models.model_stream import stream_response
         try:
             previous=None
@@ -406,6 +437,9 @@ class ModelClient:
                     previous=error.model_usage
                     config={**config,'_recover_thinking':True}
                     system=self.recovery_prompt(system,config)
+        except asyncio.CancelledError as exc:
+            exc.stop_reason = 'cancelled'
+            raise
         except HTTPException as exc:
             from avatar.models.diagnostics import contextual
             error=contextual(exc,config)

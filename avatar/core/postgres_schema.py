@@ -1388,7 +1388,8 @@ def _idempotent(statement):
 
 def install_schema(connection):
     from avatar.core.postgres_helpers import STATEMENTS as HELPERS
-    for statement in [*STATEMENTS, *HELPERS]:
+    from avatar.core.postgres_schema_runs import STATEMENTS as RUNS
+    for statement in [*STATEMENTS, *HELPERS, *RUNS]:
         connection.execute(_idempotent(statement))
 
     connection.execute("""ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_stage

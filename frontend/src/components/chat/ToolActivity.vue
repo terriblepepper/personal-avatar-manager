@@ -116,7 +116,7 @@ function inputDetails(event: ToolEvent) {
   return fields
 }
 const states: Record<string, string> = {
-  running: '进行中', paused: '等待补充', completed: '已完成', error: '失败', interrupted: '已中止', skipped: '已跳过',
+  running: '进行中', paused: '已暂停', completed: '已完成', error: '失败', interrupted: '已中止', skipped: '已跳过',
 }
 const text = (value: unknown) => typeof value === 'string' ? value : JSON.stringify(value, null, 2)
 </script>

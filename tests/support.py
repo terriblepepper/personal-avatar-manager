@@ -115,10 +115,12 @@ def modified_at(client):
 
 def fake_completion(request):
     body = json.loads(request.content)
-    if body.get('tools'):
-        if any(t.get('function',{}).get('name')=='finish_reading' for t in body['tools']):
-            return httpx.Response(200,json={'choices':[{'message':{'tool_calls':[{'type':'function','function':{'name':'finish_reading','arguments':'{}'}}]}}],'usage':{'total_tokens':2}})
-        return httpx.Response(200,json={'choices':[{'message':{'tool_calls':[{'type':'function','function':{'name':'continue_answer','arguments':'{}'}}]}}],'usage':{'total_tokens':2}})
+    declared = {tool['function']['name'] for tool in body.get('tools', ())}
+    for name, arguments in (('plan_task', {'steps': []}), ('check_file_receipt', {'decision': 'plain_answer'}),
+                            ('finish_reading', {}), ('continue_answer', {})):
+        if name in declared:
+            call = {'type': 'function', 'function': {'name': name, 'arguments': json.dumps(arguments)}}
+            return httpx.Response(200, json={'choices': [{'message': {'tool_calls': [call]}}], 'usage': {'total_tokens': 2}})
     return httpx.Response(200, json={"choices": [{"message": {"content": "模型回答："+body["messages"][0]["content"]}}],
                                     "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30}})
 
