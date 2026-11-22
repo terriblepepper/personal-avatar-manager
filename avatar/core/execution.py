@@ -1,5 +1,5 @@
 """Execution boundaries can revoke work without depending on a transport."""
-from avatar.core.text_budget import AgentText, TEXT_LIMIT, fits_text_budget
+from avatar.core.text_budget import AgentText, fits_text_budget, budget_error
 import asyncio
 import json
 import re
@@ -90,7 +90,7 @@ class AskUser(BaseModel):
     @model_validator(mode="after")
     def check_budget(self):
         if not fits_text_budget(self.question, *self.options):
-            raise ValueError(TEXT_LIMIT)
+            raise ValueError(budget_error())
         return self
 
     def pending(self):

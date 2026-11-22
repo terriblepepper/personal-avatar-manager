@@ -25,10 +25,11 @@ class SavedMaterials:
             condition += " AND id=ANY(?::text[]) AND created_at::timestamptz<=to_timestamp(?)"
             params.extend((scope.get('materials', []),current_generation.get()['created_at']))
         with self.database.connect() as db:
-            rows=db.execute("""SELECT id,user_id,filename,relative_path,caption,content_type,sha256,
+            rows=db.execute("""SELECT id,user_id,size,visibility,filename,relative_path,caption,content_type,sha256,
                 animation_metadata,'profile' AS source FROM attachments WHERE """+condition+
                 ' ORDER BY relative_path,filename,id',params)
-            return with_folder_captions(db,rows,self.owner)
+            return with_folder_captions(db,(row for row in rows if
+                self.attachments.directory.available(self.owner,row['id'],row['size'])),self.owner)
 
     def owned(self, db, identifier, animation_only=False):
         scope = authorization()

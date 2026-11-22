@@ -38,7 +38,7 @@ OFFLINE_ANIMATION = ('动画必须完全离线，严禁使用任何网络资源�
                      'import * as THREE from "three"，由预览器提供本地核心模块；不要使用插件、外部 importmap 或全局 THREE。')
 ANIMATION_INPUT = ('自由编写完整 html，提供 duration_seconds 和 render_frame。'
                    'html 定义场景和一次性初始化，render_frame 按绝对秒数 time 从任意位置重绘，可用 duration、state。'
-                   'Three.js 在 html 模块中初始化，render_frame 可调用挂在 window 上的绘制函数。'
+                   'Three.js 在 html 模块中初始化。render_frame 直接执行绘制语句，或调用同名的 window 绘制函数；不要再包一层函数声明。场景、相机、网格及每一项更新引用的对象都须先定义。'
                    '平台提供播放、暂停和可拖动的进度条。所有运动由 time 驱动，勿另起计时、动画循环或独立播放的 CSS 动画。')
 CREATE_ANIMATION = {
     'name':'create_animation',
@@ -165,6 +165,19 @@ def custom_animation(artifact):
     if re.search(r'</script\b', artifact.render_frame, re.I):
         raise ValueError('render_frame 只填写 JavaScript 函数体，请移除 script 标签或转义结束标签')
     source = artifact.html
+    frame_body = artifact.render_frame.strip()
+    wrapper = re.match(r'^function\s+(?:render_frame|renderFrame)\s*\(\s*time\b[^()]*\)\s*\{', frame_body)
+    if wrapper and re.compile(r'(?:[^{}]*\{[^{}]*\})*[^{}]*\}\s*;?\Z').match(frame_body, wrapper.end()):
+        raise ValueError('render_frame 需要直接执行绘制的函数体；请移除外层 render_frame 函数声明')
+    # A lone guarded callback otherwise makes the clock look healthy while drawing nothing.
+    delegate = re.fullmatch(r'(?:if\s*\(\s*window\.(?P<guard>[A-Za-z_$][\w$]*)\s*\)\s*)?'
+                            r'(?:\{\s*)?window\.(?P<name>[A-Za-z_$][\w$]*)\s*\(\s*time(?:\s*,\s*(?:state|duration))*\s*\)\s*;?\s*\}?', frame_body)
+    if delegate and delegate['guard'] in (None, delegate['name']):
+        name = re.escape(delegate['name'])
+        link = re.search(rf'\bwindow\.{name}\s*=\s*{name}\s*;', source)
+        if (link and not re.compile(rf'(?<![\w$]){name}(?![\w$])').search(source, 0, link.start()) and
+                re.compile(rf'\s*(?:{name}\s*\(\s*0\s*\)\s*;?\s*)?</(?i:script)\b').match(source, link.end())):
+            raise ValueError('render_frame 调用的绘制函数没有实现。请在 HTML 中明确导出同名函数，再按 time 调用它')
     parser = AnimationDependencies()
     parser.feed(source)
     parser.close()

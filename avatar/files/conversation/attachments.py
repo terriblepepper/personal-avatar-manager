@@ -43,41 +43,75 @@ class ChatFiles(ConversationResources):
         if editable and row['lease_until']>time.time():raise HTTPException(409,'会话正在处理，请等待回答完成')
         return row
 
-    @staticmethod
-    def model_catalog(db, owner, conversation):
-        rows = db.execute("""SELECT id,filename,filename AS relative_path,left(description,300) AS description,
-            content_type,animation_metadata,'chat' AS source,origin FROM chat_files
-            WHERE user_id=? AND conversation_id=? AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))
-            ORDER BY created_at DESC,id LIMIT 20""",(owner,conversation))
-        return [dict(row) for row in rows]
+    def model_catalog(self, db, owner, conversation):
+        self.session(db, owner, conversation)
+        cards = []
+        offset = 0
+        while len(cards) < 20:
+            rows = db.execute("""SELECT id,filename,filename AS relative_path,left(description,300) AS description,
+                content_type,animation_metadata,'chat' AS source,origin,size FROM chat_files
+                WHERE user_id=? AND conversation_id=? AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))
+                ORDER BY created_at DESC,id LIMIT 20 OFFSET ?""",(owner,conversation,offset)).fetchall()
+            cards.extend(dict(row) for row in rows if self.directory.available(owner,row['id'],row['size']))
+            if len(rows)<20:
+                break
+            offset+=len(rows)
+        return cards[:20]
 
-    def discover(self, owner, conversation, query, offset, outputs=()):
+    def discover(self, owner, conversation, query, offset, outputs=(), *, grants=None):
         # Material cards keep the library original; uploaded and generated cards live in chat_files.
-        sql="""WITH originals AS (
-            SELECT id,filename,left(description,300) AS description,content_type,
-                   animation_metadata::jsonb->>'title' AS title,origin,'chat' AS source,created_at AS stamp
+        chat_rows="""SELECT id,filename,left(description,300) AS description,content_type,
+                   animation_metadata::jsonb->>'title' AS title,origin,'chat' AS source,created_at AS stamp,size
             FROM chat_files WHERE user_id=? AND conversation_id=?
-              AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))
-            UNION ALL
+              AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))"""
+        shared_rows=""" UNION ALL
             SELECT a.id,a.filename,left(a.caption,300),a.content_type,a.animation_metadata::jsonb->>'title',
-                   'material','profile',links.stamp
+                   'material','profile',links.stamp,a.size
             FROM (SELECT l.attachment_id,max(m.created_at) AS stamp FROM chat_messages m
                   JOIN chat_message_materials l ON l.message_id=m.id WHERE m.user_id=? AND m.conversation_id=?
                   GROUP BY l.attachment_id) links
-            JOIN attachments a ON a.id=links.attachment_id AND a.user_id=?
-        ) SELECT id,filename,description,content_type,title,origin,source FROM originals
+            JOIN attachments a ON a.id=links.attachment_id AND a.user_id=?"""
+        selection=""") SELECT id,filename,description,content_type,title,origin,source,size FROM originals
           WHERE strpos(lower(concat_ws(' ',filename,description,title,content_type,id)),lower(?))>0
           ORDER BY stamp DESC,id LIMIT ? OFFSET ?"""
         def page(db, term, start):
-            staged=[{'id':item['id'],'filename':item['filename'],'origin':'generated','source':'chat'}
-                    for item in reversed(outputs) if term.casefold() in (item['filename']+' '+item['id']).casefold()]
-            items=staged[start:start+11]
-            if len(items)<11:
-                rows=db.execute(sql,(owner,conversation,owner,conversation,owner,term,11-len(items),max(0,start-len(staged))))
-                items.extend(dict(row) for row in rows)
-            return {'items':items[:10],'next_offset':start+10 if len(items)>10 else None}
+            staged=[{'id':item['id'],'filename':item['filename'],'origin':'generated','source':'chat',
+                     'delivery_state':'staged','can_read':False}
+                    for item in reversed(outputs) if item['id'] not in committed and
+                    term.casefold() in (item['filename']+' '+item['id']).casefold()]
+            items=staged[start:start+10]
+            cursor=start+len(items)
+            if cursor<len(staged):
+                return {'items':items,'next_offset':cursor}
+            while True:
+                rows=db.execute(sql,(*params,term,11,max(0,cursor-len(staged)))).fetchall()
+                for row in rows:
+                    directory=self.attachments.directory if row['source']=='profile' else self.directory
+                    if directory.available(owner,row['id'],row['size']):
+                        if len(items)==10:
+                            return {'items':items,'next_offset':cursor}
+                        items.append({**dict(row),'delivery_state':'available','can_read':True})
+                    cursor+=1
+                if len(rows)<11:
+                    return {'items':items,'next_offset':None}
         with self.database.connect() as db:
             self.session(db,owner,conversation)
+            params=(owner,conversation)
+            if grants is None:
+                originals=chat_rows+shared_rows
+                params+=owner,conversation,owner
+            else:
+                outputs=()
+                originals=chat_rows+""" AND EXISTS(SELECT 1 FROM jsonb_each_text(?::jsonb) g
+                    WHERE g.key=chat_files.id AND g.value=chat_files.sha256)"""
+                params+=(json.dumps(grants(db)),)
+            sql='WITH originals AS ('+originals+selection
+            committed=set()
+            if outputs:
+                ids=tuple(item['id'] for item in outputs)
+                rows=db.execute(f"SELECT id FROM chat_files WHERE user_id=? AND conversation_id=? AND id IN ({','.join('?' for _ in ids)})",
+                                (owner,conversation,*ids))
+                committed={row['id'] for row in rows}
             result=page(db,query.strip(),offset)
             if query.strip() and offset==0 and not result['items']:
                 result=page(db,'',0)
@@ -104,7 +138,11 @@ class ChatFiles(ConversationResources):
                 (ANIMATION_MIME,user_id,conversation_id))
             items = []
             for row in rows:
+                if not self.directory.available(user_id,row['id'],row['size']):
+                    continue
                 item = dict(row)
+                if item['promoted_id'] and not self.attachments.directory.available(user_id,item['promoted_id']):
+                    item['promoted_id']=None
                 item.update(json.loads(item.pop('animation_metadata')))
                 item.update(referenced=bool(item['referenced']), download_url='/api/conversations/'+conversation_id+'/files/'+item['id'])
                 items.append(item)
@@ -176,7 +214,7 @@ class ChatFiles(ConversationResources):
     def owned(self, db, user_id, conversation_id, file_id):
         self.session(db,user_id,conversation_id)
         row=db.execute("SELECT * FROM chat_files WHERE id=? AND user_id=? AND conversation_id=? AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))",(file_id,user_id,conversation_id)).fetchone()
-        if not row:raise HTTPException(404,'会话附件不存在')
+        if not row or not self.directory.available(user_id,file_id,row['size']):raise HTTPException(404,'会话附件不存在')
         return dict(row)
 
     # 职责：在调用方事务期间移除选中文件，并在事务失败时恢复原件。
@@ -260,12 +298,12 @@ class ChatFiles(ConversationResources):
             current=[self.owned(db,user_id,parent,identifier) for identifier in dict.fromkeys(selected)]
             if any(not row['referenced'] or row['origin']=='attachment' for row in current):raise HTTPException(409,'文件引用已关闭，请刷新会话后重新发送')
             if persistent:
-                return [dict(row) for row in db.execute("SELECT * FROM chat_files WHERE user_id=? AND conversation_id=? AND referenced=1 AND origin!='attachment' AND (expires_at IS NULL OR julianday(expires_at)>julianday('now')) ORDER BY created_at,id LIMIT 5",(user_id,parent))]
+                return [dict(row) for row in db.execute("SELECT * FROM chat_files WHERE user_id=? AND conversation_id=? AND referenced=1 AND origin!='attachment' AND (expires_at IS NULL OR julianday(expires_at)>julianday('now')) ORDER BY created_at,id LIMIT 5",(user_id,parent)) if self.directory.available(user_id,row['id'],row['size'])]
             history=db.execute('''SELECT f.* FROM chat_files f WHERE f.user_id=? AND f.conversation_id=? AND (
                 EXISTS(SELECT 1 FROM chat_file_usages u JOIN chat_messages m ON m.id=u.message_id WHERE u.file_id=f.id AND m.conversation_id=?)
                 OR EXISTS(SELECT 1 FROM chat_messages m WHERE m.id=f.generated_message_id AND m.conversation_id=?))
                 AND f.referenced=1 AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now')) ORDER BY f.created_at DESC LIMIT 5''',(user_id,parent,session['id'],session['id'])).fetchall()
-        return (current+[dict(row) for row in history if row['id'] not in selected])[:5]
+        return (current+[dict(row) for row in history if row['id'] not in selected and self.directory.available(user_id,row['id'],row['size'])])[:5]
 
     # 职责：保存本人文件的引用开关；发送成功不修改此字段，刷新或再次登录后仍保持用户选择。
     def reference_enabled(self,user_id,conversation_id,file_id,enabled):

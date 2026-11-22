@@ -92,6 +92,10 @@ class FileRag:
             if not valid:raise HTTPException(404,'会话文件已过期')
         return row
 
+    def original_available(self, source, owner, identifier, size=None):
+        directory = self.attachments.directory if source=='profile' else self.chat.chat_files.directory
+        return directory.available(owner,identifier,size)
+
     def status(self,user,requested_source=None):
         with self.database.connect() as db:
             query = 'SELECT source,file_id,status,coverage,error,updated_at FROM file_rag_documents WHERE user_id=?'
@@ -102,17 +106,21 @@ class FileRag:
             rows = [dict(row) for row in db.execute(query,args)]
             config=EmbeddingSettings.current(db,user['id'])
             summary={}
+            live=set()
             for source,table in (('profile','attachments'),('chat','chat_files')):
                 if requested_source is not None and source != requested_source:
                     continue
                 eligible=" AND referenced=1 AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))" if source=='chat' else ''
-                identifiers={r[0] for r in db.execute('SELECT id FROM '+table+' WHERE user_id=?'+eligible,(user['id'],))}
+                identifiers={r[0] for r in db.execute('SELECT id,size FROM '+table+' WHERE user_id=?'+eligible,(user['id'],))
+                             if self.original_available(source,user['id'],r[0],r[1])}
+                live.update((source, identifier) for identifier in identifiers)
                 states={r['file_id']:r['status'] for r in rows if r['source']==source}
                 from collections import Counter
                 counts=Counter(states.get(identifier,'queued') for identifier in identifiers)
                 summary[source]={'total':len(identifiers),'completed':counts['ready'],'remaining':len(identifiers)-counts['ready'],
                     'running':counts['running'],'queued':counts['queued']+counts['stale'],
                     'failed':counts['failed'],'blocked':counts['blocked'],'partial':counts['partial']}
+            rows=[r for r in rows if (r['source'],r['file_id']) in live]
         return {'configured':bool(config),'updating':any(row['status'] in ('queued','running') for row in rows),'items':rows,'summary':summary}
 
     def sync(self,user,*,force=False):

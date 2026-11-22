@@ -9,6 +9,10 @@ _JSON_TOKEN = r'"(?:[^"\\]++|\\.)*+"|[]["{},:]'
 _STRUCTURE = (re.compile(_JSON_TOKEN,re.DOTALL),re.compile(_JSON_TOKEN.encode(),re.DOTALL))
 
 
+class IncompleteModelString(ValueError):
+    """The JSON reader reached a string that can still receive more streamed bytes."""
+
+
 def load_model_json(value, *, object_pairs_hook=None):
     if len(value) > 2*1024*1024:
         scanner = _STRUCTURE[0] if isinstance(value,str) else _STRUCTURE[1]
@@ -20,7 +24,7 @@ def load_model_json(value, *, object_pairs_hook=None):
             elif first in (']','}',b']',b'}'):
                 depth -= 1
             elif first in ('"',b'"') and token.end()-token.start()==1:
-                raise ValueError('Unterminated model JSON string')
+                raise IncompleteModelString('Unterminated model JSON string')
             if count > 65536 or depth > 128:
                 raise ValueError('Model JSON structure too large')
     return json.loads(value,object_pairs_hook=object_pairs_hook)

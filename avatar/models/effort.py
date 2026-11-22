@@ -56,6 +56,18 @@ def with_chat_effort(config, override):
     return config
 
 
+def visible_output_config(config):
+    """Retry a step that exhausted output without any usable characters."""
+    provider = config.get('provider')
+    model = config.get('model','').split('/')[-1].lower()
+    if config.get('api_format') == 'openai' and provider == 'custom' and model.startswith('qwen'):
+        return {**config,'reasoning_effort':None,'_recover_thinking':True}
+    supported = levels(config)
+    if supported and (provider != 'custom' or config.get('reasoning_effort')):
+        return {**config,'reasoning_effort':supported[0]}
+    return config
+
+
 def thinking_budget(config, effort):
     divisor, ceiling = {'low': (8, 512), 'medium': (3, 2048), 'high': (2, 8192)}[effort]
     return min(ceiling, max(128, config['max_tokens'] // divisor))

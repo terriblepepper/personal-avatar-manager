@@ -1,4 +1,5 @@
 """在当轮授权目录中合并路径、模糊名称和已发布正文命中。"""
+import asyncio
 from datetime import date
 from difflib import get_close_matches
 import re
@@ -34,7 +35,8 @@ def document_date(text):
 
 
 class MaterialDiscovery:
-    def __init__(self, documents, retrieve, excluded=()):
+    def __init__(self, documents, retrieve, excluded=(), *, refresh=None):
+        self.refresh=refresh
         self.documents=[row for row in documents if row['id'] not in excluded]
         self.catalog={item['file_id']:item for item in file_catalog(self.documents)}
         self.directories=directory_catalog(self.documents)
@@ -42,21 +44,34 @@ class MaterialDiscovery:
         self.last_key=None
         self.last_rows=[]
 
+    async def validate_candidates(self):
+        if not self.refresh or not self.documents:
+            return
+        current={row['id']:row for row in await asyncio.to_thread(self.refresh)}
+        live=[row for row in self.documents if current.get(row['id'])==row]
+        if len(live)==len(self.documents):
+            return
+        self.documents=live
+        self.catalog={item['file_id']:item for item in file_catalog(live)}
+        self.directories=directory_catalog(live)
+        self.last_rows=[item for item in self.last_rows if item['file_id'] in self.catalog]
+
     async def page(self, request, *, animation_only=False):
         query=folded(request.query.strip())
         folder=folded(request.folder.strip('/'))
         prefix=folder+'/' if folder else ''
+        key=(query,folder,animation_only,request.sort)
+        if request.mode!='directories' and key!=self.last_key:
+            scoped=[row for row in self.documents if folded(row.get('relative_path') or row['filename']).startswith(prefix)
+                    and (not animation_only or is_animation_file(row))]
+            self.last_rows=await self.rank(scoped,request.query.strip(),latest=request.sort=='latest')
+            self.last_key=key
+        await self.validate_candidates()
         directories=[item for item in self.directories if folded(item['path']).startswith(prefix)]
         if request.mode=='directories':
             matches=[item for item in directories if not query or query in folded(item['path']+' '+item['description'])]
             return {'items':[], 'directories':matches[request.offset:request.offset+10],
                     'next_offset':request.offset+10 if len(matches)>request.offset+10 else None}
-        key=(query,folder,animation_only,request.sort)
-        if key!=self.last_key:
-            scoped=[row for row in self.documents if folded(row.get('relative_path') or row['filename']).startswith(prefix)
-                    and (not animation_only or is_animation_file(row))]
-            self.last_rows=await self.rank(scoped,request.query.strip(),latest=request.sort=='latest')
-            self.last_key=key
         rows=self.last_rows
         return {'items':rows[request.offset:request.offset+10],
                 'directories':directories[:10],

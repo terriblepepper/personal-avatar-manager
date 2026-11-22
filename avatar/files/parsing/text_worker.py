@@ -12,6 +12,8 @@ import sys
 import threading
 import time
 
+from avatar.core.performance import measure
+
 MAX_REPLY_BYTES = 6_000_256  # One million characters, including JSON control escapes.
 MAX_TASKS = 64
 MAX_POOLED_BYTES = 4096
@@ -23,6 +25,15 @@ LINUX_FDS = sys.platform == 'linux' and Path('/proc/self/fd').is_dir()
 def supports(extension):
     from avatar.files.parsing import PLAIN_TEXT_EXTENSIONS
     return LINUX_FDS and extension in PLAIN_TEXT_EXTENSIONS
+
+
+@measure('material_read')
+def read_original(path,extension,**options):
+    if supports(extension):
+        return parse(path, extension, 'read', **options)
+    from avatar.core.config import ROOT
+    result=subprocess.run([sys.executable,'-m','avatar.files.parsing.reader',str(path),extension],input=json.dumps(options).encode(),cwd=ROOT,capture_output=True,timeout=90 if extension in ('.doc','.docx') else 45,check=True)
+    return json.loads(result.stdout)
 
 
 class _Worker:

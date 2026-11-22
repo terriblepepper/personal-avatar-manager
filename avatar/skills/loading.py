@@ -4,10 +4,10 @@ import posixpath
 import re
 from pathlib import PurePosixPath
 from urllib.parse import unquote
+from avatar.core.tokens import estimate
+from avatar.core.db import dump
 
 TEXT_SUFFIXES = {'.md', '.markdown', '.txt', '.json', '.csv', '.yaml', '.yml', '.toml', '.xml'}
-INSTRUCTION_BUDGET = 144000
-RESOURCE_BUDGET = 48000
 
 
 # 职责：从模型的纯 JSON 或 JSON 代码块中读取技能选择结果。
@@ -93,10 +93,12 @@ def load_resources(service, user_id, row, instructions, requested, budget):
         except (UnicodeError,OSError):
             omitted.append(path+'（非 UTF-8 文本或文件不可用）')
             continue
-        if len(content)>budget:
+        item={'path':path,'excerpt':content}
+        cost=estimate(dump(item)+', ')
+        if cost>budget:
             omitted.append(path+'（超过本轮资源预算）')
             continue
-        resources.append({'path':path,'excerpt':content})
-        budget-=len(content)
+        resources.append(item)
+        budget-=cost
         pending.append((path,content))
     return resources, omitted, budget

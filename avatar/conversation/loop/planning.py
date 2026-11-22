@@ -3,7 +3,8 @@ import json
 
 from fastapi import HTTPException
 
-from avatar.core.text_budget import TEXT_LIMIT, fits_text_budget
+from avatar.core.text_budget import TEXT_LIMIT, fits_text_budget, budget_error
+from avatar.conversation.loop.file_context import explicit_file_context
 from avatar.conversation.working_context import bounded_excerpt, fit_turn, input_budget
 from avatar.core.tokens import estimate
 from avatar.core.execution import AskUser, call_with_retry, check_execution_async
@@ -40,6 +41,7 @@ def available_tools(config, system):
         if ((name == 'list_avatars' and directory_allowed(system))
                 or (name == 'continue_answer' and (not domain or config.get('_optional_tools')))
                 or (name == 'deliver_material' and owner)
+                or (not domain and config.get('_session_file_scope') and name=='find_conversation_files')
                 or (personal and name in ('find_conversation_files','contact_avatar'))):
             allowed[name] = tool
     disabled = {t['id']: t for t in config.get('_conversation_tools', ()) if t['id'] != 'animation' and not t['enabled']}
@@ -108,7 +110,7 @@ def validate_disclosure(value, choices, *, revise=False):
         text_parts.extend((s['goal'], s.get('criterion',''), s.get('lookup',{}).get('query','')))
         steps.append(s)
     if not fits_text_budget(*text_parts):
-        raise ValueError(TEXT_LIMIT)
+        raise ValueError(budget_error())
     if type(value.get('continue_draft',False)) is not bool:
         raise ValueError('计划规模或草稿决定无效')
     ret={'tools':selected,'steps':steps}
@@ -142,6 +144,8 @@ async def disclose_tools(model, settings, key, system, history, question, catalo
             '每个独立作品单列交付条件和维度；多个步骤服务于同一作品时只为最终作品列一项。'
             '当前授权目录只列摘要；不可选择目录外工具。已关闭的能力如确实需要，可选择其 ID 以提示用户。'
             '只返回 plan_task 或相同结构的 JSON。'+json.dumps(catalog,ensure_ascii=False))
+    if 'read_session_file' in catalog:
+        prompt+='修改已有作品时，已知文件 ID 就直接用 read_session_file 读取；只有缺少 ID 时才查会话目录。读取后据原文提交局部修改。局部修改通常无需分片重写整份作品。'
     if revise:
         prompt+='只规划剩余目标；说明是否保留当前草稿。'
     usage=None
@@ -150,7 +154,14 @@ async def disclose_tools(model, settings, key, system, history, question, catalo
         await check_execution_async(validate)
         options=config if not attempt else {**config,'_tools':[]}
         spec=prompt if not attempt else prompt+'\n上次未得到有效披露，请用简洁的 JSON 重试。'
-        focus = bounded_excerpt(question, max(64, input_budget(options) - estimate(spec))) if overflow else question
+        room = max(0, input_budget(options)-estimate(spec))
+        if overflow:
+            room //= 2
+        focus = bounded_excerpt(question,room)
+        originals = explicit_file_context(options,spec,focus)
+        if not originals and options.get('_explicit_session_files'):
+            originals = explicit_file_context(options,spec,'',limit=room//2)
+        focus = bounded_excerpt(focus,max(0,room-estimate(originals))) + originals
         rows,msg=fit_turn(options,spec,history[-2:] if overflow else history,focus,[])
         try:
             check_context(options,spec,rows,msg)
@@ -231,7 +242,7 @@ def revise_goals(plan, pending, selected, addition, replace_goals):
 
 # Alternative read methods can satisfy the evidence requirement of a composite delivery.
 EVIDENCE_TOOLS = {'search_materials','read_material','find_material','find_animation','find_public_material',
-                  'find_conversation_files'}
+                  'find_conversation_files','read_session_file'}
 WRITING_CONTROLS = EVIDENCE_TOOLS | {'ask_user','request_tools','read_step_receipt','list_avatars'}
 
 

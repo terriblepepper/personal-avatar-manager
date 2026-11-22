@@ -118,6 +118,34 @@ class PeerResources:
                   AND prior.delivery_mode='message' AND prior.session_id=current.session_id)))
           ORDER BY CASE WHEN f.origin='attachment' THEN 0 ELSE 1 END,f.created_at,f.id LIMIT 5''',(task_id,user_id))]
 
+    def model_files(self,db,task_id,owner):
+        return [item for item in self.selected(db,task_id,owner) if item.get('sha256')
+                and self.files.directory.available(owner,item['id'],item['size'])]
+
+    def session_file_grants(self,db,task,owner,workspace):
+        """Only this speaker's shared copies and this turn's saved outputs can be read."""
+        current=self.dialogues.owned(db,{'id':owner},task['id'])
+        speaker=current['target_user_id'] if current['next_speaker'] else current['user_id']
+        if current['status']!='running' or current['revision']!=task['revision'] or speaker!=owner:
+            return {}
+        selected=self.model_files(db,task['id'],owner)
+        grants={item['id']:item['sha256'] for item in selected if item['conversation_id']==workspace}
+        held=json.loads(current['agent_checkpoint'] or '{}')
+        ids=held.get('file_ids',()) if held.get('speaker_id')==owner else ()
+        if ids and held.get('source_revision')==self.dialogues.output_revision(db,current,owner,selected):
+            rows=db.execute("""SELECT id,sha256,size FROM chat_files WHERE user_id=? AND conversation_id=?
+                AND origin='generated' AND id=ANY(?::text[])
+                AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))""",(owner,workspace,list(ids)))
+            grants.update((row['id'],row['sha256']) for row in rows if row['sha256'] and
+                          self.files.directory.available(owner,row['id'],row['size']))
+        return grants
+
+    def validate_file_receipts(self,db,task,owner,workspace,proofs,*,lock=True):
+        from avatar.files.conversation.session_files import SessionFiles
+        reader=SessionFiles(self.files,owner,workspace,proofs,
+                            grants=lambda conn:self.session_file_grants(conn,task,owner,workspace))
+        reader.validate_in(db,lock=lock)
+
     def metadata(self,task_id,user_id):
         """只返回该查看者已获得的文件名称、下载地址和到期日期。"""
         with self.database.connect() as db:
@@ -132,7 +160,8 @@ class PeerResources:
                 FROM chat_files f JOIN agent_task_files a ON a.file_id=f.id
                 WHERE a.task_id=? AND f.user_id=? AND julianday(f.expires_at)>julianday('now')
                 ORDER BY f.created_at,f.id""",(task_id,user_id)).fetchall()
-        return [{'id':r['id'],'sender_user_id':r['source_user_id'],'message_id':r['message_id'],'origin':r['display_origin'],'promoted_id':r['promoted_id'],'filename':r['filename'],'content_type':r['content_type'],'size':r['size'],**json.loads(r['animation_metadata']),'expires_at':r['expires_at'],'download_url':'/api/conversations/'+r['conversation_id']+'/files/'+r['id']} for r in rows]
+        return [{'id':r['id'],'sender_user_id':r['source_user_id'],'message_id':r['message_id'],'origin':r['display_origin'],'promoted_id':r['promoted_id'],'filename':r['filename'],'content_type':r['content_type'],'size':r['size'],**json.loads(r['animation_metadata']),'expires_at':r['expires_at'],'download_url':'/api/conversations/'+r['conversation_id']+'/files/'+r['id']} for r in rows
+                if self.files.directory.available(user_id,r['id'],r['size'])]
 
     def cleanup(self):
         """每分钟回收过期原件、预览、解析及授权行，转存的资料副本独立保留。"""
@@ -159,23 +188,27 @@ class PeerResources:
         """按本条发言的授权将附件标记、历史下载链接映射到查看者的独立副本。"""
         if '[[attachment:' not in text and '/api/conversations/' not in text:
             return text
-        rows=db.execute("""SELECT f.id,f.conversation_id,a.source_file_id FROM agent_task_files a
+        rows=db.execute("""SELECT f.id,f.size,f.conversation_id,a.source_file_id FROM agent_task_files a
             JOIN chat_files f ON f.id=a.file_id WHERE a.task_id=? AND a.message_id=? AND f.user_id=?
             AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now'))""",(task_id,message_id,user_id)).fetchall()
-        markers={row['source_file_id']:row['id'] for row in rows if row['source_file_id']}
+        markers={row['source_file_id']:row['id'] for row in rows if row['source_file_id'] and
+                 self.files.directory.available(user_id,row['id'],row['size'])}
         if '/api/conversations/' in text or any(not row['source_file_id'] for row in rows):
-            links=db.execute("""SELECT source.id,source.conversation_id,source.user_id,a.source_user_id,local.id AS local_id,local.conversation_id AS local_conversation
+            links=db.execute("""SELECT source.id,source.conversation_id,source.user_id,a.source_user_id,local.id AS local_id,local.size AS local_size,local.conversation_id AS local_conversation
                 FROM agent_task_files a JOIN chat_files source ON source.id=a.file_id
                 JOIN agent_task_files b ON b.task_id=a.task_id AND b.source_user_id=a.source_user_id AND b.message_id=a.message_id
                 JOIN chat_files local ON local.id=b.file_id AND local.user_id=? WHERE a.task_id=? AND a.message_id=?
                 AND ((a.source_file_id IS NOT NULL AND b.source_file_id=a.source_file_id) OR
                      (a.source_file_id IS NULL AND source.sha256<>'' AND local.sha256=source.sha256 AND local.filename=source.filename))
                 AND (local.expires_at IS NULL OR julianday(local.expires_at)>julianday('now'))""",(user_id,task_id,message_id))
+            urls={}
             for row in links:
+                if not self.files.directory.available(user_id,row['local_id'],row['local_size']):continue
                 if row['user_id']==row['source_user_id']:
                     markers.setdefault(row['id'],row['local_id'])
-                text=text.replace('/api/conversations/'+row['conversation_id']+'/files/'+row['id'],
-                                  '/api/conversations/'+row['local_conversation']+'/files/'+row['local_id'])
+                urls[(row['conversation_id'],row['id'])]='/api/conversations/'+row['local_conversation']+'/files/'+row['local_id']
+            text=re.sub(r'/api/conversations/([\w-]{1,80})/files/([\w-]{1,80})(?![\w-])',
+                        lambda match:urls.get(match.groups(),'（附件不可用）'),text)
         if '[[attachment:' in text:
             lines=text.splitlines(keepends=True)
             fence=''

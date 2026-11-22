@@ -29,10 +29,24 @@ def fit_catalog(rows, query, budget):
         fields = (row.get('id',''),row.get('file_id',''),row.get('filename',''),row.get('relative_path',''),
                   row.get('path',''),row.get('title',''),*row.get('tags',[]))
         return (any(_mentioned(field,needle) for field in fields), row.get('source')=='chat')
+    return fit_text_rows(sorted(rows,key=priority,reverse=True),budget,'description')
+
+
+def fit_text_rows(rows, budget, field):
+    """Keep ranked rows and their source identifiers, clipping free text only when needed."""
+    from avatar.conversation.working_context import json_text_view
     remaining = budget - estimate('[]')
     kept = []
-    for row in sorted(rows,key=priority,reverse=True):
+    for row in rows:
+        if remaining<=0:break
         cost = estimate(dump(row)+', ')
+        if cost>remaining and row.get(field):
+            compact={**row,field:''}
+            room=remaining-estimate(dump(compact)+', ')
+            if room>0:
+                compact[field]=json_text_view(row[field],room)
+                row=compact
+                cost=estimate(dump(row)+', ')
         if cost<=remaining:
             kept.append(row)
             remaining-=cost

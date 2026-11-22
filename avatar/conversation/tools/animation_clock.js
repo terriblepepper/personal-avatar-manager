@@ -14,7 +14,20 @@ function installAnimationClock(host, duration, renderFrame) {
   let time = 0, previous, frame = 0, seeking = false
   let playing = !matchMedia('(prefers-reduced-motion: reduce)').matches
   function draw() {
-    renderFrame(time, duration, state)
+    try {
+      renderFrame(time, duration, state)
+    } catch {
+      playing = false
+      button.textContent = '重试播放'
+      label.removeAttribute('aria-hidden')
+      label.setAttribute('role', 'alert')
+      label.textContent = '动画帧绘制失败'
+      return
+    }
+    if (label.hasAttribute('role')) {
+      label.removeAttribute('role')
+      label.setAttribute('aria-hidden', 'true')
+    }
     slider.value = Math.round(time / duration * 1000)
     const elapsed = time.toFixed(1) + ' / ' + duration + ' 秒'
     label.textContent = elapsed

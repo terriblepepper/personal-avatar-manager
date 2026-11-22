@@ -48,6 +48,11 @@ class PeerDialogueTasks:
         if receipt.get('authority') and receipt.get('revision')==task['revision'] and receipt.get('speaker')==owner:
             if receipt['authority'] != PeerTurn.source_version(self.dialogues,db,task,owner,receipt['workspace']):
                 raise ManagementTaskError(-32009,'原任务资料或工具授权已变化')
+            if proofs:=receipt.get('session_file_reads'):
+                try:
+                    self.dialogues.resources.validate_file_receipts(db,task,owner,receipt['workspace'],proofs,lock=False)
+                except HTTPException:
+                    raise ManagementTaskError(-32009,'原任务的会话文件或读取授权已变化') from None
             return True
         return False
 

@@ -105,10 +105,15 @@ class AvatarChat:
                 (user_id, session['id'], message_ids)).fetchall()
         by_message={}
         for ref in references:
+            directory=self.chat_files.attachments.directory if ref['origin']=='material' else self.chat_files.directory
+            if not directory.available(user_id,ref['id'],ref['size']):
+                continue
             if ref['origin']=='material':
                 file=material_card(ref)
             else:
                 file={key:ref[key] for key in ('id','filename','origin','expires_at','promoted_id','content_type','size')}
+                if file['promoted_id'] and not self.chat_files.attachments.directory.available(user_id,file['promoted_id']):
+                    file['promoted_id']=None
                 file['download_url']='/api/conversations/'+ref['conversation_id']+'/files/'+ref['id']
             by_message.setdefault(ref['message_id'],[]).append(file)
         for row in result:
@@ -186,7 +191,7 @@ class AvatarChat:
             agent['model_config']=public_config(config)
             files_date=db.execute('SELECT updated_at FROM attachment_collections WHERE user_id=?',(row['user_id'],)).fetchone()
             agent['last_modified_at']=max(agent['last_modified_at'],files_date['updated_at'] if files_date else '')
-            skills,skill_date=self.skills.context(row['user_id'],request.message,db)
+            skills,skill_date=self.skills.context(row['user_id'],request.message,db,config=config)
             agent['last_modified_at']=max(agent['last_modified_at'],skill_date)
             private_access=bool(private_access and row['user_id']==user['id'])
             background={key:value for key,value in agent['profile'].items() if key not in ('visibility','attachments')} if private_access else public_profile(agent['profile'])
@@ -282,7 +287,7 @@ class AvatarChat:
             scope=authorization()
             if scope is not None:files=[file for file in files if file['id'] in scope.get('files',[])]
             overview['_attachment_ids']=[file['id'] for file in files]
-            if config.get('_material_delivery') and not config.get('_resume_sandbox') and overview.get('_private_context') and overview['agent']['user_id']==user['id']:
+            if config.get('_material_delivery') and not files and not config.get('_resume_sandbox') and overview.get('_private_context') and overview['agent']['user_id']==user['id']:
                 recent = await asyncio.to_thread(self._deliveries,user['id'],session['id'])
                 overview['_material_delivery']=True
                 overview['_generated_files'] = outputs = []
@@ -291,8 +296,14 @@ class AvatarChat:
             parent_id=session.get('parent_id') or session['id']
             config,key,system,history=context
             prefix,raw=system.split('\n',1);background=json.loads(raw)
-            background['conversation_file_references']=[{'file_id':file['id'],'filename':file['filename'],'description':file['description'][:300]} for file in files]
-            background['conversation_file_reference_rules']='这些是本会话仍启用的显式文件引用，关联独立于摘要持久保存；可按需读取，不代表本轮已经读取原件。仅检索到的公开资料不会成为引用。'
+            references=[{'file_id':file['id'],'filename':file['filename'],'description':file['description']} for file in files]
+            background['conversation_file_reference_rules']='这里列出本会话已启用的文件引用。用户消息另附当前授权原件的文字、分页或图像；metadata_only 仅有元信息，其余部分可凭文件 ID 按需读取。历史检索结果不授予文件访问权限。'
+            from avatar.conversation.working_context import compression_budget
+            from avatar.core.tokens import estimate
+            from avatar.files.library.catalog import fit_catalog
+            room = compression_budget(config)-estimate(prefix+'\n'+dump(background))-estimate(request.message)-16
+            background['conversation_file_references'] = (references if estimate(dump(references))<=room
+                                                            else fit_catalog(references,request.message,max(0,room)))
             config={**config,'_mermaid_enabled':True}
             overview['_mermaid_enabled']=True
             if overview['agent']['user_id']==user['id']:
@@ -326,6 +337,8 @@ class AvatarChat:
                 if enabled and overview.get('_private_context'):
                     from avatar.conversation.jobs.pipeline import sandbox_inputs
                     inputs=await asyncio.to_thread(sandbox_inputs,self,user['id'],parent_id,files,context[0].get('_agent_saved_files',()),request.agent_pause_id)
+                    if context[0].get('_session_sandbox_inputs'):
+                        inputs.update(context[0]['_session_sandbox_inputs']())
                 return await self.skill_execution.enrich(overview['agent']['user_id'],context,objective,self.model_client,caller_id=user['id'],conversation_id=session['id'],parent_id=parent_id,inputs=inputs,progress=progress,enabled=enabled,allow_code=enabled)
             overview['_generated_files'] = context[0].setdefault('_generated_files', [])
             # Enrichment can add evidence after memory.prepare. Fit this working copy without reloading the old turns.
@@ -337,16 +350,23 @@ class AvatarChat:
             context=(*context[:3],working_history)
             overview['_workflow_notices']=context[0].get('_workflow_notices',[])
             from avatar.models.limits import check_context
-            check_context(context[0],context[2],context[3],request.message)
+            if not context[0].get('_avatar_agent'):
+                check_context(context[0],context[2],context[3],request.message)
             if overview.get('_private_context') and overview['agent']['user_id']==user['id']:
                 recent = await asyncio.to_thread(self._deliveries,user['id'],session['id'])
                 context=({**context[0],'_material_owner':user['id'],'_material_history':recent},*context[1:])
             from avatar.conversation.loop.entry_tools import bind_entry_tools
+            own_files = bool(overview.get('_private_context') and overview['agent']['user_id']==user['id']
+                             and session.get('platform')=='web' and not session.get('parent_id'))
+            explicit_grants = {row['id']:row['sha256'] for row in files}
             context = await bind_entry_tools(self,context,overview['agent']['user_id'],overview['agent']['aic'],session,files,
                 include_private=bool(overview.get('_private_context')), sandbox=sandbox if enabled else None,
+                session_file_scope=parent_id if own_files or files else None, session_file_owner=user['id'],
+                session_file_grants=None if own_files else lambda db:explicit_grants,
                 status=(lambda:self.assistant_reply(self.service.overview(user['id']),'')) if overview.get('_private_context') and overview['agent']['user_id']==user['id'] else None,
                 progress=progress)
             overview['_validate_sandbox'] = context[0]['_validate_entry_results']
+            overview['_validate_session_files_in'] = context[0].get('_validate_session_files_in')
             return context
         if request.attachment_ids:raise HTTPException(422,'请先选择一个分身，再发送附件提问')
         return None
@@ -354,7 +374,7 @@ class AvatarChat:
     def _deliveries(self, user_id, conversation_id):
         from avatar.conversation.collaboration.intent import delivery_history
         with self.service.database.connect() as db:
-            return delivery_history(db,user_id,conversation_id)
+            return delivery_history(db,user_id,conversation_id,self.service.attachments.directory)
 
     # 职责：生成无需模型调用的申请引导和状态答复。
     # 输入：overview 为本人业务概览；调用工具已在上游确定，不从文本推断操作。
@@ -387,6 +407,8 @@ class AvatarChat:
             job=current_generation.get()
             from avatar.conversation.jobs.pipeline import validate_authorization
             validate_authorization(db,job,lock=True)
+            if validate_originals := overview.get('_validate_session_files_in'):
+                validate_originals(db, lock=True)
             store=overview.get('_run_store')
             if store:
                 if not job:overview['_source_guard'](db,full=True)

@@ -1,7 +1,7 @@
 """Bound the model's working copy without changing the task, receipts or stored messages."""
 import json
 import re
-from avatar.models.limits import tool_budget
+from avatar.models.limits import context_window, tool_budget
 from avatar.core.tokens import estimate
 
 
@@ -56,11 +56,18 @@ def compression_ratio(config):
 
 
 def input_budget(config):
-    return max(0,int(config.get('context_tokens',128000)*compression_ratio(config))-config.get('max_tokens',1024)-512-tool_budget(config))
+    return max(0, context_window(config) - config.get('max_tokens',1024) - 512 - tool_budget(config))
+
+
+def compression_budget(config):
+    # The trigger measures occupied input; the full configured output must also fit in the window.
+    window = context_window(config)
+    return max(0, min(round(window*compression_ratio(config)),window-config.get('max_tokens',1024))
+               - 512 - tool_budget(config))
 
 
 def retained_budget(config, prompt, question):
-    window = config.get('context_tokens') or 128000
+    window = context_window(config)
     overhead = estimate(prompt) + estimate(question) + tool_budget(config) + 512
     return max(0, min(int(window * .32), window - config.get('max_tokens', 1024)) - overhead)
 
@@ -73,7 +80,7 @@ def fit_turn(config, prompt, history, question, observations):
 def fit_working_set(config, prompt, history, question, observations, *, force=False, target_tokens=None):
     # Protect the original objective and sourced material. Old tool chatter and assistant prose go first.
     floor = retained_budget(config, prompt, question)
-    budget = max(0, input_budget(config) - estimate(prompt) - estimate(question))
+    budget = max(0, compression_budget(config) - estimate(prompt) - estimate(question))
     if target_tokens is not None:
         budget = min(budget, target_tokens)
     floor = min(floor, budget)
@@ -160,6 +167,11 @@ def fit_working_set(config, prompt, history, question, observations, *, force=Fa
             kept.append(view)
             note_room -= estimate(view)
         notes = kept[::-1]
+    if observations and not any(notes):
+        # A low trigger can leave no soft budget after the prompt. Preserve the latest evidence when it fits.
+        remaining = input_budget(config)-estimate(prompt)-estimate(question)-sum(estimate(r['content'])+16 for r in rows)
+        if remaining>0:
+            notes = [bounded_excerpt(observations[-1],remaining)]
     return rows, notes
 
 
@@ -175,3 +187,19 @@ def bounded_excerpt(text, tokens):
     prefix = (room - len(mark)) // 2
     suffix = room - len(mark) - prefix
     return data[:prefix].decode('utf-8', 'ignore') + mark.decode() + data[-suffix:].decode('utf-8', 'ignore')
+
+def json_text_view(text, budget):
+    """Fit a JSON string's escaped content to a token budget, excluding its two quotes."""
+    room=max(0,budget)*3
+    def size(value):
+        return len(json.dumps(value,ensure_ascii=False).encode('utf-8'))-2
+    if size(text)<=room:
+        return text
+    low,high=0,min(estimate(text),max(0,budget))
+    while low<high:
+        middle=(low+high+1)//2
+        if size(bounded_excerpt(text,middle))<=room:
+            low=middle
+        else:
+            high=middle-1
+    return bounded_excerpt(text,low)

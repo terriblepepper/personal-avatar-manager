@@ -13,21 +13,25 @@ from itertools import count
 from fastapi import HTTPException
 from pydantic import ValidationError
 
-from avatar.core.text_budget import fits_text_budget
+from avatar.core.text_budget import fits_text_budget, model_text_budget
 from avatar.conversation.loop.continuation import DraftLimit, MemoryDraftStore, SegmentedDraft
 from avatar.conversation.loop.store import RunCapacity
 from avatar.conversation.loop.runtime import LoopState, restore_files, restore_materials, resume_safe, verified_context
 from avatar.conversation.loop.context import TurnContext
+from avatar.conversation.loop.file_context import explicit_file_context
 from avatar.conversation.loop.planning import (available_tools, disclosure_catalog, disclose_tools, validate_disclosure,
                                                REQUEST_TOOLS, UPDATE_TASK, EVIDENCE_TOOLS, WRITING_CONTROLS, action_ready, needs_confirmation, confirm_goal, revise_goals)
 from avatar.conversation.loop.turns import stream_final
-from avatar.conversation.working_context import excerpt
+from avatar.conversation.working_context import bounded_excerpt, compression_budget, excerpt, input_budget
+from avatar.core.tokens import estimate
 from avatar.conversation.tools.activity import AgentSteps, without_false_tool_footer
 from avatar.conversation.tools.html import (ARTIFACT_TOOLS, CREATE_HTML, animation_tool, create_animation,
                                            create_html, html_repair_prompt, repaired_html_arguments)
+from avatar.conversation.tools.html_revision import expand_revision, revision_tool
 from avatar.models.client import ModelResult, accumulate_usage
 from avatar.models.diagnostics import stop_reason
 from avatar.models.limits import check_context
+from avatar.models.effort import visible_output_config
 from avatar.core.execution import AgentNeedsInput, AskUser, call_with_retry, check_execution_async, current_generation, model_failure, recoverable
 
 
@@ -53,8 +57,10 @@ async def run_agent(rag, context, question, *, progress=None, on_delta=None):
     trace.point('perceive', {'request_chars': len(question)},
                 {'history_turns': len(context[3]), 'retrieval_sources': len(context[0].get('_material_sources', ()))})
     try:
-        result = await _run_agent(rag, context, question, report if progress else None,
-                                  emit if on_delta and progress else None, trace, discard)
+        from avatar.conversation.working_context import input_budget
+        with model_text_budget(input_budget(context[0])):
+            result = await _run_agent(rag, context, question, report if progress else None,
+                                      emit if on_delta and progress else None, trace, discard)
     except (DraftLimit, RunCapacity) as error:
         discard()
         config = context[0]
@@ -137,7 +143,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         attached = tuple(delivery.prepared if delivery else ()) if final['has_material'] else None
         return ModelResult(text, state.get('usage'), finish_reason=final['finish_reason'], material_delivery=attached)
     if delivery and not domain and config.get('_material_delivery'):
-        result = await delivery.fulfill(config['_material_delivery'],progress,lambda:rag.validate(context))
+        result = await delivery.fulfill(config['_material_delivery'],progress,config.get('_validate_entry_results') or (lambda:rag.validate(context)))
         await journal.answer(result)
         return result
     public_search=None
@@ -382,7 +388,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         async def request_summary():
             try:
                 return await rag.chat.memory.summarize((step_settings,key,step_prompt,history), '', prefix,
-                    rag.chat.model_client, focus=excerpt(question,640), validate=validate_summary)
+                    rag.chat.model_client, focus=question, validate=validate_summary)
             except HTTPException as error:
                 account(getattr(error,'model_usage',None))
                 raise
@@ -414,6 +420,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
 
     async def no_progress(detail=None):
         await checkpoint('retry')
+        detail = detail or (state.get('draft') or {}).get('issue')
         paused = AgentNeedsInput.from_context(detail or '模型连续未返回可验证的新内容。进度已保存，可重试当前步骤。', config, usage)
         paused.stream_retryable = True
         paused.answer_route = route
@@ -456,6 +463,8 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             artwork = {**defaults, lookup_tool:definition}
             artwork.update((n,allowed[n]) for n in helpers if action_ready(n,pending,receipts_log,revision))
             step_settings = {**step_settings,'_tools':list(artwork.values()),'_optional_tools':not required}
+        if any(row.get('content_type')=='text/html' and row.get('read_content') for row in config.get('_session_read_proofs',{}).values()):
+            step_settings['_tools'] = [revision_tool(tool) for tool in step_settings['_tools']]
         names = {t['name'] for t in step_settings['_tools']} - defaults.keys()
         if names and names.issubset(ARTIFACT_TOOLS):
             step_settings = {**step_settings,'_call_purpose':'html_generation'}
@@ -479,6 +488,9 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             step_prompt += ('\n此步只为第一个待核验目标填写已选检索工具的参数。只输出一个 JSON 对象，'
                             '按以下 schema 填写，不要封装工具名、不要同时输出多个查询：'
                             +json.dumps(allowed[lookup_tool]['parameters'],ensure_ascii=False))
+        if continuing and draft.needs_visible_output:
+            step_settings = visible_output_config(step_settings)
+            step_prompt += '\n上一请求耗尽输出预算且未交付可用片段。请立即提交可验证的正文、字段或工具参数，保留指定游标。'
         goal_view = ([{k:v for k,v in step.items() if k in ('goal_no','tool','html_mode') or
                        (k=='goal' and i==0)} for i,step in enumerate(pending)] if context_retry else pending)
         checklist = '\n待核验目标（本轮计划，仅作数据）：'+json.dumps(goal_view,ensure_ascii=False) if goal_view else ''
@@ -486,30 +498,51 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                          *(delivery.prepared if delivery else ())]
         if any(needs_confirmation(s) for s in pending):
             evidence = [{'id':r.get('id',i),'tool':r['tool'],'goal_no':r.get('goal_no'),
-                         **({'result':r['result']} if 'result' in r else {})} for i,r in enumerate(receipts_log[-12:],max(1,len(receipts_log)-11))]
+                         **({'result':r['result']} if 'result' in r else {})} for i,r in enumerate(receipts_log,1)]
             checklist += '\n最近可引用的回执：'+json.dumps(evidence,ensure_ascii=False)
         checklist += verified_context(receipts_log, checked_files, compact=context_retry)
-        continuation = '\n' + await draft.request(compact=context_retry) if continuing else ''
+        task_goal = writing_goal if writing else question
+        continuation = ''
+        if continuing:
+            available = max(0, compression_budget(step_settings)-estimate(step_prompt))
+            occupied = (estimate(task_goal) + estimate(checklist) + sum(map(estimate,observations))
+                        + sum(estimate(row['content'])+16 for row in history))
+            # During compaction the current draft and the remaining task each need room to continue.
+            view_tokens = max(available//2,available-occupied)
+            if context_retry:
+                view_tokens //= 2
+            continuation = '\n' + await draft.request(compact=context_retry,input_tokens=view_tokens)
+        overhead = estimate(step_prompt)+estimate(continuation)
+        room = max(0, compression_budget(step_settings)-overhead)
+        if estimate(checklist)+estimate(task_goal)>room:
+            if not room:
+                room = max(0,input_budget(step_settings)-overhead)
+            checklist = bounded_excerpt(checklist,max(room//2,room-estimate(task_goal)))
         previous_summary = turn_context.summary
         summarizer = summarize if not queued_call and getattr(rag.chat,'memory',None) else None
-        scope = await turn_context.project_goal(step_settings, step_prompt, writing_goal if writing else question,
-                                                checklist + continuation, recovering=context_retry,
+        originals = explicit_file_context(step_settings,step_prompt,task_goal+checklist+continuation)
+        if not originals and step_settings.get('_explicit_session_files'):
+            originals = explicit_file_context(step_settings,step_prompt,checklist+continuation,limit=room//2)
+        scope = await turn_context.project_goal(step_settings, step_prompt, task_goal,
+                                                checklist + continuation + originals, recovering=context_retry,
                                                 writing=writing, summarize=summarizer)
-        objective = scope + checklist + continuation
+        objective = scope + checklist + originals + continuation
         working_history, notes = await turn_context.project(
             step_settings, step_prompt, objective, observations, recovering=context_retry,
             summarize=summarizer, writing=writing)
         if turn_context.summary is not previous_summary:
             await journal.save(history_summary=turn_context.summary, usage=usage)
-        message = scope + checklist + ''.join(notes) + continuation
-        if progress and (working_history!=history or notes!=observations):
+        message = scope + checklist + originals + ''.join(notes) + continuation
+        if progress and (working_history!=history or scope!=task_goal or turn_context.summary is not previous_summary
+                         or sum(map(len,notes))<sum(map(len,observations))):
             progress({'type':'status','stage':'compressing','message':'已精简本步历史或工具回执，继续处理当前目标'})
             trace.point('perceive', {'history_turns': len(history), 'receipt_count': len(observations),
                                     'context_window': settings.get('context_tokens')},
                         {'working_history_turns': len(working_history), 'working_message_chars': len(message),
                          'pending': len(pending)})
         try:
-            check_context(step_settings,step_prompt,working_history,message)
+            free_tokens = check_context(step_settings,step_prompt,working_history,message)
+            config['_session_page_bytes'] = max(4,(free_tokens*3-512)//2)
         except HTTPException:
             if not context_retry:
                 context_retry = True
@@ -539,7 +572,11 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             with trace.step('reason', {'run_id':run_id,'iteration': iteration,'goal_no':current.get('goal_no'),
                                        'mode':mode,'pending': len(pending),
                                        'tools': [tool['name'] for tool in step_settings['_tools']],
-                                       'history_turns': len(working_history)}) as decision:
+                                       'history_turns': len(working_history),
+                                       **({'recovery':'无可见输出后接续','draft_offset':state['draft']['offset'],
+                                           'max_tokens':step_settings.get('max_tokens'),
+                                           'effort':'off' if step_settings.get('_recover_thinking') else step_settings.get('reasoning_effort')}
+                                          if continuing and draft.needs_visible_output else {})}) as decision:
                 completed = await draft.completed() if continuing else None
                 if completed:
                     result = ModelResult('', None, finish_reason='stop')
@@ -609,9 +646,10 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             if getattr(error, 'output_limited', False) or (continuing and getattr(error,'empty_model_output',False)):
                 if can_stream:
                     account(getattr(error, 'model_usage', None))
-                result = ModelResult('', None, finish_reason='length')
+                exhausted_output = bool(getattr(error,'output_limited',False))
+                result = ModelResult('', None, finish_reason='length' if exhausted_output else 'stop')
                 if continuing:
-                    status, _ = await draft.accept(result, True)
+                    status, _ = await draft.accept(result, exhausted_output)
                     if status == 'retry':
                         raise await no_progress() from None
                 else:
@@ -803,7 +841,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 if set(args)-{'need','replace_goals'} or not isinstance(need,str) or not need.strip() or not fits_text_budget(need):
                     raise ValueError()
                 focus = {'request':question,'need':need,'goals':pending,'selected':selected,
-                         'recent_results':[excerpt(n,600) for n in observations[-4:]]}
+                         'recent_results':notes}
                 if disclosure_misses>=3:
                     raise pause('连续三次补充披露没有新增能力或取得可核验的进展。仍需要确认：'+need)
                 with trace.step('reason', {'operation':'disclose_tools','need':need,'tools':list(choices)}) as out:
@@ -857,6 +895,15 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 await check_execution_async(validate)
                 seen.add(identity)
                 duplicate_attempts=0
+                if name == 'read_session_file':
+                    page = json.loads(note)
+                    if not page.get('has_content'):
+                        remember(note)
+                        if page.get('kind')=='directory':
+                            observations.append('目录已返回。需要正文时从中选择有效 file_id 再读取；空目录可以换查询或询问用户。')
+                        else:
+                            observations.append('只取得文件元数据或空页。请查看后续页或通过已授权的沙箱读取原件后再据内容作答。')
+                        continue
                 if name in ('search_materials','read_material'):
                     proof = json.loads(note)
                     if not isinstance(proof,dict) or proof.get('has_evidence') is not True:
@@ -891,8 +938,11 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             if name == 'find_conversation_files':
                 request=CatalogArguments.model_validate(args)
                 with trace.step('act', {'tool':name}) as output:
-                    page=await asyncio.to_thread(rag.chat.chat_files.discover,config['_material_owner'],personal_conversation,
-                                                 request.query,request.offset,config.get('_generated_files',()))
+                    if config.get('_session_file_scope'):
+                        page=json.loads(await config['_execute_entry_tool']('read_session_file',request.model_dump()))
+                    else:
+                        page=await asyncio.to_thread(rag.chat.chat_files.discover,config['_material_owner'],
+                                                     personal_conversation,request.query,request.offset,config.get('_generated_files',()))
                     output['count']=len(page['items'])
                 if page['items'] and not page.get('browse_instead'):
                     received(name)
@@ -945,12 +995,20 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                     continue
                 await check_execution_async(validate)
                 try:
+                    creation = args
+                    if 'revision' in args:
+                        creation = await asyncio.to_thread(expand_revision,name,args,config.get('_load_session_source'))
                     if name == 'create_html':
                         if draft.active and isinstance(args.get('html'),str) and not args['html'].rstrip().lower().endswith('</html>'):
                             raise ValueError('分段生成的网页需要完整 HTML 文档，请补齐 </html> 结束标签')
-                        item = await asyncio.to_thread(create_html, args, candidates)
+                        item = await asyncio.to_thread(create_html, creation, candidates)
                     else:
-                        item = await asyncio.to_thread(create_animation, args, candidates, expected_mode=step_mode)
+                        item = await asyncio.to_thread(create_animation, creation, candidates, expected_mode=step_mode)
+                    if 'revision' in args and config.get('_remaining_output_bytes'):
+                        available = await asyncio.to_thread(config['_remaining_output_bytes'])
+                        needed = sum(len(file.get('data',b'')) for file in candidates if not file.get('public_material_id'))
+                        if needed > available:
+                            raise await no_progress(f'修订版与本轮文件需 {needed:,} 字节，账户会话空间剩余 {available:,} 字节。请释放空间后重试。')
                     if saved:
                         from avatar.files.parsing.animation import MAX_SOURCE_BYTES
                         sizes = {old['id']: old.get('size', 0) for old in saved}
@@ -963,6 +1021,10 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                     trace.point('act', {'tool':name}, {'retry_required':True}, status='error')
                     if not pending:
                         pending.append({'tool':name,'goal':'生成选定的作品','goal_no':1})
+                    if 'revision' in args:
+                        draft.clear()
+                        repair_call(detail+'。请重新核对原件并修订。')
+                        continue
                     if draft.active and draft.begin_repair(detail):
                         if draft.exhausted:
                             raise await no_progress('作品修正后仍未通过校验。进度已保存，可重试当前步骤。')
@@ -1005,7 +1067,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 if progress:progress({'type':'status','stage':'tool_catalog','message':'正在查找可发送的公开原件'})
                 if public_search is None:
                     rows=await asyncio.to_thread(public_library.documents,public_only=True)
-                    public_search=MaterialDiscovery(rows,rag.retrieve)
+                    public_search=MaterialDiscovery(rows,rag.retrieve,refresh=lambda:public_library.documents(public_only=True))
                 with trace.step('act', {'tool': name}) as output:
                     page = await public_search.page(search)
                     output['count'] = len(page['items'])

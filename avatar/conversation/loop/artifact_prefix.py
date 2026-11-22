@@ -77,3 +77,72 @@ def salvage_object(source, allowed):
     if partial:
         prefix += (',' if values else '') + dump(partial[0]) + ':' + dump(partial[1])[:-1]
     return prefix, {'fields':list(values), 'conflicts':conflicts, 'partial':partial[0] if partial else None}
+
+
+def _members(source, start):
+    if source[start:start+1] != '{':
+        return
+    pos = start+1
+    while pos < len(source):
+        name,end = _DECODER.raw_decode(source,_SPACE.match(source,pos).end())
+        colon = _SPACE.match(source,end).end()
+        if not isinstance(name,str) or source[colon:colon+1] != ':':
+            return
+        value = _SPACE.match(source,colon+1).end()
+        yield name,value
+        _,end = _DECODER.raw_decode(source,value)
+        comma = _SPACE.match(source,end).end()
+        if source[comma:comma+1] != ',':
+            return
+        pos = comma+1
+
+
+def edit_signature(edit):
+    import hashlib
+    result = {}
+    for key,value in edit.items():
+        if key in ('field','old','new') and isinstance(value,str):
+            digest = hashlib.sha256()
+            for pos in range(0,len(value),65536):
+                digest.update(value[pos:pos+65536].encode())
+            result[key] = digest.hexdigest()
+    return result
+
+
+def revision_evidence(source):
+    """Bind a replacement to the visible original and every completed edit before the damaged byte."""
+    from avatar.conversation.tools.html_revision import SourceEdit
+
+    proof = {'edits':[]}
+    try:
+        for name,start in _members(source,_SPACE.match(source).end()):
+            if name != 'revision':
+                continue
+            for name,start in _members(source,start):
+                if name in ('file_id','sha256'):
+                    value,_ = _DECODER.raw_decode(source,start)
+                    if isinstance(value,str) and len(value)<=80:
+                        proof[name] = value
+                if name != 'edits' or source[start:start+1]!='[':
+                    continue
+                pos=_SPACE.match(source,start+1).end()
+                while source[pos:pos+1]=='{' and len(proof['edits']) < 32:
+                    try:
+                        item,end=_DECODER.raw_decode(source,pos)
+                    except json.JSONDecodeError:
+                        partial={}
+                        proof['partial']=partial
+                        for key,field_start in _members(source,pos):
+                            value,_=_DECODER.raw_decode(source,field_start)
+                            partial.update(edit_signature({key:value}))
+                        return proof
+                    edit=SourceEdit.model_validate(item)
+                    proof['edits'].append(edit_signature(edit.model_dump()))
+                    comma=_SPACE.match(source,end).end()
+                    if source[comma:comma+1]!=',':
+                        break
+                    pos=_SPACE.match(source,comma+1).end()
+            break
+    except (TypeError,ValueError,RecursionError):
+        pass
+    return proof

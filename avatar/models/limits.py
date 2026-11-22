@@ -39,8 +39,12 @@ def tool_budget(config):
     return estimate(json.dumps(body,ensure_ascii=False,separators=(',',':')))
 
 
+def context_window(config):
+    return config.get('context_tokens') or (limits(config.get('provider'),config.get('model')) or {}).get('context_tokens',128000)
+
+
 def check_context(config,system,history,message):
-    window=config.get('context_tokens') or (limits(config.get('provider'),config.get('model')) or {}).get('context_tokens',128000)
+    window=context_window(config)
     used=tool_budget(config)+estimate(system)+estimate(message)+sum(estimate(m['content'])+16 for m in history)+config.get('max_tokens',1024)+512
     if used>window:
         error = HTTPException(422,'当前输入与输出预算超过模型上下文窗口，请缩短输入、降低输出上限或新建会话')
