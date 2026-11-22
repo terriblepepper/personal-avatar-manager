@@ -5,6 +5,7 @@ import { ElButton, ElOption, ElSelect, ElMessage, ElMessageBox } from 'element-p
 import AppIcon from '../components/AppIcon.vue'
 import ComposerToolbar from '../components/chat/ComposerToolbar.vue'
 import ComposerInput from '../components/chat/ComposerInput.vue'
+import ComposerAction from '../components/chat/ComposerAction.vue'
 import EffortPicker from '../components/chat/EffortPicker.vue'
 import ConversationTools from '../components/chat/ConversationTools.vue'
 import { request, notifyError } from '../api/client'
@@ -306,19 +307,23 @@ onUnmounted(()=>{destroyed=true;olderRequest?.abort();controller.abort();generat
       <ComposerInput ref="input" v-model="draft" :catalog="skillCatalog" :session="conversationId" :usage-url="conversationId ? selectedURL(conversationId)+'/compact' : ''" :usage-revision="(messages.at(-1)?.id || 0)+'/'+compressionThrough" label="聊天消息" :placeholder="pauseId ? '补充任务所需信息…' : '向自己的分身提问，或输入 $ 选择技能…'" :disabled="busy||loading||!conversationId" submit-on-enter @submit="send()"/>
     </form>
     <div class="chat-compose-actions">
-      <ComposerToolbar v-if="conversationId" class="personal-chat-toolbar">
-        <details class="chat-quick composer-tool">
-          <summary title="常用提问" aria-label="常用提问">常用提问</summary>
-          <div class="composer-popover quick chat-command-panel"><button v-for="text in quickPrompts" :key="text" type="button" class="chat-menu-item" :disabled="busy||uploading" @click="ask(text)">{{ text }}</button></div>
-        </details>
-        <ChatSettings :conversation-id="conversationId" :busy="busy||uploading" :revision="messages.length" @catalog="skillCatalog=$event"/>
-        <ChatFilesManager :conversation-id="conversationId" :busy="busy" @selected="value=>selectedFiles=value" @uploading="value=>uploading=value"/>
-        <EffortPicker :conversation-id="conversationId" :busy="busy||uploading" @saving="effortPending=$event"/>
-        <ConversationTools :conversation-id="conversationId" :busy="busy||uploading" @saving="toolPending=$event"/>
+      <ComposerToolbar class="personal-chat-toolbar">
+        <template v-if="conversationId">
+          <details class="chat-quick composer-tool">
+            <summary title="常用提问" aria-label="常用提问">常用提问</summary>
+            <div class="composer-popover quick chat-command-panel"><button v-for="text in quickPrompts" :key="text" type="button" class="chat-menu-item" :disabled="busy||uploading" @click="ask(text)">{{ text }}</button></div>
+          </details>
+          <ChatSettings :conversation-id="conversationId" :busy="busy||uploading" :revision="messages.length" @catalog="skillCatalog=$event"/>
+          <ChatFilesManager :conversation-id="conversationId" :busy="busy" @selected="value=>selectedFiles=value" @uploading="value=>uploading=value"/>
+          <ConversationTools :conversation-id="conversationId" :busy="busy||uploading" @saving="toolPending=$event"/>
+        </template>
+        <div class="composer-primary-actions">
+          <EffortPicker :conversation-id="conversationId" :busy="busy||uploading" @saving="effortPending=$event"/>
+          <ComposerAction v-if="runningId" label="停止" stop :disabled="!!stopping || loading" @click="stop"/>
+          <ComposerAction v-else-if="pauseId && !draft.trim()" label="结束任务" stop :disabled="busy||uploading||toolsSaving||loading" @click="send('end')"/>
+          <ComposerAction v-else type="submit" form="personal-chat-compose" :label="busy?'回答中…':pauseId?'补充并继续':'发送'" :disabled="busy||uploading||toolsSaving||loading||!conversationId||!draft.trim()"/>
+        </div>
       </ComposerToolbar>
-      <button v-if="runningId" type="button" class="button primary chat-command chat-send" :disabled="!!stopping || loading" @click="stop">停止<span aria-hidden="true">■</span></button>
-      <button v-else-if="pauseId && !draft.trim()" type="button" class="button primary chat-command chat-send" :disabled="busy||uploading||toolsSaving||loading" @click="send('end')">结束任务</button>
-      <button v-else type="submit" form="personal-chat-compose" class="button primary chat-command chat-send" :disabled="busy||uploading||toolsSaving||loading||!conversationId||!draft.trim()">{{ busy?'回答中…':pauseId?'补充并继续':'发送' }}<AppIcon name="up" :size="15"/></button>
     </div>
   </section><FilePreview v-if="preview" :file="preview.file" :url="preview.url" @close="preview=null"/>
 </template>

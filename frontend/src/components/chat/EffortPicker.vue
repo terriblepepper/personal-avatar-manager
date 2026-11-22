@@ -3,12 +3,17 @@ import { computed, ref, watch } from 'vue'
 import { request, notifyError } from '../../api/client'
 import { effortLabels, type Effort } from '../../utils/reasoningEffort'
 
-interface Settings { selected: Effort | null; default: Effort | null; levels: Effort[] }
+interface Settings { model: string; selected: Effort | null; default: Effort | null; levels: Effort[] }
 const props = defineProps<{ conversationId: string; busy: boolean }>()
 const emit = defineEmits<{ saving: [pending: boolean] }>()
 const settings = ref<Settings>(), saving = ref(false), failure = ref(false)
 const url = computed(() => '/conversations/' + encodeURIComponent(props.conversationId) + '/reasoning-effort')
 const defaultLabel = computed(() => settings.value?.default ? '默认（' + effortLabels[settings.value.default] + '）' : '默认')
+const modelLabel = computed(() => settings.value?.model || (failure.value ? '读取失败' : settings.value ? '未配置模型' : '读取中…'))
+const levelLabel = computed(() => {
+  const level = settings.value?.selected ?? settings.value?.default
+  return level ? effortLabels[level] : '默认'
+})
 let controller: AbortController
 
 async function load(signal: AbortSignal) {
@@ -42,8 +47,10 @@ async function select(level: Effort | null) {
 </script>
 
 <template>
-  <details v-if="conversationId" class="composer-menu composer-tool">
-    <summary title="调整本会话的推理强度">推理强度 <small>{{ settings?.selected ? effortLabels[settings.selected] : defaultLabel }}</small></summary>
+  <details v-if="conversationId" class="composer-menu composer-tool effort-picker">
+    <summary :title="modelLabel + ' · 调整推理强度'" :aria-label="modelLabel + '，推理强度：' + levelLabel">
+      <span class="composer-model-name">{{ modelLabel }}</span><span v-if="settings?.model" class="composer-effort-level">{{ levelLabel }}</span>
+    </summary>
     <div class="composer-popover chat-command-panel" aria-label="推理强度">
       <button v-if="failure" type="button" class="chat-menu-item" @click="load(controller.signal)">读取失败，重试</button>
       <span v-else-if="!settings" class="sub" role="status">正在读取…</span>

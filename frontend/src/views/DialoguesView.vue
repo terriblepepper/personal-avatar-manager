@@ -17,6 +17,7 @@ import MarkdownContent from '../components/MarkdownContent.vue'
 import ComposerToolbar from '../components/chat/ComposerToolbar.vue'
 import ComposerInput from '../components/chat/ComposerInput.vue'
 import ChatFilesManager from '../components/chat/ChatFilesManager.vue'
+import ComposerAction from '../components/chat/ComposerAction.vue'
 import EffortPicker from '../components/chat/EffortPicker.vue'
 import ConversationTools from '../components/chat/ConversationTools.vue'
 import AppIcon from '../components/AppIcon.vue'
@@ -483,7 +484,6 @@ onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
       </div>
     </details>
     <ChatFilesManager :conversation-id="resourceId" :busy="busy || switching || detail?.task?.status==='running'" @selected="fileIds=$event" @uploading="resourceBusy=$event"/>
-    <EffortPicker :conversation-id="resourceId" :busy="busy || switching || resourceBusy || detail?.task?.status==='running'" @saving="effortPending=$event"/>
     <ConversationTools :conversation-id="resourceId" @saving="toolPending=$event" :busy="busy || switching || resourceBusy || detail?.task?.status==='running'"/>
     <details class="composer-tool chat-command-menu">
       <summary class="chat-command chat-icon-command" aria-label="会话操作" title="会话操作"><AppIcon name="more" :size="18"/></summary>
@@ -497,13 +497,14 @@ onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
         <button type="button" class="chat-menu-item danger" :disabled="commandsDisabled" @click="remove(`/agent-sessions/${encodeURIComponent(current)}`,'删除本方会话视图？','DELETE',true)"><AppIcon name="trash" :size="16"/>删除会话</button>
       </div>
     </details>
-  </ComposerToolbar>
-  <div class="peer-send-actions">
     <span v-if="writeState==='sending'" role="status">正在发送…</span>
-    <button v-if="runningTask || (pausedTask && !message.trim())" type="button" class="button primary chat-command chat-send" :disabled="commandsDisabled" @click="taskAction('end')">停止<span aria-hidden="true">■</span></button>
-    <button v-else type="button" class="button primary chat-command chat-send" :aria-busy="writeState==='sending'" :disabled="sendDisabled" @click="send">{{ pausedTask ? '补充并继续' : '发送' }}<AppIcon :name="writeState==='sending'?'clock':'up'" :size="15"/></button>
     <button v-if="detail?.task?.can_accept" type="button" class="button chat-command" :disabled="commandsDisabled" @click="taskAction('accept')">确认任务请求</button>
     <button v-if="detail?.task?.needs_confirmation" type="button" class="button chat-command" :disabled="commandsDisabled" @click="taskAction('confirm')">确认并补充意图</button>
-  </div>
+    <div class="composer-primary-actions">
+      <EffortPicker :conversation-id="resourceId" :busy="busy || switching || resourceBusy || detail?.task?.status==='running'" @saving="effortPending=$event"/>
+      <ComposerAction v-if="runningTask || (pausedTask && !message.trim())" label="停止" stop :disabled="commandsDisabled" @click="taskAction('end')"/>
+      <ComposerAction v-else :label="pausedTask ? '补充并继续' : '发送'" :aria-busy="writeState==='sending'" :disabled="sendDisabled" @click="send"/>
+    </div>
+  </ComposerToolbar>
   </div>
 </div></main></div></section></Transition></Teleport><IntentDialog v-if="intent" :intent="intent" @closed="intent=null" @sent="(session,task)=>{intent=null;enterSession(session,task)}"/><FilePreview v-if="filePreview?.download_url" :file="filePreview" :url="filePreview.download_url" @close="filePreview=null"/></template>

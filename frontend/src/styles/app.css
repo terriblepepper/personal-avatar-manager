@@ -289,7 +289,6 @@ a.el-button { text-decoration:none; }
   padding: .75rem;
 }
 .peer-composer-toolbar .composer-popover h3 { margin: 0 0 .4rem; }
-.peer-send-actions { display: flex; flex-wrap: wrap; gap: .3rem; }
 .agent-dialogue-window { container: dialogue / inline-size; }
 @container dialogue (max-width: 35rem) {
   .peer-workspace.tasks-open { padding-inline-start: 0; }
@@ -450,7 +449,21 @@ a.el-button { text-decoration:none; }
   padding: 0 .55rem; border-radius: .375rem; font-size: .8125rem; line-height: 1.2; white-space: nowrap;
 }
 .composer-toolbar .composer-tool > .chat-icon-command { width: var(--chat-command-height); padding: 0; }
-.chat-compose-actions .chat-send { flex: none; margin-inline-start: auto; }
+.composer-primary-actions { display: flex; align-items: center; gap: .4rem; margin-inline-start: auto; min-width: 0; max-width: 100%; }
+.composer-primary-actions .effort-picker { min-width: 0; }
+.chat-compose-actions .composer-toolbar .effort-picker > summary {
+  max-inline-size: min(22rem, 45vw); border-color: transparent; border-radius: 999px; background: transparent; gap: .4rem;
+}
+.chat-compose-actions .composer-toolbar .effort-picker:is([open], :hover) > summary { background: var(--ui-hover); }
+.composer-model-name { overflow: hidden; text-overflow: ellipsis; }
+.composer-effort-level { flex: none; color: var(--text-secondary); }
+.chat-compose-actions .composer-toolbar .effort-picker > .composer-popover {
+  inset-inline-start: auto; inset-inline-end: 0; width: min(13rem, 100%);
+}
+.chat-compose-actions .chat-send {
+  flex: none; width: var(--chat-command-height); min-width: 0; padding: 0; border-radius: 50%;
+}
+.chat-stop-icon { width: .8rem; height: .8rem; border-radius: .16rem; background: currentColor; }
 .chat-header-commands .composer-tool > .chat-command-panel {
   inset: calc(100% + .3rem) 0 auto auto; width: min(15rem, calc(100vw - 2rem)); padding: .25rem;
 }
@@ -458,7 +471,6 @@ a.el-button { text-decoration:none; }
 .peer-composer .chat-command-menu { position: relative; }
 .peer-composer .chat-command-menu > .chat-command-panel { inset-inline-start: auto; inset-inline-end: 0; width: min(15rem, 66cqi); }
 .peer-composer .chat-compose-actions { margin-top: .35rem; align-items: flex-start; flex-wrap: wrap; }
-.peer-composer .peer-send-actions { margin-inline-start: auto; align-items: center; }
 .composer-toolbar .composer-popover, .chat-menu-subpanel {
   border: 1px solid var(--border); border-radius: .5rem; background: var(--surface);
   color: var(--text); line-height: 1.35;
