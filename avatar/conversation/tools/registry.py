@@ -6,7 +6,7 @@ from avatar.models.effort import levels
 
 TOOL_CATALOG = {
     'python': {'name': 'Python 沙箱', 'description': '计算、分析数据、绘制图表、处理选中文件并生成下载文件。支持 NumPy、pandas、Matplotlib、Pillow 和 pypdf。', 'default': False},
-    'animation': {'name': '制作动画', 'description': '将制作动画作为本轮目标，并授权当前会话使用 Python 沙箱。'},
+    'animation': {'name': '制作动画', 'description': '将制作动画作为本轮目标，并授权当前会话使用 Python 沙箱。', 'default': False},
 }
 
 
