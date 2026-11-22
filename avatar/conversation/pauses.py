@@ -142,6 +142,8 @@ def continue_task(chat, user, request, parent, task):
     overview['_prior_tool_events']=task.get('activity', [])
     overview['_target']={'aic':target['aic'],'name':overview['agent']['profile'].get('avatar_name','我的分身')}
     cfg,key,system,history=context
+    if request.agent_control=='continue' and (question:=task['snapshot'].get('user_question')):
+        cfg={**cfg,'_answered_question':{**question,'answer':request.message.strip()}}
     if (request.agent_control=='retry' or not request.message.strip()) and task.get('answer_route'):
         cfg={**cfg,'_answer_route':task['answer_route']}
     if task.get('sources') and task['snapshot'].get('reply'):

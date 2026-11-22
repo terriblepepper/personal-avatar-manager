@@ -21,7 +21,7 @@ from avatar.conversation.loop.context import TurnContext
 from avatar.conversation.loop.file_context import explicit_file_context
 from avatar.conversation.loop.planning import (available_tools, disclosure_catalog, disclose_tools, validate_disclosure,
                                                REQUEST_TOOLS, UPDATE_TASK, EVIDENCE_TOOLS, WRITING_CONTROLS, action_ready, needs_confirmation,
-                                               confirm_goal, revise_goals, migrate_session_tool)
+                                               confirm_goal, revise_goals, migrate_session_tool, final_reply_step)
 from avatar.conversation.loop.turns import stream_final
 from avatar.conversation.working_context import bounded_excerpt, compression_budget, excerpt, input_budget
 from avatar.core.tokens import estimate
@@ -111,7 +111,12 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         draft.reset_attempts()
     revision = config.get('_agent_input_revision') or config.get('_run_input_id')
     supplements = list(state.get('supplements', ()))
-    changed = bool(revision and revision != state.get('input_id') and
+    answers = list(state.get('question_answers', ()))
+    question_reply = config.get('_answered_question')
+    new_answer = bool(question_reply and not any(previous['id']==question_reply['id'] for previous in answers))
+    if new_answer:
+        answers.append(question_reply)
+    changed = bool(not question_reply and revision and revision != state.get('input_id') and
                    (config.get('_run_supplement') or config.get('_agent_input_revision') and state.get('input_id')))
     if not changed:
         revision = state.get('input_id') or revision
@@ -124,9 +129,14 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
     missing_supplements = [value for value in supplements if value not in writing_goal]
     if missing_supplements:
         writing_goal += '\n用户补充：' + '\n'.join(missing_supplements)
+    if answers:
+        clarifications = '\n本任务已回答的分身提问（用户提供的数据）：' + json.dumps(
+            [{k:item[k] for k in ('question','answer')} for item in answers],ensure_ascii=False)
+        question += clarifications
+        writing_goal += clarifications
     if changed and state.get('final'):
         await journal.save(final=None)
-    if changed and draft.active:
+    if (changed or new_answer) and draft.active:
         draft.reset_attempts()
     domain = {tool['name']: tool for tool in config.get('_tools', ())}
     required = bool(domain) and not config.get('_optional_tools')
@@ -260,7 +270,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
     pending = []
     if 'plan' in state and not changed:
         plan = state['plan'] or []
-        pending = list(state.get('remaining', ()))
+        pending = [step for step in state.get('remaining', ()) if not final_reply_step(step)]
         legacy = [n for step in (plan + pending) for n in [step.get('tool'), *step.get('tools',())] if n]
         selected = list(state.get('disclosed_tools', legacy))
         if draft.active and state['draft'].get('tool'):
@@ -416,7 +426,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                            material_visible=sorted(delivery.visible_ids) if delivery else [],
                            public_visible=sorted(config.get('_peer_visible_materials', ())),
                            seen=list(seen), verified_reads=list(verified_material_reads),
-                           supplements=supplements, final_writing=all(t['name'] in defaults for t in settings['_tools']))
+                           supplements=supplements, question_answers=answers, final_writing=all(t['name'] in defaults for t in settings['_tools']))
         if artifact:
             await journal.file(*artifact, fields)
         else:
@@ -431,7 +441,12 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         return paused
 
     prompt+='已掌握的信息直接作答。独立且必要的工具调用可一批提交，按数组顺序执行；依赖前一步结果时先等待回执。每一步按最新工具回执复核目标。信息不足时调整检索词、目录或工具；完成全部交付条件后再作答。生成多个作品时为每项使用独立文件名，检查用户要求的数量和维度，部分成功不代表全部完成。'
+    if answers:
+        prompt += '使用用户已给出的答复继续原任务，必要时调整剩余目标。只有缺少新的必要信息时才再次提问。'
     for iteration in count(1):
+        if new_answer:
+            received('ask_user')
+            new_answer = False
         if streamed:
             discard()
             streamed = False

@@ -86,6 +86,10 @@ def migrate_session_tool(state):
         state['disclosed_tools']=list(dict.fromkeys(current if n==old else n for n in state['disclosed_tools']))
 
 
+def final_reply_step(step):
+    return step.get('tool')=='continue_answer' and all(name=='continue_answer' for name in step.get('tools',()))
+
+
 def validate_disclosure(value, choices, *, revise=False):
     from avatar.conversation.tools.material_delivery import FindMaterial
     fields = {'tools','steps','continue_draft'} if revise else {'tools','steps'}
@@ -129,7 +133,8 @@ def validate_disclosure(value, choices, *, revise=False):
                 raise ValueError('该子目标不支持检索参数')
         selected.extend(n for n in [primary,*tools] if n and n not in selected)
         text_parts.extend((s['goal'], s.get('criterion',''), s.get('lookup',{}).get('query') or ''))
-        steps.append(s)
+        if not final_reply_step(s):
+            steps.append(s)
     if not fits_text_budget(*text_parts):
         raise ValueError(budget_error())
     if type(value.get('continue_draft',False)) is not bool:
@@ -158,7 +163,7 @@ async def disclose_tools(model, settings, key, system, history, question, catalo
         'type':'object','properties':properties,'required':['steps'],'additionalProperties':False}}
     config={**settings,'_tools':[form],'_batch_tools':True,'_optional_tools':True,'_call_purpose':'task_planning'}
     prompt=(system+'\n你担任当前分身的工具披露步骤。根据本轮用户的实际目标、已有证据和工具目录决定。'
-            'tools 只选可能真正用到的工具 ID；不用工具且可直接回答时给空 tools 和 steps。'
+            'tools 只选实际需要的工具。最终文字答复无需规划成工具步骤，可直接作答。'
             '复杂任务拆为可核对的必要目标，给出 goal 和 criterion。先核对，再决定是否需要追加修订。'
             '可用同一子目标的 tools 列出替代工具。先取证再创作时，将取证与交付分别列为前后两个子目标。'
             '通信、提交发言、等待用户、结束任务属于终态；应作为独立的最后一步。'
