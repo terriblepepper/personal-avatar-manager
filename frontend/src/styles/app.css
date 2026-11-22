@@ -464,7 +464,7 @@ a.el-button { text-decoration:none; }
 .chat-compose-actions .chat-send {
   flex: none; width: var(--chat-command-height); min-width: 0; padding: 0; border-radius: 50%;
 }
-.chat-pause-icon { width: .75rem; height: .85rem; border-inline: .22rem solid currentColor; border-radius: .08rem; }
+.chat-pause-icon { width: .875rem; height: .875rem; border-radius: .125rem; background: currentColor; forced-color-adjust: preserve-parent-color; }
 .chat-resume-icon { border-block: .46rem solid transparent; border-inline-start: .7rem solid currentColor; margin-inline-start: .1rem; }
 .chat-header-commands .composer-tool > .chat-command-panel {
   inset: calc(100% + .3rem) 0 auto auto; width: min(15rem, calc(100vw - 2rem)); padding: .25rem;
