@@ -7,6 +7,7 @@ const paths: Record<string, string> = {
   person: 'M8 7a4 4 0 1 0 8 0 4 4 0 0 0-8 0M4 21v-3a8 8 0 0 1 16 0v3',
   people: 'M4 21v-3a6 6 0 0 1 12 0v3M7 6a3 3 0 1 0 6 0 3 3 0 0 0-6 0M17 3a3 3 0 0 1 0 6m2 4a5 5 0 0 1 3 5v3',
   agent: 'M4 5h16v15H4zM8 2v3m8-3v3M8 10h.01M16 10h.01M8 15h8',
+  bolt: 'M13 2 4 14h7l-1 8 10-13h-7l1-7z',
   clock: 'M12 8v5l4 2|M22 12a10 10 0 1 1-20 0 10 10 0 0 1 20 0',
   book: 'M3 4h7l2 2 2-2h7v16h-7l-2 2-2-2H3zM12 6v16',
   mail: 'M3 5h18v14H3zM3 5l9 7 9-7',
