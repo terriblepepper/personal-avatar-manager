@@ -88,7 +88,7 @@ class GenerationStore:
         with self.database.connect(write=True) as db:
             rows=db.execute("SELECT * FROM chat_generation_jobs WHERE state='queued' ORDER BY created_at,rowid LIMIT ?",(max(0,limit),)).fetchall()
             for row in rows:db.execute("UPDATE chat_generation_jobs SET state='running',updated_at=? WHERE task_id=? AND state='queued'",(time.time(),row['task_id']))
-        return [dict(row) for row in rows]
+        return [dict(row, state='running') for row in rows]
 
     def release_unstarted(self, tasks):
         with self.database.connect(write=True) as db:

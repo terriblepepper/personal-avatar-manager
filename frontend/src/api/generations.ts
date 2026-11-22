@@ -75,20 +75,37 @@ export async function submitAndObserve(body: GenerationRequest, onSnapshot: (val
     if (signal.aborted || error instanceof ApiError && error.status < 500 && error.status !== 429) throw error
     return observeGeneration(body.request_id, onSnapshot, signal)
   }
-  // The existing SSE adapter idempotently observes the same persisted request.
+  // A proxy can keep a silent response open even after the job has finished.
+  const stream = new AbortController()
+  const closeStream = () => stream.abort()
+  let deadline: ReturnType<typeof setTimeout> | undefined
+  const expectSnapshot = () => { clearTimeout(deadline); deadline = setTimeout(closeStream, 15000) }
+  signal.addEventListener('abort', closeStream, { once: true })
+  if (signal.aborted) closeStream()
+  expectSnapshot()
   try {
     const response = await fetch('/api/chat/stream', {
-      method: 'POST', credentials: 'same-origin', signal,
+      method: 'POST', credentials: 'same-origin', signal: stream.signal,
       headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() }, body: JSON.stringify(body),
     })
     if (!response.ok || !response.body) throw new Error('流连接暂不可用')
     let latest: GenerationSnapshot | undefined
     await parseSSE(response.body, event => {
       if (event.type === 'snapshot' && event.snapshot && typeof event.snapshot === 'object') {
-        latest = event.snapshot as GenerationSnapshot; onSnapshot(latest)
+        const snapshot = event.snapshot as GenerationSnapshot
+        if (stream.signal.aborted || snapshot.request_id !== body.request_id) return
+        latest = snapshot
+        onSnapshot(snapshot)
+        if (terminal(snapshot)) closeStream()
+        else expectSnapshot()
       }
-    }, signal)
+    }, stream.signal)
     if (latest && terminal(latest)) return latest
   } catch (error) { if (signal.aborted) throw error }
+  finally {
+    clearTimeout(deadline)
+    signal.removeEventListener('abort', closeStream)
+    closeStream()
+  }
   return observeGeneration(body.request_id, onSnapshot, signal)
 }

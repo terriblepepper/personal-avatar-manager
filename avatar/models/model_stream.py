@@ -192,23 +192,29 @@ class ToolFragments:
 
 async def stream_response(model, config, api_key, system, history, message, *, collect=False):
     from avatar.core.execution import check_execution_async
-    for attempt in range(6):
+    attempts = 6
+    expires = asyncio.get_running_loop().time() + attempts * generation_deadline(config)
+    for attempt in range(attempts):
         await check_execution_async()
         try:
-            async with aclosing(_stream_once(model,config,api_key,system,history,message,collect)) as source:
+            async with asyncio.timeout_at(expires), aclosing(_stream_once(model,config,api_key,system,history,message,collect)) as source:
                 async for event in source:
                     yield event
             return
+        except TimeoutError:
+            error = unconfirmed_response(504, '本步模型调用已用完总等待时间，仍未收到完整结果。可重试或结束任务。')
+            error.stream_exhausted = True
+            raise error from None
         except HTTPException as error:
             if not getattr(error,'stream_interrupted',False):
                 raise
             logging.getLogger(__name__).warning('Model stream interrupted purpose=%s attempt=%d/6',
                                                 config.get('_call_purpose','answer'),attempt+1)
-            if attempt==5:
+            if attempt + 1 == attempts:
                 error.stream_exhausted=True
                 error.detail='模型响应流中断，5 次自动重试均未取得完整结果。'
                 raise
-        yield {'type':'status','stage':'stream_retry','reset_reply':True,
+        yield {'type':'status','stage':'stream_retry','reset_reply':True,'retry':attempt+1,
                'message':f'模型响应流中断，正在进行第 {attempt+1}/5 次重试'}
         await asyncio.sleep(min(2**attempt,4))
 
@@ -224,8 +230,10 @@ async def _stream_once(model, config, api_key, system, history, message, collect
     headers['Host'] = url.netloc.decode()
     timeout = generation_http_timeout(config,streaming=True)
     receiving = False
+    loop = asyncio.get_running_loop()
+    idle_limit = generation_deadline(config)
     try:
-        async with asyncio.timeout(generation_deadline(config)), model.session(url, timeout) as (addresses, client):
+        async with asyncio.timeout(idle_limit) as watchdog, model.session(url, timeout) as (addresses, client):
             yield {'type': 'status', 'stage': 'waiting', 'message': '等待模型响应'}
             async with client.stream('POST', url.copy_with(host=addresses[0]), headers=headers, json=body,
                                      extensions={'sni_hostname': url.host}) as response:
@@ -248,6 +256,7 @@ async def _stream_once(model, config, api_key, system, history, message, collect
                     yield {'type': 'delta', 'text': result.text}
                     yield {'type': 'usage', 'usage': result.usage, **({'finish_reason': result.finish_reason} if config.get('_avatar_agent') else {})}
                     return
+                started = last_update = loop.time()
                 chunks = StringIO()
                 fragments = ToolFragments(content_limit)
                 usage, finished, thinking, action = {}, False, False, False
@@ -261,6 +270,7 @@ async def _stream_once(model, config, api_key, system, history, message, collect
                         from avatar.models.diagnostics import provider_error
                         raise provider_error(200,data.get('error') or data,request_id(response.headers),api_key)
                     text, thought = '', False
+                    size_before = fragments.size
                     if fmt == 'openai':
                         if data.get('usage'):
                             usage.update(data['usage'])
@@ -290,7 +300,7 @@ async def _stream_once(model, config, api_key, system, history, message, collect
                         elif kind == 'content_block_delta':
                             delta = data.get('delta') or {}
                             text = delta.get('text', '') if delta.get('type') == 'text_delta' else ''
-                            thought = delta.get('type') == 'thinking_delta'
+                            thought = delta.get('type') == 'thinking_delta' and bool(delta.get('thinking'))
                         elif kind == 'message_stop':
                             finished = True
                     else:
@@ -310,9 +320,16 @@ async def _stream_once(model, config, api_key, system, history, message, collect
                                         fragments.account(part['functionCall'])
                                         fragments.gemini.append({'functionCall':part['functionCall']})
                             action |= any('functionCall' in p for p in parts)
-                            thought = any(p.get('thought') for p in parts)
+                            thought = any(p.get('thought') and p.get('text') for p in parts)
                             reason=candidates[0].get('finishReason') or reason
                             finished |= bool(candidates[0].get('finishReason'))
+                    if text or thought or fragments.size > size_before:
+                        timestamp = loop.time()
+                        watchdog.reschedule(timestamp + idle_limit)
+                        if collect and timestamp - last_update >= 10:
+                            last_update = timestamp
+                            yield {'type': 'status', 'stage': 'model_progress',
+                                   'message': f'正在接收模型输出，已用时 {int(timestamp - started)} 秒'}
                     if thought and not thinking:
                         thinking = True
                         yield {'type': 'status', 'stage': 'processing', 'message': '模型正在处理问题'}

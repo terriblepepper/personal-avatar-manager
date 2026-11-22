@@ -6,6 +6,7 @@ import time
 from contextlib import aclosing
 from fastapi import HTTPException
 from avatar.core.schemas import ChatRequest
+from avatar.models.client import collected_model_status
 from avatar.core.execution import run_blocking
 from avatar.conversation.jobs.store import GenerationStore
 from avatar.conversation.jobs.pipeline import generation_scope
@@ -107,36 +108,47 @@ class GenerationRunner:
             if not actor or actor['account_status']!='active':
                 await run_blocking(self.store.finish,uid, rid, 'cancelled', error='账户不可用，未执行请求')
                 return
-            async with aclosing(self.chat.stream(dict(actor), body)) as source:
-                async for event in source:
-                    kind = event['type']
-                    first_delta = kind == 'delta' and not snapshot['reply'] and bool(event['text'])
-                    if kind == 'delta': snapshot['reply'] += event['text']
-                    elif kind == 'status':
-                        if event.get('reset_reply'): snapshot['reply']=''
-                        snapshot.update(status=event['message'], stage=event.get('stage', 'generating'))
-                        if event.get('target'): snapshot['target'] = event['target']
-                    elif kind == 'usage': snapshot['usage'] = event['usage']
-                    elif kind == 'skills': snapshot['used_skills'] = event['items']
-                    elif kind == 'tools': snapshot['mermaid_enabled'] = event['mermaid']
-                    elif kind == 'tool':
-                        items=snapshot.setdefault('tool_events',[])
-                        item=next((item for item in items if item['id']==event['id']),None)
-                        if item is None:items.append(dict(event))
-                        else:item.update(event)
-                    elif kind == 'error':
-                        await run_blocking(self.store.finish,uid, rid, 'failed', error=event['message'])
-                        return
-                    elif kind == 'awaiting_input':
-                        await run_blocking(self.store.finish,uid, rid, 'awaiting_input', result=event)
-                        return
-                    elif kind == 'done':
-                        await run_blocking(self.store.finish,uid, rid, 'succeeded', result=event)
-                        return
-                    # Publish the first visible text immediately; coalesce subsequent provider chunks.
-                    if kind=='delta' and not first_delta and time.monotonic()-last_saved<.25:continue
-                    if not await run_blocking(self.store.record,uid, rid, snapshot): return
-                    last_saved=time.monotonic()
+            publishing = asyncio.Lock()
+            async def report_model_status(message):
+                async with publishing:
+                    snapshot.update(status=message, stage='model_progress')
+                    await run_blocking(self.store.record, uid, rid, snapshot)
+
+            token = collected_model_status.set(report_model_status)
+            try:
+                async with aclosing(self.chat.stream(dict(actor), body)) as source:
+                    async for event in source:
+                        async with publishing:
+                            kind = event['type']
+                            first_delta = kind == 'delta' and not snapshot['reply'] and bool(event['text'])
+                            if kind == 'delta': snapshot['reply'] += event['text']
+                            elif kind == 'status':
+                                if event.get('reset_reply'): snapshot['reply']=''
+                                snapshot.update(status=event['message'], stage=event.get('stage', 'generating'))
+                                if event.get('target'): snapshot['target'] = event['target']
+                            elif kind == 'usage': snapshot['usage'] = event['usage']
+                            elif kind == 'skills': snapshot['used_skills'] = event['items']
+                            elif kind == 'tools': snapshot['mermaid_enabled'] = event['mermaid']
+                            elif kind == 'tool':
+                                items=snapshot.setdefault('tool_events',[])
+                                item=next((item for item in items if item['id']==event['id']),None)
+                                if item is None:items.append(dict(event))
+                                else:item.update(event)
+                            elif kind == 'error':
+                                await run_blocking(self.store.finish,uid, rid, 'failed', error=event['message'])
+                                return
+                            elif kind == 'awaiting_input':
+                                await run_blocking(self.store.finish,uid, rid, 'awaiting_input', result=event)
+                                return
+                            elif kind == 'done':
+                                await run_blocking(self.store.finish,uid, rid, 'succeeded', result=event)
+                                return
+                            # Publish the first visible text immediately; coalesce subsequent provider chunks.
+                            if kind=='delta' and not first_delta and time.monotonic()-last_saved<.25:continue
+                            if not await run_blocking(self.store.record,uid, rid, snapshot): return
+                            last_saved=time.monotonic()
+            finally:
+                collected_model_status.reset(token)
             await run_blocking(self.store.finish,uid, rid, 'indeterminate', error='原请求未返回最终结果，不会自动重发')
         except asyncio.CancelledError:
             if not row.get('_user_pause'):
