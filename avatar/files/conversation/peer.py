@@ -43,7 +43,7 @@ class PeerResources:
     def share(self,db,user,task_id,file_ids,source=None,generated=False,authorize_ids=(),*,attachments=False):
         """事务内校验双方与所有源文件，生成七天临时快照；同内容不重复复制或延长期限。"""
         identifiers=list(dict.fromkeys(file_ids))
-        if len(identifiers)>5:raise HTTPException(422,'一次最多发送五个文件')
+        if not generated and len(identifiers)>5:raise HTTPException(422,'一次最多发送五个文件')
         if not identifiers:return []
         task=self.dialogues.owned(db,user,task_id)
         own=self.workspace(db,user['id'],task['session_id'],task_id)
@@ -78,7 +78,8 @@ class PeerResources:
                             if stored!=(digest,md5):
                                 raise HTTPException(409,'接收方已有副本校验失败，未重复引用')
                     else:
-                        check_chat_quota(db,uid,destination,1,row['size'],ordinary_chat_bytes(row))
+                        origin='attachment' if attachments else 'generated' if generated and row['origin']=='generated' else 'reference'
+                        check_chat_quota(db,uid,destination,int(origin!='generated'),row['size'],ordinary_chat_bytes(row))
                         identifier=str(uuid.uuid4());self.files.directory.mkdir(parents=True,exist_ok=True,mode=0o700)
                         for suffix, source_path in (('.blob',original),('.jpg',preview_path)):
                             if suffix=='.jpg' and not source_path.is_file():continue
@@ -92,7 +93,6 @@ class PeerResources:
                                 if suffix == '.blob' and copied != (digest,md5):
                                     raise HTTPException(409,'原件在发送期间发生变化')
                         active=attachments or db.execute("SELECT count(*) FROM chat_files WHERE conversation_id=? AND referenced=1 AND origin!='attachment'",(destination,)).fetchone()[0]<5
-                        origin='attachment' if attachments else 'generated' if generated and row['origin']=='generated' else 'reference'
                         db.execute('''INSERT INTO chat_files(id,user_id,conversation_id,filename,content_type,size,extracted_text,extraction_status,created_at,origin,description,source_label,sha256,referenced,parse_checked,extraction_version,animation_metadata,animation_digest)
                           VALUES(?,?,?,?,?,?,?,?,?,?,?,'分身会话授权文件',?,?,?,?,?,?)''',(identifier,uid,destination,row['filename'],row['content_type'],row['size'],row['extracted_text'],row['extraction_status'],now(),origin,row['description'],digest,int(active),row['parse_checked'],row['extraction_version'],row['animation_metadata'],row['animation_digest']))
                         if row['expires_at']:db.execute('UPDATE chat_files SET expires_at=CASE WHEN julianday(?)<julianday(expires_at) THEN ? ELSE expires_at END WHERE id=?',(row['expires_at'],row['expires_at'],identifier))

@@ -255,7 +255,7 @@ class SkillExecution:
                     previous.append(token)
                 execution=await self.sandbox.execute(user_id,resources,script,args,https_inputs=https_inputs,authorize=authorize)
                 files=execution.pop('files',[])
-                if len(outputs)+len(files)>5 or sum(len(item['data']) for item in outputs+files)>20*1024*1024:raise ValueError('本轮累计生成文件超过五份/20 MiB')
+                if sum(len(item['data']) for item in outputs+files)>20*1024*1024:raise ValueError('本轮累计普通生成文件超过 20 MiB')
                 if not parent_id and files:raise ValueError('当前通道不支持保存生成文件，请在本人 Web 会话开启 Python 工具后处理')
                 record.update(execution)
                 if execution['status']=='success':

@@ -144,7 +144,7 @@ class MaterialDelivery:
         for item in self.prepared:
             if item['id']==request.file_id:
                 return {'prepared':item['filename']}
-        if len(self.prepared)+len(self.config.get('_generated_files',()))>=5:
+        if len(self.prepared)>=5:
             self.failure='每轮附件最多五份。'
             return {'error':self.failure}
         try:
@@ -159,9 +159,7 @@ class MaterialDelivery:
     async def fulfill(self, selection, progress, validate):
         trace = AgentSteps(progress)
         targets = list(dict.fromkeys(selection.get('queries') or [selection['query']]))
-        limit = max(0, 5-len(self.config.get('_generated_files', ())))
-        if not limit:
-            return ModelResult('本轮附件已达五份，请另发消息索取原件。', None, material_delivery=())
+        limit = 5
         history = self.config.get('_material_history', ())
         sent = {identifier for row in history for identifier in row['delivered']}
         excluded = sent.intersection(selection.get('exclude_ids', ()))

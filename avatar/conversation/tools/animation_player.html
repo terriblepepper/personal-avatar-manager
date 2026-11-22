@@ -2,9 +2,9 @@
 <html lang="zh-CN" data-mode="__MODE__"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>__TITLE__</title>
 <style>
-*{box-sizing:border-box}body{margin:0;min-height:100vh;background:#101d31;color:#eff6ff;font:15px/1.45 system-ui,sans-serif}main{max-width:1000px;margin:auto;padding:clamp(12px,3vw,26px)}h1{font-size:clamp(18px,3.2vw,32px);line-height:1.15;margin:0 0 12px}canvas{display:block;width:100%;height:clamp(155px,49vh,440px);background:radial-gradient(ellipse at 50% 44%,#203858,#132339 75%);border:1px solid #354c68;border-radius:14px}section{margin:.8em 0;min-height:3.8em}h2{font-size:1.12em;margin:0;color:#a6e7ff}p{margin:.2em 0;overflow-wrap:anywhere}footer{display:flex;gap:12px;align-items:center}button{border:1px solid #517393;color:inherit;background:#203752;border-radius:7px;padding:6px 12px;cursor:pointer}input{flex:1;min-width:50px;accent-color:#65d5ff}output{font-variant-numeric:tabular-nums}button:focus-visible,input:focus-visible{outline:2px solid #ffd47d}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:#101d31;color:#eff6ff;font:15px/1.45 system-ui,sans-serif}main{max-width:1000px;margin:auto;padding:clamp(12px,3vw,26px)}h1{font-size:clamp(18px,3.2vw,32px);line-height:1.15;margin:0 0 12px}canvas{display:block;width:100%;height:clamp(155px,49vh,440px);background:radial-gradient(ellipse at 50% 44%,#203858,#132339 75%);border:1px solid #354c68;border-radius:14px}section{margin:.8em 0;min-height:3.8em}h2{font-size:1.12em;margin:0;color:#a6e7ff}p{margin:.2em 0;overflow-wrap:anywhere}footer{display:flex;gap:12px;align-items:center}footer button{min-height:36px}button{border:1px solid #517393;color:inherit;background:#203752;border-radius:7px;padding:6px 12px;cursor:pointer}input{flex:1;min-width:50px;accent-color:#65d5ff}output{font-variant-numeric:tabular-nums}button:focus-visible,input:focus-visible{outline:2px solid #ffd47d}
 </style><main><h1>__TITLE__</h1><canvas aria-label="动画演示"></canvas><section><h2></h2><p></p></section>
-<footer><button type="button"></button><input aria-label="播放进度" type="range" min="0" max="1000" value="0"><output></output></footer><noscript>__TRANSCRIPT__</noscript></main>
+<footer aria-label="动画播放控制" role="group"><button type="button">播放</button><input aria-label="播放进度" type="range" min="0" max="1000" value="0"><output aria-hidden="true"></output></footer><noscript>__TRANSCRIPT__</noscript></main>
 <script type="application/json" id="scene">__DATA__</script>
 <script>
 'use strict';
@@ -54,12 +54,26 @@ function paint2d(f,index){
    for(let j=1;j<=6;j++)dot(cx+r*.125*j*Math.cos(j*2),cy+r*.125*j*Math.sin(j*2),4,colors(j));break;
  }
 }
-function paint3d(f){
- const a=f*TAU,points=[],edges=[];
+function paint3d(f,index){
+ const a=f*TAU,points=[],edges=[],labels=[];
  function add(x,y,z,c=0,size=3){points.push({x,y,z,c,size});return points.length-1}
  function chain(previous,current){if(previous>=0)edges.push([previous,current]);return current}
  function ring(radius,y,n,c){let start=points.length;for(let i=0;i<n;i++){let t=i/n*TAU;add(radius*Math.cos(t),y,radius*Math.sin(t),c,2);edges.push([start+i,start+(i+1)%n])}return start}
  switch(template){
+ case 'process': {
+   const spacing=1.8/Math.max(1,scenes.length-1);
+   for(let i=0;i<scenes.length;i++){
+     const x=scenes.length===1?0:-.9+i*spacing;
+     const y=(i%2===0?1:-1)*.18,z=i%2===0?-.24:.24;
+     const node=add(x,y,z,i,i===index?10:5);
+     if(i)edges.push([node-1,node]);
+     labels.push([node,scenes[i].label]);
+   }
+   const start=points[index],end=points[Math.min(index+1,scenes.length-1)];
+   const t=Math.min(1,f*1.35);
+   add(start.x+(end.x-start.x)*t,start.y+(end.y-start.y)*t+.14,start.z+(end.z-start.z)*t,1,4);
+   break;
+ }
  case 'cube':
  case 'layers':
    {const layers=template==='cube'?2:5;for(let j=0;j<layers;j++){const y=(j/(layers-1)-.5)*(template==='cube'?1.35:1.0+.65*Math.sin(a));const first=ring(.95,y,4,j);if(j)for(let i=0;i<4;i++)edges.push([first+i-4,first+i])}}break;
@@ -80,24 +94,38 @@ function paint3d(f){
  case 'arms':
    {let parent=add(0,-.85,0,1,7),x=0,y=-.85,z=0;for(let i=0;i<4;i++){const bend=.7*Math.sin(a+i*.8),turn=i*.8+.45*Math.cos(a+i);x+=.5*Math.sin(bend)*Math.cos(turn);y+=.5*Math.cos(bend);z+=.5*Math.sin(bend)*Math.sin(turn);parent=chain(parent,add(x,y,z,i,7))}}break;
  }
- const yaw=.6+a,pitch=.37,sy=Math.sin(yaw),cy=Math.cos(yaw),cp=Math.cos(pitch),sp=Math.sin(pitch);
+ const yaw=template==='process'?.42:.6+a,pitch=.37,sy=Math.sin(yaw),cy=Math.cos(yaw),cp=Math.cos(pitch),sp=Math.sin(pitch);
  const scale=Math.min(W*.32,H*.38);
  const screen=points.map(p=>{const x=p.x*cy-p.z*sy,z=p.x*sy+p.z*cy,depth=z*cp+p.y*sp,k=3.7/(4-depth);return {x:W/2+x*scale*k,y:H/2-(p.y*cp-z*sp)*scale*k,z:depth,k,c:p.c,size:p.size}});
  for(const [i,j] of edges){const p=screen[i],q=screen[j];line(p.x,p.y,q.x,q.y,'#6587a9',1.35)}
- for(const p of screen.sort((l,r)=>l.z-r.z))dot(p.x,p.y,p.size*p.k,colors(p.c));
+ for(const p of [...screen].sort((l,r)=>l.z-r.z))dot(p.x,p.y,p.size*p.k,colors(p.c));
+ for(const [i,label] of labels){
+   if(W<640&&Math.abs(i-index)>1)continue;
+   const p=screen[i];text(p.x,p.y+(i%2?29:-19),label,i===index?'#ffd47d':'#dcecff')
+ }
 }
 function draw(){
  const ratio=Math.min(devicePixelRatio||1,2);W=Math.max(1,canvas.clientWidth);H=Math.max(1,canvas.clientHeight);
  if(canvas.width!==Math.round(W*ratio)||canvas.height!==Math.round(H*ratio)){canvas.width=Math.round(W*ratio);canvas.height=Math.round(H*ratio)}
  ctx.setTransform(ratio,0,0,ratio,0,0);ctx.clearRect(0,0,W,H);
  const index=Math.min(scenes.length-1,Math.floor(clock/4)),f=clock/4%1;
- if(index!==shown){shown=index;document.querySelector('h2').textContent=scenes[index].label;document.querySelector('p').textContent=scenes[index].caption;count.textContent=(index+1)+' / '+scenes.length}
- if(document.documentElement.dataset.mode==='3d')paint3d(f);else paint2d(f,index);
- slider.value=Math.round(clock/duration*1000);button.textContent=playing?'暂停':'播放';
+ if(index!==shown){shown=index;document.querySelector('h2').textContent=scenes[index].label;document.querySelector('p').textContent=scenes[index].caption}
+ if(document.documentElement.dataset.mode==='3d')paint3d(f,index);else paint2d(f,index);
+ const elapsed=clock.toFixed(1)+' / '+duration+' 秒';
+ count.textContent=elapsed;
+ slider.value=Math.round(clock/duration*1000);
+ slider.setAttribute('aria-valuetext',elapsed);
+ button.textContent=playing?'暂停':'播放';
 }
 function tick(now){frame=0;if(last)clock=(clock+Math.min((now-last)/1000,.12))%duration;last=now;draw();schedule()}
 function schedule(){if(playing&&!document.hidden&&!frame)frame=requestAnimationFrame(tick)}
-button.onclick=()=>{playing=!playing;last=0;if(frame)cancelAnimationFrame(frame);frame=0;draw();schedule()};
+let resumeAfterSeek=false;
+function setPlaying(value){playing=value;last=0;if(frame)cancelAnimationFrame(frame);frame=0;draw();schedule()}
+button.onclick=()=>setPlaying(!playing);
+slider.onpointerdown=()=>{resumeAfterSeek=playing;if(playing)setPlaying(false)};
+function endSeek(){if(resumeAfterSeek){resumeAfterSeek=false;setPlaying(true)}}
+window.addEventListener('pointerup',endSeek);
+window.addEventListener('pointercancel',endSeek);
 slider.oninput=()=>{clock=Math.min(duration-.001,+slider.value/1000*duration);last=0;draw()};
 document.addEventListener('visibilitychange',()=>{last=0;if(document.hidden&&frame){cancelAnimationFrame(frame);frame=0}else schedule()});
 new ResizeObserver(draw).observe(canvas);draw();schedule();

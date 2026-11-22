@@ -41,7 +41,10 @@ OFFLINE_ANIMATION = ('动画必须完全离线，严禁使用任何网络资源�
 CREATE_ANIMATION = {
     'name':'create_animation',
     'description':('创建有时间变化的 HTML 动画，按意图选择二维或三维，默认二维。'
-                   '自定义动画提交完整 html；模板动画提交 template、title 和 1 至 12 个 scenes（label、caption），省略 html。'
+                   '根据用户题材设计场景、对象和运动。协议握手、证书签发等 3D 流程用 process 模板，'
+                   '按实际步骤填写分镜；只有明确要求立方体或分层拆解时用 cube 或 layers。其他题材选匹配模板或自行制作。'
+                   '自定义动画提交完整 html 并提供播放、暂停和可拖动的真实时间进度滑杆。'
+                   '模板动画提交 template、title 和 1 至 12 个 scenes（label、caption），省略 html。'
                    + '；'.join(mode+' '+', '.join(key+'='+label for key,label in choices.items()) for mode,choices in TEMPLATES.items())
                    + '。'+OFFLINE_ANIMATION),
     'parameters':ANIMATION_PARAMETERS,
@@ -61,7 +64,8 @@ def html_repair_prompt(tool, mode):
         return '直接输出完整 HTML 网页，以 <html> 或 <!doctype html> 开头，以 </html> 结束。内联样式和脚本。'
     choices = {mode:TEMPLATES[mode]} if mode in ('2d','3d') else TEMPLATES
     return ('返回动画工具参数 JSON，包含 filename（.html）、mode、template、title 和 1 至 12 项 scenes。'
-            '每项填 label、caption，省略 html。按目标选择动画维度及模板：'+json.dumps(choices,ensure_ascii=False)+OFFLINE_ANIMATION)
+            '每项填 label、caption，省略 html。选择能表现用户要求的模板，证书签发、协议握手等三维流程使用 process。'
+            '仅明确提出对应形状时选 cube 或 layers。按目标选择动画维度及模板：'+json.dumps(choices,ensure_ascii=False)+OFFLINE_ANIMATION)
 
 
 def repaired_html_arguments(text, tool, filename):
@@ -98,9 +102,9 @@ def checked_args(schema, args):
         raise ValueError('参数校验失败：'+'；'.join(issues)) from None
 
 
-def create_html(args, outputs, available):
+def create_html(args, outputs):
     page = checked_args(WebPage,args)
-    return store_html(page.filename,page.html,'html',outputs,available)
+    return store_html(page.filename,page.html,'html',outputs)
 
 
 class AnimationDependencies(HTMLParser):
@@ -144,11 +148,17 @@ class AnimationDependencies(HTMLParser):
             raise ValueError('动画模块依赖不能离线加载。'+OFFLINE_ANIMATION)
 
 
-def create_animation(args, outputs, available, *, expected_mode=None):
+def create_animation(args, outputs, *, expected_mode=None, objective=''):
     artifact = checked_args(Animation,args)
     if expected_mode in ('2d','3d') and artifact.mode != expected_mode:
         raise ValueError('mode 应为 '+expected_mode)
     if artifact.template:
+        if artifact.mode == '3d' and artifact.template in ('cube','layers'):
+            pattern = r'正方体|立方体|\bcube\b' if artifact.template=='cube' else r'分层|拆解|爆炸图|\blayers?\b'
+            if not re.search(pattern, objective, re.I) or re.search(
+                r'(?:不要|不是|避免|禁止|别)(?:使用|做成)?\s*(?:'+pattern+')', objective, re.I
+            ):
+                raise ValueError('方体及分层模板仅用于明确要求对应结构时。流程用 process，其他主题请选择匹配模板或制作自定义动画。')
         if artifact.html or not artifact.title.strip() or not artifact.scenes:
             raise ValueError('动画模板需要标题和分镜，请省略 html')
         source = render_animation(artifact.mode,artifact.template,artifact.title,artifact.scenes)
@@ -159,10 +169,10 @@ def create_animation(args, outputs, available, *, expected_mode=None):
         parser = AnimationDependencies()
         parser.feed(source)
         parser.close()
-    return store_html(artifact.filename,source,artifact.mode,outputs,available)
+    return store_html(artifact.filename,source,artifact.mode,outputs)
 
 
-def store_html(filename, source, mode, outputs, available):
+def store_html(filename, source, mode, outputs):
     data = source.encode('utf-8')
     if b'\x00' in data:
         raise HTTPException(422, 'HTML 必须为有效文本')
@@ -176,8 +186,8 @@ def store_html(filename, source, mode, outputs, available):
             if item.get('data') == data and item.get('html_mode', 'html') == mode:
                 return item
             raise HTTPException(409, '本轮已有同名文件，请使用不同文件名')
-    if len(outputs) >= available:
-        raise HTTPException(413, '本轮附件已达到五份')
+    if sum(len(item.get('data', b'')) for item in outputs) + len(data) > MAX_SOURCE_BYTES:
+        raise HTTPException(413, '本轮生成文件合计超过 100 MiB')
     item = {'id': str(uuid.uuid4()), 'filename': filename, 'data': data, 'html_mode': mode}
     outputs.append(item)
     return item

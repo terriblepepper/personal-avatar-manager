@@ -46,12 +46,12 @@ def ordinary_chat_bytes(row):
 
 
 def check_chat_quota(db, user_id, conversation_id, added_count, added_bytes, ordinary_bytes):
-    count, ordinary, pending = db.execute("""SELECT count(*),
+    count, ordinary, pending = db.execute("""SELECT count(*) FILTER (WHERE origin!='generated'),
         coalesce(sum(size) FILTER (WHERE content_type NOT IN (?, 'text/html')),0),
         count(*) FILTER (WHERE referenced=1 AND origin!='attachment')
         FROM chat_files WHERE conversation_id=?""", (ANIMATION_MIME,conversation_id)).fetchone()
     if count + added_count > 20 or ordinary + ordinary_bytes > 50*1024*1024 or added_bytes > remaining_chat_bytes(db,user_id):
-        raise HTTPException(413,'会话最多 20 份文件，普通文件合计 50 MiB，账户会话原件合计 100 MiB')
+        raise HTTPException(413,'会话最多上传或引用 20 份文件，普通文件合计 50 MiB，账户会话原件合计 100 MiB')
     return pending
 
 
@@ -122,7 +122,7 @@ class ConversationResources:
                 source_animation_id=row['id'] if row['animation_digest'] and not temporary else None)
 
     # 职责：与成功回答共用事务保存生成文件；提交失败或取消时删除本次原件和预览。
-    # 结果与约束：每轮最多五份/20 MiB，仍计入会话及账户现有配额；原上传文件不被覆盖。
+    # 结果与约束：生成文件计入会话及账户字节配额；原上传文件不被覆盖。
     @contextmanager
     def storing_outputs(self,db,user_id,conversation_id,message_id,outputs):
         paths=[]
@@ -132,11 +132,11 @@ class ConversationResources:
             generated=[item for item in outputs if not item.get('public_material_id')]
             ordinary=sum(len(item['data']) for item in generated if OUTPUT_TYPES.get(Path(item['filename']).suffix.lower()) != 'text/html')
             total=sum(len(item['data']) for item in generated)
-            if len(outputs)>5 or ordinary>20*1024*1024 or total>MAX_SOURCE_BYTES:
-                raise HTTPException(413,'每轮最多五份，普通生成文件合计 20 MiB，生成文件总计 100 MiB')
+            if ordinary>20*1024*1024 or total>MAX_SOURCE_BYTES:
+                raise HTTPException(413,'普通生成文件合计 20 MiB，生成文件总计 100 MiB')
             sources={item['id']:PublicMaterials.validate(db,user_id,item) for item in outputs if item.get('public_material_id')}
             new_sources=[sources[item['id']] for item in outputs if item.get('public_material_id') and not item.get('reuse')]
-            check_chat_quota(db,user_id,conversation_id,len(generated)+len(new_sources),total+sum(row['size'] for row in new_sources),
+            check_chat_quota(db,user_id,conversation_id,len(new_sources),total+sum(row['size'] for row in new_sources),
                              ordinary+sum(ordinary_chat_bytes(row) for row in new_sources))
             for item in outputs:
                 source=sources.get(item['id'])

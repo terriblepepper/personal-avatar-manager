@@ -39,25 +39,30 @@ def configure_tools(fmt, body, tools, *, required=True, batch=False):
                     toolConfig={'functionCallingConfig': {'mode': 'ANY' if required else 'AUTO'}})
 
 
+def raw_tool_calls(fmt, data):
+    if fmt == 'openai':
+        message = (data.get('choices') or [{}])[0].get('message') or {}
+        raw = message.get('tool_calls')
+        if raw is None:
+            raw = []
+        if not isinstance(raw,list):
+            raise ValueError()
+        calls = [c['function'] for c in raw]
+    elif fmt == 'anthropic':
+        calls = [{'name':c.get('name'),'arguments':c.get('input')} for c in data.get('content',[]) if c.get('type')=='tool_use']
+    else:
+        parts = ((data.get('candidates') or [{}])[0].get('content') or {}).get('parts',[])
+        calls = [{'name':p['functionCall'].get('name'),'arguments':p['functionCall'].get('args',{})}
+                 for p in parts if 'functionCall' in p and not p.get('thought')]
+    return calls
+
+
 def parse_tools(fmt, data, tools, *, required=True, batch=False):
     """调用名/参数严格校验；必需工具缺失时报错，可选工具允许无调用，不从文字猜测计划。"""
     count = None
     issue = '工具调用结构无效'
     try:
-        if fmt == 'openai':
-            message = (data.get('choices') or [{}])[0].get('message') or {}
-            raw = message.get('tool_calls')
-            if raw is None:
-                raw = []
-            if not isinstance(raw,list):
-                raise ValueError()
-            calls = [c['function'] for c in raw]
-        elif fmt == 'anthropic':
-            calls = [{'name':c.get('name'),'arguments':c.get('input')} for c in data.get('content',[]) if c.get('type')=='tool_use']
-        else:
-            parts = ((data.get('candidates') or [{}])[0].get('content') or {}).get('parts',[])
-            calls = [{'name':p['functionCall'].get('name'),'arguments':p['functionCall'].get('args',{})}
-                     for p in parts if 'functionCall' in p and not p.get('thought')]
+        calls = raw_tool_calls(fmt, data)
         count = len(calls)
         if not count and not required:
             return []
