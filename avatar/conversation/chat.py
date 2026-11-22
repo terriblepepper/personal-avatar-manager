@@ -7,6 +7,7 @@ import logging
 import re
 from fastapi import HTTPException
 from avatar.conversation.tools.registry import ConversationTools
+from avatar.models.effort import with_chat_effort
 from avatar.core.schemas import ChatRequest
 from avatar.core.db import now, dump
 from avatar.models.model_config import require_complete
@@ -242,6 +243,7 @@ class AvatarChat:
             agent=self.service.overview(user['id'])['agent']
             if not agent:return {'message':'当前没有可压缩的分身对话。'}
             overview,context=self.context(user,ChatRequest(channel='avatar',message='/compact'),agent,private_access=True)
+            context = (with_chat_effort(context[0], json.loads(session['tools_config']).get('reasoning_effort')), *context[1:])
             revision=self.owner_memory_revision(overview,session)
             await self.memory.prepare(session,overview['agent']['last_modified_at'],context,'',self.model_client,
                                       user['id'],context_revision=revision,force=True,focus=focus)
@@ -584,7 +586,10 @@ class AvatarChat:
                     for event in route_events:
                         yield event
                 if context:
-                    context=({**context[0],'_avatar_agent':True},*context[1:])
+                    config = context[0]
+                    if overview['agent']['user_id'] == user['id']:
+                        config = with_chat_effort(config, json.loads(parent['tools_config']).get('reasoning_effort'))
+                    context=({**config,'_avatar_agent':True},*context[1:])
                 if request.personal and context is None and local_reply:request=request.model_copy(update={'attachment_ids':[]})
                 request = request.model_copy(update={'conversation_id':session['id']})
                 if overview.get('_target'):

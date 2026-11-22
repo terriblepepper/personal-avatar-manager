@@ -1,6 +1,7 @@
 # 模块说明：输入契约：Pydantic 负责字段结构、格式和部分跨字段约束，数据库归属与业务权限另行检查。
 from pydantic import StrictBool, BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from typing import Literal, Annotated
+from avatar.models.effort import Effort
 from avatar.protocols.identity.acs import AcsInput
 from avatar.files.library.attachments import AttachmentRef
 from avatar.profiles.profile_dates import ModifiedAt
@@ -265,6 +266,7 @@ class ModelConfigInput(BaseModel):
     api_key: SecretStr | None = None
     max_tokens: int = Field(default=1024, ge=128, le=10000000)
     context_tokens: int | None = Field(default=None, ge=2048, le=10000000)
+    reasoning_effort: Effort | None = None
     compression_ratio: float = Field(default=0.6, ge=0.1, le=0.95)
     vision_enabled: StrictBool = False
     audio_enabled: StrictBool = False

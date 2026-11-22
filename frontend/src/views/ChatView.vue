@@ -5,6 +5,7 @@ import { ElButton, ElOption, ElSelect, ElMessage, ElMessageBox } from 'element-p
 import AppIcon from '../components/AppIcon.vue'
 import ComposerToolbar from '../components/chat/ComposerToolbar.vue'
 import ComposerInput from '../components/chat/ComposerInput.vue'
+import EffortPicker from '../components/chat/EffortPicker.vue'
 import ConversationTools from '../components/chat/ConversationTools.vue'
 import { request, notifyError } from '../api/client'
 import { useHistoryScroll } from '../composables/useHistoryScroll'
@@ -36,7 +37,8 @@ const completedFiles = computed(() => {
   return job?.done && job.state === 'succeeded' && !job.error ? job.result?.generated_files || [] : []
 })
 const stopping = ref('')
-const toolsSaving = ref(false)
+const toolPending = ref(false), effortPending = ref(false)
+const toolsSaving = computed(() => toolPending.value || effortPending.value)
 const runningId = computed(() => ['queued','running'].includes(pending.value?.state || '') ? pending.value?.request_id : undefined)
 async function stop() {
   if (!runningId.value) return
@@ -311,7 +313,8 @@ onUnmounted(()=>{destroyed=true;olderRequest?.abort();controller.abort();generat
         </details>
         <ChatSettings :conversation-id="conversationId" :busy="busy||uploading" :revision="messages.length" @catalog="skillCatalog=$event"/>
         <ChatFilesManager :conversation-id="conversationId" :busy="busy" @selected="value=>selectedFiles=value" @uploading="value=>uploading=value"/>
-        <ConversationTools :conversation-id="conversationId" :busy="busy||uploading" @saving="toolsSaving=$event"/>
+        <EffortPicker :conversation-id="conversationId" :busy="busy||uploading" @saving="effortPending=$event"/>
+        <ConversationTools :conversation-id="conversationId" :busy="busy||uploading" @saving="toolPending=$event"/>
       </ComposerToolbar>
       <button v-if="runningId" type="button" class="button primary chat-command chat-send" :disabled="!!stopping || loading" @click="stop">停止<span aria-hidden="true">■</span></button>
       <button v-else-if="pauseId && !draft.trim()" type="button" class="button primary chat-command chat-send" :disabled="busy||uploading||toolsSaving||loading" @click="send('end')">结束任务</button>

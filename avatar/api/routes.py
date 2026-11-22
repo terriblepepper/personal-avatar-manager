@@ -200,6 +200,13 @@ def model_providers(user=Depends(auth.current_user)):
     return catalog()
 
 
+@router.get("/model-providers/effort-levels")
+def model_effort_levels(provider: str, api_format: Literal['openai','anthropic','gemini'],
+                        model: str = Query(max_length=160), user=Depends(auth.current_user)):
+    from avatar.models.effort import levels
+    return levels({'provider': provider, 'api_format': api_format, 'model': model})
+
+
 # 职责：保存当前账户的个人资料草稿。
 # 输入：body 含 Profile、修改日期和旧客户端可选模型配置，user 经过会话与 CSRF 检查。
 # 结果与约束：委托服务校验身份、选填学号、状态和修改日期后保存；独立文件及模型设置不参与身份审核。

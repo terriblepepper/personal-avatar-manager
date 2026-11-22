@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 from avatar.core.db import dump, now
+from avatar.models.effort import with_chat_effort
 from avatar.models.model_config import require_complete
 
 
@@ -12,7 +13,7 @@ async def generate_title(chat, user_id, conversation_id, message, reply):
             row = db.execute("SELECT * FROM chat_conversations WHERE id=? AND user_id=? AND caller_id=? AND platform='web' AND parent_id IS NULL AND title_source='pending'", (conversation_id,user_id,user_id)).fetchone()
             if not row:
                 return
-            config = chat.service.models.current(db,user_id)
+            config = with_chat_effort(chat.service.models.current(db,user_id), json.loads(row['tools_config']).get('reasoning_effort'))
         fallback = ' '.join(message.split())[:24] or '新对话'
         title = fallback
         try:

@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import HTTPException
+from avatar.models.effort import levels
 from avatar.models.limits import limits, validate
 
 PROVIDERS = {
@@ -53,7 +54,7 @@ def catalog():
 # 输入：config 为可能包含 encrypted_key 的配置字典。
 # 结果与约束：仅返回平台、格式、地址、模型、输出上限及 key_configured 标志，不返回明文或密文 Key。
 def public_config(config):
-    return {k: config[k] for k in ("provider", "api_format", "base_url", "model", "max_tokens", "vision_enabled", "audio_enabled", "context_tokens", "compression_ratio", "capability_status", "capability_source") if k in config} | {
+    return {k: config[k] for k in ("provider", "api_format", "base_url", "model", "max_tokens", "vision_enabled", "audio_enabled", "context_tokens", "compression_ratio", "reasoning_effort", "capability_status", "capability_source") if k in config} | {
         "key_configured": bool(config.get("encrypted_key"))}
 
 
@@ -115,6 +116,10 @@ class SecretVault:
         if same_target and previous.get('model')==data['model']:
             for name in ('vision_enabled','audio_enabled'):
                 if name not in request.model_fields_set:data[name]=previous.get(name,False)
+            if 'reasoning_effort' not in request.model_fields_set:
+                data['reasoning_effort'] = previous.get('reasoning_effort')
+        if data.get('reasoning_effort') and data['reasoning_effort'] not in levels(data):
+            raise HTTPException(422, '当前接口和模型不支持所选推理强度，请选择模型默认或受支持的等级')
         data['context_tokens']=data.get('context_tokens') or (limits(data['provider'],data['model']) or {}).get('context_tokens',128000)
         validate(data)
         data["encrypted_key"] = self.encrypt(key) if key else previous.get("encrypted_key", "") if same_target else ""

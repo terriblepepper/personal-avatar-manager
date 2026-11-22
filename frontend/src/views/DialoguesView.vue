@@ -17,6 +17,7 @@ import MarkdownContent from '../components/MarkdownContent.vue'
 import ComposerToolbar from '../components/chat/ComposerToolbar.vue'
 import ComposerInput from '../components/chat/ComposerInput.vue'
 import ChatFilesManager from '../components/chat/ChatFilesManager.vue'
+import EffortPicker from '../components/chat/EffortPicker.vue'
 import ConversationTools from '../components/chat/ConversationTools.vue'
 import AppIcon from '../components/AppIcon.vue'
 import RecordPagination from '../components/RecordPagination.vue'
@@ -41,7 +42,8 @@ const writeState = ref<'idle' | 'sending' | 'working'>('idle')
 const busy = computed(() => writeState.value !== 'idle')
 const resourceBusy=ref(false), taskMenu=ref(false), switching=ref(false), shownTask=ref('')
 const filePreview=ref<ChatFile|null>(null)
-const toolsSaving = ref(false)
+const toolPending = ref(false), effortPending = ref(false)
+const toolsSaving = computed(() => toolPending.value || effortPending.value)
 const commandsDisabled = computed(() => busy.value || switching.value || resourceBusy.value || !detail.value)
 const sendDisabled = computed(() => commandsDisabled.value || toolsSaving.value || !message.value.trim() || (!/^\/compact(?:\s|$)/.test(message.value.trim()) && (detail.value?.task?.can_supplement === false ||
   detail.value?.task?.status === 'ended' || detail.value?.task?.status === 'awaiting_acceptance' || !!detail.value?.task?.needs_confirmation)))
@@ -481,7 +483,8 @@ onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
       </div>
     </details>
     <ChatFilesManager :conversation-id="resourceId" :busy="busy || switching || detail?.task?.status==='running'" @selected="fileIds=$event" @uploading="resourceBusy=$event"/>
-    <ConversationTools :conversation-id="resourceId" @saving="toolsSaving=$event" :busy="busy || switching || resourceBusy || detail?.task?.status==='running'"/>
+    <EffortPicker :conversation-id="resourceId" :busy="busy || switching || resourceBusy || detail?.task?.status==='running'" @saving="effortPending=$event"/>
+    <ConversationTools :conversation-id="resourceId" @saving="toolPending=$event" :busy="busy || switching || resourceBusy || detail?.task?.status==='running'"/>
     <details class="composer-tool chat-command-menu">
       <summary class="chat-command chat-icon-command" aria-label="会话操作" title="会话操作"><AppIcon name="more" :size="18"/></summary>
       <div class="composer-popover chat-command-panel">
