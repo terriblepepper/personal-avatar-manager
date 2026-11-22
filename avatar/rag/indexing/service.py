@@ -92,9 +92,16 @@ class FileRag:
             if not valid:raise HTTPException(404,'会话文件已过期')
         return row
 
-    def original_available(self, source, owner, identifier, size=None):
-        directory = self.attachments.directory if source=='profile' else self.chat.chat_files.directory
-        return directory.available(owner,identifier,size)
+    def original_available(self, source, owner, identifier, size=None, conversation=None):
+        if source=='profile':
+            return self.attachments.directory.available(owner,identifier,size)
+        return self.chat.chat_files.directory.available_in(owner,conversation,identifier,size)
+
+    def original_path(self, row, source):
+        name = row['id']+'.blob'
+        if source=='profile':
+            return self.attachments.directory.new(row['user_id'],name)
+        return self.chat.chat_files.directory.path(row['user_id'],row['conversation_id'],name)
 
     def status(self,user,requested_source=None):
         with self.database.connect() as db:
@@ -111,8 +118,9 @@ class FileRag:
                 if requested_source is not None and source != requested_source:
                     continue
                 eligible=" AND referenced=1 AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))" if source=='chat' else ''
-                identifiers={r[0] for r in db.execute('SELECT id,size FROM '+table+' WHERE user_id=?'+eligible,(user['id'],))
-                             if self.original_available(source,user['id'],r[0],r[1])}
+                fields = 'id,size,conversation_id' if source=='chat' else 'id,size,NULL'
+                identifiers={r[0] for r in db.execute('SELECT '+fields+' FROM '+table+' WHERE user_id=?'+eligible,(user['id'],))
+                             if self.original_available(source,user['id'],r[0],r[1],r[2])}
                 live.update((source, identifier) for identifier in identifiers)
                 states={r['file_id']:r['status'] for r in rows if r['source']==source}
                 from collections import Counter
@@ -209,8 +217,7 @@ class FileRag:
                 db.execute('INSERT INTO model_calls(user_id,provider,model,usage,created_at,purpose,caller_id) VALUES(?,?,?,?,?,?,?)',(row['user_id'],model['provider'],model['model'],dump(usage),now(),'file_parse',row['user_id']))
 
     async def prepare(self,row,source,embedding,model):
-        directory=self.attachments.directory if source=='profile' else self.chat.chat_files.directory
-        path=directory/(row['id']+'.blob');caption=row.get('caption',row.get('description',''))
+        path=self.original_path(row,source);caption=row.get('caption',row.get('description',''))
         label=row['filename']+'\n'+caption;rows=[];coverage=[]
         if row['content_type'].startswith(('audio/','video/')):
             coverage.append('metadata_only:media')

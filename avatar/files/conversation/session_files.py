@@ -22,12 +22,14 @@ def usable_text(text):
 
 
 class SessionFiles:
-    def __init__(self, files, owner, conversation, proofs, *, grants=None, sandbox_ids=(), outputs=()):
+    def __init__(self, files, owner, conversation, proofs, *, grants=None, sandbox_ids=(), outputs=(), staged_reads=None):
         self.files, self.owner, self.conversation = files, owner, conversation
         self.grants, self.sandbox_ids = grants, set(sandbox_ids)
         self.proofs = {key:{'source':'chat', 'origin':'generated', **proof} for key,proof in proofs.items()}
         self.verified = {}
         self.outputs = outputs
+        self.staged_reads = dict(staged_reads or {}) if grants is None else {}
+        self.staged_digests = {}
 
     def _rows(self, db, ids, *, lock=False):
         self.files.session(db, self.owner, self.conversation)
@@ -54,12 +56,16 @@ class SessionFiles:
             result[row['id']]=dict(row)
         return result
 
-    def _directory(self, row):
-        return self.files.attachments.directory if row['source']=='profile' else self.files.directory
+    def _available(self, row):
+        if row['source']=='profile':
+            return self.files.attachments.directory.available(self.owner,row['id'],row['size'])
+        return self.files.directory.available_in(self.owner,self.conversation,row['id'],row['size'])
 
     def _original(self, row):
         identifier = row['id']
-        path = self._directory(row).new(self.owner, identifier+'.blob')
+        name = identifier+'.blob'
+        path = (self.files.attachments.directory.new(self.owner,name) if row['source']=='profile'
+                else self.files.directory.path(self.owner,self.conversation,name))
         try:
             info = path.lstat()
             stamp = (info.st_dev, info.st_ino, info.st_size, info.st_ctime_ns)
@@ -98,7 +104,7 @@ class SessionFiles:
         for identifier, proof in self.proofs.items():
             row = rows.get(identifier)
             if row is not None and proof.get('listed_only'):
-                if not self._directory(row).available(self.owner,identifier,row['size']):
+                if not self._available(row):
                     row = None
             elif row is not None:
                 self._original(row)
@@ -114,6 +120,17 @@ class SessionFiles:
                          item.get('html_mode') in ('html','2d','3d') and isinstance(item.get('data'),bytes)),None)
         return None
 
+    def staged_digest(self, item):
+        data = item['data']
+        cache = self.staged_digests.get(item['id'])
+        if cache is None or cache[0] is not data:
+            cache = self.staged_digests[item['id']] = (data,hashlib.sha256(data).hexdigest())
+        return cache[1]
+
+    def has_html_source(self):
+        return (any(self.staged_html(identifier) for identifier in self.staged_reads) or
+                any(row.get('content_type')=='text/html' and row.get('read_content') for row in self.proofs.values()))
+
     def discover(self, query, offset):
         result = self.files.discover(self.owner,self.conversation,query,offset,self.outputs,grants=self.grants)
         ids = [item['id'] for item in result['items'] if item['can_read']]
@@ -124,7 +141,7 @@ class SessionFiles:
             for item in result['items']:
                 if item['can_read']:
                     row = rows.get(item['id'])
-                    if row is None or not self._directory(row).available(self.owner,row['id'],row['size']):
+                    if row is None or not self._available(row):
                         continue
                     self.proofs.setdefault(row['id'],{**row,'listed_only':True,'read_content':False})
                 visible.append(item)
@@ -149,9 +166,12 @@ class SessionFiles:
             self._check_text_cursor(offset,page,size)
             chunk=data[offset:offset+(limit if limit is not None else 8192)]
             text=self._text_page(chunk,offset,size)
-            return {'kind':'file','id':identifier,'filename':staged['filename'],'size':size,
+            digest = self.staged_digest(staged)
+            if usable_text(text.get('text')):
+                self.staged_reads[identifier]=digest
+            return {'kind':'file','id':identifier,'filename':staged['filename'],'size':size,'sha256':digest,
                     'content_type':'text/html','origin':'generated','source':'chat','delivery_state':'staged',
-                    'has_content':bool(text.get('text')),**text}
+                    'has_content':usable_text(text.get('text')),**text}
         try:
             path = self._original(row)
         except HTTPException as exc:
@@ -245,6 +265,12 @@ class SessionFiles:
         return {'text':text,'offset':offset,'next_offset':end if end<size else None}
 
     def html(self, identifier, sha256):
+        if self.staged_reads.get(identifier)==sha256:
+            if not (staged:=self.staged_html(identifier)):
+                raise ValueError('本轮暂存作品已不可用，请查找当前有效原件')
+            if self.staged_digest(staged)!=sha256:
+                raise HTTPException(409,'暂存作品版本已改变')
+            return staged['filename'],staged['data'].decode('utf-8'),staged['html_mode']
         proof = self.proofs.get(identifier)
         if not proof or not proof.get('read_content') or proof['sha256']!=sha256 or proof['content_type']!='text/html':
             raise ValueError('请先用 read_session_file 读取当前会话旧 HTML，再使用其 ID 和 sha256')

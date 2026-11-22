@@ -38,7 +38,7 @@ def background(system):
 
 async def bind_entry_tools(chat, context, owner, aic, session, files, *, include_private=False,
                            sandbox=None, status=None, directory_reply=None, progress=None, session_file_scope=None,
-                           session_file_grants=None, session_file_owner=None):
+                           session_file_grants=None, session_file_owner=None, search_only=False):
     """Keep grants and source revisions in Python; only schemas and sanitized results reach the LLM."""
     config, key, system, history = context
     scope = (owner, aic, session, files, include_private)
@@ -58,6 +58,7 @@ async def bind_entry_tools(chat, context, owner, aic, session, files, *, include
     config['_remaining_output_bytes'] = remaining_output_bytes
     outputs = config.setdefault('_generated_files', [])
     tools = []
+    lookup_types = {}
     session_files = None
     read_images = {}
     other_images = list(config.get('_image_inputs', ()))
@@ -81,9 +82,11 @@ async def bind_entry_tools(chat, context, owner, aic, session, files, *, include
     if session_file_scope is not None:
         from avatar.files.conversation.session_files import SessionFiles
         session_files = SessionFiles(chat.chat_files, session_file_owner or owner, session_file_scope, previous_reads,
-                                    grants=session_file_grants, sandbox_ids=[f['id'] for f in (*files,*config.get('_agent_saved_files',()))], outputs=outputs)
+                                    grants=session_file_grants, sandbox_ids=[f['id'] for f in (*files,*config.get('_agent_saved_files',()))], outputs=outputs,
+                                    staged_reads=state.get('staged_html_reads'))
         config.update(_session_file_scope=session_file_scope, _load_session_source=session_files.html,
-                      _session_read_proofs=session_files.proofs, _session_sandbox_inputs=session_files.sandbox_inputs,
+                      _session_read_proofs=session_files.proofs, _has_html_source=session_files.has_html_source,
+                      _session_sandbox_inputs=session_files.sandbox_inputs,
                       _validate_session_files_in=session_files.validate_in)
         await run_blocking(session_files.validate)
         if files:
@@ -105,16 +108,20 @@ async def bind_entry_tools(chat, context, owner, aic, session, files, *, include
     elif previous_reads:
         raise HTTPException(409, '此前读取的原件已失去会话授权')
 
-    def tool(name, description, schema=ToolQuestion):
+    def tool(name, description, schema=ToolQuestion, *, prefill=False):
         tools.append({'name':name, 'description':description, 'parameters':schema.model_json_schema()})
+        if prefill:
+            lookup_types[name]=schema
 
-    tool('search_materials', '混合检索已授权资料的正文片段，可指定目录。', SearchQuestion)
-    tool('read_material', '按文件名、说明或问题定位授权资料并读取原文。')
+    tool('search_materials', '混合检索已授权资料的正文片段，可指定目录。', SearchQuestion, prefill=True)
+    if not search_only:
+        tool('read_material', '按文件名、说明或问题定位授权资料并读取原文。', prefill=True)
     if session_files:
-        tool('read_session_file', '查找或读取本会话授权文件，也可复查本轮生成的 HTML。query 查目录，file_id 读原件。按返回游标续读。', SessionFileRequest)
+        tool('read_session_file', '查找或读取本会话授权文件，也可复查本轮生成的 HTML。query 查目录，file_id 读原件。按返回游标续读。', SessionFileRequest, prefill=True)
     if directory_reply:
-        from avatar.conversation.avatar_assistant import LIST_AVATARS
+        from avatar.conversation.avatar_assistant import CatalogArguments, LIST_AVATARS
         tools.append(LIST_AVATARS)
+        lookup_types['list_avatars']=CatalogArguments
     if status:
         tools.append({'name':'application_status','description':'查看本人的分身申请与审核状态。',
                       'parameters':{'type':'object','properties':{},'additionalProperties':False}})
@@ -139,7 +146,7 @@ async def bind_entry_tools(chat, context, owner, aic, session, files, *, include
         return json.dumps({'results':records}, ensure_ascii=False)
 
     # Recover files and recheck source grants even when the next model step only writes the final answer.
-    if state.get('sandbox') or config.get('_sandbox_receipts') or config.get('_agent_checkpoint',{}).get('sandbox_attempted'):
+    if not search_only and (state.get('sandbox') or config.get('_sandbox_receipts') or config.get('_agent_checkpoint',{}).get('sandbox_attempted')):
         if not sandbox:
             raise HTTPException(409, '此前沙箱权限已撤回，未恢复其结果')
         await run_python('', restoring=True)
@@ -178,7 +185,8 @@ async def bind_entry_tools(chat, context, owner, aic, session, files, *, include
                         result.update(coverage='metadata_only',has_content=False,notice='本次已有五张显式图片，请缩小范围')
             if store:
                 await run_blocking(store.merge, {'session_file_reads':dict(session_files.proofs),
-                                                'session_image_ids':list(read_images)})
+                                                'session_image_ids':list(read_images),
+                                                'staged_html_reads':dict(session_files.staged_reads)})
             return json.dumps(result, ensure_ascii=False)
         if name=='list_avatars' and directory_reply:
             from avatar.conversation.avatar_assistant import CatalogArguments
@@ -190,7 +198,7 @@ async def bind_entry_tools(chat, context, owner, aic, session, files, *, include
             return await run_blocking(status)
         if name=='python':
             return await run_python(ToolQuestion.model_validate(args).query)
-        if name not in ('read_material','search_materials'):
+        if name!='search_materials' and (search_only or name!='read_material'):
             raise ValueError('当前会话未提供此工具')
         request = (SearchQuestion if name=='search_materials' else ToolQuestion).model_validate(args)
         route = {'mode':'search' if name=='search_materials' else 'read', **request.model_dump()}
@@ -242,5 +250,6 @@ async def bind_entry_tools(chat, context, owner, aic, session, files, *, include
                            'matches':evidence,'reading':reading,
                            'sources':cfg.get('_material_sources',[]),'notices':cfg.get('_workflow_notices',[])},ensure_ascii=False)
 
-    config.update(_entry_tools=tools,_execute_entry_tool=execute,_validate_entry_results=validate)
+    config.update(_entry_tools=tools,_entry_lookup_types=lookup_types,
+                  _execute_entry_tool=execute,_validate_entry_results=validate)
     return context

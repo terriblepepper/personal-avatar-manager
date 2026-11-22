@@ -105,8 +105,9 @@ class AvatarChat:
                 (user_id, session['id'], message_ids)).fetchall()
         by_message={}
         for ref in references:
-            directory=self.chat_files.attachments.directory if ref['origin']=='material' else self.chat_files.directory
-            if not directory.available(user_id,ref['id'],ref['size']):
+            present = (self.chat_files.attachments.directory.available(user_id,ref['id'],ref['size']) if ref['origin']=='material'
+                       else self.chat_files.directory.available_in(user_id,ref['conversation_id'],ref['id'],ref['size']))
+            if not present:
                 continue
             if ref['origin']=='material':
                 file=material_card(ref)

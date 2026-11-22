@@ -158,8 +158,7 @@ class ConversationResources:
                     if item.get('html_mode'):
                         metadata = json.dumps({'html_mode': item['html_mode']})
                 identifier=str(uuid.UUID(item['id']))
-                self.directory.mkdir(parents=True,exist_ok=True,mode=0o700)
-                path=self.directory.new(user_id,identifier+'.blob')
+                path=self.directory.path(user_id,conversation_id,identifier+'.blob',create=True)
                 with os.fdopen(os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'wb') as stream:
                     paths.append(path)
                     if source:
@@ -172,7 +171,7 @@ class ConversationResources:
                         sha=hashlib.sha256(item['data']).hexdigest()
                 if mime.startswith('image/'):
                     from avatar.files.parsing.images import jpeg_bytes
-                    encoded=jpeg_bytes(path);preview=self.directory.new(user_id,identifier+'.jpg')
+                    encoded=jpeg_bytes(path);preview=path.with_suffix('.jpg')
                     with os.fdopen(os.open(preview,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'wb') as stream:
                         paths.append(preview);stream.write(encoded)
                 db.execute('''INSERT INTO chat_files(id,user_id,conversation_id,filename,content_type,size,extracted_text,

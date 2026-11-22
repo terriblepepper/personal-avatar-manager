@@ -1,4 +1,4 @@
-from avatar.core.user_storage import UserBlobs
+from avatar.core.user_storage import ConversationBlobs, UserBlobs
 from avatar.files.uploads.buffer import upload_work, write_original
 # 模块说明：独立资料文件存储、归属、说明和隐私；用户保存立即生效，原件不进入公开静态目录。
 import asyncio
@@ -386,9 +386,9 @@ class AttachmentService:
                         content['attachments']=[ref for ref in content['attachments'] if ref['id'] not in identifiers]
                         db.execute('UPDATE avatar_records SET profile=? WHERE user_id=?',(dump(content),user['id']))
                 if identifiers:
-                    chat_directory = UserBlobs(self.database,'chat_attachments','chat_files')
-                    reference_paths = [chat_directory.new(user['id'],r['id']+'.blob') for r in db.execute(
-                        'SELECT id FROM chat_files WHERE user_id=? AND source_animation_id=ANY(?::text[])',
+                    chat_directory = ConversationBlobs(self.database)
+                    reference_paths = [chat_directory.path(user['id'],r['conversation_id'],r['id']+'.blob') for r in db.execute(
+                        'SELECT id,conversation_id FROM chat_files WHERE user_id=? AND source_animation_id=ANY(?::text[])',
                         (user['id'],list(identifiers)))]
                 db.executemany('DELETE FROM attachments WHERE id=? AND user_id=?',[(item,user['id']) for item in identifiers])
                 event(db,user['id'],user['username'],'删除资料文件夹及全部内容' if folder_path is not None else '删除资料文件及全部说明',folder_path if folder_path is not None else identifier or str(len(identifiers)),actor_id=user['id'])

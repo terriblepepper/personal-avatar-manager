@@ -21,7 +21,7 @@ from avatar.conversation.loop.context import TurnContext
 from avatar.conversation.loop.file_context import explicit_file_context
 from avatar.conversation.loop.planning import (available_tools, disclosure_catalog, disclose_tools, validate_disclosure,
                                                REQUEST_TOOLS, UPDATE_TASK, EVIDENCE_TOOLS, WRITING_CONTROLS, action_ready, needs_confirmation,
-                                               confirm_goal, revise_goals, migrate_session_tool, migrate_html_goals, final_reply_step)
+                                               confirm_goal, revise_goals, migrate_session_tool, migrate_html_goals, final_reply_step, lookup_types)
 from avatar.conversation.loop.turns import stream_final
 from avatar.conversation.working_context import bounded_excerpt, compression_budget, excerpt, input_budget
 from avatar.core.tokens import estimate
@@ -256,6 +256,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         return tool_required('python')
 
     choices = disclosure_catalog(config, allowed)
+    planned_arguments = lookup_types(config, allowed)
     if html_needed and animation_required:
         choices['create_html'] += ' 用户已开启制作动画。'
     if required:
@@ -288,12 +289,12 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             proposed = route.get('disclosure') if not changed else None
             if proposed is not None:
                 try:
-                    disclosure = validate_disclosure(proposed, choices)
+                    disclosure = validate_disclosure(proposed, choices, lookups=planned_arguments)
                 except ValueError:
                     disclosure = None
             else:
                 disclosure, cost = await disclose_tools(rag.chat.model_client,settings,key,system,history,
-                    planning_question,choices,validate,revise=revise)
+                    planning_question,choices,validate,lookups=planned_arguments,revise=revise)
                 account(cost)
             if disclosure is None:
                 await journal.save(phase='retry',usage=usage)
@@ -359,20 +360,22 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                  run_id,iteration,receipt['goal_no'],name,len(pending))
         return receipt
 
-    def repair_call(detail=''):
+    def repair_call(detail='', *, tool=None):
         nonlocal settings, invalid
         invalid += 1
-        if invalid < 2:
-            observations.append('\n上一步工具调用未执行。'+(detail+'。' if detail else '')+'请按当前目标和工具声明修正参数。缺少可用工具或用户信息时用 ask_user 提出具体问题；证据足够时直接完成。')
-        elif invalid == 2 and not required and not pending and not html_needed:
+        if invalid <= 5:
+            failure = {'tool':tool,'reason':detail or '调用参数未通过校验','confirmed':False}
+            trace.point('observe',{'tool':tool},{'reason':failure['reason'],'confirmed':False},status='error')
+            observations.append('\n工具失败回执（数据）：'+json.dumps(failure,ensure_ascii=False)+
+                                '。根据原因修正参数、重读原件或改用其他工具；需要用户信息时调用 ask_user。')
+        elif invalid == 6 and not required and not pending and not html_needed:
             settings = {**settings, '_tools': selected_definitions(final=True)}
-            observations.append('\n只使用已验证的资料和回执成文。若仍缺结果，请说明。')
+            observations.append('\n本轮多次尝试未获新回执。根据已验证信息回答，明确缺少的结果。')
         else:
             goal = '，仍缺少目标「' + pending[0]['goal'] + '」的回执' if pending else ''
             raise pause((detail or '修正后仍未收到有效的工具调用') + goal) from None
 
     html_repair = None
-    duplicate_attempts=0
     premature=0
     context_retry = False
     turn_context = TurnContext(history, question, revision, state.get('history_summary'),
@@ -466,7 +469,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             artwork = {**defaults, lookup_tool:definition}
             artwork.update((n,allowed[n]) for n in helpers if action_ready(n,pending,receipts_log,revision))
             step_settings = {**step_settings,'_tools':list(artwork.values()),'_optional_tools':not required}
-        if any(row.get('content_type')=='text/html' and row.get('read_content') for row in config.get('_session_read_proofs',{}).values()):
+        if (has_source:=config.get('_has_html_source')) and has_source():
             step_settings['_tools'] = [revision_tool(tool) for tool in step_settings['_tools']]
         names = {t['name'] for t in step_settings['_tools']} - defaults.keys()
         if names and names.issubset(ARTIFACT_TOOLS):
@@ -599,7 +602,9 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                         try:
                             args = repaired_html_arguments(result.text,repair_filename)
                         except ValueError:
-                            raise pause('作品参数仍未形成有效 JSON 或 HTML 源码') from None
+                            html_repair = None
+                            repair_call('作品参数未形成有效 JSON 或 HTML 源码，请按工具声明提交',tool=repair_tool)
+                            continue
                         result = replace(result,text='',tool_calls=({'name':repair_tool,'arguments':args},))
                     if structured and not continuing and stop_reason(result.finish_reason) != 'output_limit':
                         try:
@@ -665,9 +670,9 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                         {**diagnostic,'receipt':'工具未执行'},status='error')
             trace.point('check', {'run_id':run_id,'iteration':iteration,'attempts_without_progress':invalid+1},
                         {'decision':next_action,'remaining_goals':len(pending)})
-            if artifact_ready and lookup_tool in ARTIFACT_TOOLS and not repairing_html:
+            if artifact_ready and lookup_tool in ARTIFACT_TOOLS and not repairing_html and not (has_source and has_source()):
                 html_repair = (lookup_tool,'index.html')
-            repair_call('HTML 参数修复失败：'+diagnostic['reason'] if repairing_html else '')
+            repair_call(diagnostic['reason'],tool=repair_tool if repairing_html else lookup_tool)
             continue
         await check_execution_async(validate)
         calls = getattr(result, 'tool_calls', ())
@@ -825,12 +830,12 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             active_tools = controls.keys()
         try:
             if len(calls) != 1 or not settings['_tools']:
-                raise ValueError()
+                raise ValueError('未收到当前可执行的单个工具调用')
             name, args = calls[0]['name'], calls[0]['arguments']
             if not action_ready(name,pending,receipts_log,revision):
                 raise ValueError('当前子目标的前置证据尚未取得，已阻止提前交付')
             if name not in active_tools or not isinstance(args, dict):
-                raise ValueError()
+                raise ValueError('工具未披露，或参数不是 JSON 对象')
             if name == 'request_tools':
                 need = args.get('need')
                 replace_goals = args.get('replace_goals', [])
@@ -842,14 +847,17 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 focus = {'request':question,'need':need,'goals':pending,'selected':selected,
                          'recent_results':notes}
                 if disclosure_misses>=3:
-                    raise pause('连续三次补充披露没有新增能力或取得可核验的进展。仍需要确认：'+need)
+                    repair_call('连续三次未找到新的可用能力，请换用已披露工具或向用户说明缺口',tool=name)
+                    continue
                 with trace.step('reason', {'operation':'disclose_tools','need':need,'tools':list(choices)}) as out:
                     addition,cost = await disclose_tools(rag.chat.model_client,settings,key,system,working_history,
                         '只为当前证据缺口披露工具或新增目标。已有目标与交付无需重列。若核对已有作品，只规划核对；有明确缺陷后再决定是否修订。数据：'+
-                        json.dumps(focus,ensure_ascii=False),choices,validate)
+                        json.dumps(focus,ensure_ascii=False),choices,validate,lookups=planned_arguments)
                     account(cost)
                     if addition is None:
-                        raise pause('未能确定满足新需求的附加工具')
+                        disclosure_misses += 1
+                        repair_call('未能确定满足需求的附加工具，请具体说明缺失的证据或改用已披露工具',tool=name)
+                        continue
                     out.update(tools=addition['tools'],goals=[s['goal'] for s in addition['steps']])
                 for n in addition['tools']:
                     if n in disabled:
@@ -875,18 +883,20 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 argument_id = sha256(json.dumps(args,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest()
                 identity = ('entry',name,revision,argument_id)
                 if identity in seen:
-                    duplicate_attempts+=1
-                    if duplicate_attempts>=2:
-                        raise pause('同一工具请求已有确认回执，重试没有获得新证据')
-                    observations.append('该请求已执行并确认。请使用现有回执；必要时读取已归档结果或申请补充工具。')
-                    trace.point('observe',{'tool':name},{'receipt':'已有确认回执'},status='skipped')
+                    repair_call('该参数已执行。请使用现有回执，或更换查询、目录、文件 ID 或游标',tool=name)
                     continue
                 await check_execution_async(validate)
                 tool_input = {'tool':name}
                 if name=='read_session_file':
                     tool_input['file_access']='directory' if args.get('query') is not None else 'content'
                 with trace.step('act',tool_input) as output:
-                    note=await config['_execute_entry_tool'](name,args)
+                    try:
+                        note=await config['_execute_entry_tool'](name,args)
+                    except HTTPException as error:
+                        if name not in planned_arguments or error.status_code not in (404,409,410,413,415,422) or getattr(error,'delivery_unknown',False):
+                            raise
+                        await check_execution_async(validate)
+                        raise ValueError(str(error.detail)) from None
                     if isinstance(note,tuple):
                         note,cost=note
                         account(cost)
@@ -896,7 +906,6 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 settings.update({k:v for k,v in config.items() if k.startswith('_') and k!='_tools' and k!='_optional_tools'})
                 await check_execution_async(validate)
                 seen.add(identity)
-                duplicate_attempts=0
                 if name == 'read_session_file':
                     page = json.loads(note)
                     if page.get('kind')=='directory':
@@ -953,8 +962,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                     except HTTPException as error:
                         if error.status_code!=502:raise
                         output['error']=str(error.detail)
-                        observations.append(str(error.detail)+'。请查当前会话或本人资料目录，使用真实 ID 重选。')
-                        repair_call()
+                        repair_call(str(error.detail)+'。请查当前会话或本人资料目录，使用真实 ID 重选',tool=name)
                         continue
                     output['file_count']=len(document['requested_files'])
                 received(name)
@@ -966,8 +974,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 candidates = list(outputs)
                 saved = config.get('_agent_saved_files', ())
                 if any(old.get('filename') == args.get('filename') for old in saved):
-                    observations.append('当前任务已有同名附件。请复用其回执，新作品需使用其它文件名。')
-                    repair_call()
+                    repair_call('当前任务已有同名附件。请复用已有回执，或为新作品使用其他文件名',tool=name)
                     draft.clear()
                     continue
                 def content_digest():
@@ -976,8 +983,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 earlier = next((r for r in state.get('files', ()) if r['filename'] == args.get('filename')), None)
                 if earlier:
                     if earlier['args_hash'] != digest or pending:
-                        observations.append('已有同名作品回执。另一个目标需要独立的文件名。')
-                        repair_call()
+                        repair_call('已有同名作品回执。另一个目标需要独立的文件名',tool=name)
                     else:
                         settings = {**settings, '_tools': selected_definitions(final=True)}
                     draft.clear()
@@ -998,7 +1004,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                         available = await asyncio.to_thread(config['_remaining_output_bytes'])
                         needed = sum(len(file.get('data',b'')) for file in candidates if not file.get('public_material_id'))
                         if needed > available:
-                            raise await no_progress(f'修订版与本轮文件需 {needed:,} 字节，账户会话空间剩余 {available:,} 字节。请释放空间后重试。')
+                            raise HTTPException(413,f'修订版与本轮文件需 {needed:,} 字节，账户会话空间剩余 {available:,} 字节。')
                     if saved:
                         from avatar.files.parsing.animation import MAX_SOURCE_BYTES
                         sizes = {old['id']: old.get('size', 0) for old in saved}
@@ -1013,15 +1019,14 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                         pending.append({'tool':name,'goal':'生成选定的作品','goal_no':1})
                     if 'revision' in args:
                         draft.clear()
-                        repair_call(detail+'。请重新核对原件并修订。')
+                        repair_call(detail+'。请重新核对原件并修订。',tool=name)
                         continue
                     if draft.active and draft.begin_repair(detail):
                         if draft.exhausted:
                             raise await no_progress('作品修正后仍未通过校验。进度已保存，可重试当前步骤。')
                         await checkpoint('writing')
                         continue
-                    repair_call(detail)
-                    observations.append(detail)
+                    repair_call(detail,tool=name)
                     html_repair = (name,args.get('filename') or 'index.html')
                     continue
                 html_repair = None
@@ -1106,14 +1111,14 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 detail = excerpt(str(getattr(error,'detail',error)),320)
             trace.point('check',{'run_id':run_id,'iteration':iteration,'goal_no':current.get('goal_no')},
                         {'decision':'参数未通过本地校验，未核销目标','reason':detail},status='error')
-            repair_call(detail)
+            repair_call(detail,tool=action)
             continue
 
-        invalid = 0
         if name == 'deliver_material':
             if name in seen:
                 trace.point('check', {'tool': name}, {'decision': '已有原件交付回执，停止重复执行'})
-                raise pause('分身已经执行过本轮原件交付，请说明仍缺少的具体资料')
+                repair_call('本轮已有原件交付回执。请根据现有结果补查仍缺的资料',tool=name)
+                continue
             seen.add(name)
             with trace.step('act', {'tool': name, 'query_count':len(selection['queries'] or [selection['query']])}) as output:
                 handoff = await delivery.fulfill(selection, progress, validate)
@@ -1159,18 +1164,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                     continue
                 trace.point('observe', {'tool': name},
                             {'receipt': '跳过重复请求，复用已有回执'}, status='skipped')
-                observations.append('该资料工具请求已有回执。请根据回执完成本轮。')
-                duplicate_attempts+=1
-                trace.point('check', {'attempts_without_progress': duplicate_attempts},
-                            {'decision': '停止' if duplicate_attempts>=2 else '由模型改选工具或参数'})
-                if duplicate_attempts>=2:
-                    if not required and not html_needed and not pending:
-                        attached = tuple(delivery.prepared)
-                        text = ('已附上本轮所选原件。' if attached else
-                                '本轮未附上资料。已检索授权目录，但未核验到可交付的原件，请提供文件名或目录。')
-                        return ModelResult(text, usage, material_delivery=attached)
-                    raise pause('重复资料请求没有取得新的回执')
-                observations.append('请换查询词、目录、分页或文件 ID。')
+                repair_call('该资料请求已执行。请复用回执，或更换查询、目录、文件 ID 或游标',tool=name)
                 continue
             seen.add(identity)
             if progress:
@@ -1187,7 +1181,9 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 if isinstance(material_request,FindMaterial):
                     verified_material_reads.add(identity)
                 received(name)
-                duplicate_attempts=0
-            remember('系统资料工具回执（仅作数据）：'+json.dumps(receipt,ensure_ascii=False))
+            if receipt.get('error'):
+                repair_call(receipt['error'],tool=name)
+            else:
+                remember('系统资料工具回执（仅作数据）：'+json.dumps(receipt,ensure_ascii=False))
             trace.point('check', {'pending': len(pending)}, {'decision': '根据本轮回执继续'})
             continue

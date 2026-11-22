@@ -1,4 +1,4 @@
-from avatar.core.user_storage import UserBlobs
+from avatar.core.user_storage import ConversationBlobs
 # 模块说明：会话私有附件、受限解析、模型输入和个人资料转存；原件随会话清理，转存副本独立保留。
 import asyncio
 import base64
@@ -30,7 +30,7 @@ class ChatFiles(ConversationResources):
     def __init__(self, database, attachments=None):
         self.database=database
         self.attachments=attachments or AttachmentService(database)
-        self.directory=UserBlobs(database,'chat_attachments','chat_files')
+        self.directory=ConversationBlobs(database)
         self.promotion_locks={}
 
     # 职责：确认会话属于当前用户且为可见的 Web 父会话。
@@ -52,7 +52,7 @@ class ChatFiles(ConversationResources):
                 content_type,animation_metadata,'chat' AS source,origin,size FROM chat_files
                 WHERE user_id=? AND conversation_id=? AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))
                 ORDER BY created_at DESC,id LIMIT 20 OFFSET ?""",(owner,conversation,offset)).fetchall()
-            cards.extend(dict(row) for row in rows if self.directory.available(owner,row['id'],row['size']))
+            cards.extend(dict(row) for row in rows if self.directory.available_in(owner,conversation,row['id'],row['size']))
             if len(rows)<20:
                 break
             offset+=len(rows)
@@ -86,8 +86,9 @@ class ChatFiles(ConversationResources):
             while True:
                 rows=db.execute(sql,(*params,term,11,max(0,cursor-len(staged)))).fetchall()
                 for row in rows:
-                    directory=self.attachments.directory if row['source']=='profile' else self.directory
-                    if directory.available(owner,row['id'],row['size']):
+                    present = (self.attachments.directory.available(owner,row['id'],row['size']) if row['source']=='profile'
+                               else self.directory.available_in(owner,conversation,row['id'],row['size']))
+                    if present:
                         if len(items)==10:
                             return {'items':items,'next_offset':cursor}
                         items.append({**dict(row),'delivery_state':'available','can_read':True})
@@ -124,7 +125,7 @@ class ChatFiles(ConversationResources):
     def list(self, user_id, conversation_id):
         with self.database.connect() as db:
             self.session(db,user_id,conversation_id)
-            rows = db.execute("""SELECT f.id,f.filename,f.content_type,f.size,f.extraction_status,f.created_at,
+            rows = db.execute("""SELECT f.id,f.conversation_id,f.filename,f.content_type,f.size,f.extraction_status,f.created_at,
                 f.description,f.origin,f.source_label,f.expires_at,f.referenced,f.animation_metadata,
                 length(f.extracted_text)>0 AS text_available,
                 EXISTS(SELECT 1 FROM chat_file_usages u WHERE u.file_id=f.id) AS sent,
@@ -138,9 +139,10 @@ class ChatFiles(ConversationResources):
                 (ANIMATION_MIME,user_id,conversation_id))
             items = []
             for row in rows:
-                if not self.directory.available(user_id,row['id'],row['size']):
+                if not self.directory.available_in(user_id,row['conversation_id'],row['id'],row['size']):
                     continue
                 item = dict(row)
+                item.pop('conversation_id')
                 if item['promoted_id'] and not self.attachments.directory.available(user_id,item['promoted_id']):
                     item['promoted_id']=None
                 item.update(json.loads(item.pop('animation_metadata')))
@@ -167,8 +169,9 @@ class ChatFiles(ConversationResources):
         with self.database.connect() as db:
             self.session(db,user['id'],conversation_id,editable=True)
             check_chat_quota(db,user['id'],conversation_id,1,len(data),0 if scene or TYPES[extension]=='text/html' else len(data))
-        self.directory.mkdir(parents=True,exist_ok=True,mode=0o700)
-        identifier=str(uuid.uuid4());path=self.directory.new(user['id'],identifier+'.blob');preview=self.directory.new(user['id'],identifier+'.jpg')
+        identifier=str(uuid.uuid4())
+        path=self.directory.path(user['id'],conversation_id,identifier+'.blob',create=True)
+        preview=path.with_suffix('.jpg')
         sha = write_original(path,data)
         try:
             extracted,status='','rag_pending'
@@ -188,7 +191,7 @@ class ChatFiles(ConversationResources):
                 for candidate in candidates:
                     old_md5=candidate['md5']
                     if not old_md5 or not candidate['sha256'] or old_md5!=md5:
-                        original=self.directory/(candidate['id']+'.blob')
+                        original=self.directory.path(user['id'],conversation_id,candidate['id']+'.blob')
                         if not original.exists():continue
                         with original.open('rb') as previous:
                             if hashlib.file_digest(previous,'sha256').hexdigest()!=sha:continue
@@ -214,23 +217,25 @@ class ChatFiles(ConversationResources):
     def owned(self, db, user_id, conversation_id, file_id):
         self.session(db,user_id,conversation_id)
         row=db.execute("SELECT * FROM chat_files WHERE id=? AND user_id=? AND conversation_id=? AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))",(file_id,user_id,conversation_id)).fetchone()
-        if not row or not self.directory.available(user_id,file_id,row['size']):raise HTTPException(404,'会话附件不存在')
+        if not row or not self.directory.available_in(user_id,conversation_id,file_id,row['size']):raise HTTPException(404,'会话附件不存在')
         return dict(row)
 
     # 职责：在调用方事务期间移除选中文件，并在事务失败时恢复原件。
     # 输入：rows 必须由已授权查询取得，元数据在同一事务删除。
     # 结果与约束：只删除会话原件和预览，转存后的独立个人文件不受影响；内存恢复不留下磁盘备份。
     @contextmanager
-    def deleting(self, db, rows):
+    def deleting(self, db, rows, *, workspaces=()):
         paths = []
         for row in rows:
             for suffix in ('.blob','.jpg'):
-                paths.append(self.directory.new(row['user_id'],row['id']+suffix))
+                paths.append(self.directory.path(row['user_id'],row['conversation_id'],row['id']+suffix))
             db.execute('DELETE FROM chat_files WHERE id=?',(row['id'],))
         # Callers exit the DB transaction before this context. A rollback leaves originals in place.
         yield
         from avatar.files.uploads.buffer import clean_removed
         clean_removed((None,path) for path in paths)
+        for owner, conversation in workspaces:
+            self.directory.remove_workspace(owner,conversation)
 
     # 职责：把会话附件复制为本人独立个人资料文件，保留会话原件直到会话删除。
     # 输入：caption 选填，visibility 默认私密；调用方持有父会话租约阻止并发删除。
@@ -244,7 +249,7 @@ class ChatFiles(ConversationResources):
             row=await asyncio.to_thread(owned)
             filename=row['filename'] if new_name is None else renamed_filename(row['filename'],new_name)
             try:
-                original = self.directory.new(user['id'],file_id+'.blob').open('rb')
+                original = self.directory.path(user['id'],conversation_id,file_id+'.blob').open('rb')
             except FileNotFoundError:
                 raise HTTPException(410,'会话原件已删除或过期') from None
             created=None
@@ -298,12 +303,12 @@ class ChatFiles(ConversationResources):
             current=[self.owned(db,user_id,parent,identifier) for identifier in dict.fromkeys(selected)]
             if any(not row['referenced'] or row['origin']=='attachment' for row in current):raise HTTPException(409,'文件引用已关闭，请刷新会话后重新发送')
             if persistent:
-                return [dict(row) for row in db.execute("SELECT * FROM chat_files WHERE user_id=? AND conversation_id=? AND referenced=1 AND origin!='attachment' AND (expires_at IS NULL OR julianday(expires_at)>julianday('now')) ORDER BY created_at,id LIMIT 5",(user_id,parent)) if self.directory.available(user_id,row['id'],row['size'])]
+                return [dict(row) for row in db.execute("SELECT * FROM chat_files WHERE user_id=? AND conversation_id=? AND referenced=1 AND origin!='attachment' AND (expires_at IS NULL OR julianday(expires_at)>julianday('now')) ORDER BY created_at,id LIMIT 5",(user_id,parent)) if self.directory.available_in(user_id,row['conversation_id'],row['id'],row['size'])]
             history=db.execute('''SELECT f.* FROM chat_files f WHERE f.user_id=? AND f.conversation_id=? AND (
                 EXISTS(SELECT 1 FROM chat_file_usages u JOIN chat_messages m ON m.id=u.message_id WHERE u.file_id=f.id AND m.conversation_id=?)
                 OR EXISTS(SELECT 1 FROM chat_messages m WHERE m.id=f.generated_message_id AND m.conversation_id=?))
                 AND f.referenced=1 AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now')) ORDER BY f.created_at DESC LIMIT 5''',(user_id,parent,session['id'],session['id'])).fetchall()
-        return (current+[dict(row) for row in history if row['id'] not in selected and self.directory.available(user_id,row['id'],row['size'])])[:5]
+        return (current+[dict(row) for row in history if row['id'] not in selected and self.directory.available_in(user_id,row['conversation_id'],row['id'],row['size'])])[:5]
 
     # 职责：保存本人文件的引用开关；发送成功不修改此字段，刷新或再次登录后仍保持用户选择。
     def reference_enabled(self,user_id,conversation_id,file_id,enabled):
@@ -339,7 +344,7 @@ class ChatFiles(ConversationResources):
                 if row.get('source')=='profile':
                     from avatar.files.parsing.images import jpeg_bytes
                     encoded=jpeg_bytes(self.attachments.directory/(row['id']+'.blob'))
-                else:encoded=(self.directory/(row['id']+'.jpg')).read_bytes()
+                else:encoded=self.directory.path(row['user_id'],row['conversation_id'],row['id']+'.jpg').read_bytes()
                 images.append({'mime_type':'image/jpeg','data':base64.b64encode(encoded).decode()})
                 files[-1]['image_order']=len(images)
                 for item in background.get('attachments',[]):

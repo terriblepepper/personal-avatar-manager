@@ -23,6 +23,7 @@ class PeerResources:
         avatar=db.execute('SELECT aic FROM avatar_records WHERE user_id=?',(user_id,)).fetchone()
         if not avatar:raise HTTPException(404,'本人分身不存在')
         db.execute("INSERT INTO chat_conversations(id,user_id,channel,target_aic,caller_id,platform,title,created_at,updated_at) VALUES(?,?,'peer',?,?,'web',?,?,?)",(identifier,user_id,avatar['aic'],user_id,title,stamp,stamp))
+        self.files.directory.workspace(user_id,identifier,create=True)
         return identifier
 
     def workspace(self,db,user_id,session_id,task_id=None):
@@ -35,10 +36,23 @@ class PeerResources:
         identifier=task_id or session_id
         member=db.execute(f'SELECT resource_conversation_id FROM {table} WHERE {key}=? AND user_id=?',(identifier,user_id)).fetchone()
         if not member:raise HTTPException(404,'分身会话不存在')
-        if member['resource_conversation_id']:return member['resource_conversation_id']
+        if member['resource_conversation_id']:
+            self.files.directory.workspace(user_id,member['resource_conversation_id'],create=True)
+            return member['resource_conversation_id']
         workspace=self.new_workspace(db,user_id,'分身任务资源' if task_id else '分身间会话资源')
         db.execute(f'UPDATE {table} SET resource_conversation_id=? WHERE {key}=? AND user_id=?',(workspace,identifier,user_id))
         return workspace
+
+    def release_workspaces(self, db, stack, workspaces):
+        for owner, conversation in set(workspaces):
+            if not conversation or not db.execute(
+                    "SELECT 1 FROM chat_conversations WHERE user_id=? AND id=? AND channel='peer' FOR UPDATE",
+                    (owner,conversation)).fetchone():
+                continue
+            rows = db.execute('SELECT * FROM chat_files WHERE user_id=? AND conversation_id=?',(owner,conversation)).fetchall()
+            stack.enter_context(self.files.deleting(db,rows,workspaces=[(owner,conversation)]))
+            db.execute('DELETE FROM agent_intents WHERE user_id=? AND conversation_id=?',(owner,conversation))
+            db.execute('DELETE FROM chat_conversations WHERE user_id=? AND id=?',(owner,conversation))
 
     def share(self,db,user,task_id,file_ids,source=None,generated=False,authorize_ids=(),*,attachments=False):
         """事务内校验双方与所有源文件，生成七天临时快照；同内容不重复复制或延长期限。"""
@@ -53,12 +67,12 @@ class PeerResources:
         paths=[]
         try:
             for row in rows:
-                original=self.files.directory.new(row['user_id'],row['id']+'.blob')
+                original=self.files.directory.path(row['user_id'],source,row['id']+'.blob')
                 if not original.is_file():raise HTTPException(410,'发送文件已删除或过期')
                 if row['size'] < 0:
                     raise HTTPException(409,'会话原件大小无效')
                 digest, md5 = original_hashes(original,row['size'])
-                preview_path=original.with_suffix('.jpg')
+                preview_path=self.files.directory.path(row['user_id'],source,row['id']+'.jpg')
                 if row['sha256'] and row['sha256']!=digest or row.get('md5') and row['md5']!=md5:
                     raise HTTPException(409,'会话文件校验失败，未发送原件')
                 for uid in (task['user_id'],task['target_user_id']):
@@ -73,17 +87,17 @@ class PeerResources:
                     if existing:
                         identifier=existing['id']
                         if identifier!=row['id']:
-                            try:stored=original_hashes(self.files.directory.new(uid,identifier+'.blob'),row['size'])
+                            try:stored=original_hashes(self.files.directory.path(uid,destination,identifier+'.blob'),row['size'])
                             except FileNotFoundError:raise HTTPException(410,'接收方已有副本丢失，请删除该引用后重试') from None
                             if stored!=(digest,md5):
                                 raise HTTPException(409,'接收方已有副本校验失败，未重复引用')
                     else:
                         origin='attachment' if attachments else 'generated' if generated and row['origin']=='generated' else 'reference'
                         check_chat_quota(db,uid,destination,int(origin!='generated'),row['size'],ordinary_chat_bytes(row))
-                        identifier=str(uuid.uuid4());self.files.directory.mkdir(parents=True,exist_ok=True,mode=0o700)
+                        identifier=str(uuid.uuid4())
                         for suffix, source_path in (('.blob',original),('.jpg',preview_path)):
                             if suffix=='.jpg' and not source_path.is_file():continue
-                            path=self.files.directory.new(uid,identifier+suffix)
+                            path=self.files.directory.path(uid,destination,identifier+suffix,create=True)
                             size = row['size'] if suffix == '.blob' else source_path.stat().st_size
                             if suffix == '.jpg' and size > MAX_FILE:
                                 raise HTTPException(413,'图片预览过大')
@@ -120,7 +134,7 @@ class PeerResources:
 
     def model_files(self,db,task_id,owner):
         return [item for item in self.selected(db,task_id,owner) if item.get('sha256')
-                and self.files.directory.available(owner,item['id'],item['size'])]
+                and self.files.directory.available_in(owner,item['conversation_id'],item['id'],item['size'])]
 
     def session_file_grants(self,db,task,owner,workspace):
         """Only this speaker's shared copies and this turn's saved outputs can be read."""
@@ -137,7 +151,7 @@ class PeerResources:
                 AND origin='generated' AND id=ANY(?::text[])
                 AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))""",(owner,workspace,list(ids)))
             grants.update((row['id'],row['sha256']) for row in rows if row['sha256'] and
-                          self.files.directory.available(owner,row['id'],row['size']))
+                          self.files.directory.available_in(owner,workspace,row['id'],row['size']))
         return grants
 
     def validate_file_receipts(self,db,task,owner,workspace,proofs,*,lock=True):
@@ -161,7 +175,7 @@ class PeerResources:
                 WHERE a.task_id=? AND f.user_id=? AND julianday(f.expires_at)>julianday('now')
                 ORDER BY f.created_at,f.id""",(task_id,user_id)).fetchall()
         return [{'id':r['id'],'sender_user_id':r['source_user_id'],'message_id':r['message_id'],'origin':r['display_origin'],'promoted_id':r['promoted_id'],'filename':r['filename'],'content_type':r['content_type'],'size':r['size'],**json.loads(r['animation_metadata']),'expires_at':r['expires_at'],'download_url':'/api/conversations/'+r['conversation_id']+'/files/'+r['id']} for r in rows
-                if self.files.directory.available(user_id,r['id'],r['size'])]
+                if self.files.directory.available_in(user_id,r['conversation_id'],r['id'],r['size'])]
 
     def cleanup(self):
         """每分钟回收过期原件、预览、解析及授权行，转存的资料副本独立保留。"""
@@ -175,14 +189,20 @@ class PeerResources:
             if len(rows)<10:break
         # 异常断电可能留下已写文件而未提交元数据的孤儿；最多七天后同样回收。
         with self.database.connect() as db:
-            for path in self.files.directory.glob('*'):
-                if path.suffix not in ('.blob','.jpg'):continue
+            for path in self.files.directory.glob():
+                if path.is_symlink() or path.suffix not in ('.blob','.jpg'):continue
                 try:modified=path.stat().st_mtime
                 except FileNotFoundError:continue
                 if modified>time.time()-7*86400:continue
                 try:uuid.UUID(path.stem)
                 except ValueError:continue
-                if not db.execute('SELECT 1 FROM chat_files WHERE id=?',(path.stem,)).fetchone():path.unlink(missing_ok=True)
+                if not db.execute('SELECT 1 FROM chat_files WHERE id=?',(path.stem,)).fetchone():
+                    path.unlink(missing_ok=True)
+                    parent=path.parent
+                    if parent.name != 'chat_attachments':
+                        owner=parent.parent.parent.name
+                        if not db.execute('SELECT 1 FROM chat_conversations WHERE id=? AND user_id=?',(parent.name,owner)).fetchone():
+                            self.files.directory.remove_workspace(owner,parent.name)
 
     def localize(self,db,text,task_id,user_id,message_id):
         """按本条发言的授权将附件标记、历史下载链接映射到查看者的独立副本。"""
@@ -192,7 +212,7 @@ class PeerResources:
             JOIN chat_files f ON f.id=a.file_id WHERE a.task_id=? AND a.message_id=? AND f.user_id=?
             AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now'))""",(task_id,message_id,user_id)).fetchall()
         markers={row['source_file_id']:row['id'] for row in rows if row['source_file_id'] and
-                 self.files.directory.available(user_id,row['id'],row['size'])}
+                 self.files.directory.available_in(user_id,row['conversation_id'],row['id'],row['size'])}
         if '/api/conversations/' in text or any(not row['source_file_id'] for row in rows):
             links=db.execute("""SELECT source.id,source.conversation_id,source.user_id,a.source_user_id,local.id AS local_id,local.size AS local_size,local.conversation_id AS local_conversation
                 FROM agent_task_files a JOIN chat_files source ON source.id=a.file_id
@@ -203,7 +223,7 @@ class PeerResources:
                 AND (local.expires_at IS NULL OR julianday(local.expires_at)>julianday('now'))""",(user_id,task_id,message_id))
             urls={}
             for row in links:
-                if not self.files.directory.available(user_id,row['local_id'],row['local_size']):continue
+                if not self.files.directory.available_in(user_id,row['local_conversation'],row['local_id'],row['local_size']):continue
                 if row['user_id']==row['source_user_id']:
                     markers.setdefault(row['id'],row['local_id'])
                 urls[(row['conversation_id'],row['id'])]='/api/conversations/'+row['local_conversation']+'/files/'+row['local_id']

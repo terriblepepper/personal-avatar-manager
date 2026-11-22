@@ -169,7 +169,7 @@ def available_outputs(chat, db, user_id, parent_id, ids):
     from avatar.files.conversation.resources import original_hashes
     available=[]
     for item in files:
-        path=chat.chat_files.directory.new(user_id,item['id']+'.blob')
+        path=chat.chat_files.directory.path(user_id,parent_id,item['id']+'.blob')
         expected=item.pop('sha256')
         try:
             digest,_=original_hashes(path,item['size'])

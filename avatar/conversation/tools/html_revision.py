@@ -10,7 +10,8 @@ from avatar.files.parsing.animation import MAX_SOURCE_BYTES
 class SourceEdit(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
     field: Literal['html', 'render_frame'] = 'html'
-    old: str = Field(min_length=1, description='从原件复制的唯一、完整匹配文本。')
+    old: str = Field(min_length=1, description='从原件复制的准确文本。未提供 offset 时须唯一匹配。')
+    offset: int | None = Field(default=None, ge=0, description='可选的绝对 UTF-8 字节偏移，用于定位重复文本。')
     new: str
 
 
@@ -31,7 +32,7 @@ def revision_tool(tool):
         return tool
     form = tool['parameters']
     properties = {**form['properties'], 'revision':{k:v for k,v in REVISION_SCHEMA.items() if k!='$defs'}}
-    return {**tool, 'description':tool['description']+' 支持按已读原件进行局部修改并另存。',
+    return {**tool, 'description':tool['description']+' 局部修改使用已读取原件的 file_id、sha256 和准确片段，另存新文件。',
             'parameters':{**form,'properties':properties,'$defs':{**form.get('$defs',{}),**REVISION_SCHEMA['$defs']},'required':['filename']}}
 
 
@@ -53,27 +54,36 @@ def author_fields(source, mode):
 
 
 def apply_edits(text, edits):
+    source=text.encode('utf-8')
+    size=len(source)
     spans=[]
-    size=len(text.encode('utf-8'))
     for edit in edits:
-        if edit.new==edit.old:
+        old=edit.old.encode('utf-8')
+        new=edit.new.encode('utf-8')
+        if old==new:
             raise ValueError('修改前后的文本相同，请提交实际改动')
-        start=text.find(edit.old)
-        if start < 0 or text.find(edit.old,start+1)>=0:
-            raise ValueError('修改片段必须在原字段中唯一匹配，请重新读取并扩大定位范围')
-        spans.append((start,start+len(edit.old),edit.new))
-        size += len(edit.new.encode('utf-8'))-len(edit.old.encode('utf-8'))
+        if edit.offset is None:
+            start=source.find(old)
+            if start < 0 or source.find(old,start+1)>=0:
+                raise ValueError('修改片段必须唯一匹配，或填写核对过的 UTF-8 字节偏移')
+        else:
+            start=edit.offset
+            if not source.startswith(old,start):
+                raise ValueError('字节偏移处的内容与原文不符，请重新读取对应片段')
+        spans.append((start,start+len(old),new))
+        size += len(new)-len(old)
     if size>MAX_SOURCE_BYTES:
         raise ValueError('修订后源码超过 100 MiB')
     parts=[]
+    view=memoryview(source)
     previous=0
     for start,end,replacement in sorted(spans):
         if start < previous:
             raise ValueError('修改片段重叠，请合并成一个修改')
-        parts.extend((text[previous:start],replacement))
+        parts.extend((view[previous:start],replacement))
         previous=end
-    parts.append(text[previous:])
-    return ''.join(parts)
+    parts.append(view[previous:])
+    return b''.join(parts).decode('utf-8')
 
 
 def expand_revision(args, load_source, *, legacy_animation=False):

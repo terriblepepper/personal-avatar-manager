@@ -147,14 +147,14 @@ async def upload(conversation_id: str, request: Request, user=Depends(current_us
 def download(conversation_id: str, file_id: str, request: Request, user=Depends(current_user), preview: bool=False):
     service=request.app.state.chat.chat_files
     with service.database.connect() as db:row=service.owned(db,user['id'],conversation_id,file_id)
-    path=service.directory/(file_id+'.blob')
+    path=service.directory.path(user['id'],conversation_id,file_id+'.blob')
     if not path.is_file():
         from fastapi import HTTPException
         raise HTTPException(404,'会话原件不存在')
     if preview:
         from fastapi import HTTPException
         # 内联只使用服务端重新编码的 JPEG，下载仍返回授权原件。
-        image=service.directory/(file_id+'.jpg')
+        image=service.directory.path(user['id'],conversation_id,file_id+'.jpg')
         if not row['content_type'].startswith('image/') or not image.is_file():
             raise HTTPException(404,'图片预览不存在')
         return FileResponse(image,media_type='image/jpeg',headers={'Cache-Control':'private, no-store'})

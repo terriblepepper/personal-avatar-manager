@@ -106,6 +106,8 @@ def edit_signature(edit):
             for pos in range(0,len(value),65536):
                 digest.update(value[pos:pos+65536].encode())
             result[key] = digest.hexdigest()
+        elif key=='offset' and type(value) is int:
+            result[key] = value
     return result
 
 

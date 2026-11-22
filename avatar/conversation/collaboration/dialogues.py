@@ -710,8 +710,14 @@ class AgentDialogues:
 
     # 删除本方历史游标和记忆，不改写对方记忆、任务账单或对方保留的原文。
     def clear_session(self,user,identifier,hide=False):
-        with self.database.connect(write=True) as db:
+        with ExitStack() as resources, self.database.connect(write=True) as db:
             self.member(db,user,identifier,hidden=True)
+            if hide:
+                if db.execute("SELECT 1 FROM agent_dialogues WHERE session_id=? AND delivery_mode='message' AND status NOT IN ('ended','failed')",(identifier,)).fetchone():
+                    raise HTTPException(409,'会话仍有消息在处理，请结束后再删除')
+                row = db.execute('SELECT resource_conversation_id FROM agent_session_members WHERE session_id=? AND user_id=?',
+                                 (identifier,user['id'])).fetchone()
+                self.resources.release_workspaces(db,resources,[(user['id'],row[0])])
             maximum=db.execute('SELECT COALESCE(MAX(m.id),0) FROM agent_dialogue_messages m JOIN agent_dialogues d ON d.id=m.dialogue_id WHERE d.session_id=?',(identifier,)).fetchone()[0]
             db.execute("UPDATE agent_session_members SET hidden=?,cleared_through=?,summary='',summary_through=?,cleared_at=? WHERE session_id=? AND user_id=?",(int(hide),maximum,maximum,now(),identifier,user['id']))
             sources=db.execute('SELECT source_message_id FROM agent_task_memories WHERE session_id=? AND user_id=?',(identifier,user['id'])).fetchall()
@@ -723,25 +729,31 @@ class AgentDialogues:
         return {'cleared':True}
 
     def dismiss_all_history(self,user,session=None):
-        with self.database.connect(write=True) as db:
+        with ExitStack() as resources, self.database.connect(write=True) as db:
             if session:self.member(db,user,session)
             condition="d.status='ended'"+(' AND d.session_id=?' if session else '')
             values=(user['id'],session) if session else (user['id'],)
-            count=db.execute("UPDATE agent_task_members SET hidden=1,summary='',summary_through=0 WHERE user_id=? AND hidden=0 AND task_id IN (SELECT d.id FROM agent_dialogues d WHERE "+condition+')',values).rowcount
+            tasks=db.execute("UPDATE agent_task_members SET hidden=1,summary='',summary_through=0 WHERE user_id=? AND hidden=0 AND task_id IN (SELECT d.id FROM agent_dialogues d WHERE "+condition+') RETURNING resource_conversation_id',values).fetchall()
+            workspaces=list(tasks)
             if not session:
-                sessions=db.execute("UPDATE agent_session_members SET hidden=1,summary='',cleared_at=?,cleared_through=(SELECT coalesce(max(m.id),0) FROM agent_dialogue_messages m JOIN agent_dialogues d ON d.id=m.dialogue_id WHERE d.session_id=agent_session_members.session_id),summary_through=0 WHERE user_id=? AND hidden=0 AND NOT EXISTS(SELECT 1 FROM agent_dialogues d WHERE d.session_id=agent_session_members.session_id AND d.status!='ended')",(now(),user['id'])).rowcount
-            else:sessions=0
-        return {'deleted':count,'sessions':sessions}
+                sessions=db.execute("UPDATE agent_session_members SET hidden=1,summary='',cleared_at=?,cleared_through=(SELECT coalesce(max(m.id),0) FROM agent_dialogue_messages m JOIN agent_dialogues d ON d.id=m.dialogue_id WHERE d.session_id=agent_session_members.session_id),summary_through=0 WHERE user_id=? AND hidden=0 AND NOT EXISTS(SELECT 1 FROM agent_dialogues d WHERE d.session_id=agent_session_members.session_id AND d.status!='ended') RETURNING resource_conversation_id",(now(),user['id'])).fetchall()
+                workspaces.extend(sessions)
+            else:sessions=[]
+            self.resources.release_workspaces(db,resources,[(user['id'],row[0]) for row in workspaces])
+        return {'deleted':len(tasks),'sessions':len(sessions)}
 
     async def delete(self,user,identifier):
         """删除本方记录；未完成任务先终止且不回传记忆，完成总结不随记录删除。"""
-        with self.database.connect(write=True) as db:
+        with ExitStack() as resources, self.database.connect(write=True) as db:
             row=self.owned(db,user,identifier)
             if row['status']!='ended':
                 self.close_record(db,identifier,'任务已提前删除','cancel',remember=False)
                 db.execute('UPDATE agent_dialogues SET revision=revision+1 WHERE id=?',(identifier,))
                 db.execute('DELETE FROM agent_pending_inputs WHERE task_id=? AND applied=0',(identifier,))
-            db.execute("UPDATE agent_task_members SET hidden=1,summary='',summary_through=0 WHERE task_id=? AND user_id=?",(identifier,user['id']))
+            member=db.execute("UPDATE agent_task_members SET hidden=1,summary='',summary_through=0 WHERE task_id=? AND user_id=? RETURNING resource_conversation_id",
+                              (identifier,user['id'])).fetchone()
+            if member and row['delivery_mode']!='message':
+                self.resources.release_workspaces(db,resources,[(user['id'],member[0])])
             db.execute('UPDATE agent_notifications SET deleted_at=? WHERE task_id=? AND user_id=?',(now(),identifier,user['id']))
         await self.interrupt(identifier)
         await self.flush_controls(identifier)
@@ -791,7 +803,7 @@ class AgentDialogues:
     # 只有双方均清理的原文才物理回收；个人记忆清理绝不触及另一方保留记录。
     def cleanup(self):
         self.resources.cleanup()
-        with self.database.connect(write=True) as db:
+        with ExitStack() as resources, self.database.connect(write=True) as db:
             RunStore.prune_in(db)
             # 修复旧版本已输出明确结束状态却被继续排队的任务，不重放模型。
             stale=db.execute('''SELECT d.id,m.content,m.id AS message_id FROM agent_dialogues d JOIN agent_dialogue_messages m ON m.id=(SELECT MAX(id) FROM agent_dialogue_messages WHERE dialogue_id=d.id) WHERE d.delivery_mode!='message' AND d.status IN ('queued','paused','awaiting_identity') AND m.speaker_role='agent' AND m.task_action='' AND NOT EXISTS(SELECT 1 FROM agent_pending_inputs WHERE task_id=d.id AND applied=0)''').fetchall()
@@ -801,11 +813,8 @@ class AgentDialogues:
                     db.execute("UPDATE agent_dialogue_messages SET state='ended',state_detail=? WHERE id=?",(reason,row['message_id']))
                     self.close_record(db,row['id'],reason or '分身已声明任务完成')
             # 未发送的独立任务草稿七天后回收；已创建任务的工作区不在此删除。
-            stale=db.execute("SELECT c.id FROM chat_conversations c JOIN agent_intents i ON i.conversation_id=c.id WHERE i.task_id IS NULL AND json_extract(i.document,'$.origin')='peer_task_draft' AND julianday(i.created_at)<julianday('now','-7 days') AND NOT EXISTS(SELECT 1 FROM agent_task_members WHERE resource_conversation_id=c.id) AND NOT EXISTS(SELECT 1 FROM agent_session_members WHERE resource_conversation_id=c.id)").fetchall()
-            for row in stale:
-                db.execute('DELETE FROM agent_intents WHERE conversation_id=?',(row['id'],))
-                db.execute('DELETE FROM chat_messages WHERE conversation_id=?',(row['id'],))
-                db.execute('DELETE FROM chat_conversations WHERE id=?',(row['id'],))
+            stale=db.execute("SELECT c.id,c.user_id FROM chat_conversations c JOIN agent_intents i ON i.conversation_id=c.id WHERE i.task_id IS NULL AND json_extract(i.document,'$.origin')='peer_task_draft' AND julianday(i.created_at)<julianday('now','-7 days') AND NOT EXISTS(SELECT 1 FROM agent_task_members WHERE resource_conversation_id=c.id) AND NOT EXISTS(SELECT 1 FROM agent_session_members WHERE resource_conversation_id=c.id)").fetchall()
+            self.resources.release_workspaces(db,resources,[(row['user_id'],row['id']) for row in stale])
             # 已保存到气泡的调用状态须保留，否则刷新后会丢失取消/确认结果。
             db.execute("DELETE FROM agent_intents WHERE julianday(created_at)<julianday('now','-1 day') AND message_id IS NULL AND status='pending'")
             db.execute('''DELETE FROM agent_dialogue_messages WHERE id IN (SELECT m.id FROM agent_dialogue_messages m JOIN agent_dialogues d ON d.id=m.dialogue_id
@@ -917,7 +926,7 @@ class AgentDialogues:
         from avatar.files.conversation.resources import original_hashes
         saved = []
         for row in rows:
-            path = self.chat.chat_files.directory.new(speaker_id,row['id']+'.blob')
+            path = self.chat.chat_files.directory.path(speaker_id,workspace,row['id']+'.blob')
             try:
                 actual, _ = original_hashes(path,row['size'])
             except FileNotFoundError:
@@ -1131,7 +1140,7 @@ class AgentDialogues:
                 row=self.chat.chat_files.owned(db,speaker_id,workspace,identifier)
                 if not row['referenced'] and identifier not in {item['id'] for item in self.saved_outputs(db,task,speaker_id,workspace)}:
                     raise HTTPException(409,'文件已取消引用')
-                with self.chat.chat_files.directory.new(speaker_id,identifier+'.blob').open('rb') as stream:
+                with self.chat.chat_files.directory.path(speaker_id,workspace,identifier+'.blob').open('rb') as stream:
                     return stream.read(8*1024*1024+1)
         async def sandbox(context, objective):
             inputs={file['id']:{'path':'inputs/'+file['id']+'/'+Path(file['filename']).name,'read':lambda identifier=file['id']:read_input(identifier)} for file in [*files,*saved]}
