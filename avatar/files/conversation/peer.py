@@ -297,7 +297,7 @@ class PeerResources:
             grants={item['id']:item['sha256'] for item in selected if item['conversation_id']==workspace}
         held=json.loads(current['agent_checkpoint'] or '{}')
         ids=held.get('file_ids',()) if held.get('speaker_id')==owner else ()
-        if ids and held.get('source_revision')==self.dialogues.output_revision(db,current,owner,selected):
+        if ids and held.get('source_revision')==self.dialogues.output_revision(db,current,owner,selected,style=held.get('peer_style')):
             rows=db.execute("""SELECT id,sha256,size FROM chat_files WHERE user_id=? AND conversation_id=?
                 AND origin='generated' AND id=ANY(?::text[])
                 AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))""",(storage_owner,workspace,list(ids)))

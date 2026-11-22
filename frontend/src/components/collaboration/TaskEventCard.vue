@@ -16,12 +16,13 @@ const state = computed(() => {
   if (task.rejected) return 'rejected'
   if (task.auto_retrying || task.status === 'awaiting_identity') return 'retrying'
   if (task.can_retry) return 'retry_timeout'
+  if (task.sending_prepared && task.status === 'running') return 'sending'
   const status = string(task.status) || string(task.state) || 'submitted'
   if (status !== 'awaiting_input') return status
   if (typeof task.can_supplement === 'boolean') return task.can_supplement ? 'awaiting_self_input' : 'awaiting_peer_input'
   return task.needs_confirmation ? 'awaiting_self' : 'awaiting_other'
 })
-const labels:Record<string,string>={awaiting_self_input:'等待本人补充信息',awaiting_peer_input:'等待对方补充信息',awaiting_self:'等待本人确认',awaiting_other:'等待对方确认',ended:'任务已结束',awaiting_input:'等待用户',submitted:'请求已提交',queued:'处理中',running:'分身正在回答',awaiting_acceptance:'等待对方确认',awaiting_identity:'正在自动重试',retrying:'正在自动重试',retry_timeout:'重试已超时',paused:'已暂停',failed:'处理失败',cancelled:'已取消',rejected:'任务已拒绝'}
+const labels:Record<string,string>={awaiting_self_input:'等待本人补充信息',awaiting_peer_input:'等待对方补充信息',awaiting_self:'等待本人确认',awaiting_other:'等待对方确认',ended:'任务已结束',awaiting_input:'等待用户',submitted:'请求已提交',sending:'正在发送',queued:'处理中',running:'分身正在回答',awaiting_acceptance:'等待对方确认',awaiting_identity:'正在自动重试',retrying:'正在自动重试',retry_timeout:'重试已超时',paused:'已暂停',failed:'处理失败',cancelled:'已取消',rejected:'任务已拒绝'}
 usePolling(async signal => {
   const result = await request<{task:Record<string,unknown>}>(`/agent-dialogues/${encodeURIComponent(taskId.value)}`, 'GET', undefined, signal)
   if (!signal.aborted) live.value = result.task
