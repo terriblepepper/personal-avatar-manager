@@ -13,7 +13,7 @@ from avatar.core.text_budget import AgentText, fits_text_budget, budget_error
 from avatar.core.db import dump, now
 from avatar.core.tokens import estimate
 from avatar.files.library.catalog import fit_catalog, model_animation_metadata
-from avatar.conversation.avatar_assistant import normalized
+from avatar.conversation.avatar_assistant import CatalogArguments, LIST_AVATARS, QueryArguments, normalized
 from avatar.core.execution import call_with_retry, recoverable, run_blocking
 
 
@@ -72,17 +72,6 @@ def delivery_history(db, owner, conversation, directory):
             for row in reversed(rows)]
 
 
-class QueryArguments(BaseModel):
-    """目录与旧助手目标选择共用的公开搜索输入。"""
-    model_config=ConfigDict(extra='forbid', str_strip_whitespace=True)
-    query: str=Field(default='', max_length=200)
-
-
-class CatalogArguments(QueryArguments):
-    """公开目录保留每页十条，模型根据用户要求传入分页偏移。"""
-    offset: int=Field(default=0,ge=0,le=2**31-1)
-
-
 def declaration(name, description, parameters):
     """将领域输入约束转换为模型可见的函数工具声明。"""
     return {'name': name, 'description': description, 'parameters': parameters}
@@ -94,7 +83,7 @@ TOOLS=[
     declaration('contact_avatar', '仅本轮明确要求联系其他分身时生成可编辑草稿。用户明确向某人发送消息、文件或任务时使用；若本轮明确应答紧邻的待澄清请求，可从该请求解析收件人和文件。不可从无关历史沿用目标；不得声称已发送。目标名称只作为搜索词。预约、交易等需本人明确的事项标记 requires_owner_confirmation。用户未要求转发时不要共享历史内容。', ContactArguments.model_json_schema()),
     declaration('deliver_material', '选此工具把本人资料库里的现有原件交付到当前对话。判断依据是本轮用户的请求；历史只能解析指代。请解析主题和文件要求，多个独立目标用 queries 分开。索要其他文件才排除已交付项。新制作、只解释、否定或发给他人时不要调用。', MaterialArguments.model_json_schema()),
     declaration('continue_answer', '普通提问、技能或文件处理，继续由当前分身回答。提及别的分身并不代表要联系对方；否定联系请求也用此工具。', {'type':'object', 'properties':{}, 'additionalProperties':False}),
-    declaration('list_avatars', '用户需要查询平台公开分身目录，query 为名称、AIC 或筛选词，未指定则留空。每页10条，offset 为分页偏移。', CatalogArguments.model_json_schema()),
+    LIST_AVATARS,
     declaration('application_status', '查询当前用户的申请状态，不联系其他分身。', {'type':'object', 'properties':{}, 'additionalProperties':False}),
     declaration('select_avatar', '仅供旧助手兼容入口：用户希望直接向指定分身提问。Web 本人对话应使用 contact_avatar 联系对方。', QueryArguments.model_json_schema()),
     declaration('return_to_self', '仅供旧助手兼容入口：用户明确返回本人分身或退出之前的目标。', {'type':'object', 'properties':{}, 'additionalProperties':False}),

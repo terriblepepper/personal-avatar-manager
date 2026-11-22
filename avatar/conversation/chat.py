@@ -171,7 +171,6 @@ class AvatarChat:
             raise HTTPException(403, '教师注册尚未审核通过')
         if not agent and target_row is None:
             raise HTTPException(409, '审核并创建成功后才能与分身对话')
-        catalog=self.assistant_router.catalog()
         with self.service.database.connect() as db:
             # 读取事务固定身份、模型、文件、技能与集合日期，避免并发隐私修改混用上下文。
             db.execute('BEGIN')
@@ -206,8 +205,6 @@ class AvatarChat:
             if skills:
                 background['available_skills']=skills
                 background['_skills_revision']=skill_date
-            background['platform_avatars']=[{'name':item['name'],'aic':item['aic']} for item in catalog][:20]
-            background['platform_directory_rules']='可以查询平台已注册且已审核的公开分身目录；这里只包含公开名称和 AIC，没有账号、联系方式或私密资料。'
             background['attachments']=self.service.attachments.public_context(row['user_id'],question=request.message,db=db,target_aic=row['aic'],include_private=private_access)
         try:
             require_complete(config)
@@ -363,6 +360,7 @@ class AvatarChat:
                 include_private=bool(overview.get('_private_context')), sandbox=sandbox if enabled else None,
                 session_file_scope=parent_id if own_files or files else None, session_file_owner=user['id'],
                 session_file_grants=None if own_files else lambda db:explicit_grants,
+                directory_reply=self.assistant_router.catalog_reply,
                 status=(lambda:self.assistant_reply(self.service.overview(user['id']),'')) if overview.get('_private_context') and overview['agent']['user_id']==user['id'] else None,
                 progress=progress)
             overview['_validate_sandbox'] = context[0]['_validate_entry_results']
