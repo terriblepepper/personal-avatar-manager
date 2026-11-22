@@ -49,6 +49,14 @@ def public_event(event):
         return event
     public={key:event[key] for key in ('type','id','group','name','phase','status','started_at','finished_at')
             if key in event}
+    if event.get('group') in ('model_io','tool_io'):
+        # Projected at the model boundary according to the executing owner's scope; never include transport fields.
+        for section, fields in (('input', ('message','message_chars','history_turns','tools','tool_count','attempt','tool','arguments')),
+                                ('output', ('text','text_chars','kind','received_bytes','tool_calls','finish_reason','reason','status_code','attempt','result'))):
+            data = event.get(section)
+            if isinstance(data, dict):
+                public[section] = {key:data[key] for key in fields if key in data}
+        return public
     for section in ('input','output'):
         data=event.get(section)
         if not isinstance(data,dict):continue
@@ -140,7 +148,7 @@ def continue_task(chat, user, request, parent, task):
     if evidence:
         history = [*history, {'role':'assistant','content':evidence}]
     context=({**cfg,'_resume_history':history,'_agent_checkpoint':task['checkpoint'],'_agent_saved_files':artifacts,'_agent_persisted_file_ids':task['outputs'],'_sandbox_receipts':receipts,
-              '_resume_results_only':bool(receipts) and request.message.strip() in ('继续','继续。','continue') and '相同的沙箱操作' in task['snapshot']['status']},key,system,history)
+              '_resume_results_only':bool(receipts) and (request.agent_control=='retry' or not request.message.strip())},key,system,history)
     return overview,context,dict(session),work
 
 

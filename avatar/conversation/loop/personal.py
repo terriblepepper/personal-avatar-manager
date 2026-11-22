@@ -144,6 +144,8 @@ def attach(chat, user, original, parent, session, overview, context, job, held, 
     if state.get('binding'):
         check_sources(state['sources'],sources)
         for key in ('answer_route','material_delivery'):
+            if original.agent_control=='continue' and original.message.strip():
+                continue
             if not config.get('_'+key) and state['binding'].get(key):
                 binding[key] = state['binding'][key]
                 config['_'+key] = binding[key]

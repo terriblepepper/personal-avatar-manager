@@ -195,6 +195,10 @@ class ToolFragments:
         else:
             self.pending_gemini.pop(key, None)
 
+    def names(self):
+        return [name.getvalue() for name, _ in self.openai.values() if name.tell()<=128] + [
+            name for name, _, _ in self.anthropic.values()] + [p['functionCall'].get('name','') for p in self.gemini]
+
     def response(self, fmt, text, usage, reason, thinking, refusal):
         if fmt=='openai':
             tools=[{'index':index,'function':{'name':name.getvalue(),'arguments':args.getvalue()}} for index,(name,args) in sorted(self.openai.items())]
@@ -218,8 +222,10 @@ async def stream_response(model, config, api_key, system, history, message, *, c
     expires = asyncio.get_running_loop().time() + attempts * generation_deadline(config)
     for attempt in range(attempts):
         await check_execution_async()
+        from avatar.models.trace import ModelExchange
+        exchange = ModelExchange(config, api_key, attempt+1)
         try:
-            async with asyncio.timeout_at(expires), aclosing(_stream_once(model,config,api_key,system,history,message,collect)) as source:
+            async with asyncio.timeout_at(expires), aclosing(_stream_once(model,config,api_key,system,history,message,collect,exchange)) as source:
                 async for event in source:
                     yield event
             return
@@ -227,8 +233,13 @@ async def stream_response(model, config, api_key, system, history, message, *, c
             error = unconfirmed_response(504, '本步模型调用已用完总等待时间，仍未收到完整结果。可重试或结束任务。')
             error.stream_exhausted = True
             error.stop_reason = 'interrupted'
+            exchange.fail(error)
             raise error from None
+        except (asyncio.CancelledError, GeneratorExit) as error:
+            exchange.fail(error)
+            raise
         except HTTPException as error:
+            exchange.fail(error)
             if not getattr(error,'stream_interrupted',False):
                 raise
             logging.getLogger(__name__).warning('Model stream interrupted purpose=%s attempt=%d/6',
@@ -255,8 +266,9 @@ def usage_event(result, config):
 # 职责：请求上游模型并解析为平台无关的可见事件。
 # 输入：model 提供请求构建、解析器及传输；其余参数为已审核模型上下文。
 # 结果与约束：HTTPS 固定公网 IP 并保留原 Host/SNI，输出连接/生成状态、文本与用量；过滤思考内容，完整 JSON 一次输出，缺终止标记拒绝作为成功结果。
-async def _stream_once(model, config, api_key, system, history, message, collect):
+async def _stream_once(model, config, api_key, system, history, message, collect, exchange):
     fmt, endpoint, headers, body = model.build_request(config, api_key, system, history, message, streaming=True)
+    exchange.start(fmt,body)
     url = httpx.URL(endpoint)
     model.validate_endpoint(url)
     yield {'type': 'status', 'stage': 'connecting', 'message': '连接模型平台'}
@@ -282,7 +294,13 @@ async def _stream_once(model, config, api_key, system, history, message, collect
                     async for chunk in response.aiter_bytes():
                         check_size('完整 JSON',len(payload)+len(chunk),content_limit)
                         payload.extend(chunk)
-                    result = parse_response(fmt,load_model_json(payload),config=config,request_id=request_id(response.headers),api_key=api_key)
+                    data = load_model_json(payload)
+                    try:
+                        result = parse_response(fmt,data,config=config,request_id=request_id(response.headers),api_key=api_key)
+                    except HTTPException:
+                        exchange.proposed(fmt,data)
+                        raise
+                    exchange.complete(result)
                     if collect:
                         yield {'type':'result','result':result}
                         return
@@ -377,18 +395,26 @@ async def _stream_once(model, config, api_key, system, history, message, collect
                         visible|=bool(text.strip())
                         if assemble: chunks.write(text)
                         if not collect: yield {'type': 'delta', 'text': text}
+                    if text or fragments.size > size_before:
+                        exchange.delta(text,fragments)
                 if refusal and not finished:
                     raise empty_response(fmt,reason=reason,refusal=True,usage=usage,request_id=request_id(response.headers),config=config)
                 if not complete():
                     raise interrupted()
                 if assemble:
                     data = fragments.response(fmt,chunks.getvalue(),usage,reason,thinking,refusal)
-                    result = parse_response(fmt,data,config=config,request_id=request_id(response.headers),api_key=api_key)
+                    try:
+                        result = parse_response(fmt,data,config=config,request_id=request_id(response.headers),api_key=api_key)
+                    except HTTPException:
+                        exchange.proposed(fmt,data)
+                        raise
+                    exchange.complete(result)
                     yield {'type':'result','result':result} if collect else usage_event(result, config)
                     return
                 model_usage = usage_summary(usage, fmt)
                 check_terminal(reason, model_usage)
                 if not visible:raise empty_response(fmt,reason=reason,thinking=thinking and not action,refusal=refusal,usage=usage,request_id=request_id(response.headers),config=config)
+                exchange.complete(reason=reason)
                 yield {'type': 'usage', 'usage': model_usage, **({'finish_reason': reason} if config.get('_avatar_agent') else {})}
     except TimeoutError as error:
         if receiving: raise interrupted() from None

@@ -190,7 +190,7 @@
 - `POST /api/conversations/{conversation_id}/diagrams/promote` 接收 `source`、可选 `caption`、`visibility` 和 `new_name`，保存为 `.mmd` 源码资料。缓存 ID 转存接口也保存源码。会话附件转存接口同样接受可选的 `new_name`，文件名须保留原后缀。
 - `POST /api/conversations/{conversation_id}/animations/lookup` 接收 `source`，按当前账户和规范化内容查找真实资料。返回 `attachment_id` 与 `already_exists`。未转存时 ID 为空。
 - `POST /api/conversations/{conversation_id}/animations/promote` 接收 `source` 及可选的 `caption`、`visibility`、`folder`、`new_name`。成功时返回资料 ID 与是否复用了已有资料。超时后可用相同源码查询或重试。
-- 会话工具设置沿用 `{"tools":{"animation":true}}`。开启「制作动画」后，每轮须取得 `create_animation` 的动画回执。自定义动画传入 HTML 源码，模板动画传入模板名、标题与分镜。模型选择 `2d`（默认）或 `3d`。关闭时可按需制作。通用网页由模型自主调用 `create_html`，只接收 `filename` 和 `html`。
+- 会话工具设置沿用 `{"tools":{"animation":true}}`。开启「制作动画」后，每轮须取得 `create_animation` 的动画回执。动画传入 filename、html、duration_seconds 和 render_frame，由平台注入可暂停、播放、拖动的时间轴。模型选择 `2d`（默认）或 `3d`。关闭时可按需制作。通用网页由模型自主调用 `create_html`，只接收 `filename` 和 `html`。
 - `GET /api/me/attachments/{id}/preview-text` 在本人权限内从 DOCX 原件提取纯文本供小窗阅读。原始排版和图片保留在可下载的原件中。
 - 本人会话通过 `find_material` 查询本人已上传的全部类型原件。`mode=directories` 分页列出逻辑目录，`mode=files` 可按 `folder` 限定子树，再按名称、模糊词或已发布的正文索引返回可发送的 file_id。无索引仍能列出原件。saved_at 为空表示尚未显式保存资料设置；本人发送、历史和任务回放统一按所有权及本次授权快照核验。同实例接收方通过 `find_public_material` 浏览可转交的已公开、已保存资料。模型可继续按关键词查询或翻页，以 `select_materials({file_ids,reply})` 选择本轮目录中一至五份原件并撰写正文，或通过 `clarify_material` 请求澄清。普通工具循环也可调用 `send_material`。`find_animation` 和 `send_animation` 可限定历史动画和已转存的 HTML 动画。成功提交的资料附件带有 `origin: "material"` 与授权的 `download_url`，读取原件仍需本人身份。底部资料胶囊列出已提交的文件；正文可选用独占一行的 `[[attachment:ID]]` 在指定位置展示同一份附件。历史和重放重新核对有效原件。
 

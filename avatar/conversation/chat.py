@@ -263,7 +263,7 @@ class AvatarChat:
     # 结果与约束：存在模型上下文时委托记忆服务，压缩计费用量归目标所有人；纯本地引导返回 None。
     async def prepare(self, user, request, overview, context, session, progress=None):
         activity=ToolActivity(overview.setdefault('_tool_events',[]),progress)
-        with activity.track() as emit:
+        with activity.track(private_io=bool(overview.get('_private_context') and (overview.get('agent') or {}).get('user_id')==user['id'])) as emit:
             emit({'type': 'status', 'stage': 'intent_analysis', 'message': '正在分析本轮目标和可用信息'})
             return await self._prepare(user,request,overview,context,session,emit)
 
@@ -321,21 +321,12 @@ class AvatarChat:
                 tools=[item for item in tools if item['id']=='animation']
             enabled=next((tool['enabled'] for tool in tools if tool['id']=='python'),False)
             context=({**context[0],'_conversation_tools':tools,'_animation_request':request.message},*context[1:])
-            route=context[0].get('_answer_route')
-            resumed=bool(config.get('_resume_sandbox') or config.get('_agent_checkpoint',{}).get('sandbox_attempted'))
-            if route is None and enabled and self.dialogues and not resumed:
-                # Compatibility entry points may reach prepare without the personal conversation router.
-                route=await self.dialogues.intent.answer_route(overview['agent']['user_id'],session['id'],context,request.message)
-                context=({**context[0],'_answer_route':route},*context[1:])
-            context=await self.rag.enrich(overview['agent']['user_id'],overview['agent']['aic'],session,files,context,request.message,include_private=bool(overview.get('_private_context')),progress=progress)
-            needs_python=bool(route and route.get('mode')=='agent' and route.get('needs_python') is True)
-            if needs_python or resumed:
+            async def sandbox(context, objective):
                 inputs={}
                 if enabled and overview.get('_private_context'):
                     from avatar.conversation.jobs.pipeline import sandbox_inputs
                     inputs=await asyncio.to_thread(sandbox_inputs,self,user['id'],parent_id,files,context[0].get('_agent_saved_files',()),request.agent_pause_id)
-                context=await self.skill_execution.enrich(overview['agent']['user_id'],context,request.message,self.model_client,caller_id=user['id'],conversation_id=session['id'],parent_id=parent_id,inputs=inputs,progress=progress,enabled=enabled,allow_code=enabled)
-            overview['_validate_sandbox'] = context[0].get('_validate_sandbox')
+                return await self.skill_execution.enrich(overview['agent']['user_id'],context,objective,self.model_client,caller_id=user['id'],conversation_id=session['id'],parent_id=parent_id,inputs=inputs,progress=progress,enabled=enabled,allow_code=enabled)
             overview['_generated_files'] = context[0].setdefault('_generated_files', [])
             # Enrichment can add evidence after memory.prepare. Fit this working copy without reloading the old turns.
             from avatar.conversation.working_context import fit_turn
@@ -350,6 +341,12 @@ class AvatarChat:
             if overview.get('_private_context') and overview['agent']['user_id']==user['id']:
                 recent = await asyncio.to_thread(self._deliveries,user['id'],session['id'])
                 context=({**context[0],'_material_owner':user['id'],'_material_history':recent},*context[1:])
+            from avatar.conversation.loop.entry_tools import bind_entry_tools
+            context = await bind_entry_tools(self,context,overview['agent']['user_id'],overview['agent']['aic'],session,files,
+                include_private=bool(overview.get('_private_context')), sandbox=sandbox if enabled else None,
+                status=(lambda:self.assistant_reply(self.service.overview(user['id']),'')) if overview.get('_private_context') and overview['agent']['user_id']==user['id'] else None,
+                progress=progress)
+            overview['_validate_sandbox'] = context[0]['_validate_entry_results']
             return context
         if request.attachment_ids:raise HTTPException(422,'请先选择一个分身，再发送附件提问')
         return None
@@ -451,7 +448,12 @@ class AvatarChat:
                 return dict(db.execute('SELECT * FROM chat_conversations WHERE id=? AND user_id=?',(parent['id'],user['id'])).fetchone())
         parent = await asyncio.to_thread(current_parent)
         declared = json.loads(parent['tools_config']).get('animation') is True
-        decision=await self.dialogues.trigger(user,request.message,parent,request.personal or request.channel=='avatar') if self.dialogues else None
+        overview = await asyncio.to_thread(self.service.overview,user['id'])
+        own = overview['agent']
+        # A personal chat already has its responder. Tool selection belongs to that responder's loop.
+        known_responder = request.personal and own and own.get('identity_status')=='active'
+        decision = (await self.dialogues.trigger(user,request.message,parent,request.personal or request.channel=='avatar')
+                    if self.dialogues and not known_responder else None)
         if decision and decision.get('intent'):
             overview=await asyncio.to_thread(self.service.overview,user['id']);overview['_intent']=decision['intent']
             return overview,None,parent,decision['reply']
@@ -482,8 +484,6 @@ class AvatarChat:
             child=self.assistant_router.child(self.memory,user['id'],parent,target)
             overview['_target']={'aic':target['aic'],'name':target['name']};overview['_parent_id']=parent['id']
             return overview,context,child,None
-        overview=await asyncio.to_thread(self.service.overview,user['id'])
-        own=overview['agent']
         if not own:return overview,None,parent,None
         overview,context=await asyncio.to_thread(self.context,user,request,own,private_access=True,run_parent=parent['id'])
         if action=='deliver_material' and not declared:
@@ -567,55 +567,13 @@ class AvatarChat:
                     if not (previous and previous.get('binding')) and held.get('retry_dispatch'):
                         overview,context,session,local_reply=await self.dispatch(user,request,parent)
                         overview['_prior_tool_events']=held.get('activity', []) if held.get('sources') else []
-                    elif (not (previous and previous.get('binding')) and not config.get('_answer_route') and self.dialogues and overview.get('_private_context') and overview['agent'].get('identity_status')=='active'
-                            and not session.get('parent_id') and (not config.get('_agent_saved_files') or bool(original.message.strip()))
-                            and not config.get('_agent_checkpoint',{}).get('sandbox_attempted')):
-                        steps = AgentSteps(ToolActivity(route_records, route_events.append).emit)
-                        with steps.step('reason', {'stage':'resume_route'}) as trace:
-                            for event in route_events:
-                                yield pauses.public_event(event)
-                            route_events.clear()
-                            decision = await self.dialogues.intent.choose_tool({'user': user, 'message': request.message,
-                                                'parent': parent, 'personal': True, 'resume': True})
-                            trace['action'] = decision['action']
-                            arguments = decision.get('arguments', {})
-                            if decision['action']=='contact_avatar':
-                                from avatar.conversation.collaboration.intent import CONTACT_REPLY
-                                overview['_contact_draft']=await asyncio.to_thread(self.dialogues.intent.loop_draft,user['id'],parent['id'],request.message,arguments,())
-                                context=None
-                                session=parent
-                                local_reply=CONTACT_REPLY
-                            elif decision['action']=='find_conversation_files':
-                                observation=await asyncio.to_thread(self.chat_files.discover,user['id'],parent['id'],arguments['query'],arguments['offset'])
-                                prefix,raw=context[2].split('\n',1)
-                                background=json.loads(raw)
-                                background['completed_tool_read']={'tool':decision['action'],'result':observation}
-                                context=(config,context[1],prefix+'\n'+dump(background),context[3])
-                            elif decision['action']=='deliver_material':
-                                context=({**config,'_material_delivery':arguments},*context[1:])
-                            elif decision['action']=='continue_answer':
-                                context=({**config,'_answer_route':{'mode':'answer',**arguments}},*context[1:])
-                        overview['_tool_events'] = route_records
-                        for event in route_events:
-                            yield pauses.public_event(event)
                 elif recovering:
                     yield {'type':'status','stage':'resuming','message':'正在恢复已核验的任务进度'}
                     overview,context,session,local_reply=await asyncio.to_thread(personal.restore,self,user,request,parent,previous)
                     overview['_tool_events']=route_records
                 else:
-                    trace = AgentSteps(ToolActivity(route_records, route_events.append).emit)
-                    trace.point('perceive', {'request': request.message}, {'conversation_id': parent['id']})
-                    with trace.step('reason', {'stage': 'route', 'personal': request.personal}) as decision:
-                        for event in route_events:
-                            yield pauses.public_event(event)
-                        route_events.clear()
+                    with ToolActivity(route_records, route_events.append).track(private_io=False):
                         overview,context,session,local_reply=await self.dispatch(user,request,parent)
-                        action = ('deliver_material' if context and context[0].get('_material_delivery') else
-                                  'contact_avatar' if overview.get('_intent') else
-                                  'local_reply' if local_reply else overview.get('_observed_route','continue_answer'))
-                        decision['action'] = action
-                        if context and context[0].get('_answer_route'):
-                            decision['mode'] = context[0]['_answer_route']['mode']
                     overview['_tool_events'] = route_records
                     for event in route_events:
                         yield pauses.public_event(event)
@@ -646,7 +604,7 @@ class AvatarChat:
                             await check_execution_async()
                             events.put_nowait({'type': 'skills', 'items': overview.get('_used_skills', [])})
                             events.put_nowait({'type': 'tools', 'mermaid': prepared[0].get('_mermaid_enabled', True)})
-                            with ToolActivity(overview['_tool_events'], events.put_nowait).track() as emit:
+                            with ToolActivity(overview['_tool_events'], events.put_nowait).track(private_io=bool(overview.get('_private_context') and overview['agent']['user_id']==user['id'])) as emit:
                                 async with aclosing(self.rag.stream(prepared, request.message, progress=emit)) as source:
                                     async for event in source:
                                         events.put_nowait(event)

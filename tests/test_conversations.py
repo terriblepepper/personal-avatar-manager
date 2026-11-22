@@ -365,7 +365,11 @@ def test_sandbox_inputs_cannot_expand_after_submission(context,jobs,monkeypatch)
     async def memory(session,modified,context,*args,**kwargs):return context
     async def skills(uid,context,*args,**kwargs):return context
     async def rag(uid,aic,session,files,context,*args,**kwargs):return context
-    async def execute(uid,context,*args,inputs,**kwargs):captured.update(inputs);return context
+    async def execute(uid,context,*args,inputs,**kwargs):
+        captured.update(inputs)
+        prefix, data = context[2].split('\n',1)
+        evidence = {**json.loads(data), 'skill_execution_results':[{'status':'success'}]}
+        return context[0],context[1],prefix+'\n'+json.dumps(evidence),context[3]
     monkeypatch.setattr(chat.memory,'prepare',memory)
     monkeypatch.setattr(chat.memory,'needs_compression',lambda *args:False)
     monkeypatch.setattr(chat.skills,'load_context',skills)
@@ -373,9 +377,12 @@ def test_sandbox_inputs_cannot_expand_after_submission(context,jobs,monkeypatch)
     monkeypatch.setattr(chat.skill_execution,'enrich',execute)
     overview={'agent':{'user_id':user['id'],'aic':'aic','last_modified_at':''},'_private_context':True}
     session={'id':cid,'parent_id':None}
-    route={'mode':'agent','needs_python':True}
-    context=({'context_tokens':32768,'max_tokens':16,'_answer_route':route},'key','system\n'+json.dumps({'available_skills':[]}),[])
-    with generation_scope(job):asyncio.run(chat.prepare(user,request(cid,'inputs'),overview,context,session))
+    context=({'context_tokens':32768,'max_tokens':16},'key','system\n'+json.dumps({'available_skills':[]}),[])
+    async def use_sandbox():
+        prepared=await chat.prepare(user,request(cid,'inputs'),overview,context,session)
+        assert not captured
+        await prepared[0]['_execute_entry_tool']('python',{'query':'读取可用输入'})
+    with generation_scope(job):asyncio.run(use_sandbox())
     assert original in captured and late not in captured
     assert captured[original]['read']()==b'original'
     with store.database.connect(write=True) as db:db.execute('DELETE FROM attachments WHERE id=?',(original,))
