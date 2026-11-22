@@ -68,7 +68,8 @@ def public_event(event):
         fields={k:data[k] for k in ('goal_no','iteration','planned_steps','file_count','count','accepted_bytes')
                 if type(data.get(k)) is int}
         for key,allowed in (('tool',_PUBLIC_ACTIONS),('action',_PUBLIC_ACTIONS),('stage',('route','resume_route')),
-                            ('operation',('check_file_receipt','select_materials')),('mode',('read','search','answer'))):
+                            ('operation',('check_file_receipt','select_materials')),('mode',('read','search','answer')),
+                            ('file_access',('directory','content'))):
             if isinstance(data.get(key),str) and data[key] in allowed:
                 fields[key]=data[key]
         for key in ('tools','tool_names'):

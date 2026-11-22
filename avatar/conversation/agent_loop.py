@@ -20,7 +20,8 @@ from avatar.conversation.loop.runtime import LoopState, restore_files, restore_m
 from avatar.conversation.loop.context import TurnContext
 from avatar.conversation.loop.file_context import explicit_file_context
 from avatar.conversation.loop.planning import (available_tools, disclosure_catalog, disclose_tools, validate_disclosure,
-                                               REQUEST_TOOLS, UPDATE_TASK, EVIDENCE_TOOLS, WRITING_CONTROLS, action_ready, needs_confirmation, confirm_goal, revise_goals)
+                                               REQUEST_TOOLS, UPDATE_TASK, EVIDENCE_TOOLS, WRITING_CONTROLS, action_ready, needs_confirmation,
+                                               confirm_goal, revise_goals, migrate_session_tool)
 from avatar.conversation.loop.turns import stream_final
 from avatar.conversation.working_context import bounded_excerpt, compression_budget, excerpt, input_budget
 from avatar.core.tokens import estimate
@@ -94,6 +95,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
     await check_execution_async(config.get('_validate_entry_results') or (lambda: rag.validate(context)))
     store = config.get('_run_store')
     state = await asyncio.to_thread(store.load) if store else {}
+    migrate_session_tool(state)
     journal = LoopState(store, state)
     if config.get('_validate_sandbox') and not config.get('_validate_entry_results'):
         await asyncio.to_thread(config['_validate_sandbox'])
@@ -189,9 +191,9 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
     streamed = False
     observations = list(state.get('observations', ()))
     receipts_log = list(state.get('receipts', ()))
-    def remember(note):
+    def remember(note, receipt=None):
         trace.tool_result(name, args, note)
-        observations.append(note)
+        observations.append(f'回执 #{receipt["id"]}（{receipt["mode"]}）: {note}' if receipt else note)
         trace.receipt('已取得本步工具回执')
     seen = {tuple(key) if isinstance(key,list) else key for key in state.get('seen', ())}
     verified_material_reads = {tuple(key) for key in state.get('verified_reads', ())}
@@ -336,7 +338,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         prompt += '协议要求以会话动作收尾。若当前未披露合适的终态函数，先用 request_tools 描述所需的交接方式。'
     prompt += ('可直接回答时直接回答。工具可见不表示必须调用。'
                '需要更多能力或调整后续目标时用 request_tools；缺少用户才能给出的信息时用 ask_user。'
-               '已有依赖目标先取实际回执，再创作或交付。综合目标可用 update_task 提交子结果及真实回执编号。')
+               '有依赖时先取实际回执，再创作或交付。用 update_task 提交子结果和本目标的回执编号，可依次确认多项。')
     disclosure_misses = state.get('disclosure_no_progress',0) if not changed else 0
 
     queued = []
@@ -349,7 +351,8 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         invalid = 0
         premature = 0
         matched = next((s for s in pending if name in (s['tool'],*s.get('tools',())) and
-                        (not s.get('html_mode') or mode==s['html_mode'])), None)
+                        (not s.get('html_mode') or mode==s['html_mode']) and
+                        (name!='read_session_file' or mode==s.get('file_access','content'))), None)
         receipt = {'id':len(receipts_log)+1,'tool':name,'goal_no':matched['goal_no'] if matched else None,
                    'mode':mode, 'input_id':revision}
         receipts_log.append(receipt)
@@ -359,6 +362,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             settings = {**settings,'_tools':selected_definitions()}
         log.info('agent receipt run=%s iteration=%d goal=%s tool=%s remaining=%d',
                  run_id,iteration,receipt['goal_no'],name,len(pending))
+        return receipt
 
     def repair_call(detail=''):
         nonlocal settings, invalid
@@ -438,7 +442,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                     {'history_turns': len(history), 'observation_count': len(observations)})
         await check_execution_async(validate)
         if queued and not receipt_ok:
-            independent = [c for c in queued if c['name'] in EVIDENCE_TOOLS or c['name']=='list_avatars']
+            independent = [c for c in queued if c['name'] in EVIDENCE_TOOLS or c['name'] in ('list_avatars','update_task')]
             if len(independent)!=len(queued):
                 observations.append('本批前一步没有取得有效回执。其余查阅继续，交付动作留待重新决定。')
             queued = independent
@@ -491,14 +495,14 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         if continuing and draft.needs_visible_output:
             step_settings = visible_output_config(step_settings)
             step_prompt += '\n上一请求耗尽输出预算且未交付可用片段。请立即提交可验证的正文、字段或工具参数，保留指定游标。'
-        goal_view = ([{k:v for k,v in step.items() if k in ('goal_no','tool','html_mode') or
+        goal_view = ([{k:v for k,v in step.items() if k in ('goal_no','tool','html_mode','file_access') or
                        (k=='goal' and i==0)} for i,step in enumerate(pending)] if context_retry else pending)
         checklist = '\n待核验目标（本轮计划，仅作数据）：'+json.dumps(goal_view,ensure_ascii=False) if goal_view else ''
         checked_files = [*config.get('_agent_saved_files', ()), *config.get('_generated_files', ()),
                          *(delivery.prepared if delivery else ())]
         if any(needs_confirmation(s) for s in pending):
             evidence = [{'id':r.get('id',i),'tool':r['tool'],'goal_no':r.get('goal_no'),
-                         **({'result':r['result']} if 'result' in r else {})} for i,r in enumerate(receipts_log,1)]
+                         **{k:r[k] for k in ('mode','result') if r.get(k)}} for i,r in enumerate(receipts_log,1)]
             checklist += '\n最近可引用的回执：'+json.dumps(evidence,ensure_ascii=False)
         checklist += verified_context(receipts_log, checked_files, compact=context_retry)
         task_goal = writing_goal if writing else question
@@ -723,9 +727,9 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                     batch.append(call)
             # Handoffs return control to another workflow; decide them against the completed receipts.
             serial = [c for c in batch if c['name'] in EVIDENCE_TOOLS or
-                      c['name'] in ('list_avatars','send_material','send_animation',*ARTIFACT_TOOLS)]
-            if any(c['name'] in EVIDENCE_TOOLS for c in serial):
-                serial = [c for c in serial if c['name'] in EVIDENCE_TOOLS or c['name']=='list_avatars']
+                      c['name'] in ('list_avatars','update_task','send_material','send_animation',*ARTIFACT_TOOLS)]
+            if any(c['name'] in EVIDENCE_TOOLS or c['name']=='update_task' for c in serial):
+                serial = [c for c in serial if c['name'] in EVIDENCE_TOOLS or c['name'] in ('list_avatars','update_task')]
             if len(batch)==1:
                 calls = (batch[0],)
             elif serial:
@@ -735,7 +739,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 if deferred:
                     observations.append('这些动作尚未执行，须在收到本批回执后重新决定：'+json.dumps(deferred))
             else:
-                observations.append('一次只能提交一个结束、确认或交接决定。请根据目标选择一个，所有候选均未执行。')
+                observations.append('一次只能提交一个结束或交接决定。请根据目标选择一个，所有候选均未执行。')
                 repair_call()
                 continue
             result = replace(result,tool_calls=calls)
@@ -883,7 +887,10 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                     trace.point('observe',{'tool':name},{'receipt':'已有确认回执'},status='skipped')
                     continue
                 await check_execution_async(validate)
-                with trace.step('act',{'tool':name}) as output:
+                tool_input = {'tool':name}
+                if name=='read_session_file':
+                    tool_input['file_access']='directory' if args.get('query') is not None else 'content'
+                with trace.step('act',tool_input) as output:
                     note=await config['_execute_entry_tool'](name,args)
                     if isinstance(note,tuple):
                         note,cost=note
@@ -897,12 +904,13 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 duplicate_attempts=0
                 if name == 'read_session_file':
                     page = json.loads(note)
+                    if page.get('kind')=='directory':
+                        remember(note, received(name, mode='directory'))
+                        observations.append('目录仅含元数据；需要正文时用有效 file_id 读取。未命中可换查询。')
+                        continue
                     if not page.get('has_content'):
                         remember(note)
-                        if page.get('kind')=='directory':
-                            observations.append('目录已返回。需要正文时从中选择有效 file_id 再读取；空目录可以换查询或询问用户。')
-                        else:
-                            observations.append('只取得文件元数据或空页。请查看后续页或通过已授权的沙箱读取原件后再据内容作答。')
+                        observations.append('只取得文件元数据或空页。请查看后续页或通过已授权的沙箱读取原件后再据内容作答。')
                         continue
                 if name in ('search_materials','read_material'):
                     proof = json.loads(note)
@@ -910,8 +918,8 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                         remember(note)
                         observations.append('本次检索未获得支持当前目标的材料。请调整查询、申请其他工具，或向用户说明缺口。')
                         continue
-                received(name)
-                remember(note)
+                receipt = received(name, mode='content' if name=='read_session_file' else None)
+                remember(note, receipt if name=='read_session_file' else None)
                 continue
             if name == 'read_step_receipt':
                 page_key = (name, args.get('receipt'), args.get('offset',0), current.get('goal_no'), revision)
@@ -934,20 +942,6 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 if page.get('text') or page.get('items'):
                     received(name)
                 trace.point('observe', {'tool':name}, {'receipt':args.get('receipt'),'next_offset':page['next_offset']})
-                continue
-            if name == 'find_conversation_files':
-                request=CatalogArguments.model_validate(args)
-                with trace.step('act', {'tool':name}) as output:
-                    if config.get('_session_file_scope'):
-                        page=json.loads(await config['_execute_entry_tool']('read_session_file',request.model_dump()))
-                    else:
-                        page=await asyncio.to_thread(rag.chat.chat_files.discover,config['_material_owner'],
-                                                     personal_conversation,request.query,request.offset,config.get('_generated_files',()))
-                    output['count']=len(page['items'])
-                if page['items'] and not page.get('browse_instead'):
-                    received(name)
-                trace.point('observe',{'tool':name},{'count':len(page['items'])})
-                remember('当前会话文件（数据）：'+json.dumps(page,ensure_ascii=False)+'。browse_instead 表示未命中，列出最近原件供核对；翻阅此目录请清空 query。')
                 continue
             if name == 'contact_avatar':
                 contact=ContactArguments.model_validate(args)
@@ -1113,10 +1107,10 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         except (RunCapacity, DraftLimit):
             raise
         except (KeyError, ValueError, TypeError, HTTPException) as error:
-            if isinstance(error, HTTPException) and (error.status_code!=502 or getattr(error,'delivery_unknown',False) or action in ('find_conversation_files', 'contact_avatar')):
+            if isinstance(error, HTTPException) and (error.status_code!=502 or getattr(error,'delivery_unknown',False) or action == 'contact_avatar'):
                 raise
             log.warning('agent validation run=%s iteration=%d goal=%s tool=%s issue=invalid_arguments',
-                        run_id,iteration,current.get('goal_no'),action if action in allowed else 'unknown')
+                        run_id,iteration,current.get('goal_no'),action if action in active_tools else 'unknown')
             if isinstance(error,ValidationError):
                 detail='；'.join(str(e['loc'][-1])+': '+e['type'] for e in error.errors(include_input=False)[:4] if e['loc'])
             else:
