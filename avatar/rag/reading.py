@@ -24,8 +24,8 @@ class ReadingNeedsInput(AgentNeedsInput):
 
 
 def read_has_content(item):
-    return (any(text.strip() for text in item.get('summaries', ())) or
-            any(page.get('text','').strip() for page in item.get('pages', ())))
+    return (any(text.strip() for text in item.get('summaries') or ()) or
+            any((page.get('text') or '').strip() for page in item.get('pages') or ()))
 
 
 class ReadRequest(BaseModel):
