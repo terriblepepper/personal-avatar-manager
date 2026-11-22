@@ -37,7 +37,8 @@ def background(system):
 
 
 async def bind_entry_tools(chat, context, owner, aic, session, files, *, include_private=False,
-                           sandbox=None, status=None, progress=None, session_file_scope=None, session_file_grants=None, session_file_owner=None):
+                           sandbox=None, status=None, directory_reply=None, progress=None, session_file_scope=None,
+                           session_file_grants=None, session_file_owner=None):
     """Keep grants and source revisions in Python; only schemas and sanitized results reach the LLM."""
     config, key, system, history = context
     scope = (owner, aic, session, files, include_private)
@@ -111,6 +112,9 @@ async def bind_entry_tools(chat, context, owner, aic, session, files, *, include
     tool('read_material', '按文件名、说明或问题定位授权资料并读取原文。')
     if session_files:
         tool('read_session_file', '查找或读取本会话授权文件，也可复查本轮生成的 HTML。query 查目录，file_id 读原件。按返回游标续读。', SessionFileRequest)
+    if directory_reply:
+        from avatar.conversation.avatar_assistant import LIST_AVATARS
+        tools.append(LIST_AVATARS)
     if status:
         tools.append({'name':'application_status','description':'查看本人的分身申请与审核状态。',
                       'parameters':{'type':'object','properties':{},'additionalProperties':False}})
@@ -176,6 +180,10 @@ async def bind_entry_tools(chat, context, owner, aic, session, files, *, include
                 await run_blocking(store.merge, {'session_file_reads':dict(session_files.proofs),
                                                 'session_image_ids':list(read_images)})
             return json.dumps(result, ensure_ascii=False)
+        if name=='list_avatars' and directory_reply:
+            from avatar.conversation.avatar_assistant import CatalogArguments
+            request=CatalogArguments.model_validate(args)
+            return '平台公开目录查询结果（数据）：\n'+await run_blocking(directory_reply,request.query,request.offset)
         if name=='application_status' and status:
             if args:
                 raise ValueError('申请状态工具无需参数')

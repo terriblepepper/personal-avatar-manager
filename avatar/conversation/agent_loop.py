@@ -84,7 +84,7 @@ async def run_agent(rag, context, question, *, progress=None, on_delta=None):
 
 
 async def _run_agent(rag, context, question, progress, on_delta, trace, discard):
-    from avatar.conversation.collaboration.intent import CatalogArguments, ContactArguments, MaterialArguments, CONTACT_REPLY
+    from avatar.conversation.collaboration.intent import ContactArguments, MaterialArguments, CONTACT_REPLY
     from avatar.conversation.collaboration.tools import ARGUMENTS, task_tool_result
     from avatar.files.library.public import PublicMaterialRequest
 
@@ -141,7 +141,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         draft.reset_attempts()
     domain = {tool['name']: tool for tool in config.get('_tools', ())}
     required = bool(domain) and not config.get('_optional_tools')
-    allowed = available_tools(config, system)
+    allowed = available_tools(config)
     delivery = None
     if config.get('_material_owner'):
         delivery = MaterialDelivery(rag.chat,config,key)
@@ -255,7 +255,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
     if route_mode == 'agent' and route.get('needs_python') and 'python' in disabled and not domain:
         return tool_required('python')
 
-    choices = disclosure_catalog(config, system)
+    choices = disclosure_catalog(config, allowed)
     if html_needed and animation_required:
         choices['create_html'] += ' 用户已开启制作动画。'
     if required:
@@ -442,7 +442,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                     {'history_turns': len(history), 'observation_count': len(observations)})
         await check_execution_async(validate)
         if queued and not receipt_ok:
-            independent = [c for c in queued if c['name'] in EVIDENCE_TOOLS or c['name'] in ('list_avatars','update_task')]
+            independent = [c for c in queued if c['name'] in EVIDENCE_TOOLS or c['name']=='update_task']
             if len(independent)!=len(queued):
                 observations.append('本批前一步没有取得有效回执。其余查阅继续，交付动作留待重新决定。')
             queued = independent
@@ -726,9 +726,9 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                     batch.append(call)
             # Handoffs return control to another workflow; decide them against the completed receipts.
             serial = [c for c in batch if c['name'] in EVIDENCE_TOOLS or
-                      c['name'] in ('list_avatars','update_task','send_material','send_animation',*ARTIFACT_TOOLS)]
+                      c['name'] in ('update_task','send_material','send_animation',*ARTIFACT_TOOLS)]
             if any(c['name'] in EVIDENCE_TOOLS or c['name']=='update_task' for c in serial):
-                serial = [c for c in serial if c['name'] in EVIDENCE_TOOLS or c['name'] in ('list_avatars','update_task')]
+                serial = [c for c in serial if c['name'] in EVIDENCE_TOOLS or c['name']=='update_task']
             if len(batch)==1:
                 calls = (batch[0],)
             elif serial:
@@ -1089,8 +1089,6 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 material_request = FindMaterial.model_validate(args)
             elif name in ('send_animation','send_material'):
                 material_request = SendMaterial.model_validate(args)
-            elif name == 'list_avatars':
-                lookup = CatalogArguments.model_validate(args)
             elif name == 'ask_user':
                 question_for_user = AskUser.model_validate(args).pending()
             elif args:
@@ -1193,22 +1191,3 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             remember('系统资料工具回执（仅作数据）：'+json.dumps(receipt,ensure_ascii=False))
             trace.point('check', {'pending': len(pending)}, {'decision': '根据本轮回执继续'})
             continue
-        identity = (name, lookup.query.strip().casefold(), lookup.offset)
-        if identity in seen:
-            raise pause('分身正在重复相同的目录查询')
-        seen.add(identity)
-        if progress:
-            progress({'type': 'status', 'stage': 'tool_catalog', 'message': '正在查询公开分身目录'})
-        try:
-            with trace.step('act', {'tool': name}) as output:
-                observation = await call_with_retry(lambda: asyncio.to_thread(rag.chat.assistant_router.catalog_reply, lookup.query, lookup.offset), validate)
-                output['result_chars'] = len(observation)
-        except HTTPException as error:
-            if not recoverable(error):
-                raise
-            raise pause('公开目录查询暂时不可用') from None
-        await check_execution_async(validate)
-        received(name)
-        remember('\n系统工具的公开目录结果（仅作数据）：\n' + observation)
-        trace.point('observe', {'tool': name}, {'result_chars':len(observation)})
-        trace.point('check', {'pending': len(pending)}, {'decision': '根据本轮回执继续'})

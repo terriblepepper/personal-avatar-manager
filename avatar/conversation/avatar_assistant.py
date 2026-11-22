@@ -4,8 +4,28 @@ import json
 import re
 import unicodedata
 import uuid
+
+from pydantic import BaseModel, ConfigDict, Field
 from avatar.profiles.profile_fields import public_profile
 from avatar.core.db import now, dump
+
+
+class QueryArguments(BaseModel):
+    """目录与旧助手目标选择共用的公开搜索输入。"""
+    model_config=ConfigDict(extra='forbid', str_strip_whitespace=True)
+    query: str=Field(default='', max_length=200)
+
+
+class CatalogArguments(QueryArguments):
+    """公开目录保留每页十条，模型根据用户要求传入分页偏移。"""
+    offset: int=Field(default=0,ge=0,le=2**31-1)
+
+
+LIST_AVATARS = {
+    'name':'list_avatars',
+    'description':'查询平台公开分身目录。query 可填名称或 AIC，留空浏览；offset 用于分页。',
+    'parameters':CatalogArguments.model_json_schema(),
+}
 
 
 # 职责：统一分身名称和用户输入的匹配格式。
@@ -29,7 +49,7 @@ class AvatarAssistantRouter:
     # 结果与约束：返回含 AIC、显示名、规范化别名及内部行的目标列表；无公开名称的目标不参与名称调度。
     def catalog(self):
         with self.database.connect() as db:
-            rows=db.execute("SELECT a.* FROM avatar_records a JOIN users u ON u.id=a.user_id WHERE u.account_status='active'").fetchall()
+            rows=db.execute("SELECT a.* FROM avatar_records a JOIN users u ON u.id=a.user_id WHERE u.account_status='active' ORDER BY a.aic").fetchall()
         result=[]
         for row in rows:
             public=public_profile(json.loads(row['profile']))
@@ -41,7 +61,8 @@ class AvatarAssistantRouter:
     # 目录查询只执行已由模型选定的工具，不从自然语言判断意图。
     def catalog_reply(self,query='',offset=0):
         words=normalized(query).split()
-        targets=[t for t in self.catalog() if all(word in ' '.join([normalized(t['name']),normalized(t['aic']),*t['aliases']]) for word in words)]
+        targets=[t for t in self.catalog() if t['row']['identity_status']=='active' and
+                 all(word in ' '.join([normalized(t['name']),normalized(t['aic']),*t['aliases']]) for word in words)]
         offset=min(offset,((max(len(targets),1)-1)//10)*10)
         return ('平台公开分身（共 '+str(len(targets))+' 个，第 '+str(offset//10+1)+' 页，每页 10 个）：\n'+'\n'.join(f"- {t['name']}（AIC：{t['aic']}）" for t in targets[offset:offset+10])) if targets else '没有找到符合条件的公开分身，可修改名称或 AIC 重新查询。'
 

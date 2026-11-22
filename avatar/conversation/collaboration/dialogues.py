@@ -1173,7 +1173,7 @@ class AgentDialogues:
         context=await bind_entry_tools(self.chat,context,speaker_id,speaker['aic'],{'id':workspace},files,
                                        sandbox=sandbox if settings['python'] else None, progress=progress,
                                        session_file_scope=workspace if snapshot else None,
-                                       session_file_grants=file_grants)
+                                       session_file_grants=file_grants, directory_reply=self.chat.assistant_router.catalog_reply)
         run.validate_session_files=context[0].get('_validate_session_files_in')
         context[0].setdefault('_generated_files', [])
         if prepared:

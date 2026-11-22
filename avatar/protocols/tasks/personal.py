@@ -442,7 +442,7 @@ class PersonalTaskService:
             prefix, raw = system.split('\n', 1)
             background = json.loads(raw)
             if principal is not None:
-                for name in ('available_skills', '_skills_revision', 'platform_avatars', 'platform_directory_rules'):
+                for name in ('available_skills', '_skills_revision'):
                     background.pop(name, None)
                 prefix += ' 当前为公开访客问答，仅使用公开档案与公开附件；不得执行主人技能、私人工具、委派或管理操作。'
             if resume.get('clarification'):
@@ -467,7 +467,8 @@ class PersonalTaskService:
                         caller_id=caller,conversation_id=conversation['id'],progress=progress)
                 skills = principal is None and background(model[2]).get('installed_skills')
                 model = await bind_entry_tools(self.chat,model,user['id'],target['aic'],conversation,[],
-                    include_private=bool(overview.get('_private_context')),sandbox=run_skill if skills else None,progress=progress)
+                    include_private=bool(overview.get('_private_context')),sandbox=run_skill if skills else None,progress=progress,
+                    directory_reply=self.chat.assistant_router.catalog_reply if principal is None else None)
                 result = await self.chat.rag.answer(model, question, progress=progress)
             if not result.text.strip():
                 raise HTTPException(502, '模型未返回有效回答')

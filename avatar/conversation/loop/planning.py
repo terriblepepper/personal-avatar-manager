@@ -13,15 +13,7 @@ from avatar.models.diagnostics import stop_reason
 from avatar.models.limits import check_context
 
 
-def directory_allowed(system):
-    try:
-        data, _ = json.JSONDecoder().raw_decode(system.split('\n', 1)[1])
-        return isinstance(data, dict) and 'platform_avatars' in data
-    except (ValueError, IndexError):
-        return False
-
-
-def available_tools(config, system):
+def available_tools(config):
     from avatar.conversation.collaboration.intent import TOOLS
     from avatar.conversation.tools.html import CREATE_HTML
     from avatar.conversation.tools.material_delivery import DELIVERY_TOOLS
@@ -38,8 +30,7 @@ def available_tools(config, system):
         allowed['create_html'] = CREATE_HTML
     for tool in TOOLS:
         name = tool['name']
-        if ((name == 'list_avatars' and directory_allowed(system))
-                or (name == 'continue_answer' and (not domain or config.get('_optional_tools')))
+        if ((name == 'continue_answer' and (not domain or config.get('_optional_tools')))
                 or (name == 'deliver_material' and owner)
                 or (personal and name=='contact_avatar')):
             allowed[name] = tool
@@ -54,8 +45,8 @@ def available_tools(config, system):
     return allowed
 
 
-def disclosure_catalog(config, system):
-    catalog = {name:' '.join(tool['description'].split())[:220] for name,tool in available_tools(config, system).items()}
+def disclosure_catalog(config, allowed):
+    catalog = {name:' '.join(tool['description'].split())[:220] for name,tool in allowed.items()}
     catalog.update({t['id']:t['name']+'（已关闭）' for t in config.get('_conversation_tools', ())
                     if t['id'] != 'animation' and not t['enabled']})
     return catalog
@@ -141,6 +132,9 @@ def validate_disclosure(value, choices, *, revise=False):
             if primary=='read_session_file':
                 from avatar.conversation.loop.entry_tools import SessionFileRequest
                 s['lookup']=SessionFileRequest.model_validate(s['lookup']).model_dump(exclude_unset=True)
+            elif primary=='list_avatars':
+                from avatar.conversation.avatar_assistant import CatalogArguments
+                s['lookup']=CatalogArguments.model_validate(s['lookup']).model_dump(exclude_unset=True)
             elif primary in ('find_material','find_animation','find_public_material'):
                 s['lookup']=FindMaterial.model_validate(s['lookup']).model_dump(exclude_unset=True)
             else:
@@ -160,6 +154,7 @@ def validate_disclosure(value, choices, *, revise=False):
 
 
 async def disclose_tools(model, settings, key, system, history, question, catalog, validate, *, revise=False):
+    from avatar.conversation.avatar_assistant import CatalogArguments
     from avatar.conversation.loop.entry_tools import SessionFileRequest
     from avatar.conversation.tools.material_delivery import FindMaterial
     name={'type':'string','enum':list(catalog)}
@@ -167,16 +162,16 @@ async def disclose_tools(model, settings, key, system, history, question, catalo
     steps={'type':'array','maxItems':16,'items':{'type':'object','properties':{
         'goal':{'type':'string','minLength':1,'description':TEXT_LIMIT},
         'criterion':{'type':'string','minLength':1,'description':TEXT_LIMIT},
-        'tool':name,'tools':names,'segmented':{'type':'boolean','description':'大型作品从第一段起以游标分片写作'},'lookup':{'anyOf':[FindMaterial.model_json_schema(),SessionFileRequest.model_json_schema()]},
+        'tool':name,'tools':names,'segmented':{'type':'boolean','description':'大型作品从第一段起以游标分片写作'},'lookup':{'anyOf':[FindMaterial.model_json_schema(),SessionFileRequest.model_json_schema(),CatalogArguments.model_json_schema()]},
         'file_access':{'type':'string','enum':['directory','content'],'description':'会话文件目标：查目录或读原件'}},'required':['goal'],'additionalProperties':False}}
     properties={'tools':names,'steps':steps}
     if revise:
         properties['continue_draft']={'type':'boolean','description':'当前草稿满足补充要求，继续从原游标写作'}
     form={'name':'plan_task','description':'为当前需要选择最小工具集，并分解可验证的交付。'+TEXT_LIMIT,'parameters':{
         'type':'object','properties':properties,'required':['steps'],'additionalProperties':False}}
-    config={**settings,'_tools':[form],'_batch_tools':True,'_optional_tools':True,'_call_purpose':'task_planning'}
+    config={**settings,'_tools':[form],'_batch_tools':False,'_optional_tools':False,'_call_purpose':'task_planning'}
     prompt=(system+'\n你担任当前分身的工具披露步骤。根据本轮用户的实际目标、已有证据和工具目录决定。'
-            'tools 只选实际需要的工具。最终文字答复无需规划成工具步骤，可直接作答。'
+            'tools 只选实际需要的工具。只需文字答复时提交空的 tools 和 steps，正文由下一阶段作答。'
             '复杂任务拆为可核对的必要目标，给出 goal 和 criterion。先核对，再决定是否需要追加修订。'
             '可用同一子目标的 tools 列出替代工具。先取证再创作时，将取证与交付分别列为前后两个子目标。'
             '通信、提交发言、等待用户、结束任务属于终态；应作为独立的最后一步。'
@@ -287,8 +282,8 @@ def revise_goals(plan, pending, selected, addition, replace_goals):
 
 # Alternative read methods can satisfy the evidence requirement of a composite delivery.
 EVIDENCE_TOOLS = {'search_materials','read_material','find_material','find_animation','find_public_material',
-                  'read_session_file'}
-WRITING_CONTROLS = EVIDENCE_TOOLS | {'ask_user','request_tools','read_step_receipt','list_avatars'}
+                  'read_session_file','list_avatars'}
+WRITING_CONTROLS = EVIDENCE_TOOLS | {'ask_user','request_tools','read_step_receipt'}
 
 
 def confirm_goal(args, pending, log, revision):

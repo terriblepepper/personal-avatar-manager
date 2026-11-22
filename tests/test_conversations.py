@@ -1108,7 +1108,7 @@ def test_unified_html_and_legacy_animation_setting(context):
     assert switches(updated) == {'python': True, 'animation': True}
     assert switches(user.get('/api/conversations/'+cid+'/tools')) == switches(updated)
     from avatar.conversation.loop.planning import available_tools
-    tools = available_tools({'_html_enabled':True},'')
+    tools = available_tools({'_html_enabled':True})
     assert 'create_animation' not in tools
     html = tools['create_html']
     assert html['description'].startswith('工具用于生成基于html的网页、2d动画和3d动画')
