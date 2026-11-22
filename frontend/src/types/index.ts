@@ -43,8 +43,11 @@ export interface ChatMessage {
   attachments?: ChatFile[]; used_skills?: SkillSummary[]; tool_events?: ToolEvent[]; summary_through?: number
   task_event?: Record<string, unknown>; intent?: Record<string, unknown>
 }
-export interface GenerationRequest { request_id: string; conversation_id: string; message: string; personal: boolean; channel: 'assistant' | 'avatar'; attachment_ids: string[]; agent_pause_id?: string; agent_control?: 'continue' | 'retry' | 'end' }
+export interface AgentQuestion { id: string; question: string; options?: string[] }
+export interface QuestionReply { question_id: string; message: string; request_id: string }
+export interface GenerationRequest { question_id?: string; request_id: string; conversation_id: string; message: string; personal: boolean; channel: 'assistant' | 'avatar'; attachment_ids: string[]; agent_pause_id?: string; agent_control?: 'continue' | 'retry' | 'end' }
 export interface GenerationSnapshot {
+  user_question?: AgentQuestion
   request_id?: string; conversation_id?: string; state?: string; message?: string; agent_pause_id?: string; stream_retryable?: boolean
   reply: string; status?: string; stage?: string; done: boolean; error?: string
   tool_events?: ToolEvent[]; used_skills?: SkillSummary[]; mermaid_enabled?: boolean

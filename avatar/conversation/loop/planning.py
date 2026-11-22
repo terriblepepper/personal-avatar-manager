@@ -3,9 +3,10 @@ import json
 
 from fastapi import HTTPException
 
+from avatar.core.text_budget import TEXT_LIMIT, fits_text_budget
 from avatar.conversation.working_context import bounded_excerpt, fit_turn, input_budget
 from avatar.core.tokens import estimate
-from avatar.core.execution import call_with_retry, check_execution_async
+from avatar.core.execution import AskUser, call_with_retry, check_execution_async
 from avatar.models.client import accumulate_usage
 from avatar.models.diagnostics import stop_reason
 from avatar.models.limits import check_context
@@ -42,9 +43,8 @@ def available_tools(config, system):
                 or (personal and name in ('find_conversation_files','contact_avatar'))):
             allowed[name] = tool
     disabled = {t['id']: t for t in config.get('_conversation_tools', ()) if t['id'] != 'animation' and not t['enabled']}
-    allowed['ask_user'] = {'name':'ask_user', 'description':'信息不足时提出一个可回答的问题并等待用户。',
-        'parameters': {'type':'object','properties':{'question':{'type':'string','minLength':1,'maxLength':600}},
-                       'required':['question'],'additionalProperties':False}}
+    allowed['ask_user'] = {'name':'ask_user', 'description':'需要用户补充时提出一个具体问题。可给最多三个简短建议，用户也可自由回答。',
+        'parameters':AskUser.model_json_schema()}
     if disabled:
         allowed['require_conversation_tool'] = {'name':'require_conversation_tool','description':'提示用户开启当前确实需要的已关闭工具。',
             'parameters':{'type':'object','properties':{'tool_id':{'type':'string','enum':list(disabled)}},
@@ -78,13 +78,14 @@ def validate_disclosure(value, choices, *, revise=False):
         raise ValueError('单次披露最多十六项子目标，可后续补充')
     selected = _selected(value.get('tools',[]),choices)
     steps=[]
+    text_parts=[]
     for source in value['steps']:
         if not isinstance(source,dict) or set(source)-{'goal','tool','tools','criterion','lookup','html_mode','segmented'}:
             raise ValueError('子目标结构无效')
         s=dict(source)
-        if not isinstance(s.get('goal'),str) or not 0<len(s['goal'].strip())<=240:
+        if not isinstance(s.get('goal'),str) or not s['goal'].strip():
             raise ValueError('缺少子目标说明')
-        if 'criterion' in s and (not isinstance(s['criterion'],str) or not 0<len(s['criterion'].strip())<=320):
+        if 'criterion' in s and (not isinstance(s['criterion'],str) or not s['criterion'].strip()):
             raise ValueError('验收条件无效')
         tools=_selected(s.get('tools',[]),choices)
         primary=s.get('tool') or (tools[0] if tools else '')
@@ -104,7 +105,10 @@ def validate_disclosure(value, choices, *, revise=False):
                 raise ValueError('该子目标不支持检索参数')
             s['lookup']=FindMaterial.model_validate(s['lookup']).model_dump(exclude_unset=True)
         selected.extend(n for n in [primary,*tools] if n and n not in selected)
+        text_parts.extend((s['goal'], s.get('criterion',''), s.get('lookup',{}).get('query','')))
         steps.append(s)
+    if not fits_text_budget(*text_parts):
+        raise ValueError(TEXT_LIMIT)
     if type(value.get('continue_draft',False)) is not bool:
         raise ValueError('计划规模或草稿决定无效')
     ret={'tools':selected,'steps':steps}
@@ -118,20 +122,20 @@ async def disclose_tools(model, settings, key, system, history, question, catalo
     name={'type':'string','enum':list(catalog)}
     names={'type':'array','items':name,'uniqueItems':True}
     steps={'type':'array','maxItems':16,'items':{'type':'object','properties':{
-        'goal':{'type':'string','minLength':1,'maxLength':240},
-        'criterion':{'type':'string','minLength':1,'maxLength':320},
+        'goal':{'type':'string','minLength':1,'description':TEXT_LIMIT},
+        'criterion':{'type':'string','minLength':1,'description':TEXT_LIMIT},
         'tool':name,'tools':names,'segmented':{'type':'boolean','description':'大型作品从第一段起以游标分片写作'},'lookup':FindMaterial.model_json_schema(),
         'html_mode':{'type':'string','enum':['2d','3d']}},'required':['goal'],'additionalProperties':False}}
     properties={'tools':names,'steps':steps}
     if revise:
         properties['continue_draft']={'type':'boolean','description':'当前草稿满足补充要求，继续从原游标写作'}
-    form={'name':'plan_task','description':'为当前需要选择最小工具集，并分解可验证的交付。','parameters':{
+    form={'name':'plan_task','description':'为当前需要选择最小工具集，并分解可验证的交付。'+TEXT_LIMIT,'parameters':{
         'type':'object','properties':properties,'required':['steps'],'additionalProperties':False}}
     config={**settings,'_tools':[form],'_batch_tools':True,'_optional_tools':True,'_call_purpose':'task_planning'}
     prompt=(system+'\n你担任当前分身的工具披露步骤。根据本轮用户的实际目标、已有证据和工具目录决定。'
             'tools 只选可能真正用到的工具 ID；不用工具且可直接回答时给空 tools 和 steps。'
             '复杂任务拆为可分别核对的子目标，给出 goal 和 criterion（具体证据或交付条件）。'
-            '子目标可不需要工具，也可依赖多个工具（写入 tools，第一项是首选）。'
+            '可用同一子目标的 tools 列出替代工具。先取证再创作时，将取证与交付分别列为前后两个子目标。'
             '通信、提交发言、等待用户、结束任务属于终态；应作为独立的最后一步。'
             '普通网页或动画如涉及复杂场景、交互或较长源码，可选 segmented=true 从第一段开始分段写作。'
             '简单单次动作可只写 goal 和 tool。资料检索若已确定参数可填 lookup；有依赖时等前一结果再选。'
@@ -181,12 +185,12 @@ async def disclose_tools(model, settings, key, system, history, question, catalo
     return None,usage
 
 REQUEST_TOOLS = {'name':'request_tools','description':'现有工具不足或需要补充子目标时，交给同一分身重新披露授权工具。',
-    'parameters':{'type':'object','properties':{'need':{'type':'string','minLength':1,'maxLength':800},
+    'parameters':{'type':'object','properties':{'need':{'type':'string','minLength':1,'description':TEXT_LIMIT},
         'replace_goals':{'type':'array','items':{'type':'integer','minimum':1},'description':'有新证据需调整的未完成子目标编号。明确交付的作品须保留。'}},
                   'required':['need'],'additionalProperties':False}}
 UPDATE_TASK = {'name':'update_task','description':'提交已达到验收条件的子目标结果；使用工具的目标需要引用已验证的回执编号。',
     'parameters':{'type':'object','properties':{'goal_no':{'type':'integer','minimum':1},
-        'result':{'type':'string','minLength':1,'maxLength':1600},'receipts':{'type':'array','items':{'type':'integer','minimum':1}}},
+        'result':{'type':'string','minLength':1,'description':TEXT_LIMIT},'receipts':{'type':'array','items':{'type':'integer','minimum':1}}},
         'required':['goal_no','result'],'additionalProperties':False}}
 
 
@@ -225,19 +229,43 @@ def revise_goals(plan, pending, selected, addition, replace_goals):
     return revised
 
 
+# Alternative read methods can satisfy the evidence requirement of a composite delivery.
+EVIDENCE_TOOLS = {'search_materials','read_material','find_material','find_animation','find_public_material',
+                  'find_conversation_files'}
+WRITING_CONTROLS = EVIDENCE_TOOLS | {'ask_user','request_tools','read_step_receipt','list_avatars'}
+
+
 def confirm_goal(args, pending, log, revision):
     number, result, ids = args.get('goal_no'), args.get('result'), args.get('receipts',[])
     goal = next((s for s in pending if s['goal_no']==number),None)
     if (set(args)-{'goal_no','result','receipts'} or type(number) is not int or goal is None or
-            not needs_confirmation(goal) or not isinstance(result,str) or not 0<len(result.strip())<=1600 or
+            not needs_confirmation(goal) or not isinstance(result,str) or not result.strip() or not fits_text_budget(result) or
             not isinstance(ids,list) or any(type(i) is not int or not 1<=i<=len(log) for i in ids)):
         raise ValueError('提交子结果时需要开放的目标编号和有效的回执编号')
     required = set(goal.get('tools',())) | ({goal['tool']} if goal['tool'] else set())
     evidence = {r['tool'] for i in ids for r in (log[i-1],)
                 if r.get('goal_no')==number and r.get('input_id')==revision}
-    if (required and not required.intersection(evidence)) or not (required & DELIVERABLES).issubset(evidence):
+    reads = required & EVIDENCE_TOOLS
+    if ((required and not required.intersection(evidence)) or not (required & DELIVERABLES).issubset(evidence)
+            or (required & DELIVERABLES and reads and not reads.intersection(evidence))):
         raise ValueError('缺少该子目标的实际工具回执')
     pending.remove(goal)
     log.append({'id':len(log)+1,'tool':'update_task','goal_no':number,'result':result.strip(),
                 'refs':ids,'input_id':revision})
     return '已完成子目标：'+goal['goal']+'。已确认的子结果：'+result.strip()
+
+
+def action_ready(name, pending, receipts, revision):
+    """A planned delivery waits for earlier goals and for evidence in its own composite goal."""
+    if name not in DELIVERABLES or not pending:
+        return True
+    current = pending[0]
+    if name not in (current['tool'], *current.get('tools', ()), *current.get('support', ())):
+        return False
+    verified = {r['tool'] for r in receipts if r.get('goal_no')==current['goal_no'] and r.get('input_id')==revision}
+    if name in verified:
+        return False
+    reads = set(current.get('tools', ())) & EVIDENCE_TOOLS
+    if reads and not reads.intersection(verified):
+        return False
+    return name == current['tool'] or not current['tool'] or current['tool'] in verified

@@ -62,6 +62,15 @@ def html_repair_prompt(tool, mode):
     return '返回完整动画工具参数 JSON，包含 filename（.html）。'+dimension+ANIMATION_INPUT+OFFLINE_ANIMATION
 
 
+def _artifact_fields(pairs):
+    result = {}
+    for name,value in pairs:
+        if name in result and (type(result[name]) is not type(value) or result[name] != value):
+            raise ValueError('作品参数含有取值冲突的重复字段')
+        result[name] = value
+    return result
+
+
 def repaired_html_arguments(text, tool, filename):
     source = text.strip()
     if source.startswith('```') and source.endswith('```'):
@@ -77,7 +86,7 @@ def repaired_html_arguments(text, tool, filename):
         except ValueError:
             filename = 'index.html'
         return {'filename':filename,'html':source}
-    args = load_model_json(source)
+    args = load_model_json(source,object_pairs_hook=_artifact_fields)
     if not isinstance(args,dict):
         raise ValueError('修复结果缺少参数对象')
     return args

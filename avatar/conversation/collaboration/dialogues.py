@@ -70,6 +70,8 @@ class PeerRequest:
             payload.pop('request_id', None)
         else:
             payload = body.model_dump(exclude={'request_id'})
+        if payload.get('question_id') is None:
+            payload.pop('question_id', None)
         if payload.get('expected_revision') is None:
             payload.pop('expected_revision', None)
         raw = json.dumps(payload, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
@@ -261,6 +263,8 @@ class AgentDialogues:
             checkpoint=json.loads(row['agent_checkpoint'])
             result['can_supplement']=checkpoint['speaker_id']==user['id']
             result['waiting_for_other']=not result['can_supplement']
+            if result['can_supplement'] and checkpoint.get('user_question'):
+                result['user_question']=checkpoint['user_question']
         return result
 
     @staticmethod
@@ -563,13 +567,14 @@ class AgentDialogues:
                                 (identifier,user['id'],body.request_id)).fetchone()
             previous = self.replay(db, user, request, legacy[0] if legacy else None)
         if not previous:
-            commands,message=self.chat.skills.split_commands(user['id'],body.message)
+            waiting=self.check_supplement(initial,user,body,body.message)
+            asking=waiting and bool(json.loads(initial['agent_checkpoint']).get('user_question'))
+            commands,message=('',body.message.strip()) if asking else self.chat.skills.split_commands(user['id'],body.message)
             removed=getattr(body,'remove_skills',[])
             for skill_id in removed:self.chat.skills.get(user['id'],skill_id)
             if initial['status']=='awaiting_identity':raise HTTPException(409,'正在自动重试通信入口，超时后可重新编辑并发送')
             if initial['status']=='ended':raise HTTPException(409,'该任务已完成，请在同一分身会话创建新任务')
-            self.check_supplement(initial,user,body,message)
-            booking=not approval and bool(message) and initial['delivery_mode']!='message' and await self.intent.requires_confirmation(user,message)
+            booking=not asking and not approval and bool(message) and initial['delivery_mode']!='message' and await self.intent.requires_confirmation(user,message)
             previous = self._queue_input(user, identifier, body, request, approval, commands, message, removed, booking)
         if previous != identifier and not request.scope.startswith('session:'):
             return {'id': previous, 'session_id': initial['session_id']}
@@ -581,9 +586,17 @@ class AgentDialogues:
         waiting=bool(row['agent_checkpoint'] and row['status']=='awaiting_input')
         if expected is not None and (expected!=row['revision'] or not (waiting or row['status']=='paused')):
             raise HTTPException(409,'任务状态已改变，请刷新后再补充')
+        question=None
         if waiting:
-            if json.loads(row['agent_checkpoint'])['speaker_id']!=user['id']:
+            checkpoint=json.loads(row['agent_checkpoint'])
+            if checkpoint['speaker_id']!=user['id']:
                 raise HTTPException(403,'请等待当前分身的所有人补充信息')
+            question=checkpoint.get('user_question')
+        question_id=getattr(body,'question_id',None)
+        if question_id and (not question or question_id!=question['id']):
+            raise HTTPException(409,'分身提问已改变，请刷新后回答')
+        if question and not message.strip():
+            raise HTTPException(422,'请填写对分身提问的回答')
         return waiting
 
     def _queue_input(self, user, identifier, body, request, approval, commands, message, removed, booking):
@@ -600,6 +613,19 @@ class AgentDialogues:
             if approval and row['delivery_mode'] == 'message':
                 raise HTTPException(409, '普通聊天无需确认')
             waiting=self.check_supplement(row,user,body,message)
+            checkpoint=json.loads(row['agent_checkpoint']) if waiting else {}
+            if question:=checkpoint.get('user_question'):
+                if removed:
+                    raise HTTPException(422,'请在回答问题后单独修改技能')
+                checkpoint.pop('user_question')
+                checkpoint['question_answer']={**question,'answer':message}
+                updated=db.execute("""UPDATE agent_dialogues SET agent_checkpoint=?,status='queued',revision=revision+1,
+                    waiting_reason='',error='',rounds_done=0,updated_at=?
+                    WHERE id=? AND revision=? AND status='awaiting_input'""",(dump(checkpoint),now(),identifier,row['revision']))
+                if not updated.rowcount:raise HTTPException(409,'分身提问已改变，请刷新后回答')
+                self.resources.share(db,user,identifier,getattr(body,'file_ids',[]))
+                request.remember(db,user,identifier)
+                return identifier
             if row['delivery_mode']=='message' and message and not waiting and row['status']!='paused':
                 peer=row['target_aic'] if row['user_id']==user['id'] else row['own_aic']
                 task_id=self.create(user,SimpleNamespace(target_aic=peer,objective=body.message,request_id=body.request_id,delivery_mode='message',file_ids=getattr(body,'file_ids',[])),db=db,request=request)
@@ -858,6 +884,8 @@ class AgentDialogues:
                 checkpoint={**pause.checkpoint,'speaker_id':speaker_id,'file_ids':[item['id'] for item in [*prior,*outputs]],
                             'source_revision':job.get('_output_source_revision'),
                             'activity':[*old_activity,*json.loads(task['tool_activity'])]}
+                if pause.user_question:
+                    checkpoint['user_question']=pause.user_question
                 db.execute('UPDATE agent_dialogues SET agent_checkpoint=? WHERE id=?',(dump(checkpoint),job['id']))
                 pause.usage = run.settle(db)
             raise
@@ -1028,6 +1056,10 @@ class AgentDialogues:
             config['_agent_persisted_file_ids']=checkpoint.get('file_ids', [])
         side='initiator' if speaker_id==job['user_id'] else 'target'
         background=json.loads(raw)
+        if checkpoint and checkpoint['speaker_id']==speaker_id and (answer:=checkpoint.get('question_answer')):
+            config['_agent_input_revision']=answer['id']
+            config['_run_supplement']=answer['answer']
+            background['last_clarification']=answer['question']
         excluded=set(json.loads(job.get(side+'_excluded_skills','[]')))
         background['available_skills']=[s for s in background.get('available_skills',[]) if s['id'] not in excluded]
         raw=dump(background)
@@ -1041,7 +1073,7 @@ class AgentDialogues:
             else:
                 policy+='本轮你是接收方，应优先回应对方本轮最新发言；旧对话及摘要仅作必要背景，不能用旧话题覆盖本轮消息。'
         else:
-            policy+='你在独立任务内协作，必须选择一个原生函数调用：send_message 向对方发送本轮发言；end_task 在对方已收到并回应最新补充后完成任务；wait_for_user 等待本人意图。不要在正文写状态标记或代替函数调用。已完成、没有新事项或对方告别时调用 end_task，不要继续互相确认。需要本人意图时用 wait_for_user 指定 initiator（发起人）、target（接收人）或 both。content 只写本轮正文，原因填写 reason。'
+            policy+='你在独立任务内协作，必须选择一个原生函数调用：send_message 向对方发送本轮发言；end_task 在对方已收到并回应最新补充后完成任务；wait_for_user 等待本人意图。不要在正文写状态标记或代替函数调用。已完成、没有新事项或对方告别时调用 end_task，不要继续互相确认。本轮执行缺少本人才能提供的信息时使用 ask_user 私下提问。需要流程中的参与方确认时用 wait_for_user 指定 initiator（发起人）、target（接收人）或 both。content 只写本轮正文，原因填写 reason。'
             policy+='确认按钮仅授权继续处理，不代表用户接受或拒绝预约；真实意图以用户明确填写的补充内容为准。确认时留空表示委托你自行判断和推进，不可捏造本人拒绝或同意，不因留空重复索取同一确认。涉及真实预约或交易承诺且授权不足时，整理待定事项并结束任务；未连接外部执行工具，不能声称已预订。'
         if not ordinary:
             policy+='当前已授权你自行判断或按补充意图继续的用户：'+('发起方；' if job['confirmation_acknowledged']&1 else '')+('接收方；' if job['confirmation_acknowledged']&2 else '')+'。此授权不等于预约承诺；没有补充文字时自行决断，不得捏造用户意见。'

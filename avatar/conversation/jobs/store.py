@@ -79,6 +79,8 @@ class GenerationStore:
     def submit(self,user,body):
         if not body.request_id or not body.conversation_id:raise HTTPException(422,'请求和会话标识不能为空')
         fields=body.model_dump()
+        if not body.question_id:
+            fields.pop('question_id', None)
         if not body.agent_control:
             fields.pop('agent_pause_id');fields.pop('agent_control')
         raw=canonical(fields);fingerprint=hashlib.sha256(raw.encode()).hexdigest()
@@ -169,7 +171,10 @@ class GenerationStore:
             snapshot.update(status=result['reply'],stage='cancelled',agent_pause_id=None)
             for event in snapshot.get('tool_events',[]):
                 if event.get('status')=='running':event['status']='interrupted'
+        snapshot.pop('user_question', None)
         if state=='awaiting_input':
+            if result.get('user_question'):
+                snapshot['user_question'] = result['user_question']
             for event in snapshot.get('tool_events',[]):
                 if event.get('status')=='running':event['status']='paused'
             snapshot.update(status=result['status'],agent_pause_id=result['agent_pause_id'],stream_retryable=result.get('stream_retryable',False),stage=state,reply=result.get('reply',''))

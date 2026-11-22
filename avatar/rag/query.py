@@ -1,4 +1,5 @@
 """受限自查询：模型只构造语义查询和元数据条件，权限范围始终由业务库决定。"""
+from avatar.core.text_budget import AgentText, TEXT_LIMIT, fits_text_budget
 from avatar.files.library.catalog import model_animation_metadata
 from pathlib import Path
 from typing import Literal
@@ -10,7 +11,7 @@ from avatar.models.limits import check_context
 
 class FileQuery(BaseModel):
     model_config=ConfigDict(extra='forbid',str_strip_whitespace=True)
-    query:str=Field(min_length=1,max_length=2000)
+    query:AgentText=Field(min_length=1)
     alternatives:list[str]=Field(default_factory=list,max_length=2)
     file_ids:list[str]=Field(default_factory=list,max_length=5)
     filename:str=Field(default='',max_length=200)
@@ -28,7 +29,8 @@ class FileQuery(BaseModel):
             try:validate_path(self.folder)
             except HTTPException:raise ValueError('目录过滤路径无效') from None
         if self.page_start and self.page_end and self.page_end<self.page_start:raise ValueError('页码范围无效')
-        if any(not isinstance(term,str) or not term.strip() or len(term)>2000 for term in self.alternatives):raise ValueError('查询变体无效')
+        if any(not isinstance(term,str) or not term.strip() for term in self.alternatives):raise ValueError('查询变体无效')
+        if not fits_text_budget(self.query,*self.alternatives):raise ValueError(TEXT_LIMIT)
         if any(len(identifier)>80 for identifier in self.file_ids):raise ValueError('文件 ID 无效')
         return self
 
@@ -75,19 +77,19 @@ async def construct(rag,context,message,documents):
     recent=[{'role':row['role'],'content':row['content'][-800:]} for row in history[-4:]]
     payload=dump({'question':message,'catalog':catalog,'directories':directory_catalog(documents),'history':recent})
     try:check_context(settings,system,[],payload)
-    except HTTPException:return FileQuery(query=message[:2000])
+    except HTTPException:return FileQuery(query=message)
     usage=None
     try:
         result=await rag.chat.model_client.generate(settings,key,system,[],payload);usage=result.usage
         calls=getattr(result,'tool_calls',())
-        if not calls or calls[0]['name']!='construct_file_query':return FileQuery(query=message[:2000])
+        if not calls or calls[0]['name']!='construct_file_query':return FileQuery(query=message)
         plan=FileQuery.model_validate(calls[0]['arguments'])
-        if set(plan.file_ids)-{row['id'] for row in documents}:return FileQuery(query=message[:2000])
+        if set(plan.file_ids)-{row['id'] for row in documents}:return FileQuery(query=message)
         return plan
-    except (ValidationError,ValueError):return FileQuery(query=message[:2000])
+    except (ValidationError,ValueError):return FileQuery(query=message)
     except HTTPException as error:
         usage=getattr(error,'model_usage',None)
-        if getattr(error,'invalid_tool_call',False) or getattr(error,'empty_model_output',False):return FileQuery(query=message[:2000])
+        if getattr(error,'invalid_tool_call',False) or getattr(error,'empty_model_output',False):return FileQuery(query=message)
         raise
     finally:
         owner=config['_rag_access']['scope'][0]

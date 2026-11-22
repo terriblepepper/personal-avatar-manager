@@ -7,6 +7,7 @@ from typing import Literal
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
+from avatar.core.text_budget import AgentText
 from avatar.conversation.tools.activity import AgentSteps
 from avatar.core.execution import call_with_retry, check_execution
 from avatar.files.library.delivery import SavedMaterials
@@ -18,7 +19,7 @@ from avatar.models.client import ModelResult, accumulate_usage
 
 class FindMaterial(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True, str_strip_whitespace=True)
-    query: str = Field(default='', max_length=200)
+    query: AgentText = ''
     folder: str = Field(default='',max_length=512,description='逻辑目录完整路径，留空从根目录查找。文件模式包含子目录。')
     mode: Literal['files','directories'] = 'files'
     sort: Literal['relevance','latest'] = Field(default='relevance',description='需按作品发布日期查找时选 latest，query 只填主题。')
@@ -39,7 +40,7 @@ class SelectMaterials(BaseModel):
 
 class ClarifyMaterial(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True, str_strip_whitespace=True)
-    question: str = Field(min_length=1, max_length=400)
+    question: AgentText = Field(min_length=1)
 
 
 def valid_reply(text, ids):

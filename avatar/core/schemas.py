@@ -1,6 +1,7 @@
 # 模块说明：输入契约：Pydantic 负责字段结构、格式和部分跨字段约束，数据库归属与业务权限另行检查。
 from pydantic import StrictBool, BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from typing import Literal, Annotated
+from avatar.core.text_budget import AgentText
 from avatar.models.effort import Effort
 from avatar.protocols.identity.acs import AcsInput
 from avatar.files.library.attachments import AttachmentRef
@@ -331,20 +332,23 @@ class ReviewRequest(BaseModel):
 
 
 # 职责：定义本人分身或 Avatar 助手问答请求。
-# 输入：message 为 1–2000 字符，channel 仅 assistant/avatar，conversation_id 可选。
+# 输入：message 文本按 UTF-8 计量，最大 64 KiB，channel 仅 assistant/avatar，conversation_id 可选。
 # 结果与约束：只承载用户消息和会话 ID，不能由浏览器声明可信平台调用者或任意目标账户身份。
 class ChatRequest(BaseModel):
     request_id: str | None = Field(default=None, max_length=80)
     personal: StrictBool = False
-    message: str = Field(max_length=2000)
+    message: AgentText
     channel: str = Field(default="assistant", pattern="^(assistant|avatar)$")
     conversation_id: str | None = Field(default=None, max_length=80)
     attachment_ids: list[str] = Field(default_factory=list,max_length=5)
+    question_id: str | None = Field(default=None, pattern=r'^[0-9a-f]{32}$')
     agent_pause_id: str | None = Field(default=None, min_length=1, max_length=80)
     agent_control: Literal['continue','retry','end'] | None = None
 
     @model_validator(mode='after')
     def validate_agent_control(self):
+        if self.question_id and (self.agent_control != 'continue' or not self.message.strip()):
+            raise ValueError('回答分身提问时请填写补充内容')
         if not self.message and self.agent_control != 'continue':
             raise ValueError('请填写消息')
         if bool(self.agent_pause_id) != bool(self.agent_control) or self.agent_control and not self.conversation_id:

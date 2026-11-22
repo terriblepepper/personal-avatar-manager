@@ -14,7 +14,11 @@ def folded(text):
 
 
 def terms(text):
-    return set(word for word in tokens(text) if len(word)>1 or len(text)==1)
+    words = list(dict.fromkeys(word for word in tokens(text) if len(word)>1 or len(text)==1))
+    # Bound per-file fuzzy comparisons; exact matching and hybrid retrieval keep the full query.
+    if len(words) > 256:
+        return [words[i * (len(words)-1) // 255] for i in range(256)]
+    return words
 
 
 _DATE=re.compile(r'(?<!\d)((?:19|20)\d{2})[-./年_]?([01]?\d)[-./月_]?([0-3]?\d)(?:日)?(?!\d)')

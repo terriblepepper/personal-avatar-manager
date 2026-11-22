@@ -7,14 +7,18 @@ import uuid
 
 from fastapi import HTTPException
 
+from avatar.conversation.loop.artifact_prefix import salvage_object
 from avatar.conversation.loop.store import OWNER_STORAGE_BYTES, RAW_ARGUMENT_PREFIX, RunCapacity, draft_byte_limit
 from avatar.conversation.tools.html import ANIMATION_INPUT, ARTIFACT_TOOLS, OFFLINE_ANIMATION, repaired_html_arguments
 from avatar.core.execution import run_blocking
+from avatar.models.tools import load_model_json
 from avatar.files.parsing.animation import MAX_SOURCE_BYTES
 
 
-_CHUNK_BYTES = (1200, 360, 120)
+_MAX_STALLS = 3
 _TAIL_BYTES = 640
+_RECOVERY_SCAN_BYTES = 64 * 1024
+_LEGACY_INVALID_OBJECT = '作品参数未形成完整对象，请从已确认游标补齐'
 _MARKS = re.compile(r'\\.|[\\\"{}\[\],]', re.DOTALL)
 _FIELDS = {'filename', 'mode', 'html', 'duration_seconds', 'render_frame'}
 
@@ -220,13 +224,106 @@ class SegmentedDraft:
     def __init__(self, store, state, *, max_tokens=None):
         self.store = store
         self.state = state
-        self.max_chunk = min(16 * 1024, max(16, max_tokens - 64)) if type(max_tokens) is int else 16 * 1024
+        self.max_tokens = max_tokens
 
-    def _budget(self, meta):
-        if meta['misses']:
-            return min(self.max_chunk, _CHUNK_BYTES[min(meta['misses'], len(_CHUNK_BYTES) - 1)])
-        growth = min(meta.get('streak', 0) // 2, 4)
-        return min(self.max_chunk, _CHUNK_BYTES[0] * 2 ** growth)
+    @staticmethod
+    def _fields(meta):
+        return _FIELDS if meta['tool'] == 'create_animation' else {'filename','html'}
+
+    @staticmethod
+    def _matches(meta, step):
+        return (meta.get('tool') == step.get('tool') and
+                (not step.get('html_mode') or meta.get('mode') in (None,step['html_mode'])))
+
+    def align(self, pending, *, artifact_ready=True):
+        """Park a later artifact until the corresponding goal is eligible."""
+        parked = list(self.state.get('parked_drafts') or ())
+        active = self.state.get('draft') or {}
+        changed = False
+        if active.get('kind') == 'artifact' and pending:
+            matches = [s for s in pending if self._matches(active,s)]
+            bound = active.get('goal_no')
+            if bound is None and matches:
+                bound = active['goal_no'] = matches[0]['goal_no']
+                changed = True
+            if not artifact_ready or bound != pending[0]['goal_no'] or not self._matches(active,pending[0]):
+                parked.append(active)
+                self.clear()
+                changed = True
+        elif active.get('kind') == 'answer' and pending:
+            parked.append(active)
+            self.clear()
+            changed = True
+        if not self.active:
+            for index, meta in enumerate(parked):
+                if (artifact_ready and pending and self._matches(meta,pending[0]) and
+                        meta.get('goal_no') in (None,pending[0]['goal_no'])
+                        or not pending and meta.get('kind') == 'answer'):
+                    self.state['draft'] = parked.pop(index)
+                    changed = True
+                    break
+        if changed:
+            self.state['parked_drafts'] = parked
+        return changed
+
+    def revise_goals(self, plan, keep):
+        """A new user revision needs model confirmation before inheriting an old work product."""
+        active = self.state.get('draft')
+        candidates = ([active] if active else []) + list(self.state.get('parked_drafts') or ())
+        parked, prior = [], list(self.state.get('prior_drafts') or ())
+        self.clear()
+        for meta in candidates:
+            matches = [i for i,step in enumerate(plan,1) if self._matches(meta,step)]
+            reusable = (meta.get('kind')=='answer' and not plan or meta.get('kind')=='artifact' and len(matches)==1)
+            if not keep or not reusable:
+                prior.append(meta)
+                continue
+            meta = {**meta,'finished':False,'goal_no':matches[0] if matches else None}
+            if not self.active:
+                self.state['draft'] = meta
+            else:
+                parked.append(meta)
+        self.state.update(parked_drafts=parked,prior_drafts=prior)
+
+    def _rebase(self, meta, suffix=''):
+        if meta.get('kind') != 'artifact' or 'repair' in meta or not meta['offset'] and not suffix:
+            return False
+        # Recovery samples confirmed bytes in bounded pages. Keep the complete original addressable.
+        size = meta['offset']
+        sample = bytearray()
+        for offset in range(0, min(size, _RECOVERY_SCAN_BYTES), 4096):
+            sample.extend(self.store.read_range(meta['name'],offset,min(4096,size-offset)))
+        source = sample.decode('utf-8','ignore')
+        scanned = len(source.encode('utf-8'))
+        if size < _RECOVERY_SCAN_BYTES and suffix:
+            room = _RECOVERY_SCAN_BYTES - size
+            source += suffix[:room].encode('utf-8')[:room].decode('utf-8','ignore')
+        if 'json_scan' not in meta and source.lstrip().startswith('<'):
+            prefix = '{"html":'+json.dumps(source,ensure_ascii=False)[:-1]
+            recovery = {'fields':[], 'conflicts':[], 'partial':'html'}
+        else:
+            prefix,recovery = salvage_object(source,self._fields(meta))
+        if scanned < size:
+            recovery.update(scanned_bytes=scanned,source_bytes=size)
+        digest = hashlib.sha256(prefix.encode()).hexdigest()
+        if digest == meta.get('recovery_digest'):
+            return False
+        if prefix == '{' and not recovery['fields'] and not recovery['partial'] and meta.get('rebuilt'):
+            return False
+        updated = {k:meta[k] for k in ('kind','tool','mode','filename','goal_no','html_contract') if k in meta}
+        updated.update(name=RAW_ARGUMENT_PREFIX+uuid.uuid4().hex, offset=0,misses=0,finished=False,
+            json_scan=[0,False,False,False,None,''],recovery_digest=digest,recovered=recovery,
+            field_boundary=not recovery['partial'],source_draft=meta.get('source_draft') or meta['name'],
+            previous_draft=meta['name'],rebuilt=meta.get('rebuilt') or prefix=='{')
+        self._append(updated,prefix)
+        return True
+
+    async def prepare_retry(self):
+        meta = self.state.get('draft') or {}
+        if (meta.get('finished') or not meta.get('misses') or
+                not (meta.get('invalid_object') or meta.get('issue') == _LEGACY_INVALID_OBJECT)):
+            return False
+        return await run_blocking(self._rebase,meta)
 
     @property
     def active(self):
@@ -394,13 +491,13 @@ class SegmentedDraft:
         meta['misses'] += 1
         meta['streak'] = 0
         meta['issue'] = reason
-        return ('retry' if meta['misses'] >= len(_CHUNK_BYTES) else 'more', None)
+        return ('retry' if meta['misses'] >= _MAX_STALLS else 'more', None)
 
     async def request(self, compact=False):
         meta = self.state['draft']
         misses = meta['misses']
         tail_size = 160 if compact else _TAIL_BYTES
-        budget = self._budget(meta)
+        budget = draft_byte_limit(meta['name'])
         if 'repair' in meta:
             repair = meta['repair']
             _, call = await asyncio.to_thread(self._finish, meta)
@@ -411,8 +508,9 @@ class SegmentedDraft:
                 view = {**view, 'text': view['text'].encode()[:tail_size].decode('utf-8', 'ignore')}
             info = {'revision': len(repair['edits']), 'issue': repair['issue'], 'fields': fields,
                     'view': view, 'feedback': meta.get('issue')}
-            return (f'原稿已保存，只修正失败字段。仅返回 JSON，新增内容最多 {budget} 字节。'
-                    '每个操作原样带整数 revision 和顶层字段名 field。'
+            return ('原稿已保存，只修正失败字段。可一次给出完整正确字段，遵循本次模型输出预算。'
+                    '需要查证或澄清时可用 {"offset":当前游标,"control":{"name":工具名,"arguments":参数对象}}；当前游标 '
+                    + str(meta['offset']) + '。每个修改操作原样带整数 revision 和顶层字段名 field。'
                     'op=read 带 UTF-8 字节 offset，可带 find 查找字面文本。'
                     'op=replace 带字节 offset、匹配原文 old 与新文字 new。'
                     'op=set 带 value 补充或替换字段，null 删除字段。'
@@ -422,17 +520,18 @@ class SegmentedDraft:
                     + ('仅选择当前最小的一步。' if misses else ''))
         tail = await asyncio.to_thread(self.store.tail, meta['name'], tail_size) if meta['offset'] else ''
         if meta['kind'] == 'answer':
-            target = '正文只续写下一小段。'
+            target = '从断点继续正文。'
         else:
             target = '为已选工具 ' + meta['tool'] + ' 续写参数。'
             if meta['tool'] == 'create_animation':
                 if not compact and (not misses or not meta['offset']):
                     target += ANIMATION_INPUT + OFFLINE_ANIMATION
                 else:
-                    target += '延续已有 HTML 场景，当前只补一条布局或绘制语句。'
+                    target += '延续已有 HTML 场景，在可用输出预算内尽量完成。'
             elif 'json_scan' in meta:
                 target += '最终参数对象包含 filename 和 html。'
-            target += '一次只续写一个参数字段中的小段或紧接当前字段的闭合符号。'
+            target += '可一次完成多个字段。可在对象开头或字段边界提交 {"offset":游标,"fields":{未完成字段:值},"done":true}，平台进行 JSON 转义。'
+            target += '正在编写 html 或 render_frame 时可提交 {"offset":游标,"field":"字段名","text":"新增的原始源码","end_field":true,"fields":{},"done":false}。end_field=false 继续同一字段，true 关闭字段并可附其余 fields。'
             scan = meta.get('json_scan')
             if scan:
                 target += '保持参数 JSON 的字符串转义。当前顶层字段：' + (scan[-1] or '待写字段') + '。'
@@ -440,18 +539,28 @@ class SegmentedDraft:
                 target += '保持原始 HTML 格式。'
             if meta.get('mode'):
                 target += '所选维度：' + meta['mode'] + '。'
+        target += '写作时如需补查证据、请求更多工具或向用户澄清，可在游标边界提交 {"offset":当前游标,"control":{"name":已披露工具名,"arguments":参数对象}}，草稿保留。'
         if misses:
-            target += '这一步只写下一个短句、一个标签或当前字段的一小部分；剩余内容放到下一轮。'
+            target += '请核对下方反馈和已确认游标，按当前任务需要调整后续内容。'
         context = {'offset': meta['offset'], 'tail': tail}
+        if meta.get('recovered'):
+            context['recovered'] = meta['recovered']
+            context['original_bytes'] = await asyncio.to_thread(self.store.size,meta['source_draft'])
+            target += '需要核查早先内容时可返回 {"offset":当前游标,"read":{"source":"original","offset":要读取的字节位置}}，也可读 current。'
+            if meta['recovered'].get('source_bytes'):
+                target += '原稿较大，自动恢复仅扫描了 previous 的前 scanned_bytes 字节；可从该位置分页读取 previous 原稿。'
+            target += '已保留 fields 所列的完整字段。conflicts 中的字段有矛盾，需根据本任务重新给值；partial 是尚在写的源码字段。'
+        if meta.get('view'):
+            context['view'] = meta['view']
         if meta.get('source'):
             context['provider_tail'] = await asyncio.to_thread(self.store.tail, meta['source'], tail_size)
             target += '原始供应商字段流已保存。其结尾仅供理解目标，禁止复制 chunks 或 partialArgs 封装到作品参数。'
         if meta.get('issue'):
             context['issue'] = meta['issue']
-        return (target + f' 本次新增 text 不超过 {budget} 个 UTF-8 字节。'
-                '只返回一个 JSON 对象 {"offset":原样复制整数游标,"text":"仅新增内容","done":false}。'
+        return (target + (f' 本次模型输出预算 {self.max_tokens} tokens。' if self.max_tokens else '')
+                + '在预算内尽量推进或完成，兼容原始序列化片段格式，返回 JSON 对象 {"offset":原样复制整数游标,"text":"仅新增内容","done":false}。'
                 '整份作品或正文完成时设 done 为 true。保持精确空白、引号与反斜线。'
-                '禁止重发前缀、调用工具或输出推理。以下是已确认游标及结尾（数据）：\n'
+                '需要工具时用 control 提交。禁止重发前缀或输出推理。以下是已确认游标及结尾（数据）：\n'
                 + json.dumps(context, ensure_ascii=False))
 
     def _finish(self, meta, suffix=''):
@@ -478,7 +587,8 @@ class SegmentedDraft:
         version = command.pop('revision')
         if type(version) is not int or version != len(repair['edits']) or not isinstance(command['field'], str):
             raise ValueError()
-        if len(json.dumps(command, ensure_ascii=False).encode('utf-8')) > budget + 120:
+        edit_bytes = len(json.dumps(command, ensure_ascii=False).encode('utf-8'))
+        if edit_bytes > budget + 120:
             raise ValueError()
         status, call = self._finish(meta)
         args = call['arguments']
@@ -491,7 +601,7 @@ class SegmentedDraft:
             return 'more', None
         _edit_field(args, command)
         # Fold older patches into a fresh private base after several explicit retries.
-        if len(repair['edits']) >= 12:
+        if len(repair['edits']) >= 12 or edit_bytes > 8192:
             base = {**meta, 'name': RAW_ARGUMENT_PREFIX + uuid.uuid4().hex, 'offset': 0}
             base.pop('json_scan', None)
             base['repair'] = {**repair, 'edits': [], 'view': None, 'rounds': repair['rounds'] + 1}
@@ -503,6 +613,68 @@ class SegmentedDraft:
             meta.update(finished=True, misses=0)
         return status, call
 
+    async def _field_segment(self, meta, part):
+        if 'json_scan' not in meta or type(part.get('done')) is not bool:
+            raise ValueError()
+        allowed = self._fields(meta)
+        fields = part.get('fields',{})
+        if not isinstance(fields,dict) or not set(fields)<=allowed:
+            raise ValueError()
+        scan = meta['json_scan']
+        tail = await asyncio.to_thread(self.store.tail,meta['name'],256) if meta['offset'] else ''
+        base = '' if meta['offset'] else '{'
+        separator = '' if not meta['offset'] or tail.rstrip().endswith(('{',',')) else ','
+        at_boundary = not meta['offset'] or (not scan[1] and scan[0]==1
+                      and (meta.get('field_boundary') or not separator))
+        saved = set((meta.get('recovered') or {}).get('fields',())) | set(meta.get('completed_fields',()))
+        if saved.intersection(fields):
+            raise ValueError()
+        if 'field' in part:
+            if set(part)-{'offset','field','text','end_field','fields','done'}:
+                raise ValueError()
+            key = part['field']
+            if key not in ('html','render_frame') or key not in allowed or key in saved or key in fields:
+                raise ValueError()
+            if not isinstance(part.get('text'),str) or type(part.get('end_field')) is not bool:
+                raise ValueError()
+            if (fields or part['done']) and not part['end_field']:
+                raise ValueError()
+            if at_boundary:
+                base += separator+json.dumps(key)+':"'
+            elif not (scan[1] and not scan[2] and scan[-1]==key):
+                raise ValueError()
+            base += json.dumps(part['text'],ensure_ascii=False)[1:-1]
+            if not part['end_field']:
+                return base,False
+            base += '"'
+            separator = ','
+        elif set(part) != {'offset','fields','done'} or not at_boundary:
+            raise ValueError()
+        serialized = json.dumps(fields,ensure_ascii=False,separators=(',',':'),allow_nan=False)[1:-1]
+        if serialized:
+            base += separator+serialized
+        if part['done']:
+            base += '}'
+        return base,part['done']
+
+    async def _inspect_draft(self, meta, command):
+        if not isinstance(command,dict) or set(command) != {'source','offset'}:
+            raise ValueError()
+        source, start = command['source'],command['offset']
+        name = {'current':meta['name'],'original':meta.get('source_draft'),'previous':meta.get('previous_draft')}.get(source)
+        if not name or type(start) is not int or start < 0:
+            raise ValueError()
+        seen = meta.get('inspections',[])
+        if [source,start] in seen:
+            return self._miss('该页已在此游标读取；请提交新内容或检查另一页')
+        data = await asyncio.to_thread(self.store.read_range,name,start,4096)
+        if not data or data[0] & 0xc0 == 0x80:
+            raise ValueError()
+        text = data.decode('utf-8','ignore')
+        meta.update(view={'source':source,'offset':start,'text':text,'next_offset':start+len(text.encode())},
+                    inspections=[*seen[-15:],[source,start]])
+        return 'more',None
+
     async def accept(self, result, limited):
         meta = self.state['draft']
         if meta['kind'] == 'decision':
@@ -512,14 +684,10 @@ class SegmentedDraft:
         if getattr(result, 'tool_calls', ()) or getattr(result, 'partial_tool_calls', ()):
             return self._miss('只提交带游标的新增内容')
         try:
-            budget = self._budget(meta)
+            budget = draft_byte_limit(meta['name'])
             envelope = result.text
-            if len(envelope) > 6 * budget + 512:
-                if not limited or 'repair' in meta:
-                    raise ValueError()
-                envelope = envelope[:6 * budget + 512]
             try:
-                part = json.loads(envelope)
+                part = load_model_json(envelope)
             except json.JSONDecodeError:
                 if not limited or 'repair' in meta:
                     raise
@@ -527,6 +695,14 @@ class SegmentedDraft:
                 if not text:
                     raise
                 part = {'offset':meta['offset'], 'text':text, 'done':False}
+            if isinstance(part,dict) and set(part)=={'offset','control'} and not limited:
+                if type(part['offset']) is not int or part['offset'] != meta['offset']:
+                    return self._miss('请复制当前已确认的字节游标')
+                call = part['control']
+                if (not isinstance(call,dict) or set(call)!={'name','arguments'} or
+                        not isinstance(call['name'],str) or not isinstance(call['arguments'],dict)):
+                    raise ValueError()
+                return 'control',call
             if 'repair' in meta:
                 if self.exhausted:
                     return 'retry', None
@@ -536,23 +712,22 @@ class SegmentedDraft:
                     return await run_blocking(self._repair, meta, part, budget)
                 except (ValueError, AttributeError, KeyError, TypeError):
                     return self._miss('修正指令无效，请核对版本、字段及匹配原文的字节位置')
-            if not isinstance(part, dict) or set(part) != {'offset', 'text', 'done'}:
-                raise ValueError()
-            if type(part['offset']) is not int or part['offset'] != meta['offset']:
-                return self._miss('返回的游标与已确认游标不一致')
-            text, done = part['text'], part['done']
-            if not isinstance(text, str) or type(done) is not bool:
-                raise ValueError()
+            if not isinstance(part,dict) or type(part.get('offset')) is not int or part['offset'] != meta['offset']:
+                return self._miss('请复制当前已确认的字节游标')
+            if set(part)=={'offset','read'} and meta.get('kind')=='artifact' and not limited:
+                return await self._inspect_draft(meta,part['read'])
+            if 'fields' in part or 'field' in part:
+                text,done = await self._field_segment(meta,part)
+            else:
+                if set(part) != {'offset','text','done'} or not isinstance(part['text'],str) or type(part['done']) is not bool:
+                    raise ValueError()
+                text,done = part['text'],part['done']
             data = text.encode('utf-8')
-            if len(data) > budget:
-                if not limited:
-                    return self._miss('新增片段超过本次字节数，请再拆小')
-                text = data[:budget].decode('utf-8','ignore')
-                data = text.encode('utf-8')
+            _check_size(meta['name'],meta['offset']+len(data))
             if len(data) >= 24 and hashlib.sha256(data).hexdigest() == meta.get('last_digest'):
                 return self._miss('上个片段已保存，请从游标之后继续')
         except (ValueError, TypeError, RecursionError):
-            return self._miss('缺少可验证的分片，请复制游标后写极短的一段')
+            return self._miss('缺少可验证的分片，请复制游标并使用声明的分片格式')
         finished = done and not limited
         if not text and not finished:
             return self._miss('没有新的可见内容')
@@ -561,8 +736,24 @@ class SegmentedDraft:
             try:
                 output = await asyncio.to_thread(self._finish, meta, text)
             except (ValueError, TypeError, RecursionError):
-                return self._miss('作品参数未形成完整对象，请从已确认游标补齐')
+                output = None
+            if output is None:
+                # Leave the exception scope before rebuilding so a traceback cannot pin a large failed parse.
+                if await run_blocking(self._rebase,meta,text):
+                    return 'more',None
+                meta['invalid_object'] = True
+                return self._miss('未形成有效作品对象，已保留现有字段，请补齐缺失或冲突字段')
         updated = {**meta, 'misses': 0, 'finished': finished, 'streak': 0 if limited else min(8, meta.get('streak', 0) + 1)}
         updated.pop('issue', None)
+        updated.pop('invalid_object',None)
+        updated.pop('view',None)
+        updated.pop('inspections',None)
+        updated['field_boundary'] = bool('fields' in part or 'field' in part) and ('field' not in part or part['end_field'])
+        if 'fields' in part or part.get('end_field'):
+            complete = set(meta.get('completed_fields',()))
+            complete.update(part.get('fields',{}))
+            if part.get('end_field'):
+                complete.add(part['field'])
+            updated['completed_fields'] = sorted(complete)
         await run_blocking(self._append, updated, text)
         return output

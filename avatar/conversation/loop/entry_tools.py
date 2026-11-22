@@ -4,12 +4,14 @@ import json
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
+from avatar.core.text_budget import AgentText
 from avatar.core.execution import check_execution_async, run_blocking
+from avatar.rag.reading import ReadingNeedsInput
 
 
 class ToolQuestion(BaseModel):
     model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
-    query: str = Field(min_length=1, max_length=2000)
+    query: AgentText = Field(min_length=1)
 
 
 class SearchQuestion(ToolQuestion):
@@ -88,15 +90,24 @@ async def bind_entry_tools(chat, context, owner, aic, session, files, *, include
             raise ValueError('当前会话未提供此工具')
         request = (SearchQuestion if name=='search_materials' else ToolQuestion).model_validate(args)
         route = {'mode':'search' if name=='search_materials' else 'read', **request.model_dump()}
-        selected = await chat.rag.enrich(owner,aic,session,files,({**config,'_answer_route':route},key,system,history),
+        # A new lookup must not inherit proof or excerpts from an earlier successful lookup.
+        lookup={k:v for k,v in config.items() if k not in ('_rag_access','_material_sources','_image_inputs','_workflow_notices')}
+        data=background(system)
+        for field in ('file_evidence','file_catalog','material_readings'):
+            data.pop(field,None)
+        lookup_system=system.split('\n',1)[0]+'\n'+json.dumps(data,ensure_ascii=False)
+        selected = await chat.rag.enrich(owner,aic,session,files,({**lookup,'_answer_route':route},key,lookup_system,history),
                                          request.query,include_private=include_private,progress=progress)
-        resolved, message = await chat.rag.answer_context(selected, request.query, progress=progress)
+        try:
+            resolved, message = await chat.rag.answer_context(selected, request.query, progress=progress)
+        except ReadingNeedsInput as missing:
+            await check_execution_async(validate)
+            return json.dumps({'query':request.query,'has_evidence':False,'matches':[],
+                               'sources':[],'notices':[str(missing)]},ensure_ascii=False)
         cfg = resolved[0]
         data = background(resolved[2])
         evidence = data.get('file_evidence', [])
         reading = message[len(request.query):].strip()
-        if name=='read_material' and not cfg.get('_material_sources'):
-            raise ValueError('本步未读到授权原件正文。请调整资料查询或请用户确认文件。')
         # Older protected observations stay bound to their original revisions across compaction and restart.
         await check_execution_async(validate)
         proof = cfg.get('_rag_access', {})
@@ -118,7 +129,12 @@ async def bind_entry_tools(chat, context, owner, aic, session, files, *, include
         if store:
             await run_blocking(store.merge, {'entry_material':{'sources':sources,'revisions':list(revisions.items())}})
         await check_execution_async(validate)
-        return json.dumps({'query':request.query,'matches':evidence,'reading':reading,
+        proven_ids={identity[1] for identity,_ in proof.get('revisions',())}
+        original=any(item.get('file_id') in proven_ids and item.get('type')=='源文件'
+                     for item in cfg.get('_material_sources',()))
+        matched=any(item.get('file_id') in proven_ids and str(item.get('text') or '').strip() for item in evidence)
+        return json.dumps({'query':request.query,'has_evidence':original or (name=='search_materials' and matched),
+                           'matches':evidence,'reading':reading,
                            'sources':cfg.get('_material_sources',[]),'notices':cfg.get('_workflow_notices',[])},ensure_ascii=False)
 
     config.update(_entry_tools=tools,_execute_entry_tool=execute,_validate_entry_results=validate)
