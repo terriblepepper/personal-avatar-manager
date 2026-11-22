@@ -191,9 +191,9 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
     streamed = False
     observations = list(state.get('observations', ()))
     receipts_log = list(state.get('receipts', ()))
-    def remember(note):
+    def remember(note, receipt=None):
         trace.tool_result(name, args, note)
-        observations.append(note)
+        observations.append(f'回执 #{receipt["id"]}（{receipt["mode"]}）: {note}' if receipt else note)
         trace.receipt('已取得本步工具回执')
     seen = {tuple(key) if isinstance(key,list) else key for key in state.get('seen', ())}
     verified_material_reads = {tuple(key) for key in state.get('verified_reads', ())}
@@ -338,7 +338,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         prompt += '协议要求以会话动作收尾。若当前未披露合适的终态函数，先用 request_tools 描述所需的交接方式。'
     prompt += ('可直接回答时直接回答。工具可见不表示必须调用。'
                '需要更多能力或调整后续目标时用 request_tools；缺少用户才能给出的信息时用 ask_user。'
-               '已有依赖目标先取实际回执，再创作或交付。综合目标可用 update_task 提交子结果及真实回执编号。')
+               '有依赖时先取实际回执，再创作或交付。用 update_task 提交子结果和本目标的回执编号，可依次确认多项。')
     disclosure_misses = state.get('disclosure_no_progress',0) if not changed else 0
 
     queued = []
@@ -362,6 +362,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             settings = {**settings,'_tools':selected_definitions()}
         log.info('agent receipt run=%s iteration=%d goal=%s tool=%s remaining=%d',
                  run_id,iteration,receipt['goal_no'],name,len(pending))
+        return receipt
 
     def repair_call(detail=''):
         nonlocal settings, invalid
@@ -441,7 +442,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                     {'history_turns': len(history), 'observation_count': len(observations)})
         await check_execution_async(validate)
         if queued and not receipt_ok:
-            independent = [c for c in queued if c['name'] in EVIDENCE_TOOLS or c['name']=='list_avatars']
+            independent = [c for c in queued if c['name'] in EVIDENCE_TOOLS or c['name'] in ('list_avatars','update_task')]
             if len(independent)!=len(queued):
                 observations.append('本批前一步没有取得有效回执。其余查阅继续，交付动作留待重新决定。')
             queued = independent
@@ -726,9 +727,9 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                     batch.append(call)
             # Handoffs return control to another workflow; decide them against the completed receipts.
             serial = [c for c in batch if c['name'] in EVIDENCE_TOOLS or
-                      c['name'] in ('list_avatars','send_material','send_animation',*ARTIFACT_TOOLS)]
-            if any(c['name'] in EVIDENCE_TOOLS for c in serial):
-                serial = [c for c in serial if c['name'] in EVIDENCE_TOOLS or c['name']=='list_avatars']
+                      c['name'] in ('list_avatars','update_task','send_material','send_animation',*ARTIFACT_TOOLS)]
+            if any(c['name'] in EVIDENCE_TOOLS or c['name']=='update_task' for c in serial):
+                serial = [c for c in serial if c['name'] in EVIDENCE_TOOLS or c['name'] in ('list_avatars','update_task')]
             if len(batch)==1:
                 calls = (batch[0],)
             elif serial:
@@ -738,7 +739,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 if deferred:
                     observations.append('这些动作尚未执行，须在收到本批回执后重新决定：'+json.dumps(deferred))
             else:
-                observations.append('一次只能提交一个结束、确认或交接决定。请根据目标选择一个，所有候选均未执行。')
+                observations.append('一次只能提交一个结束或交接决定。请根据目标选择一个，所有候选均未执行。')
                 repair_call()
                 continue
             result = replace(result,tool_calls=calls)
@@ -904,9 +905,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 if name == 'read_session_file':
                     page = json.loads(note)
                     if page.get('kind')=='directory':
-                        if any(step.get('file_access')=='directory' for step in pending):
-                            received(name, mode='directory')
-                        remember(note)
+                        remember(note, received(name, mode='directory'))
                         observations.append('目录仅含元数据；需要正文时用有效 file_id 读取。未命中可换查询。')
                         continue
                     if not page.get('has_content'):
@@ -919,8 +918,8 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                         remember(note)
                         observations.append('本次检索未获得支持当前目标的材料。请调整查询、申请其他工具，或向用户说明缺口。')
                         continue
-                received(name, mode='content' if name=='read_session_file' else None)
-                remember(note)
+                receipt = received(name, mode='content' if name=='read_session_file' else None)
+                remember(note, receipt if name=='read_session_file' else None)
                 continue
             if name == 'read_step_receipt':
                 page_key = (name, args.get('receipt'), args.get('offset',0), current.get('goal_no'), revision)
@@ -1111,7 +1110,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             if isinstance(error, HTTPException) and (error.status_code!=502 or getattr(error,'delivery_unknown',False) or action == 'contact_avatar'):
                 raise
             log.warning('agent validation run=%s iteration=%d goal=%s tool=%s issue=invalid_arguments',
-                        run_id,iteration,current.get('goal_no'),action if action in allowed else 'unknown')
+                        run_id,iteration,current.get('goal_no'),action if action in active_tools else 'unknown')
             if isinstance(error,ValidationError):
                 detail='；'.join(str(e['loc'][-1])+': '+e['type'] for e in error.errors(include_input=False)[:4] if e['loc'])
             else:

@@ -120,11 +120,15 @@ def validate_disclosure(value, choices, *, revise=False):
         if 'file_access' in s and (primary!='read_session_file' or s['file_access'] not in ('directory','content')):
             raise ValueError('会话文件目标须选择查目录或读原件')
         if 'lookup' in s:
-            if primary not in ('find_material','find_animation','find_public_material'):
+            if primary=='read_session_file':
+                from avatar.conversation.loop.entry_tools import SessionFileRequest
+                s['lookup']=SessionFileRequest.model_validate(s['lookup']).model_dump(exclude_unset=True)
+            elif primary in ('find_material','find_animation','find_public_material'):
+                s['lookup']=FindMaterial.model_validate(s['lookup']).model_dump(exclude_unset=True)
+            else:
                 raise ValueError('该子目标不支持检索参数')
-            s['lookup']=FindMaterial.model_validate(s['lookup']).model_dump(exclude_unset=True)
         selected.extend(n for n in [primary,*tools] if n and n not in selected)
-        text_parts.extend((s['goal'], s.get('criterion',''), s.get('lookup',{}).get('query','')))
+        text_parts.extend((s['goal'], s.get('criterion',''), s.get('lookup',{}).get('query') or ''))
         steps.append(s)
     if not fits_text_budget(*text_parts):
         raise ValueError(budget_error())
@@ -137,13 +141,14 @@ def validate_disclosure(value, choices, *, revise=False):
 
 
 async def disclose_tools(model, settings, key, system, history, question, catalog, validate, *, revise=False):
+    from avatar.conversation.loop.entry_tools import SessionFileRequest
     from avatar.conversation.tools.material_delivery import FindMaterial
     name={'type':'string','enum':list(catalog)}
     names={'type':'array','items':name,'uniqueItems':True}
     steps={'type':'array','maxItems':16,'items':{'type':'object','properties':{
         'goal':{'type':'string','minLength':1,'description':TEXT_LIMIT},
         'criterion':{'type':'string','minLength':1,'description':TEXT_LIMIT},
-        'tool':name,'tools':names,'segmented':{'type':'boolean','description':'大型作品从第一段起以游标分片写作'},'lookup':FindMaterial.model_json_schema(),
+        'tool':name,'tools':names,'segmented':{'type':'boolean','description':'大型作品从第一段起以游标分片写作'},'lookup':{'anyOf':[FindMaterial.model_json_schema(),SessionFileRequest.model_json_schema()]},
         'html_mode':{'type':'string','enum':['2d','3d']},
         'file_access':{'type':'string','enum':['directory','content'],'description':'会话文件目标：查目录或读原件'}},'required':['goal'],'additionalProperties':False}}
     properties={'tools':names,'steps':steps}
@@ -252,8 +257,12 @@ def revise_goals(plan, pending, selected, addition, replace_goals):
     for step in addition['steps']:
         if not any(s['goal']==step['goal'] and s['tool']==step['tool'] for s in pending):
             plan.append(dict(step))
-            pending.insert(insert,dict(step,goal_no=len(plan)))
-            insert+=1
+            added=dict(step,goal_no=len(plan))
+            if DELIVERABLES.intersection([step['tool'], *step.get('tools',())]):
+                pending.append(added)
+            else:
+                pending.insert(insert,added)
+                insert+=1
             revised = True
     return revised
 
@@ -268,15 +277,19 @@ def confirm_goal(args, pending, log, revision):
     number, result, ids = args.get('goal_no'), args.get('result'), args.get('receipts',[])
     goal = next((s for s in pending if s['goal_no']==number),None)
     if (set(args)-{'goal_no','result','receipts'} or type(number) is not int or goal is None or
-            not needs_confirmation(goal) or not isinstance(result,str) or not result.strip() or not fits_text_budget(result) or
-            not isinstance(ids,list) or any(type(i) is not int or not 1<=i<=len(log) for i in ids)):
-        raise ValueError('提交子结果时需要开放的目标编号和有效的回执编号')
+            not needs_confirmation(goal) or not isinstance(result,str) or not result.strip() or not fits_text_budget(result)):
+        raise ValueError('提交结果时须填写仍需核对的目标编号和结果')
+    if not isinstance(ids,list) or any(type(i) is not int or not 1<=i<=len(log) for i in ids):
+        raise ValueError(f'回执编号必须使用清单中的整数编号，当前共有 {len(log)} 条回执')
     required = set(goal.get('tools',())) | ({goal['tool']} if goal['tool'] else set())
     evidence = {r['tool'] for i in ids for r in (log[i-1],)
                 if r.get('goal_no')==number and r.get('input_id')==revision}
+    deliveries = required & DELIVERABLES
+    primary = goal['tool']
     reads = required & EVIDENCE_TOOLS
-    if ((required and not required.intersection(evidence)) or not (required & DELIVERABLES).issubset(evidence)
-            or (required & DELIVERABLES and reads and not reads.intersection(evidence))):
+    if ((required and not required.intersection(evidence)) or (deliveries and not deliveries.intersection(evidence))
+            or (primary in deliveries and primary not in evidence)
+            or (deliveries and reads and not reads.intersection(evidence))):
         raise ValueError('缺少该子目标的实际工具回执')
     pending.remove(goal)
     log.append({'id':len(log)+1,'tool':'update_task','goal_no':number,'result':result.strip(),
