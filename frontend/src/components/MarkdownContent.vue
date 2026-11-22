@@ -109,7 +109,7 @@ const rendered = computed(() => {
   function addFile(file: ChatFile) {
     if (embedded.has(file.id)) return
     const url = chatFileURL(file, props.conversationId)
-    if (!url) return
+    if (!url && !file.expired) return
     flush()
     embedded.add(file.id)
     blocks.push({kind:'file',file,url,mode:previewKind(file.filename.split('.').pop()?.toLowerCase() || '')})
@@ -168,7 +168,8 @@ const rendered = computed(() => {
       <MermaidDiagram v-if="block.kind === 'diagram'" :source="block.source" :conversation-id="conversationId" />
       <AnimationDiagram v-else-if="block.kind === 'animation'" :source="block.source" :conversation-id="conversationId" />
       <template v-else-if="block.kind === 'file'">
-        <AnimationAttachments v-if="block.mode === 'animation'" :files="[block.file]" :inline-keys="rendered.inlineKeys"
+        <p v-if="block.file.expired" class="expired-file sub" role="status">{{ block.file.filename }} · 文件已过期</p>
+        <AnimationAttachments v-else-if="block.mode === 'animation'" :files="[block.file]" :inline-keys="rendered.inlineKeys"
           :conversation-id="conversationId" @preview="emit('preview',$event)" />
         <GeneratedImage v-else-if="block.mode === 'image'" :file="block.file" :url="block.url" @preview="emit('preview',$event)" />
         <InlineTextFile v-else-if="block.mode === 'text' || block.mode === 'mermaid' || block.mode === 'html'" :file="block.file" :url="block.url" :mode="block.mode" :saved="savedFileIds?.has(block.file.id)" @preview="emit('preview',$event)" @promote="emit('promote',$event)"/>
@@ -183,6 +184,7 @@ const rendered = computed(() => {
 </template>
 
 <style scoped>
+.expired-file { overflow-wrap:anywhere; margin-block:0.65rem; }
 .markdown-content :is(audio,video) { max-inline-size:100%; max-block-size:60dvh; }
 .markdown-content :deep(.file-link) { max-inline-size:100%; overflow-wrap:anywhere; text-align:start; }
 </style>

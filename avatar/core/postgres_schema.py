@@ -1463,9 +1463,13 @@ def install_schema(connection):
             ADD CONSTRAINT chat_generation_jobs_state_check CHECK
             (state IN ('queued','running','succeeded','failed','cancelled','indeterminate','awaiting_input'))""")
 
+    from avatar.core.migrations.task_workspaces import install_task_workspaces
+    install_task_workspaces(connection)
     connection.execute("""UPDATE chat_files SET expires_at=to_char(
         (created_at::timestamptz AT TIME ZONE 'UTC') + interval '7 days','YYYY-MM-DD HH24:MI:SS')
-        WHERE origin='generated' AND expires_at IS NULL""")
+        WHERE origin='generated' AND expires_at IS NULL AND NOT EXISTS (
+            SELECT 1 FROM agent_task_members m WHERE m.resource_conversation_id=chat_files.conversation_id
+            AND m.user_id=chat_files.user_id)""")
 
     from avatar.knowledge.everos_storage import ensure_schema
     from avatar.protocols.tasks.store import initialize_system_tasks

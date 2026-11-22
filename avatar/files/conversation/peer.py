@@ -5,10 +5,23 @@ import re
 import time
 import uuid
 from contextlib import ExitStack
+from datetime import datetime, timezone
 from fastapi import HTTPException
 from avatar.core.db import now
 from avatar.files.conversation.resources import original_hashes, reference_count
 from avatar.files.library.attachments import MAX_FILE
+
+
+GENERATED_FILE = """(f.origin='generated' OR (f.origin='reference' AND f.sha256!='' AND EXISTS (
+    SELECT 1 FROM agent_task_files source JOIN chat_files original ON original.id=source.file_id
+    WHERE source.task_id=a.task_id AND source.source_user_id=a.source_user_id
+      AND source.message_id=a.message_id AND original.user_id=a.source_user_id
+      AND original.sha256=f.sha256 AND original.origin='generated')))"""
+
+
+def workspace_expired(task):
+    deadline = task and task['delivery_mode']!='message' and task['status']=='ended' and task['expires_at']
+    return bool(deadline and datetime.fromisoformat(deadline).replace(tzinfo=timezone.utc).timestamp()<=time.time())
 
 
 class PeerResources:
@@ -39,9 +52,35 @@ class PeerResources:
         if member['resource_conversation_id']:
             self.files.directory.workspace(user_id,member['resource_conversation_id'],create=True)
             return member['resource_conversation_id']
+        if task_id and task['status']=='ended':
+            raise HTTPException(409,'任务已结束，无法创建工作区')
         workspace=self.new_workspace(db,user_id,'分身任务资源' if task_id else '分身间会话资源')
         db.execute(f'UPDATE {table} SET resource_conversation_id=? WHERE {key}=? AND user_id=?',(workspace,identifier,user_id))
         return workspace
+
+    @staticmethod
+    def sync_task_expiry(db,task_id):
+        for table in ('chat_files','conversation_diagrams'):
+            db.execute(f"""UPDATE {table} f SET expires_at=d.expires_at
+                FROM agent_task_members m JOIN agent_dialogues d ON d.id=m.task_id
+                JOIN chat_conversations c ON c.id=m.resource_conversation_id AND c.user_id=m.user_id AND c.channel='peer'
+                WHERE d.id=? AND f.conversation_id=m.resource_conversation_id AND f.user_id=m.user_id
+                    AND f.expires_at IS DISTINCT FROM d.expires_at
+                    AND NOT EXISTS(SELECT 1 FROM agent_session_members s WHERE s.resource_conversation_id=c.id)""",(task_id,))
+
+    @staticmethod
+    def expired_cards(db,task_id,user_id):
+        row=db.execute("SELECT expired_files FROM agent_task_members WHERE task_id=? AND user_id=? AND hidden=0",
+                       (task_id,user_id)).fetchone()
+        if row and row[0]!='[]':
+            return json.loads(row[0])
+        rows=db.execute(f"""SELECT coalesce(a.source_file_id,f.id) AS id,f.filename,f.content_type,f.size,
+            a.source_user_id AS sender_user_id,a.message_id,'generated' AS origin,true AS expired
+            FROM agent_task_members m JOIN chat_files f ON f.conversation_id=m.resource_conversation_id AND f.user_id=m.user_id
+            JOIN agent_task_files a ON a.task_id=m.task_id AND a.file_id=f.id
+            WHERE m.task_id=? AND m.user_id=? AND m.hidden=0 AND {GENERATED_FILE} AND a.message_id IS NOT NULL
+            ORDER BY f.created_at,f.id""",(task_id,user_id))
+        return [dict(item) for item in rows]
 
     def release_workspaces(self, db, stack, workspaces):
         for owner, conversation in set(workspaces):
@@ -53,6 +92,17 @@ class PeerResources:
             stack.enter_context(self.files.deleting(db,rows,workspaces=[(owner,conversation)]))
             db.execute('DELETE FROM agent_intents WHERE user_id=? AND conversation_id=?',(owner,conversation))
             db.execute('DELETE FROM chat_conversations WHERE user_id=? AND id=?',(owner,conversation))
+
+    def release_task_workspaces(self,db,stack,workspaces):
+        candidates=[]
+        for owner, workspace in set(workspaces):
+            if workspace and not db.execute("""SELECT 1 FROM agent_task_members
+                WHERE user_id=? AND resource_conversation_id=? AND hidden=0
+                UNION ALL SELECT 1 FROM agent_session_members
+                WHERE user_id=? AND resource_conversation_id=? AND hidden=0 LIMIT 1""",
+                (owner,workspace,owner,workspace)).fetchone():
+                candidates.append((owner,workspace))
+        self.release_workspaces(db,stack,candidates)
 
     def share(self,db,user,task_id,file_ids,source=None,generated=False,authorize_ids=(),*,attachments=False):
         """事务内校验双方与所有源文件，生成七天临时快照；同内容不重复复制或延长期限。"""
@@ -159,19 +209,17 @@ class PeerResources:
                             grants=lambda conn:self.session_file_grants(conn,task,owner,workspace))
         reader.validate_in(db,lock=lock)
 
-    def metadata(self,task_id,user_id):
+    def metadata(self,task_id,user_id,*,expired=False):
         """只返回该查看者已获得的文件名称、下载地址和到期日期。"""
+
         with self.database.connect() as db:
-            rows=db.execute("""SELECT f.id,f.conversation_id,f.filename,f.content_type,f.size,f.animation_metadata,
+            if expired:
+                return self.expired_cards(db,task_id,user_id)
+            rows=db.execute(f"""SELECT f.id,f.conversation_id,f.filename,f.content_type,f.size,f.animation_metadata,
                 f.expires_at,f.promoted_id,a.source_user_id,a.message_id,
-                CASE WHEN f.origin='reference' AND f.sha256!='' AND EXISTS (
-                    SELECT 1 FROM agent_task_files source JOIN chat_files original ON original.id=source.file_id
-                    WHERE source.task_id=a.task_id AND source.source_user_id=a.source_user_id
-                    AND source.message_id=a.message_id AND original.user_id=a.source_user_id
-                    AND original.sha256=f.sha256 AND original.origin='generated'
-                ) THEN 'generated' ELSE f.origin END AS display_origin
+                CASE WHEN {GENERATED_FILE} THEN 'generated' ELSE f.origin END AS display_origin
                 FROM chat_files f JOIN agent_task_files a ON a.file_id=f.id
-                WHERE a.task_id=? AND f.user_id=? AND julianday(f.expires_at)>julianday('now')
+                WHERE a.task_id=? AND f.user_id=? AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now'))
                 ORDER BY f.created_at,f.id""",(task_id,user_id)).fetchall()
         return [{'id':r['id'],'sender_user_id':r['source_user_id'],'message_id':r['message_id'],'origin':r['display_origin'],'promoted_id':r['promoted_id'],'filename':r['filename'],'content_type':r['content_type'],'size':r['size'],**json.loads(r['animation_metadata']),'expires_at':r['expires_at'],'download_url':'/api/conversations/'+r['conversation_id']+'/files/'+r['id']} for r in rows
                 if self.files.directory.available_in(user_id,r['conversation_id'],r['id'],r['size'])]
@@ -182,10 +230,27 @@ class PeerResources:
             # 分批提交，避免长期停机后的过期原件一起进入事务恢复缓冲。
             with ExitStack() as stack:
                 with self.database.connect(write=True) as db:
+                    expired=db.execute("""SELECT m.task_id,m.user_id,m.resource_conversation_id
+                        FROM agent_task_members m JOIN agent_dialogues d ON d.id=m.task_id
+                        JOIN chat_conversations c ON c.id=m.resource_conversation_id AND c.user_id=m.user_id AND c.channel='peer'
+                        WHERE d.delivery_mode<>'message' AND d.status='ended' AND d.expires_at IS NOT NULL
+                          AND d.expires_at<=to_char(CURRENT_TIMESTAMP AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+                          AND NOT EXISTS(SELECT 1 FROM agent_session_members s WHERE s.resource_conversation_id=c.id)
+                          AND NOT EXISTS(SELECT 1 FROM agent_task_members other
+                            JOIN agent_dialogues sibling ON sibling.id=other.task_id
+                            WHERE other.resource_conversation_id=m.resource_conversation_id
+                              AND other.user_id=m.user_id AND other.task_id<>m.task_id
+                              AND (sibling.expires_at IS NULL OR julianday(sibling.expires_at)>julianday('now')))
+                        ORDER BY d.expires_at LIMIT 10""").fetchall()
+                    for scope in expired:
+                        cards=self.expired_cards(db,scope['task_id'],scope['user_id'])
+                        db.execute('UPDATE agent_task_members SET expired_files=? WHERE task_id=? AND user_id=?',
+                                   (json.dumps(cards,ensure_ascii=False),scope['task_id'],scope['user_id']))
+                    self.release_workspaces(db,stack,[(row['user_id'],row['resource_conversation_id']) for row in expired])
                     rows=db.execute("SELECT * FROM chat_files WHERE expires_at IS NOT NULL AND julianday(expires_at)<=julianday('now') LIMIT 10").fetchall()
                     stack.enter_context(self.files.deleting(db,rows))
                     db.execute("DELETE FROM conversation_diagrams WHERE expires_at IS NOT NULL AND julianday(expires_at)<=julianday('now')")
-            if len(rows)<10:break
+            if len(rows)<10 and len(expired)<10:break
         # 异常断电可能留下已写文件而未提交元数据的孤儿；最多七天后同样回收。
         with self.database.connect() as db:
             for path in self.files.directory.glob():
@@ -203,7 +268,7 @@ class PeerResources:
                         if not db.execute('SELECT 1 FROM chat_conversations WHERE id=? AND user_id=?',(parent.name,owner)).fetchone():
                             self.files.directory.remove_workspace(owner,parent.name)
 
-    def localize(self,db,text,task_id,user_id,message_id):
+    def localize(self,db,text,task_id,user_id,message_id,*,expired=False):
         """按本条发言的授权将附件标记、历史下载链接映射到查看者的独立副本。"""
         if '[[attachment:' not in text and '/api/conversations/' not in text:
             return text
@@ -212,6 +277,11 @@ class PeerResources:
             AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now'))""",(task_id,message_id,user_id)).fetchall()
         markers={row['source_file_id']:row['id'] for row in rows if row['source_file_id'] and
                  self.files.directory.available_in(user_id,row['conversation_id'],row['id'],row['size'])}
+        if expired:
+            markers={file['id']:file['id'] for file in self.expired_cards(db,task_id,user_id)
+                     if file['message_id']==message_id}
+            text=re.sub(r'!?(?:\[([^\]\n]*)\])\(\s*<?/api/conversations/[\w-]{1,80}/files/[\w-]{1,80}>?\s*\)',
+                        lambda match:(match[1]+' · ' if match[1] else '')+'文件已过期',text)
         if '/api/conversations/' in text or any(not row['source_file_id'] for row in rows):
             links=db.execute("""SELECT source.id,source.conversation_id,source.user_id,a.source_user_id,local.id AS local_id,local.size AS local_size,local.conversation_id AS local_conversation
                 FROM agent_task_files a JOIN chat_files source ON source.id=a.file_id
@@ -227,7 +297,7 @@ class PeerResources:
                     markers.setdefault(row['id'],row['local_id'])
                 urls[(row['conversation_id'],row['id'])]='/api/conversations/'+row['local_conversation']+'/files/'+row['local_id']
             text=re.sub(r'/api/conversations/([\w-]{1,80})/files/([\w-]{1,80})(?![\w-])',
-                        lambda match:urls.get(match.groups(),'（附件不可用）'),text)
+                        lambda match:urls.get(match.groups(),'（附件已过期）' if expired else '（附件不可用）'),text)
         if '[[attachment:' in text:
             lines=text.splitlines(keepends=True)
             fence=''
@@ -238,6 +308,7 @@ class PeerResources:
                     elif edge[1].startswith(fence) and not edge[2].strip():fence=''
                 elif not fence:
                     lines[index]=re.sub(r'^( {0,3})\[\[attachment:([\w-]{1,80})\]\](?=[ \t]*\r?$)',lambda m:
-                        m[1]+('[[attachment:'+markers[m[2]]+']]' if m[2] in markers else '（附件不可用）'),line)
+                        m[1]+('[[attachment:'+markers[m[2]]+']]' if m[2] in markers
+                              else '（附件已过期）' if expired else '（附件不可用）'),line)
             text=''.join(lines)
         return text

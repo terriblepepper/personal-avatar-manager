@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from functools import partial
 import json
 import re
@@ -17,6 +18,7 @@ from avatar.models.effort import with_chat_effort
 from avatar.core.schemas import ChatRequest
 from avatar.core.execution import AgentNeedsInput,sandbox_checkpoint,execution_guard
 from avatar.conversation.loop.peer import PeerTurn, speaker as turn_speaker
+from avatar.files.conversation.peer import workspace_expired
 from avatar.conversation.loop.store import RunStore
 from avatar.conversation.collaboration.inbox import AgentInbox,notify
 from avatar.conversation.collaboration.intent import DialogueIntent
@@ -180,7 +182,14 @@ class AgentDialogues:
             draft_workspace=getattr(body,'resource_conversation_id',None)
             if draft_workspace and mode!='message':
                 if draft_workspace!=source_conversation_id:raise HTTPException(422,'任务草稿工作区不匹配')
-                db.execute('UPDATE agent_task_members SET resource_conversation_id=? WHERE task_id=? AND user_id=?',(draft_workspace,identifier,user['id']))
+                taken=db.execute("""SELECT 1 FROM agent_task_members WHERE resource_conversation_id=?
+                    UNION ALL SELECT 1 FROM agent_session_members WHERE resource_conversation_id=? LIMIT 1""",
+                    (draft_workspace,draft_workspace)).fetchone()
+                private_draft=db.execute("SELECT 1 FROM chat_conversations WHERE id=? AND user_id=? AND channel='peer'",
+                                         (draft_workspace,user['id'])).fetchone()
+                if private_draft and not taken:
+                    db.execute('UPDATE agent_task_members SET resource_conversation_id=? WHERE task_id=? AND user_id=?',(draft_workspace,identifier,user['id']))
+                    self.resources.sync_task_expiry(db,identifier)
             if shared and mode!='message':
                 db.execute("INSERT INTO agent_dialogue_messages(dialogue_id,turn,speaker_aic,speaker_name,speaker_role,content,usage,created_at) VALUES(?,1,?,'用户授权共享资料','user',?,'null',?)",(identifier,own['aic'],'任务：'+objective+'\n\n'+shared,stamp))
             if mode!='message':
@@ -240,10 +249,12 @@ class AgentDialogues:
 
     def view(self,row,user):
         result={k:row[k] for k in ['id','session_id','own_aic','target_aic','objective','status','active_speaker','error','created_at','updated_at','revision','ended_at','end_reason','round_limit','rounds_done','task_kind','delivery_mode','transport_mode','waiting_reason']}
-        result['files']=self.resources.metadata(row['id'],user['id'])
+        expired=workspace_expired(row)
+        result['files']=self.resources.metadata(row['id'],user['id'],expired=expired)
         result['tool_activity']=self.visible_tools(row['tool_activity'],user['id'])
         result['active_speaker_is_own'] = (row['next_speaker'] == 0) == (row['user_id'] == user['id'])
-        result.update(is_initiator=row['user_id']==user['id'],confirmed_by_me=bool(row['confirmation_acknowledged']&(1 if row['user_id']==user['id'] else 2)),expires_at=None,other_deleted=False)
+        result.update(is_initiator=row['user_id']==user['id'],confirmed_by_me=bool(row['confirmation_acknowledged']&(1 if row['user_id']==user['id'] else 2)),expires_at=row['expires_at'] if row['delivery_mode']!='message' and row['status']=='ended' else None,
+                      workspace_expired=expired,other_deleted=False)
         result['message_delivered']=False
         if row['delivery_mode']=='message' and row['status']=='ended':
             with self.database.connect() as db:
@@ -296,7 +307,7 @@ class AgentDialogues:
                 workspace=self.resources.workspace(db,user['id'],task['session_id'],identifier)
                 avatar=db.execute('SELECT aic,profile FROM avatar_records WHERE user_id=?',(task['target_user_id'],)).fetchone()
                 if not avatar:raise HTTPException(409,'目标分身不可用')
-                files=[r[0] for r in db.execute("SELECT f.id FROM chat_files f JOIN agent_task_files a ON a.file_id=f.id WHERE a.task_id=? AND a.source_user_id=? AND f.user_id=? AND f.conversation_id=? AND f.referenced=1 AND julianday(f.expires_at)>julianday('now') ORDER BY f.created_at,f.id LIMIT 5",(identifier,user['id'],user['id'],workspace))]
+                files=[r[0] for r in db.execute("SELECT f.id FROM chat_files f JOIN agent_task_files a ON a.file_id=f.id WHERE a.task_id=? AND a.source_user_id=? AND f.user_id=? AND f.conversation_id=? AND f.referenced=1 AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now')) ORDER BY f.created_at,f.id LIMIT 5",(identifier,user['id'],user['id'],workspace))]
                 document={'target_query':json.loads(avatar['profile']).get('avatar_name',''),'target_aic':avatar['aic'],
                           'objective':task['objective'],'shared_content':task['shared_content'],'skills':task['initiator_skills'],
                           'requires_confirmation':task['task_kind']=='booking','delivery_mode':task['delivery_mode'],
@@ -361,10 +372,14 @@ class AgentDialogues:
             separate=bool(task and task['delivery_mode']!='message')
             table,key=('agent_task_members','task_id') if separate else ('agent_session_members','session_id')
             workspace=db.execute(f'SELECT resource_conversation_id FROM {table} WHERE {key}=? AND user_id=?',(task_id if separate else identifier,user['id'])).fetchone()[0]
-        if not workspace:
+        if separate and workspace_expired(task):
+            workspace=None
+        elif not workspace and not (separate and task['status']=='ended'):
             with self.database.connect(write=True) as db:
                 self.member(db,user,identifier)
-                workspace=self.resources.workspace(db,user['id'],identifier,task_id)
+                current=self.owned(db,user,task_id) if separate else None
+                if not current or current['status']!='ended':
+                    workspace=self.resources.workspace(db,user['id'],identifier,task_id)
         with self.database.connect() as db:
             pair=self.member(db,user,identifier)
             snapshot={}
@@ -399,6 +414,7 @@ class AgentDialogues:
         with self.database.connect() as db:
             messages=[]
             modes={r['id']:r['delivery_mode'] for r in message_tasks}
+            expired={r['id'] for r in message_tasks if workspace_expired(r)}
             for r in rows:
                 item=dict(r)
                 if r['speaker_role']=='agent' and had_successful_sandbox(json.loads(r['tool_activity'])):
@@ -407,7 +423,8 @@ class AgentDialogues:
                     body,state,detail,_=reply_status(item['content'],0)
                     if state!='queued':item.update(content=body,state=state,state_detail=detail or r['state_detail'])
                 author_id=r['speaker_user_id'] or (r['initiator_id'] if r['speaker_aic']==r['initiator_aic'] else r['recipient_id'] if r['speaker_aic']==r['recipient_aic'] else None)
-                item.update(is_own=author_id==user['id'],turn=r['id'],usage=json.loads(r['usage']),content=self.resources.localize(db,item['content'],r['dialogue_id'],user['id'],r['id']),tool_activity=self.visible_tools(r['tool_activity'],user['id']))
+                item.update(is_own=author_id==user['id'],turn=r['id'],usage=json.loads(r['usage']),content=self.resources.localize(db,item['content'],r['dialogue_id'],user['id'],r['id'],
+                    expired=r['dialogue_id'] in expired),tool_activity=self.visible_tools(r['tool_activity'],user['id']))
                 if item['speaker_role']=='user' and item['speaker_name']=='用户补充要求':
                     author=db.execute('SELECT a.profile,u.username FROM users u LEFT JOIN avatar_records a ON a.user_id=u.id WHERE u.id=?',(author_id,)).fetchone()
                     if author:item['speaker_name']=json.loads(author['profile'] or '{}').get('name') or author['username']
@@ -519,12 +536,14 @@ class AgentDialogues:
                                 'WHERE d.session_id=? AND p.user_id=? AND p.request_id=? LIMIT 1',
                                 (user['id'], body.request_id, identifier, user['id'], body.request_id)).fetchone()
             prior = self.replay(db, user, request, legacy[0] if legacy else None)
-            current=db.execute("SELECT id FROM agent_dialogues WHERE session_id=? AND status NOT IN ('ended','failed') ORDER BY created_at,id LIMIT 1",(identifier,)).fetchone()
+            current=db.execute("SELECT id FROM agent_dialogues WHERE session_id=? AND delivery_mode!='message' AND status NOT IN ('ended','failed') ORDER BY created_at,id LIMIT 1",(identifier,)).fetchone()
             peer=row['right_user_id'] if row['left_user_id']==user['id'] else row['left_user_id']
             target=db.execute('SELECT aic FROM avatar_records WHERE user_id=?',(peer,)).fetchone()
         if prior:
             return self.get(user,prior)
-        if current and getattr(body,'delivery_mode','message')!='message' and not getattr(body,'new_task',False):
+        if getattr(body,'delivery_mode','message')!='message' and not getattr(body,'new_task',False):
+            if not current:
+                raise HTTPException(409,'当前没有可继续的任务，请创建新任务')
             return await self._resume(user,current['id'],body,request)
         if not body.message.strip():raise HTTPException(422,'请填写新的聊天内容或任务')
         mode=getattr(body,'delivery_mode','message')
@@ -733,13 +752,16 @@ class AgentDialogues:
             if session:self.member(db,user,session)
             condition="d.status='ended'"+(' AND d.session_id=?' if session else '')
             values=(user['id'],session) if session else (user['id'],)
-            tasks=db.execute("UPDATE agent_task_members SET hidden=1,summary='',summary_through=0 WHERE user_id=? AND hidden=0 AND task_id IN (SELECT d.id FROM agent_dialogues d WHERE "+condition+') RETURNING resource_conversation_id',values).fetchall()
-            workspaces=list(tasks)
+            tasks=db.execute("UPDATE agent_task_members SET hidden=1,summary='',summary_through=0,expired_files='[]' WHERE user_id=? AND hidden=0 AND task_id IN (SELECT d.id FROM agent_dialogues d WHERE "+condition+') RETURNING task_id,resource_conversation_id',values).fetchall()
+            workspaces=[row['resource_conversation_id'] for row in tasks]
+            if tasks:
+                db.execute('UPDATE agent_task_members SET resource_conversation_id=NULL WHERE user_id=? AND task_id=ANY(?::text[])',
+                           (user['id'],[row['task_id'] for row in tasks]))
             if not session:
                 sessions=db.execute("UPDATE agent_session_members SET hidden=1,summary='',cleared_at=?,cleared_through=(SELECT coalesce(max(m.id),0) FROM agent_dialogue_messages m JOIN agent_dialogues d ON d.id=m.dialogue_id WHERE d.session_id=agent_session_members.session_id),summary_through=0 WHERE user_id=? AND hidden=0 AND NOT EXISTS(SELECT 1 FROM agent_dialogues d WHERE d.session_id=agent_session_members.session_id AND d.status!='ended') RETURNING resource_conversation_id",(now(),user['id'])).fetchall()
-                workspaces.extend(sessions)
+                workspaces.extend(row[0] for row in sessions)
             else:sessions=[]
-            self.resources.release_workspaces(db,resources,[(user['id'],row[0]) for row in workspaces])
+            self.resources.release_task_workspaces(db,resources,[(user['id'],workspace) for workspace in workspaces])
         return {'deleted':len(tasks),'sessions':len(sessions)}
 
     async def delete(self,user,identifier):
@@ -750,27 +772,42 @@ class AgentDialogues:
                 self.close_record(db,identifier,'任务已提前删除','cancel',remember=False)
                 db.execute('UPDATE agent_dialogues SET revision=revision+1 WHERE id=?',(identifier,))
                 db.execute('DELETE FROM agent_pending_inputs WHERE task_id=? AND applied=0',(identifier,))
-            member=db.execute("UPDATE agent_task_members SET hidden=1,summary='',summary_through=0 WHERE task_id=? AND user_id=? RETURNING resource_conversation_id",
+            member=db.execute("UPDATE agent_task_members SET hidden=1,summary='',summary_through=0,expired_files='[]' WHERE task_id=? AND user_id=? RETURNING resource_conversation_id",
                               (identifier,user['id'])).fetchone()
             if member and row['delivery_mode']!='message':
-                self.resources.release_workspaces(db,resources,[(user['id'],member[0])])
+                db.execute('UPDATE agent_task_members SET resource_conversation_id=NULL WHERE task_id=? AND user_id=?',
+                           (identifier,user['id']))
+                self.resources.release_task_workspaces(db,resources,[(user['id'],member[0])])
             db.execute('UPDATE agent_notifications SET deleted_at=? WHERE task_id=? AND user_id=?',(now(),identifier,user['id']))
         await self.interrupt(identifier)
         await self.flush_controls(identifier)
         return {'deleted':True,'memory_retained':row['status']=='ended'}
 
     def close_record(self,db,identifier,reason,action='complete',remember=True):
-        if not db.execute("UPDATE agent_dialogues SET status='ended',agent_checkpoint=NULL,ended_at=?,end_reason=?,expires_at=NULL,active_speaker='',error='',waiting_reason='',confirmation_required=0,updated_at=? WHERE id=? AND status!='ended'",(now(),reason,now(),identifier)).rowcount:return
-        task=dict(db.execute('SELECT * FROM agent_dialogues WHERE id=?',(identifier,)).fetchone())
+        stamp=now()
+        deadline=(datetime.fromisoformat(stamp)+timedelta(days=7)).isoformat(timespec='microseconds').replace('+00:00','Z') if action=='complete' else None
+        task=db.execute("""UPDATE agent_dialogues SET status='ended',agent_checkpoint=NULL,ended_at=?,end_reason=?,
+            expires_at=CASE WHEN delivery_mode='message' THEN NULL ELSE ? END,active_speaker='',error='',
+            waiting_reason='',confirmation_required=0,updated_at=? WHERE id=? AND status!='ended' RETURNING *""",
+            (stamp,reason,deadline,stamp,identifier)).fetchone()
+        if not task:return
         for owner in (task['user_id'],task['target_user_id']):
             PeerTurn.clear(db, identifier, owner)
         db.execute('UPDATE agent_dialogues SET pending_file_delivery=NULL WHERE id=?', (identifier,))
         result_title=('消息已送达' if action=='complete' else '消息已取消') if task['delivery_mode']=='message' else ('任务已完成' if action=='complete' else '任务已终止')
         db.execute('INSERT OR IGNORE INTO agent_protocol_controls(task_id,action) VALUES(?,?)',(identifier,action))
         if task['delivery_mode']=='message':return
+        if deadline:
+            self.resources.sync_task_expiry(db,identifier)
+            for owner in (task['user_id'],task['target_user_id']):
+                cards=self.resources.expired_cards(db,identifier,owner)
+                if cards:
+                    db.execute('UPDATE agent_task_members SET expired_files=? WHERE task_id=? AND user_id=?',
+                               (dump(cards),identifier,owner))
         for member in db.execute('SELECT * FROM agent_session_members WHERE session_id=?',(task['session_id'],)).fetchall():
             if task['delivery_mode']!='message' or member['user_id']==task['user_id']:
-                notify(db,member['user_id'],'result',task['session_id'],identifier,result_title,reason,'result:'+identifier)
+                notify(db,member['user_id'],'result',task['session_id'],identifier,result_title,
+                       ('任务文件将在完成七天后清理，需要保留请转存到资料库。\n' if deadline else '')+reason,'result:'+identifier)
             if not remember:continue
             own_aic=task['own_aic'] if member['user_id']==task['user_id'] else task['target_aic']
             messages=db.execute("SELECT m.content,m.task_action FROM agent_dialogue_messages m WHERE dialogue_id=? AND m.id>? AND speaker_aic=? AND speaker_role='agent' ORDER BY id DESC LIMIT 1",(identifier,member['cleared_through'],own_aic)).fetchall()
@@ -982,7 +1019,9 @@ class AgentDialogues:
     async def compact(self,user,session_id,task_id,focus=''):
         uid=user['id']
         with self.database.connect() as db:
-            member,memory,task_id,_=self.compact_scope(db,user,session_id,task_id)
+            member,memory,task_id,job=self.compact_scope(db,user,session_id,task_id)
+            if job and job['status']=='ended':
+                raise HTTPException(409,'任务已完成，仅可查看记录')
             rows=self.memory_rows(db,session_id,task_id,max(member['cleared_through'],memory['summary_through']),uid)
             if not rows:return {'message':'没有新的消息需要压缩。'}
         overview,context=self.chat.context(user,ChatRequest(channel='avatar',message='/compact'))

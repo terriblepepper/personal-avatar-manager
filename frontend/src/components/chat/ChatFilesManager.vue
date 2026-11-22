@@ -15,7 +15,7 @@ import { readAnimation } from '../../utils/readAnimation'
 import { submitAnimationPromotion } from '../../utils/animationPromotion'
 
 const FilePreview = defineAsyncComponent(() => import('../FilePreview.vue'))
-const props=defineProps<{conversationId:string;busy?:boolean;temporary?:boolean;includeConversationFiles?:boolean;selectedIds?:string[]}>()
+const props=defineProps<{conversationId:string;busy?:boolean;readOnly?:boolean;temporary?:boolean;includeConversationFiles?:boolean;selectedIds?:string[]}>()
 const emit=defineEmits<{selected:[ids:string[]];uploading:[value:boolean]}>()
 interface ChatFile {id:string;filename:string;content_type:string;size:number;description:string;referenced:boolean;download_url:string;origin?:string;source_label?:string;expires_at?:string;promoted_id?:string|null}
 interface LibraryFile extends AnimationMetadata {id:string;filename:string;source:'folder'|'profile';path?:string;relative_path?:string;description:string;size:number;sha256?:string;already_referenced?:boolean}
@@ -175,16 +175,16 @@ async function promote(value:FilePromotion) {
 }
 </script>
 <template><details class="composer-menu composer-tool"><summary :title="temporary ? '添加和预览发送附件' : '上传、引用和管理会话文件'"><AppIcon name="folder" :size="14"/><span>文件</span><small>{{ active.length }}</small></summary><div class="composer-popover chat-file-menu"><h3>{{ temporary ? '本次发送附件' : '会话文件' }}</h3><div class="actions">
-  <button type="button" class="button small" :disabled="busy||working||!conversationId" @click="uploadInput?.click()">上传本地文件</button>
-  <button type="button" class="button small" :disabled="busy||working||!conversationId" @click="openLibrary">{{ temporary ? '从资料库添加' : '从资料库引用' }}</button>
+  <button v-if="!readOnly" type="button" class="button small" :disabled="busy||working||!conversationId" @click="uploadInput?.click()">上传本地文件</button>
+  <button v-if="!readOnly" type="button" class="button small" :disabled="busy||working||!conversationId" @click="openLibrary">{{ temporary ? '从资料库添加' : '从资料库引用' }}</button>
   <button v-if="uploadController" type="button" class="button small" @click="uploadController.abort()">取消上传</button>
   <input ref="uploadInput" hidden type="file" multiple accept=".png,.jpg,.jpeg,.webp,.gif,.bmp,.txt,.md,.mmd,.avanim,.html,.htm,.csv,.tsv,.xlsx,.json,.log,.pdf,.docx,.pptx,.mp3,.wav,.m4a,.ogg,.flac,.webm,.mp4,.mov" :disabled="busy||working||!conversationId" @change="upload">
 </div>
-<p class="sub">{{ temporary?'发送选中的原件副本，最多五份。':'后续提问最多同时引用五份，超过时可继续上传。其他会话临时文件需先转存为资料；索引与检索使用模型额度。' }} HTML 与动画单件最多 100 MiB。</p>
+<p v-if="!readOnly" class="sub">{{ temporary?'发送选中的原件副本，最多五份。':'后续提问最多同时引用五份，超过时可继续上传。其他会话临时文件需先转存为资料；索引与检索使用模型额度。' }} HTML 与动画单件最多 100 MiB。</p>
 <p v-if="status" class="sub" role="status">{{ status }}</p>
-<article v-for="file in page" :key="file.id" class="chat-file compact-chat-file"><label><input v-if="!temporary" type="checkbox" :checked="included(file)" :disabled="busy||working" @change="toggle(file,$event)"><MaterialTypeIcon :filename="file.filename"/> {{ file.filename }}</label><div class="actions"><el-button @click="preview=file">{{ /\.(mmd|avanim)$/i.test(file.filename) ? '预览与下载' : '预览' }}</el-button>
+<article v-for="file in page" :key="file.id" class="chat-file compact-chat-file"><label><input v-if="!temporary && !readOnly" type="checkbox" :checked="included(file)" :disabled="busy||working" @change="toggle(file,$event)"><MaterialTypeIcon :filename="file.filename"/> {{ file.filename }}</label><div class="actions"><el-button @click="preview=file">{{ /\.(mmd|avanim)$/i.test(file.filename) ? '预览与下载' : '预览' }}</el-button>
     <el-button v-if="temporary" :disabled="busy||working" @click="toggleAttachment(file)">{{ included(file) ? '移除附件' : '添加为附件' }}</el-button>
-    <template v-else><el-button @click="openDetail(file)">详情与说明</el-button><el-button v-if="!/\.(mmd|avanim)$/i.test(file.filename)" tag="a" :href="file.download_url" :download="file.filename">下载</el-button><el-button :disabled="busy||working||!!file.promoted_id" @click="openPromotion(file)">{{ file.promoted_id?'已转存':'转存资料' }}</el-button><el-button :disabled="busy||working" @click="remove(file)">删除</el-button></template></div></article>
+    <template v-else><el-button v-if="!readOnly" @click="openDetail(file)">详情与说明</el-button><el-button v-if="!/\.(mmd|avanim)$/i.test(file.filename)" tag="a" :href="file.download_url" :download="file.filename">下载</el-button><el-button :disabled="busy||working||!!file.promoted_id" @click="openPromotion(file)">{{ file.promoted_id?'已转存':'转存资料' }}</el-button><el-button v-if="!readOnly" :disabled="busy||working" @click="remove(file)">删除</el-button></template></div></article>
 <p v-if="!visible.length" class="sub">{{ temporary ? '暂无发送附件。' : '本会话暂无文件。' }}</p>
 <RecordPagination v-model:offset="listOffset" :total="visible.length" :label="temporary ? '附件分页' : '会话文件分页'" unit="项"/></div></details><FilePreview v-if="preview" :file="preview" :url="preview.download_url" @close="preview=null"/>
 <AppDialog v-model="libraryOpen" :title="temporary ? '从资料库添加附件' : '从资料库引用'" class="library-picker" width="min(52rem, calc(100vw - 1rem))" align-center>

@@ -75,6 +75,7 @@ const content = computed(() => {
     names.add(file.filename)
     const kinds = new Set(citations.get(file.filename))
     kinds.add(({material:'资料原件', generated:'生成文件', attachment:'附件'} as Record<string,string>)[file.origin || ''] || '会话文件')
+    if (file.expired) kinds.add('已过期')
     entries.push({key:'file/'+file.id, name:file.filename, kinds, file, url:chatPreviewURL(file,props.conversationId)})
   }
   for (const [name,kinds] of citations) {

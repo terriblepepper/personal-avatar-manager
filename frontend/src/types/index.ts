@@ -33,7 +33,7 @@ export interface FilePromotion {
 
 export interface ChatFile {
   id: string; filename: string; content_type?: string; size?: number; referenced?: boolean
-  origin?: string; promoted_id?: string | null; expires_at?: string
+  origin?: string; promoted_id?: string | null; expires_at?: string; expired?: boolean
   caption?: string; download_url?: string; visibility?: string; temporary?: boolean
 }
 export interface ToolEvent { id: string; name: string; status: string; group?: string; phase?: string; input?: unknown; output?: unknown; steps?: { time: string; message: string }[] }

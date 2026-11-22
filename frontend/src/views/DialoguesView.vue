@@ -32,10 +32,10 @@ const FilePreview = defineAsyncComponent(() => import('../components/FilePreview
 const IntentDialog = defineAsyncComponent(() => import('../components/collaboration/IntentDialog.vue'))
 interface Session { session_id:string; peer_name:string; messages?: Pick<Message, 'speaker_role' | 'content'>[] }
 interface Message { dialogue_id:string; turn:number; speaker_name:string; speaker_role:string; speaker_user_id?:string; content:string; state?:string; state_detail?:string; task_action?:string; tool_activity?:ToolEvent[]; is_own:boolean }
-interface TaskFile extends ChatFile {message_id:number|null;sender_user_id:string;download_url:string}
-interface Task { user_question?:AgentQuestion; can_supplement?:boolean; revision?:number; files?:TaskFile[];id:string; objective:string; status:string; can_accept?:boolean; needs_confirmation?:boolean; delivery_mode:string; can_retry?:boolean; auto_retrying?:boolean; error?:string; rounds_done?:number; round_limit?:number;tool_activity?:ToolEvent[];skill_commands?:string;created_at?:string;ended_at?:string;returned_summary?:string;waiting_reason?:string;waiting_for_other?:boolean; end_reason?:string; reason?:string; message_delivered?:boolean; active_speaker?:string; active_speaker_is_own?:boolean }
+interface TaskFile extends ChatFile {message_id:number|null;sender_user_id:string}
+interface Task { expires_at?:string | null; workspace_expired?:boolean; user_question?:AgentQuestion; can_supplement?:boolean; revision?:number; files?:TaskFile[];id:string; objective:string; status:string; can_accept?:boolean; needs_confirmation?:boolean; delivery_mode:string; can_retry?:boolean; auto_retrying?:boolean; error?:string; rounds_done?:number; round_limit?:number;tool_activity?:ToolEvent[];skill_commands?:string;created_at?:string;ended_at?:string;returned_summary?:string;waiting_reason?:string;waiting_for_other?:boolean; end_reason?:string; reason?:string; message_delivered?:boolean; active_speaker?:string; active_speaker_is_own?:boolean }
 interface Intent {id:string;conversation_id:string;target_query:string;target_aic:string;objective:string;shared_content:string}
-interface Detail { summary_through?:number; history_revision?:string; task_page?:Page<Task>; embedding_status?:{configured?:boolean;peerConfigured?:boolean}; resource_conversation_id:string; current_transport_mode?:string; chat?:Task; peer_name:string; messages:Message[]; message_tasks?:Task[]; tasks:Task[]; task?:Task; has_more:boolean }
+interface Detail { summary_through?:number; history_revision?:string; task_page?:Page<Task>; embedding_status?:{configured?:boolean;peerConfigured?:boolean}; resource_conversation_id:string | null; current_transport_mode?:string; chat?:Task; peer_name:string; messages:Message[]; message_tasks?:Task[]; tasks:Task[]; task?:Task; has_more:boolean }
 interface Skill {id:string;name:string;enabled:boolean}
 const copyMenu=ref<InstanceType<typeof MessageCopyMenu>>()
 const skills=ref<Skill[]>([])
@@ -48,8 +48,9 @@ const filePreview=ref<ChatFile|null>(null)
 const toolPending = ref(false), effortPending = ref(false)
 const toolsSaving = computed(() => toolPending.value || effortPending.value)
 const commandsDisabled = computed(() => busy.value || switching.value || resourceBusy.value || !detail.value)
-const sendDisabled = computed(() => commandsDisabled.value || toolsSaving.value || (!message.value.trim() && !pausedTask.value) || (!/^\/compact(?:\s|$)/.test(message.value.trim()) && (detail.value?.task?.can_supplement === false ||
-  detail.value?.task?.status === 'ended' || detail.value?.task?.status === 'awaiting_acceptance' || (!!detail.value?.task?.needs_confirmation && !userQuestion.value))))
+const taskClosed = computed(() => !!taskId.value && detail.value?.task?.status === 'ended')
+const sendDisabled = computed(() => commandsDisabled.value || toolsSaving.value || taskClosed.value || (!message.value.trim() && !pausedTask.value) || (!/^\/compact(?:\s|$)/.test(message.value.trim()) && (detail.value?.task?.can_supplement === false ||
+  detail.value?.task?.status === 'awaiting_acceptance' || (!!detail.value?.task?.needs_confirmation && !userQuestion.value))))
 const activeTask=computed(()=>detail.value?.task || detail.value?.chat)
 const runningTask = computed(() => activeTask.value?.status === 'running' ? activeTask.value : undefined)
 const activeStage = computed(() => {
@@ -193,6 +194,7 @@ async function refresh(signal: AbortSignal) {
     if (signal.aborted) return
     const log = transcript.value
     const atBottom = log && log.scrollHeight - log.clientHeight - log.scrollTop <= 2
+    if (value.task?.workspace_expired) filePreview.value = null
     const beforeRun = previous?.task || previous?.chat, afterRun = value.task || value.chat
     const activityChanged = afterRun?.status === 'running' && (
       beforeRun?.status !== 'running' || beforeRun.id !== afterRun.id ||
@@ -451,6 +453,10 @@ onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
       <strong>{{ detail.task.can_accept ? '收到任务请求' : progress.label }}</strong>
       <span v-if="progress.note">{{ progress.note }}</span>
     </div>
+    <p v-if="detail.task.workspace_expired" class="sub" role="status">任务文件已过期。聊天记录可继续查看。</p>
+    <p v-else-if="detail.task.expires_at" class="sub" role="status">
+      任务文件将于 {{ date(detail.task.expires_at) }} 自动删除。需要保留请转存到资料库。
+    </p>
     <details v-if="detail.task.returned_summary" class="compact-disclosure peer-result">
       <summary><AppIcon name="chevron" :size="14"/>任务总结已返回主分身记忆</summary>
       <MarkdownContent :source="detail.task.returned_summary" :diagrams="false"/>
@@ -486,12 +492,12 @@ onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
       <div class="bubble"><ToolActivity :items="runningTask.tool_activity || []" :pending="activeStage"/><ChatNotices :items="runningTask.tool_activity"/></div>
     </article>
   </div><div class="peer-composer">
-  <AgentQuestionPrompt ref="questionPrompt" :key="current+'/'+shownTask" :scope="'peer:'+current+'/'+shownTask" :question="userQuestion"
+  <AgentQuestionPrompt v-if="!taskClosed" ref="questionPrompt" :key="current+'/'+shownTask" :scope="'peer:'+current+'/'+shownTask" :question="userQuestion"
     :disabled="commandsDisabled || toolsSaving" @answer="send"/>
-  <ComposerInput v-model="message" :catalog="skills" :session="taskId || current" :usage-url="current ? '/agent-sessions/'+encodeURIComponent(current)+'/compact'+(taskId?'?task_id='+encodeURIComponent(taskId):'') : ''" :usage-revision="(detail?.history_revision||'')+'/'+(detail?.summary_through||0)" :disabled="switching" label="分身会话消息" @submit="send()" :placeholder="pausedTask ? '补充任务所需信息…' : '输入消息或任务目标，$ 选择技能…'" @update:model-value="pending=''"/>
+  <ComposerInput v-if="!taskClosed" v-model="message" :catalog="skills" :session="taskId || current" :usage-url="current ? '/agent-sessions/'+encodeURIComponent(current)+'/compact'+(taskId?'?task_id='+encodeURIComponent(taskId):'') : ''" :usage-revision="(detail?.history_revision||'')+'/'+(detail?.summary_through||0)" :disabled="switching" label="分身会话消息" @submit="send()" :placeholder="pausedTask ? '补充任务所需信息…' : '输入消息或任务目标，$ 选择技能…'" @update:model-value="pending=''"/>
   <div class="chat-compose-actions">
   <ComposerToolbar class="peer-composer-toolbar" label="分身会话工具栏">
-    <details class="composer-menu composer-tool">
+    <details v-if="!taskClosed" class="composer-menu composer-tool">
       <summary class="chat-command" title="管理当前任务技能"><span aria-hidden="true">✧</span><span>技能</span><small>{{ activeSkills.length }}</small></summary>
       <div class="composer-popover">
         <h3>当前任务技能</h3>
@@ -502,14 +508,14 @@ onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
         </div>
       </div>
     </details>
-    <ChatFilesManager :conversation-id="resourceId" :busy="busy || switching || detail?.task?.status==='running'" @selected="fileIds=$event" @uploading="resourceBusy=$event"/>
-    <ConversationTools :conversation-id="resourceId" @saving="toolPending=$event" :busy="busy || switching || resourceBusy || detail?.task?.status==='running'"/>
+    <ChatFilesManager v-if="resourceId" :conversation-id="resourceId" :read-only="taskClosed" :busy="busy || switching || detail?.task?.status==='running'" @selected="fileIds=$event" @uploading="resourceBusy=$event"/>
+    <ConversationTools v-if="!taskClosed" :conversation-id="resourceId" @saving="toolPending=$event" :busy="busy || switching || resourceBusy || detail?.task?.status==='running'"/>
     <details class="composer-tool chat-command-menu">
       <summary class="chat-command chat-icon-command" aria-label="会话操作" title="会话操作"><AppIcon name="more" :size="18"/></summary>
       <div class="composer-popover chat-command-panel">
         <template v-if="taskId">
           <button type="button" class="chat-menu-item" :disabled="commandsDisabled || detail?.task?.status==='paused' || detail?.task?.status==='ended'" @click="taskAction('cancel')"><AppIcon name="clock" :size="16"/>暂停</button>
-          <button type="button" class="chat-menu-item danger" :disabled="commandsDisabled" @click="remove(`/agent-dialogues/${encodeURIComponent(taskId)}`,'删除任务记录？未完成任务将终止。','DELETE')"><AppIcon name="trash" :size="16"/>删除任务</button>
+          <button type="button" class="chat-menu-item danger" :disabled="commandsDisabled" @click="remove(`/agent-dialogues/${encodeURIComponent(taskId)}`,'删除本方任务记录和工作区？未完成任务将终止。','DELETE')"><AppIcon name="trash" :size="16"/>删除任务</button>
         </template>
         <button v-else type="button" class="chat-menu-item" :disabled="commandsDisabled" @click="remove(`/agent-sessions/${encodeURIComponent(current)}/clear`,'清空本方记录与记忆？')"><AppIcon name="rebuild" :size="16"/>清空本方记录与记忆</button>
         <button type="button" class="chat-menu-item danger" :disabled="commandsDisabled" @click="remove(`/agent-sessions/${encodeURIComponent(current)}`,'删除本方会话视图？','DELETE',true)"><AppIcon name="trash" :size="16"/>删除会话</button>
@@ -518,7 +524,7 @@ onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
     <span v-if="writeState==='sending'" role="status">正在发送…</span>
     <button v-if="detail?.task?.can_accept" type="button" class="button chat-command" :disabled="commandsDisabled" @click="taskAction('accept')">确认任务请求</button>
     <button v-if="detail?.task?.needs_confirmation" type="button" class="button chat-command" :disabled="commandsDisabled" @click="taskAction('confirm')">确认并补充意图</button>
-    <div class="composer-primary-actions">
+    <div v-if="!taskClosed" class="composer-primary-actions">
       <EffortPicker :conversation-id="resourceId" :busy="!!runningTask" @saving="effortPending=$event"/>
       <ComposerAction v-if="runningTask" label="暂停任务" stop :disabled="commandsDisabled" @click="taskAction('cancel')"/>
       <ComposerAction v-else :resume="!!pausedTask" :label="pausedTask ? (message.trim() ? '补充并继续' : '继续任务') : '发送'" :aria-busy="writeState==='sending'" :disabled="sendDisabled" @click="send()"/>
