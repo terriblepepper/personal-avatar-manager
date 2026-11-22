@@ -290,7 +290,7 @@ class PeerResources:
             available=db.execute("""SELECT f.id,f.sha256,f.size FROM chat_files f
                 WHERE f.conversation_id=? AND f.sha256<>'' AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now'))
                 AND (f.origin NOT IN ('attachment','generated') OR EXISTS(
-                    SELECT 1 FROM agent_task_files a WHERE a.file_id=f.id AND (a.task_id=? OR f.origin='generated')))""",
+                    SELECT 1 FROM agent_task_files a WHERE a.file_id=f.id AND (a.task_id=? OR a.message_id IS NOT NULL)))""",
                 (workspace,task['id']))
             grants={f['id']:f['sha256'] for f in available}
         else:
