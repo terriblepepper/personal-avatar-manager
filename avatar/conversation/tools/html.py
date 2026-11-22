@@ -8,7 +8,7 @@ from typing import Literal
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from avatar.conversation.tools.animation_templates import Scene, TEMPLATES, render_animation
+from avatar.conversation.tools.animation_templates import Scene, TEMPLATES, animation_clock, render_animation
 from avatar.files.conversation.resources import validate_output
 from avatar.files.parsing.animation import MAX_SOURCE_BYTES
 from avatar.models.tools import load_model_json
@@ -26,6 +26,8 @@ class WebPage(HtmlFile):
 class Animation(HtmlFile):
     mode: Literal['2d','3d'] = '2d'
     html: str = Field(default='',max_length=MAX_SOURCE_BYTES)
+    duration_seconds: float | None = Field(default=None, gt=0, allow_inf_nan=False, description='自定义动画总秒数。')
+    render_frame: str = Field(default='', max_length=MAX_SOURCE_BYTES, description='自定义动画的 JS 函数体，根据绝对秒数 time 绘制当前帧，可用 duration 和跨帧对象 state。')
     template: str = Field(default='',max_length=24)
     title: str = Field(default='',max_length=100)
     scenes: list[Scene] = Field(default_factory=list,max_length=12)
@@ -38,13 +40,16 @@ ANIMATION_PARAMETERS['properties']['scenes']['items'] = ANIMATION_PARAMETERS.pop
 OFFLINE_ANIMATION = ('动画必须完全离线，严禁使用任何网络资源，包括 CDN、远程脚本、字体、纹理、图片、音视频、接口和联网兜底。'
                      '内联 HTML/CSS/JS 和数据，图形自行绘制。Three.js 只用 <script type="module"> 与 '
                      'import * as THREE from "three"，由预览器提供本地核心模块；不要使用插件、外部 importmap 或全局 THREE。')
+ANIMATION_INPUT = ('自由绘制和内置模板均可，按题材自行选择。'
+                   '自由绘制提交完整 html、duration_seconds 和 render_frame，省略 template、scenes。'
+                   'html 定义场景和一次性初始化；render_frame 是函数体，必须根据绝对秒数 time 从任意位置重绘，'
+                   '可使用 duration、state。示例：document.querySelector("circle").setAttribute("cx",100*time/duration)。'
+                   'Three.js 在 html 的模块中初始化，把绘制函数挂到 window，再由 render_frame 调用。'
+                   '平台提供播放、暂停和可拖动进度条。所有运动由 time 驱动，勿另起计时、动画循环或独立播放的 CSS 动画。'
+                   '选择模板时提交 template、title 和 1 至 12 个 scenes（label、caption），省略自定义字段。')
 CREATE_ANIMATION = {
     'name':'create_animation',
-    'description':('创建有时间变化的 HTML 动画，按意图选择二维或三维，默认二维。'
-                   '根据用户题材设计场景、对象和运动。协议握手、证书签发等 3D 流程用 process 模板，'
-                   '按实际步骤填写分镜；只有明确要求立方体或分层拆解时用 cube 或 layers。其他题材选匹配模板或自行制作。'
-                   '自定义动画提交完整 html 并提供播放、暂停和可拖动的真实时间进度滑杆。'
-                   '模板动画提交 template、title 和 1 至 12 个 scenes（label、caption），省略 html。'
+    'description':('创建有时间变化的 HTML 动画，按意图选择二维或三维，默认二维。'+ANIMATION_INPUT
                    + '；'.join(mode+' '+', '.join(key+'='+label for key,label in choices.items()) for mode,choices in TEMPLATES.items())
                    + '。'+OFFLINE_ANIMATION),
     'parameters':ANIMATION_PARAMETERS,
@@ -63,9 +68,8 @@ def html_repair_prompt(tool, mode):
     if tool == 'create_html':
         return '直接输出完整 HTML 网页，以 <html> 或 <!doctype html> 开头，以 </html> 结束。内联样式和脚本。'
     choices = {mode:TEMPLATES[mode]} if mode in ('2d','3d') else TEMPLATES
-    return ('返回动画工具参数 JSON，包含 filename（.html）、mode、template、title 和 1 至 12 项 scenes。'
-            '每项填 label、caption，省略 html。选择能表现用户要求的模板，证书签发、协议握手等三维流程使用 process。'
-            '仅明确提出对应形状时选 cube 或 layers。按目标选择动画维度及模板：'+json.dumps(choices,ensure_ascii=False)+OFFLINE_ANIMATION)
+    return ('返回完整动画工具参数 JSON，包含 filename（.html）和 mode。'+ANIMATION_INPUT+
+            '可选模板：'+json.dumps(choices,ensure_ascii=False)+OFFLINE_ANIMATION)
 
 
 def repaired_html_arguments(text, tool, filename):
@@ -110,6 +114,7 @@ def create_html(args, outputs):
 class AnimationDependencies(HTMLParser):
     """Catch external asset declarations before delivery. The sandbox CSP also blocks dynamic requests."""
     block = ''
+    document_end = None
     css_resources = re.compile(r"""(?:url\(\s*['"]?([^'")\s]+)|@import\s+['"]([^'"]+))""",re.I)
     module_imports = re.compile(r"""(?:\bfrom\s*|\bimport\s*\(?\s*)['"]([^'"]+)['"]""")
 
@@ -138,6 +143,8 @@ class AnimationDependencies(HTMLParser):
                 raise ValueError('请使用预览器提供的本地 Three.js 模块映射。'+OFFLINE_ANIMATION)
 
     def handle_endtag(self, tag):
+        if self.document_end is None and tag in ('body', 'html'):
+            self.document_end = self.getpos()
         if tag == self.block:
             self.block = ''
 
@@ -148,27 +155,46 @@ class AnimationDependencies(HTMLParser):
             raise ValueError('动画模块依赖不能离线加载。'+OFFLINE_ANIMATION)
 
 
-def create_animation(args, outputs, *, expected_mode=None, objective=''):
+def custom_animation(artifact):
+    if not artifact.html.strip() or artifact.duration_seconds is None or not artifact.render_frame.strip():
+        raise ValueError('自由绘制需要 html、正数 duration_seconds 和按 time 重绘的 render_frame 函数体')
+    if re.search(r'</script\b', artifact.render_frame, re.I):
+        raise ValueError('render_frame 只填写 JavaScript 函数体，请移除 script 标签或转义结束标签')
+    source = artifact.html
+    parser = AnimationDependencies()
+    parser.feed(source)
+    parser.close()
+    if parser.document_end is None:
+        raise ValueError('自定义 html 需要完整页面，请补齐 body 或 html 结束标签')
+    frame = AnimationDependencies()
+    frame.feed('<script>'+artifact.render_frame+'</script>')
+    frame.close()
+    line, column = parser.document_end
+    offset = 0
+    for _ in range(line - 1):
+        offset = source.index('\n', offset) + 1
+    offset += column
+    script = ('<script type="module">\n'+animation_clock()+
+              '\nconst host = document.createElement("div");'
+              '\nhost.style.cssText = "position:fixed;inset:auto 8px 8px;z-index:2147483647";'
+              '\ndocument.body.append(host);'
+              '\ninstallAnimationClock(host, '+json.dumps(artifact.duration_seconds)+
+              ', function(time, duration, state) {\n'+artifact.render_frame+'\n});\n</script>\n')
+    return source[:offset]+script+source[offset:]
+
+
+def create_animation(args, outputs, *, expected_mode=None):
     artifact = checked_args(Animation,args)
     if expected_mode in ('2d','3d') and artifact.mode != expected_mode:
         raise ValueError('mode 应为 '+expected_mode)
     if artifact.template:
-        if artifact.mode == '3d' and artifact.template in ('cube','layers'):
-            pattern = r'正方体|立方体|\bcube\b' if artifact.template=='cube' else r'分层|拆解|爆炸图|\blayers?\b'
-            if not re.search(pattern, objective, re.I) or re.search(
-                r'(?:不要|不是|避免|禁止|别)(?:使用|做成)?\s*(?:'+pattern+')', objective, re.I
-            ):
-                raise ValueError('方体及分层模板仅用于明确要求对应结构时。流程用 process，其他主题请选择匹配模板或制作自定义动画。')
-        if artifact.html or not artifact.title.strip() or not artifact.scenes:
-            raise ValueError('动画模板需要标题和分镜，请省略 html')
+        if artifact.html or artifact.render_frame or artifact.duration_seconds is not None or not artifact.title.strip() or not artifact.scenes:
+            raise ValueError('模板动画需要标题和分镜，请省略 html、render_frame 和 duration_seconds')
         source = render_animation(artifact.mode,artifact.template,artifact.title,artifact.scenes)
     else:
-        if artifact.scenes or not artifact.html:
-            raise ValueError('自定义动画需要完整 html，使用分镜时须选择动画模板')
-        source = artifact.html
-        parser = AnimationDependencies()
-        parser.feed(source)
-        parser.close()
+        if artifact.scenes:
+            raise ValueError('自由绘制请省略 scenes；使用内置分镜时请指定 template')
+        source = custom_animation(artifact)
     return store_html(artifact.filename,source,artifact.mode,outputs)
 
 

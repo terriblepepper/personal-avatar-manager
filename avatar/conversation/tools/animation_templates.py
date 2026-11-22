@@ -26,10 +26,15 @@ def player():
     return Path(__file__).with_name('animation_player.html').read_text(encoding='utf-8')
 
 
+@lru_cache(maxsize=1)
+def animation_clock():
+    return Path(__file__).with_name('animation_clock.js').read_text(encoding='utf-8')
+
+
 def render_animation(mode, template, title, scenes):
     if template not in TEMPLATES.get(mode,{}):
         raise ValueError('模板与动画维度不匹配')
     data = json.dumps({'template':template,'scenes':[s.model_dump() for s in scenes]},ensure_ascii=False)
-    fields = {'TITLE':escape(title),'MODE':mode,'DATA':data.replace('<',r'\u003c'),
+    fields = {'CLOCK':animation_clock(),'TITLE':escape(title),'MODE':mode,'DATA':data.replace('<',r'\u003c'),
               'TRANSCRIPT':' '.join(escape(s.label+'：'+s.caption) for s in scenes)}
-    return re.sub(r'__(TITLE|MODE|DATA|TRANSCRIPT)__',lambda m:fields[m[1]],player())
+    return re.sub(r'__(TITLE|MODE|DATA|TRANSCRIPT|CLOCK)__',lambda m:fields[m[1]],player())

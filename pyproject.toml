@@ -46,7 +46,7 @@ include = ["avatar*"]
 namespaces = false
 
 [tool.setuptools.package-data]
-avatar = ["skills/runtime.ts", "conversation/tools/animation_player.html"]
+avatar = ["skills/runtime.ts", "conversation/tools/animation_player.html", "conversation/tools/animation_clock.js"]
 
 [dependency-groups]
 dev = [

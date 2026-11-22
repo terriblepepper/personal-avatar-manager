@@ -548,7 +548,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                         except ValueError:
                             if artifact_prefix:
                                 artifact_prefix = ''
-                                observations.append('草稿续写未闭合成有效 JSON。请生成较短的完整作品参数，适合模板的主题优先使用模板。')
+                                observations.append('草稿续写未闭合成有效 JSON。请生成较短的完整作品参数，保留所选的自由绘制或模板方案。')
                                 continue
                             raise pause('作品参数仍未形成有效 JSON 或完整网页') from None
                         artifact_prefix = ''
@@ -758,7 +758,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace):
                         if name == 'create_html':
                             item = create_html(args,outputs)
                         else:
-                            item = create_animation(args,outputs,expected_mode=step_mode,objective=animation_request)
+                            item = create_animation(args,outputs,expected_mode=step_mode)
                     except (ValueError, HTTPException) as error:
                         detail = str(error.detail) if isinstance(error, HTTPException) else str(error)
                         output.update(error=detail, retry_required=True)
