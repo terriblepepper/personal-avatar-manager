@@ -116,10 +116,10 @@ class AvatarChat:
             if row['role']=='assistant':
                 row['content']=visible_delivery_reply(row['content'],row['attachments'])
             row['used_skills']=json.loads(row.get('used_skills') or '[]')
-            row['tool_events']=[item for item in json.loads(row.get('tool_events') or '[]')
-                                if item.get('group') != 'agent_receipt']
-            if row['role']=='assistant' and had_successful_sandbox(row['tool_events']):
+            activity=json.loads(row.get('tool_events') or '[]')
+            if row['role']=='assistant' and had_successful_sandbox(activity):
                 row['content']=without_false_tool_footer(row['content'])
+            row['tool_events']=[pauses.public_event(item) for item in activity if item.get('group')!='agent_receipt']
         by_intent={r['message_id']:{'id':r['id'],'conversation_id':r['conversation_id'],'status':r['status'],'task_id':r['task_id'],**json.loads(r['document'])} for r in intents}
         for row in result:
             row['intent']=by_intent.get(row['id'])
@@ -157,7 +157,7 @@ class AvatarChat:
     # 职责：构建当前已审核目标的模型配置和公开身份背景。
     # 输入：user 为调用者，request 指定频道，target_row 可指定助手调度目标而非本人分身。
     # 结果与约束：返回概览和可选上下文四元组，要求注册激活及模型配置完整；默认加载目标公开资料及其本人启用技能，本人 Web 授权可读取私密资料，集合日期用于旧摘要失效；Key 仅在服务端解密。
-    def context(self, user, request, target_row=None, *, private_access=False):
+    def context(self, user, request, target_row=None, *, private_access=False, run_parent=None):
         overview = self.service.overview(user['id'])
         agent = overview['agent']
         if request.channel != 'avatar' and target_row is None:
@@ -166,6 +166,7 @@ class AvatarChat:
             raise HTTPException(403, '教师注册尚未审核通过')
         if not agent and target_row is None:
             raise HTTPException(409, '审核并创建成功后才能与分身对话')
+        catalog=self.assistant_router.catalog()
         with self.service.database.connect() as db:
             # 读取事务固定身份、模型、文件、技能与集合日期，避免并发隐私修改混用上下文。
             db.execute('BEGIN')
@@ -175,6 +176,9 @@ class AvatarChat:
                            (selected['aic'], selected['user_id'])).fetchone()
             if not row:
                 raise HTTPException(409,'目标分身当前不可用')
+            if run_parent:
+                from avatar.conversation.loop.personal import source_snapshot
+                overview['_run_sources']=source_snapshot(db,user['id'],run_parent,row['user_id'],row['aic'])
             agent=self.service.decode_agent(row)
             overview['agent']=agent
             config=self.service.models.current(db,row['user_id'])
@@ -197,7 +201,7 @@ class AvatarChat:
             if skills:
                 background['available_skills']=skills
                 background['_skills_revision']=skill_date
-            background['platform_avatars']=[{'name':item['name'],'aic':item['aic']} for item in self.assistant_router.catalog()][:20]
+            background['platform_avatars']=[{'name':item['name'],'aic':item['aic']} for item in catalog][:20]
             background['platform_directory_rules']='可以查询平台已注册且已审核的公开分身目录；这里只包含公开名称和 AIC，没有账号、联系方式或私密资料。'
             background['attachments']=self.service.attachments.public_context(row['user_id'],question=request.message,db=db,target_aic=row['aic'],include_private=private_access)
         try:
@@ -278,7 +282,7 @@ class AvatarChat:
             scope=authorization()
             if scope is not None:files=[file for file in files if file['id'] in scope.get('files',[])]
             overview['_attachment_ids']=[file['id'] for file in files]
-            if config.get('_material_delivery') and overview.get('_private_context') and overview['agent']['user_id']==user['id']:
+            if config.get('_material_delivery') and not config.get('_resume_sandbox') and overview.get('_private_context') and overview['agent']['user_id']==user['id']:
                 recent = await asyncio.to_thread(self._deliveries,user['id'],session['id'])
                 overview['_material_delivery']=True
                 overview['_generated_files'] = outputs = []
@@ -318,7 +322,7 @@ class AvatarChat:
             enabled=next((tool['enabled'] for tool in tools if tool['id']=='python'),False)
             context=({**context[0],'_conversation_tools':tools,'_animation_request':request.message},*context[1:])
             route=context[0].get('_answer_route')
-            resumed=bool(config.get('_agent_checkpoint',{}).get('sandbox_attempted'))
+            resumed=bool(config.get('_resume_sandbox') or config.get('_agent_checkpoint',{}).get('sandbox_attempted'))
             if route is None and enabled and self.dialogues and not resumed:
                 # Compatibility entry points may reach prepare without the personal conversation router.
                 route=await self.dialogues.intent.answer_route(overview['agent']['user_id'],session['id'],context,request.message)
@@ -331,6 +335,7 @@ class AvatarChat:
                     from avatar.conversation.jobs.pipeline import sandbox_inputs
                     inputs=await asyncio.to_thread(sandbox_inputs,self,user['id'],parent_id,files,context[0].get('_agent_saved_files',()),request.agent_pause_id)
                 context=await self.skill_execution.enrich(overview['agent']['user_id'],context,request.message,self.model_client,caller_id=user['id'],conversation_id=session['id'],parent_id=parent_id,inputs=inputs,progress=progress,enabled=enabled,allow_code=enabled)
+            overview['_validate_sandbox'] = context[0].get('_validate_sandbox')
             overview['_generated_files'] = context[0].setdefault('_generated_files', [])
             # Enrichment can add evidence after memory.prepare. Fit this working copy without reloading the old turns.
             from avatar.conversation.working_context import fit_turn
@@ -371,18 +376,24 @@ class AvatarChat:
     # 职责：原子保存成功问答及对应模型用量。
     # 输入：user 为调用者，request 指定实际父或子会话，overview 提供目标版本，reply 为完整回答，usage 为上游用量。
     # 结果与约束：消息归调用者并记录来源，模型用量归目标所有人；返回答复、资料入口、父会话 ID 和目标信息，失败片段不应调用本方法。
-    def save(self, user, request, overview, reply, usage=None, caller_id=None):
+    def save(self, user, request, overview, reply, usage=None, caller_id=None, *, commit_in=None):
         model = not overview.get('_dialogue_id') and (bool(overview.get('_target')) or (request.channel == 'avatar' and not request.personal))
         target = overview.get('_target')
         outputs = overview.get('_generated_files')
         if outputs is not None:
             reply = reply_with_artifacts(reply, outputs, overview.get('_tool_events', ()),
                 saved=overview.get('_prior_files', ()))
+        if overview.get('_validate_sandbox'):
+            overview['_validate_sandbox']()
         with ExitStack() as resources, self.service.database.connect(write=True) as db:
             from avatar.conversation.jobs.pipeline import current_generation
             job=current_generation.get()
             from avatar.conversation.jobs.pipeline import validate_authorization
-            validate_authorization(db,job)
+            validate_authorization(db,job,lock=True)
+            store=overview.get('_run_store')
+            if store:
+                if not job:overview['_source_guard'](db,full=True)
+                store.check_in(db)
             # 完整问答对同事务保存，避免只记录问题或半段回答；调度问答记录目标来源。
             for role, content in [('user', request.message), ('assistant', reply)]:
                 if role == 'user' and (not content.strip() or request.agent_control == 'retry'):
@@ -418,6 +429,10 @@ class AvatarChat:
             generated += pauses.finish(self,db,user['id'],overview.get('_parent_id',request.conversation_id),request.agent_pause_id,cursor.lastrowid)
             result={'reply':reply, 'profile_url':'/#profile', 'mode':'model' if model else 'demo', 'usage':usage,'conversation_id':overview.get('_parent_id',request.conversation_id),'target':target,'dialogue_id':overview.get('_dialogue_id'),'intent':overview.get('_intent'),'used_skills':overview.get('_used_skills',[]),'notices':overview.get('_workflow_notices',[]),'generated_files':generated}
             pauses.update_waiters(db,user['id'],result['conversation_id'],request.agent_pause_id,'succeeded',result)
+            if store:
+                store.clear_in(db,user['id'],'chat',result['conversation_id'],store.run_id)
+            if commit_in:
+                commit_in(db)
             if job:
                 from avatar.conversation.jobs.store import GenerationStore
                 GenerationStore.finish_in(db,user['id'],job['request_id'],'succeeded',result)
@@ -429,7 +444,7 @@ class AvatarChat:
     async def dispatch(self,user,request,parent):
         # 指定 avatar 频道的旧纯问答 API 不承担助手调度；Web 本人会话统一传 personal=true。
         if request.channel=='avatar' and not request.personal:
-            overview,context=await asyncio.to_thread(self.context,user,request,private_access=True)
+            overview,context=await asyncio.to_thread(self.context,user,request,private_access=True,run_parent=parent['id'])
             return overview,context,parent,None
         def current_parent():
             with self.service.database.connect() as db:
@@ -463,14 +478,14 @@ class AvatarChat:
         elif action not in ('answer_self','deliver_material','find_conversation_files') and not request.personal and request.channel=='assistant' and parent.get('selected_aic'):
             target=next((t for t in self.assistant_router.catalog() if t['aic']==parent['selected_aic']),None)
         if target:
-            overview,context=await asyncio.to_thread(self.context,user,request,target['row'],private_access=True)
+            overview,context=await asyncio.to_thread(self.context,user,request,target['row'],private_access=True,run_parent=parent['id'])
             child=self.assistant_router.child(self.memory,user['id'],parent,target)
             overview['_target']={'aic':target['aic'],'name':target['name']};overview['_parent_id']=parent['id']
             return overview,context,child,None
         overview=await asyncio.to_thread(self.service.overview,user['id'])
         own=overview['agent']
         if not own:return overview,None,parent,None
-        overview,context=await asyncio.to_thread(self.context,user,request,own,private_access=True)
+        overview,context=await asyncio.to_thread(self.context,user,request,own,private_access=True,run_parent=parent['id'])
         if action=='deliver_material' and not declared:
             context=({**context[0],'_material_delivery':arguments},*context[1:])
         elif action=='continue_answer':
@@ -533,7 +548,14 @@ class AvatarChat:
                 if request.agent_control=='end':
                     yield {'type':'done',**pauses.end_task(self,user,parent,request)}
                     return
-                if not held and (request.personal or request.channel=='assistant'):
+                from avatar.conversation.loop import personal
+                durable = parent['platform']=='web'
+                run_id = personal.run_id_for(job,held,original)
+                previous = await asyncio.to_thread(personal.inspect,self,user['id'],parent['id'],run_id,job) if durable else None
+                recovering = bool(job and json.loads(job['authorization']).get('resume_run'))
+                if recovering and not (previous and previous.get('binding')):
+                    raise HTTPException(409,'缺少可验证的执行状态，原请求不会自动重发')
+                if not held and not recovering and (request.personal or request.channel=='assistant'):
                     failure_stage='intent_analysis'
                     yield {'type':'status','stage':'intent_analysis','message':'正在分析本轮请求的意图…'}
                 route_records, route_events = [], []
@@ -542,16 +564,16 @@ class AvatarChat:
                     overview,context,session,request=await asyncio.to_thread(pauses.continue_task,self,user,request,parent,held)
                     local_reply=None
                     config = context[0]
-                    if held.get('retry_dispatch'):
+                    if not (previous and previous.get('binding')) and held.get('retry_dispatch'):
                         overview,context,session,local_reply=await self.dispatch(user,request,parent)
-                        overview['_prior_tool_events']=held.get('activity', [])
-                    elif (not config.get('_answer_route') and self.dialogues and overview.get('_private_context') and overview['agent'].get('identity_status')=='active'
+                        overview['_prior_tool_events']=held.get('activity', []) if held.get('sources') else []
+                    elif (not (previous and previous.get('binding')) and not config.get('_answer_route') and self.dialogues and overview.get('_private_context') and overview['agent'].get('identity_status')=='active'
                             and not session.get('parent_id') and (not config.get('_agent_saved_files') or bool(original.message.strip()))
                             and not config.get('_agent_checkpoint',{}).get('sandbox_attempted')):
                         steps = AgentSteps(ToolActivity(route_records, route_events.append).emit)
                         with steps.step('reason', {'stage':'resume_route'}) as trace:
                             for event in route_events:
-                                yield event
+                                yield pauses.public_event(event)
                             route_events.clear()
                             decision = await self.dialogues.intent.choose_tool({'user': user, 'message': request.message,
                                                 'parent': parent, 'personal': True, 'resume': True})
@@ -575,13 +597,17 @@ class AvatarChat:
                                 context=({**config,'_answer_route':{'mode':'answer',**arguments}},*context[1:])
                         overview['_tool_events'] = route_records
                         for event in route_events:
-                            yield event
+                            yield pauses.public_event(event)
+                elif recovering:
+                    yield {'type':'status','stage':'resuming','message':'正在恢复已核验的任务进度'}
+                    overview,context,session,local_reply=await asyncio.to_thread(personal.restore,self,user,request,parent,previous)
+                    overview['_tool_events']=route_records
                 else:
                     trace = AgentSteps(ToolActivity(route_records, route_events.append).emit)
                     trace.point('perceive', {'request': request.message}, {'conversation_id': parent['id']})
                     with trace.step('reason', {'stage': 'route', 'personal': request.personal}) as decision:
                         for event in route_events:
-                            yield event
+                            yield pauses.public_event(event)
                         route_events.clear()
                         overview,context,session,local_reply=await self.dispatch(user,request,parent)
                         action = ('deliver_material' if context and context[0].get('_material_delivery') else
@@ -592,13 +618,15 @@ class AvatarChat:
                             decision['mode'] = context[0]['_answer_route']['mode']
                     overview['_tool_events'] = route_records
                     for event in route_events:
-                        yield event
+                        yield pauses.public_event(event)
                 if context:
                     config = context[0]
                     if overview['agent']['user_id'] == user['id']:
                         effort = (authorization() or {}).get('reasoning_effort', json.loads(parent['tools_config']).get('reasoning_effort'))
                         config = with_chat_effort(config, effort)
                     context=({**config,'_avatar_agent':True},*context[1:])
+                    if durable:
+                        context=await run_blocking(personal.attach,self,user,original,parent,session,overview,context,job,held,run_id,acquired,previous)
                 if job:
                     job['_pause_state'] = (session, request, overview, context)
                 if request.personal and context is None and local_reply:request=request.model_copy(update={'attachment_ids':[]})
@@ -646,7 +674,7 @@ class AvatarChat:
                                     continue  # Delivery text and its file cards become visible together after commit.
                             elif event['type'] == 'usage':
                                 usage = event['usage']
-                            yield event
+                            yield pauses.public_event(event)
                         await generation
                     finally:
                         if not generation.done():
@@ -698,4 +726,8 @@ class AvatarChat:
             yield {'type':'error','code':500,'message':'回答处理失败，已显示内容可能不完整；系统未自动重试'}
         finally:
             if acquired:
-                await run_blocking(self.memory.release, parent['id'], acquired)
+                try:
+                    if not job and (overview or {}).get('_run_store'):
+                        await run_blocking(personal.discard_unpaused,overview['_run_store'],acquired)
+                finally:
+                    await run_blocking(self.memory.release,parent['id'],acquired)

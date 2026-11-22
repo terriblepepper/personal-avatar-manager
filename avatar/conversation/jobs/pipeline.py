@@ -45,16 +45,22 @@ def validate_versions(db,user_id,scope):
             raise HTTPException(409,'排队期间模型配置已改变，请重新发起请求')
 
 
-def validate_authorization(db,job=None):
+def validate_authorization(db,job=None,*,lock=False):
     from fastapi import HTTPException
     job=job or current_generation.get()
     if not job:return
+    if not isinstance(job,dict):job=dict(job)
     uid=job['user_id'];scope=json.loads(job['authorization'])
     if not db.execute("SELECT 1 FROM users WHERE id=? AND account_status='active'",(uid,)).fetchone():
         raise HTTPException(403,'账户已停用，未继续执行或保存回答')
-    if not db.execute("SELECT 1 FROM chat_generation_jobs WHERE task_id=? AND user_id=? AND state='running'",(job['task_id'],uid)).fetchone():
+    query="""SELECT 1 FROM chat_generation_jobs WHERE task_id=? AND user_id=? AND state='running'
+        AND (authorization::jsonb->>'claim_token') IS NOT DISTINCT FROM ?"""
+    if lock:query+=' FOR UPDATE'
+    if not db.execute(query,(job['task_id'],uid,scope.get('claim_token'))).fetchone():
         raise HTTPException(409,'原请求已结束，未继续执行或保存回答')
     validate_versions(db,uid,scope)
+    if job.get('_source_guard'):
+        job['_source_guard'](db,full=lock)
     for identifier,version in scope.get('skills',{}).items():
         row=db.execute('SELECT enabled,updated_at FROM agent_skills WHERE id=? AND user_id=?',(identifier,uid)).fetchone()
         session=db.execute('SELECT enabled,authorized FROM chat_session_skills WHERE conversation_id=? AND skill_id=?',(job['conversation_id'],identifier)).fetchone()

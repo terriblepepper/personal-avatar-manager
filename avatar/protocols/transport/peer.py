@@ -1,5 +1,6 @@
 """分身传输选择与 WIT Direct 适配：ACPS 优先，未就绪时使用明确授权的同平台内部通道。"""
 import uuid
+import json
 import asyncio
 import httpx
 from avatar.protocols.transport.directory import CertificateStatusRateLimited
@@ -54,14 +55,18 @@ class PeerAcpsTransport:
 
     async def exchange(self,job,leader_id,partner_id):
         with self.runtime.database.connect() as db:
-            count=db.execute('SELECT COUNT(*) FROM agent_dialogue_messages WHERE dialogue_id=?',(job['id'],)).fetchone()[0]
+            from avatar.conversation.loop.peer import wire_id
+            command_id=wire_id(db,job,partner_id)
             first = db.execute('SELECT command_id FROM agent_wire_results WHERE task_id=? AND session_id=? '
                                'AND local_aic=(SELECT aic FROM avatar_records WHERE user_id=?) '
                                'AND peer_aic=(SELECT aic FROM avatar_records WHERE user_id=?) ORDER BY rowid LIMIT 1',
                                (job['id'], job['session_id'], partner_id, leader_id)).fetchone()
-        command_id=str(uuid.uuid5(uuid.NAMESPACE_URL,':'.join([job['id'],str(job['revision']),str(count),partner_id])))
         operation = 'start' if not first or first[0] == command_id else 'continue'
-        result=await self.send(job,leader_id,partner_id,operation,command_id)
+        checkpoint=json.loads(job.get('agent_checkpoint') or '{}')
+        if checkpoint.get('resume_wire') == command_id:
+            result=await self.send(job,leader_id,partner_id,'get',uuid.uuid4().hex)
+        else:
+            result=await self.send(job,leader_id,partner_id,operation,command_id)
         try:
             async with asyncio.timeout(480):
                 while result.get('status',{}).get('state')=='working':
@@ -120,7 +125,12 @@ class PeerTransport:
 
     async def exchange(self,job,leader_id,partner_id):
         """内部调用仅接受库中已授权任务、固定双方及当前发言方，继续复用各方资料和额度隔离。"""
+        checkpoint=json.loads(job.get('agent_checkpoint') or '{}')
+        if checkpoint.get('unconfirmed_wire'):
+            raise HTTPException(409,'原协议命令没有确认结果，请核对对端记录后结束当前任务')
         mode='acps' if self.acps.ready(leader_id,partner_id) else 'internal'
+        if checkpoint.get('resume_wire') and mode!='acps':
+            raise PeerEndpointUnavailable('正在等待原 ACPS 入口确认已接收命令')
         if mode=='internal' and job.get('transport_mode')=='acps' and job.get('status')=='awaiting_identity':
             raise PeerEndpointUnavailable('ACPS 入口尚未恢复，继续等待原通道，不改走内部传输')
         with self.database.connect(write=True) as db:
@@ -129,7 +139,7 @@ class PeerTransport:
             if not row or not pair or row['status']!='running' or row['revision']!=job['revision']:
                 raise HTTPException(409,'分身任务状态已变化，本次未发送')
             own,target=self.dialogues.participants(db,row['user_id'],row['target_aic'])
-            mode=current_protocol(own['aic'],target['aic'],ready=mode=='acps')
+            mode='internal' if checkpoint.get('resume_internal') else current_protocol(own['aic'],target['aic'],ready=mode=='acps')
             speaker=row['user_id'] if row['next_speaker']==0 else row['target_user_id']
             if {leader_id,partner_id}!={own['user_id'],target['user_id']} or partner_id!=speaker or {pair['left_user_id'],pair['right_user_id']}!={leader_id,partner_id}:
                 raise HTTPException(403,'分身通信参与者不匹配')

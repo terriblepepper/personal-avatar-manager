@@ -9,7 +9,8 @@ from langgraph.graph import StateGraph, START, END
 from langsmith import tracing_context
 from avatar.core.db import dump, now
 from avatar.core.execution import AgentSteps
-from avatar.core.execution import check_execution
+from avatar.core.execution import AgentNeedsInput, check_execution, run_blocking, sandbox_checkpoint
+from avatar.conversation.loop.effects import SandboxEffects, file_versions, https_versions
 from avatar.models.limits import check_context
 from avatar.conversation.working_context import excerpt, fit_turn, fit_working_set, input_budget
 from avatar.skills.sandbox import LocalPythonSandbox, SandboxUnavailable
@@ -18,6 +19,7 @@ from avatar.skills.sandbox import LocalPythonSandbox, SandboxUnavailable
 # 职责：记录单次请求图的规划和执行结果；不跨账户或会话保存运行状态。
 class ExecutionState(TypedDict, total=False):
     action: dict
+    usage: dict
     stopped: bool
     count: int
     delivered: bool
@@ -34,13 +36,21 @@ class SkillExecution:
     # 结果与约束：无脚本不增加模型调用；取消不吞掉，失败提示原因并继续最终回答，不伪造成功。
     async def enrich(self,user_id,context,message,model_client,*,caller_id=None,conversation_id=None,inputs=None,progress=None,enabled=True,allow_code=False,parent_id=None):
         config,key,system,history=context
-        agent=bool(config.get('_avatar_agent'))
+        store=config.get('_run_store')
+        agent=bool(config.get('_avatar_agent') or store is not None)
         trace=AgentSteps(progress if agent else None)
-        from avatar.core.execution import sandbox_checkpoint
-        checkpoint=sandbox_checkpoint(config.get('_agent_checkpoint') if agent else None)
+        original=config.get('_agent_checkpoint')
+        checkpoint=sandbox_checkpoint(original if agent else None)
+        legacy_receipts=config.get('_sandbox_receipts',[])
+        journal=None
+        if store is not None:
+            scope=[user_id,caller_id or user_id,conversation_id,parent_id]
+            journal=await run_blocking(SandboxEffects,store,scope,checkpoint,legacy_receipts)
         previous=list(checkpoint.get('sandbox_actions',[]))
+        if journal and journal.state:
+            previous=list(dict.fromkeys([*previous,*journal.state.get('legacy_actions',()),*(r['token'] for r in journal.receipts)]))
         resumed=bool(previous)
-        legacy=checkpoint['sandbox_attempted'] and not previous
+        legacy=not previous and (checkpoint['sandbox_attempted'] or bool(journal and journal.state and 'legacy_actions' in journal.state))
         prefix,raw=system.split('\n',1);background,end=json.JSONDecoder().raw_decode(raw);suffix=raw[end:]
         libraries=['标准库','pypdf','NumPy','pandas','Matplotlib','Pillow']
         background['conversation_tools']={'items':config.get('_conversation_tools',[]),'python':bool(enabled),
@@ -60,6 +70,8 @@ class SkillExecution:
             background['conversation_tools'].update(python=False,libraries=[])
             background['tool_rules']+=' 旧任务未记录动作签名，恢复后无法再次执行沙箱。'
         context=config,key,prefix+'\n'+json.dumps(background,ensure_ascii=False)+suffix,history
+        if not enabled and journal and journal.receipts:
+            raise HTTPException(409,'沙箱工具已关闭，未使用先前结果')
         if not enabled or legacy:return context
         loaded=background.get('installed_skills',[])
         catalog=[]
@@ -67,24 +79,48 @@ class SkillExecution:
             row=self.skills.get(user_id,item['id'])
             paths=[f['path'] for f in json.loads(row['manifest']) if Path(f['path']).suffix.lower() == '.py']
             if paths:catalog.append({'skill_id':item['id'],'name':item['name'],'scripts':paths[:64],'instructions':item['instructions']})
-        if not catalog and not allow_code:return context
+        if not catalog and not allow_code and not (journal and journal.receipts):return context
         revision=self.skills.collection_date(user_id)
-        results=list(config.get('_sandbox_receipts',[]));outputs=[];notices=list(config.get('_workflow_notices',[]));seen=set()
+        results=[{k:v for k,v in item.items() if k!='_sandbox_action'} for item in legacy_receipts if not (journal and item.get('_sandbox_action'))]
+        outputs=[];notices=list(config.get('_workflow_notices',[]));seen=set()
+        inputs=inputs or {}
+
+        def authorize_sources(sources):
+            check_execution()
+            identifier=sources['skill']
+            if identifier is None:
+                if not allow_code:raise HTTPException(409,'沙箱代码执行授权已撤回')
+            else:
+                row=self.skills.get(user_id,identifier)
+                if (not row['enabled'] or row['updated_at']!=sources['skill_version']
+                        or not any(entry['skill_id']==identifier for entry in catalog)):
+                    raise HTTPException(409,'沙箱技能授权或内容已改变，未使用结果')
+            if file_versions(inputs,sources['files'])!=sources['files'] or https_versions(sources['https'])!=sources['https']:
+                raise HTTPException(409,'沙箱输入内容或授权已改变，未使用结果')
+
+        if journal and journal.receipts:
+            recovered,outputs=await run_blocking(journal.restore,inputs,authorize_sources,
+                {item['id'] for item in saved},set(config.get('_agent_persisted_file_ids',())))
+            results.extend(recovered)
         from avatar.core.tokens import estimate
         if agent:
             history,_=fit_turn(config,context[2],history,message,[])
             context=config,key,context[2],history
         result_budget=max(0,check_context(config,context[2],history,message)-512)
         if result_budget<256:
+            if journal and results:raise AgentNeedsInput('当前上下文没有足够空间接收已确认的沙箱结果',checkpoint=checkpoint)
             return {**config,'_workflow_notices':notices+['当前上下文没有足够空间接收脚本结果，本轮未运行脚本。']},key,context[2],history
-        inputs=inputs or {}
         from avatar.skills.https_inputs import configured_resources
         https_names = list(configured_resources()) if allow_code else []
         # 职责：默认只接受已加载脚本；allow_code 仅由本人 Web 工具授权开启，允许 Python 代码，仍不接受宿主命令。
+        def validate_receipts():
+            journal.check_current()
+            for receipt in journal.receipts:
+                authorize_sources(receipt['sources'])
+
         def pause(reason):
-            from avatar.core.execution import AgentNeedsInput
             pending=AgentNeedsInput(reason+'。可以继续，或补充要求后继续。',checkpoint=checkpoint)
-            pending.generated_files=list(outputs)
+            pending.generated_files=[] if journal else list(outputs)
             return pending
 
         async def plan(state):
@@ -122,6 +158,7 @@ class SkillExecution:
             payload=dump(request)
             auxiliary={**config,'_call_purpose':'skill_execution','_image_inputs':[],'_file_search':True,'_tools':[],'_audio_inputs':[]}
             async def choose():
+                if journal:await run_blocking(validate_receipts)
                 usage=None
                 try:
                     response=await model_client.generate(auxiliary,key,prompt,[],payload)
@@ -134,7 +171,7 @@ class SkillExecution:
                     action=json.loads(response.text.strip().removeprefix('```json').removeprefix('```').removesuffix('```'))
                     if not isinstance(action,dict) or action.get('action') not in (('run','python','finish') if allow_code else ('run','finish')):
                         raise ValueError('规划 action 无效')
-                    return action
+                    return action,usage
                 except ValueError:
                     error=HTTPException(502,'技能脚本规划不是有效的调用')
                     error.invalid_tool_call=True
@@ -151,10 +188,10 @@ class SkillExecution:
                 check_context(auxiliary,prompt,[],payload)
                 if progress:
                     progress({'type': 'status', 'stage': 'tool_selection', 'message': '正在选择技能或沙箱操作'})
-                trace.point('perceive', {'tool': 'python', 'input_ids': list(inputs)}, {'previous_receipts': len(results)})
+                trace.point('perceive', {'tool': 'python', 'input_count': len(inputs)}, {'previous_receipts': len(results)})
                 with trace.step('reason', {'tool': 'python', 'step': state.get('count',0)+1}) as decision:
                     try:
-                        action = await call_with_retry(choose) if agent else await choose()
+                        action,usage = await call_with_retry(choose) if agent else await choose()
                     except HTTPException as error:
                         if not agent or not getattr(error,'output_limited',False):
                             raise
@@ -165,8 +202,8 @@ class SkillExecution:
                         if progress:
                             progress({'type':'status','stage':'compressing','message':'已整理沙箱回执，正在接续未执行的规划'})
                         check_context(auxiliary,prompt,[],payload)
-                        action = await choose()
-                    decision.update(action=action['action'], input_ids=action.get('input_ids', []))
+                        action,usage = await choose()
+                    decision.update(action=action['action'])
             except HTTPException as exc:
                 if agent and getattr(exc,'stream_exhausted',False):
                     stopped=pause(exc.detail)
@@ -187,7 +224,7 @@ class SkillExecution:
                 return {'stopped':True}
             if action['action']=='finish':
                 trace.point('check', {'tool': 'python', 'receipts': len(results)}, {'decision': '模型结束沙箱步骤'})
-            return {'action':action,'stopped':action['action']=='finish'}
+            return {'action':action,'usage':usage,'stopped':action['action']=='finish'}
         # 职责：每步再次验证启用状态、集合日期、清单路径及输入 ID，再把有限字节拷贝进独立沙箱。
         async def execute(state):
             nonlocal checkpoint
@@ -208,7 +245,8 @@ class SkillExecution:
                 command=[*command,sorted(https_inputs)]
             token=hashlib.sha256(json.dumps([command,args,input_ids],sort_keys=True,separators=(',',':')).encode()).hexdigest()
             if token in seen or token in previous:
-                if agent and not any(item.get('status')=='success' for item in results):
+                confirmed=any(r['token']==token and r['record']['status']=='success' for r in journal.receipts) if journal else any(item.get('status')=='success' for item in results)
+                if agent and not confirmed:
                     raise pause('相同操作未取得成功回执，请补充要求或检查输入')
                 background['sandbox_stop_reason']='交付已有有效结果，仅指出用户请求中仍缺失的内容。'
                 return {'stopped':True}
@@ -217,20 +255,20 @@ class SkillExecution:
             seen.add(token)
             def authorize():
                 check_execution()
+                if claimed:journal.check_current()
                 if revision!=self.skills.collection_date(user_id):
                     raise HTTPException(409,'技能设置已改变，请重新发送')
+                if journal:authorize_sources(sources)
             row=None if generated else self.skills.get(user_id,identifier)
             if row and not row['enabled']:raise HTTPException(409,'技能已停用')
-            record={'skill_id':identifier,'name':'Python 沙箱' if generated else allowed['name'],'script':script,'args':args}
+            record={'skill_id':None if generated else identifier,'name':'Python 沙箱' if generated else allowed['name'],'script':script,'args':args}
             activity_id=str(uuid.uuid4())
             visible_input={'script':script,'args':args,'input_ids':action.get('input_ids',[])}
             if https_inputs:visible_input['https_inputs']=https_inputs
             if generated:visible_input['code']=str(action.get('code',''))[:24000]
-            if progress:
-                progress({'type': 'tool', 'id': activity_id, 'group': 'sandbox', 'name': record['name'],
-                          'status': 'running', 'input': visible_input,
-                          'steps': [{'time': now(), 'message': '正在准备并执行 Python 脚本'}]})
             unavailable = False
+            files=[]
+            claimed=False
             try:
                 resources={};size=0
                 if generated:
@@ -244,38 +282,66 @@ class SkillExecution:
                     resources[item['path']]=lambda path=item['path'],skill_id=identifier:self.skills.resource(user_id,skill_id,path).read_bytes()
                 selected=action.get('input_ids',[])
                 if not isinstance(selected,list) or any(not isinstance(i,str) or i not in inputs for i in selected):raise ValueError('脚本请求了未授权文件')
-                for identifier in selected:
-                    item=inputs[identifier]
-                    resources[item['path']]=item['read']
-                if progress:progress({'type':'status','stage':'skill_execution','message':'Python 沙箱正在处理任务：'+record['name']})
-                check_execution()
+                if journal:
+                    sources={'files':await run_blocking(file_versions,inputs,input_ids,resources),
+                             'skill':None if generated else identifier,'skill_version':row['updated_at'] if row else None,
+                             'https':https_versions(https_inputs)}
+                else:
+                    for file_id in selected:
+                        item=inputs[file_id]
+                        resources[item['path']]=item['read']
+            except (ValueError,OSError) as exc:
+                record.update(status='error',error=str(exc)[:2000])
+            else:
+                await run_blocking(authorize)
+                if journal:
+                    await run_blocking(journal.claim,token,sources)
+                    claimed=True
                 if agent:
                     checkpoint={'v':1,'sandbox_attempted':True,'sandbox_actions':[*previous,token]}
-                    config['_agent_checkpoint']=checkpoint
+                    config['_agent_checkpoint']={'v':1,**(original if isinstance(original,dict) else {}),
+                                                 'sandbox_attempted':True,'sandbox_actions':checkpoint['sandbox_actions']}
                     previous.append(token)
-                execution=await self.sandbox.execute(user_id,resources,script,args,https_inputs=https_inputs,authorize=authorize)
-                files=execution.pop('files',[])
-                if sum(len(item['data']) for item in outputs+files)>20*1024*1024:raise ValueError('本轮累计普通生成文件超过 20 MiB')
-                if not parent_id and files:raise ValueError('当前通道不支持保存生成文件，请在本人 Web 会话开启 Python 工具后处理')
-                record.update(execution)
-                if execution['status']=='success':
-                    record['outputs']=[]
-                    for item in files:
-                        item={**item,'id':str(uuid.uuid4())};outputs.append(item)
-                        url='/api/conversations/'+str(parent_id or conversation_id)+'/files/'+item['id']
-                        record['outputs'].append({'id':item['id'],'filename':item['filename'],'download_url':url})
-                        inputs[item['id']]={'path':'inputs/'+item['id']+'/'+item['filename'],'read':lambda data=item['data']:data}
-                if revision!=self.skills.collection_date(user_id):raise HTTPException(409,'执行期间技能设置已改变，结果不再使用')
-            except (RuntimeError,ValueError,OSError) as exc:
-                unavailable = isinstance(exc, SandboxUnavailable)
-                record.update(status='error',error=str(exc)[:2000])
+                if progress:
+                    progress({'type':'tool','id':activity_id,'group':'sandbox','name':record['name'],'status':'running',
+                              'input':{'input_count':len(input_ids)} if journal else visible_input,
+                              'steps':[{'time':now(),'message':'正在准备并执行 Python 脚本'}]})
+                    progress({'type':'status','stage':'skill_execution','message':'Python 沙箱正在处理任务：'+record['name']})
+                try:
+                    execution=await self.sandbox.execute(user_id,resources,script,args,https_inputs=https_inputs,authorize=authorize)
+                except (RuntimeError,ValueError,OSError) as exc:
+                    unavailable=isinstance(exc,SandboxUnavailable)
+                    if claimed and not unavailable:
+                        raise pause('沙箱操作未返回可确认的结果，已暂停等待核对') from None
+                    record.update(status='error',error=str(exc)[:2000])
+                else:
+                    await run_blocking(authorize)
+                    files=execution.pop('files',[]) if execution['status']=='success' else []
+                    if sum(len(item['data']) for item in outputs+files)>20*1024*1024:
+                        execution={'status':'error','error':'本轮累计普通生成文件超过 20 MiB'};files=[]
+                    if not parent_id and files:
+                        execution={'status':'error','error':'当前通道不支持保存生成文件，请在本人 Web 会话开启 Python 工具后处理'};files=[]
+                    record.update(execution)
+                    if execution['status']=='success':
+                        record['outputs']=[]
+                        for item in files:
+                            item={**item,'id':str(uuid.uuid4())};outputs.append(item)
+                            url='/api/conversations/'+str(parent_id or conversation_id)+'/files/'+item['id']
+                            record['outputs'].append({'id':item['id'],'filename':item['filename'],'download_url':url})
+                            inputs[item['id']]={'path':'inputs/'+item['id']+'/'+item['filename'],'read':lambda data=item['data']:data}
             # 二进制输出只保留在服务端，模型只接收下载元信息与有界文字；stdout/stderr 展平为纯文本，避免二次 JSON 编码干扰回答模型。
             for key in ('stdout','stderr'):
                 if isinstance(record.get(key),list):record[key]='\n'.join(str(line) for line in record[key])
             record={k:(v[:16000] if isinstance(v,str) else dump(v)[:16000] if isinstance(v,list) and k!='outputs' else v) for k,v in record.items()}
+            if claimed:
+                try:
+                    await run_blocking(journal.confirm,token,record,files,state.get('usage'))
+                except ValueError:
+                    raise pause('沙箱回执未保存，已暂停等待核对') from None
             if record.get('status')=='error':notices.append('技能脚本未成功，请展开执行过程查看错误详情。')
             if progress:progress({'type':'tool','id':activity_id,'name':record['name'],'status':'error' if record.get('status')=='error' else 'completed',
-                                  'output':{key:record[key] for key in ('stdout','stderr','error','outputs','status') if key in record}})
+                                  'output':{'status':record['status'],'file_count':len(files)} if journal else
+                                  {key:record[key] for key in ('stdout','stderr','error','outputs','status') if key in record}})
             if unavailable:
                 raise HTTPException(503,record['error'])
             results.append(record)
@@ -295,7 +361,7 @@ class SkillExecution:
             final=action.get('final_result')
             delivered=record['status']=='success' and (
                 (final=='stdout' and bool(record.get('stdout','').strip())) or (final=='file' and bool(record.get('outputs'))))
-            trace.point('observe', {'tool': 'python'}, {'status': record['status'],
+            trace.point('observe', {'tool': 'python'}, {'status':record['status'],'file_count':len(files)} if journal else {'status': record['status'],
                         'file_ids': [item['id'] for item in record.get('outputs', [])],
                         'stdout': record.get('stdout'), 'error': record.get('error')})
             trace.point('check', {'tool': 'python'}, {'decision': '已取得模型要求的产物' if delivered else '由模型核对本轮执行结果'})
@@ -310,5 +376,8 @@ class SkillExecution:
         if agent:history,_=fit_turn(config,merged,history,message,[])
         check_context(config,merged,history,message)
         succeeded=any(item.get('status')=='success' for item in results)
+        if journal and journal.receipts:
+            await run_blocking(validate_receipts)
+            config={**config,'_validate_sandbox':validate_receipts}
         return {**config,'_workflow_notices':notices,'_generated_files':outputs,'_sandbox_succeeded':succeeded,
                 '_sandbox_delivered':state.get('delivered',False)},key,merged,history

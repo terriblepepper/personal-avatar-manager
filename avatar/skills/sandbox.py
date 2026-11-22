@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 import signal
 import sys
 import tempfile
+from avatar.core.execution import run_blocking
 
 RUNTIME = Path(os.environ.get('AVATAR_SANDBOX_RUNTIME') or Path(sys.prefix) / 'share/avatar-sandbox').resolve()
 ANALYSIS_PACKAGES = {'numpy': 'numpy', 'pandas': 'pandas', 'matplotlib': 'matplotlib', 'PIL': 'pillow'}
@@ -71,15 +72,15 @@ class LocalPythonSandbox:
             async with lock, self.slots:
                 from avatar.skills.https_inputs import fetch_inputs
                 if authorize:
-                    authorize()
+                    await run_blocking(authorize)
                 library = RUNTIME / 'cache/npm/registry.npmjs.org/pyodide/0.27.8'
                 if (not (RUNTIME / 'ready').is_file() or not (library / 'pyodide.asm.wasm').is_file()
                         or not os.access(Path(sys.prefix) / 'bin/deno', os.X_OK)):
                     raise SandboxUnavailable()
                 remote = await fetch_inputs(https_inputs or [])
-                code = await asyncio.to_thread(self.prepare, resources, script, args, remote)
-                if authorize and https_inputs:
-                    authorize()
+                code = await run_blocking(self.prepare, resources, script, args, remote)
+                if authorize:
+                    await run_blocking(authorize)
                 return await self.run(code, timeout)
         finally:
             _,count=self.users[user_id]

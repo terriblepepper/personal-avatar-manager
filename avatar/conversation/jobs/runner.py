@@ -8,7 +8,7 @@ from fastapi import HTTPException
 from avatar.core.schemas import ChatRequest
 from avatar.models.client import collected_model_status
 from avatar.core.execution import run_blocking
-from avatar.conversation.jobs.store import GenerationStore
+from avatar.conversation.jobs.store import LEASE_SECONDS, GenerationStore, run_key
 from avatar.conversation.jobs.pipeline import generation_scope
 
 log = logging.getLogger(__name__)
@@ -36,9 +36,10 @@ class GenerationRunner:
         from avatar.conversation import pauses
         uid=actor['id']
         with self.database.connect(write=True) as db:
-            row=db.execute('SELECT * FROM chat_generation_jobs WHERE user_id=? AND request_id=?',(uid,request_id)).fetchone()
+            row=db.execute('SELECT * FROM chat_generation_jobs WHERE user_id=? AND request_id=? FOR UPDATE',(uid,request_id)).fetchone()
             if not row:raise HTTPException(404,'任务不存在')
             if row['state'] not in ('running','queued'):return self.store.view(row,db)
+            row=dict(row)
             payload=json.loads(row['payload'])
             parent=db.execute('SELECT * FROM chat_conversations WHERE id=? AND user_id=?',(row['conversation_id'],uid)).fetchone()
             result={'reply':'已停止本次任务。','conversation_id':parent['id']}
@@ -47,27 +48,42 @@ class GenerationRunner:
                 from avatar.core.execution import AgentNeedsInput
                 request=ChatRequest.model_validate(payload).model_copy(update={'channel':parent['channel']})
                 previous=pauses.pending(db,uid,parent['id'])
+                if active and active['authorization'] != row['authorization']:
+                    active = None
                 state=(active or {}).get('_pause_state')
+                from avatar.conversation.loop.store import RunStore
+                checkpoint=RunStore.inspect_in(db,*run_key(row)) or {}
+                binding=checkpoint.get('binding') or {}
+                if binding:
+                    from avatar.conversation.loop.personal import validate_sources_in
+                    try:
+                        validate_sources_in(db,uid,parent['id'],binding,checkpoint['sources'])
+                    except HTTPException:
+                        self.store.finish_in(db,uid,request_id,'cancelled',result)
+                        return self.store.view(db.execute('SELECT * FROM chat_generation_jobs WHERE task_id=?',(row['task_id'],)).fetchone(),db)
                 target=db.execute('SELECT user_id,aic,last_modified_at FROM avatar_records WHERE user_id=?',(uid,)).fetchone()
                 if (state and state[2].get('agent')) or target:
                     if state and state[2].get('agent'):
                         session,work,overview,context=state
+                        # Cancellation already released this worker's lease; the locked job and sources guard the pause.
+                        overview=dict(overview)
+                        overview.pop('_run_store',None)
                     else:
                         session,work,context=parent,request,None
                         if previous:
+                            work=pauses.merged_work(request,previous)
+                        source=binding or previous
+                        if source:
                             session=db.execute('SELECT * FROM chat_conversations WHERE id=? AND user_id=?',
-                                               (previous['session_id'],uid)).fetchone() or parent
-                            suffix='\n\n用户补充：'+request.message if request.message and request.agent_control=='continue' else ''
-                            objective=previous.get('goal',previous['objective']) if suffix else previous['objective']
-                            work=request.model_copy(update={'message':objective+suffix,
-                                                             'attachment_ids':request.attachment_ids or previous.get('attachment_ids',[])})
+                                               (source['session_id'],uid)).fetchone()
                             target=db.execute('SELECT user_id,aic,last_modified_at FROM avatar_records WHERE user_id=? AND aic=?',
-                                              (previous['owner'],previous['aic'])).fetchone() or target
+                                              (source['owner'],source['aic'])).fetchone()
+                            if not session or not target:raise HTTPException(409,'原分身或会话已变更')
                         overview={'agent':dict(target),'_tool_events':json.loads(row['snapshot']).get('tool_events',[])}
                     config=context[0] if context else {'_agent_checkpoint':(previous or {}).get('checkpoint')}
                     error=AgentNeedsInput.from_context('任务已暂停。点击继续，或补充信息后继续。',config)
-                    error.retry_dispatch=not state and bool((previous or {}).get('retry_dispatch', not previous))
-                    error.answer_route=config.get('_answer_route')
+                    error.retry_dispatch=not binding and not state and bool((previous or {}).get('retry_dispatch', not previous))
+                    error.answer_route=config.get('_answer_route') or binding.get('answer_route')
                     pauses.pause(chat,actor,request,work,parent,session,overview,error,previous,db=db,job=row)
                     return self.store.view(
                         db.execute('SELECT * FROM chat_generation_jobs WHERE task_id=?',(row['task_id'],)).fetchone(),db)
@@ -84,7 +100,12 @@ class GenerationRunner:
 
     async def execute(self, row):
         with generation_scope(row,database=self.database):
-            await self.generate(row)
+            try:
+                await self.generate(row)
+            except Exception:
+                await run_blocking(self.store.interrupted,row)
+                raise
+        row['_generation_finished']=True
         saved=await asyncio.to_thread(self.store.get,row['user_id'],row['request_id'])
         engine=getattr(getattr(self.chat,'services',None),'chat',self.chat)
         if saved and saved['done'] and hasattr(engine,'service') and json.loads(row['payload']).get('personal') and not json.loads(row['payload']).get('agent_control'):
@@ -130,6 +151,8 @@ class GenerationRunner:
                             elif kind == 'skills': snapshot['used_skills'] = event['items']
                             elif kind == 'tools': snapshot['mermaid_enabled'] = event['mermaid']
                             elif kind == 'tool':
+                                from avatar.conversation.pauses import public_event
+                                event=public_event(event)
                                 items=snapshot.setdefault('tool_events',[])
                                 item=next((item for item in items if item['id']==event['id']),None)
                                 if item is None:items.append(dict(event))
@@ -152,7 +175,7 @@ class GenerationRunner:
             await run_blocking(self.store.finish,uid, rid, 'indeterminate', error='原请求未返回最终结果，不会自动重发')
         except asyncio.CancelledError:
             if not row.get('_user_pause'):
-                await run_blocking(self.store.finish,uid, rid, 'indeterminate', error='服务已停止，原请求结果未确认；不会自动重发')
+                await run_blocking(self.store.interrupted,row)
             raise
         except HTTPException as error:
             await run_blocking(self.store.finish,uid,rid,'failed',error=str(error.detail))
@@ -162,22 +185,31 @@ class GenerationRunner:
 
     async def claim(self, capacity):
         claimed = []
+        busy=[job['conversation_id'] for job,task in self.active_jobs.values() if not job.get('_generation_finished')]
         def reserve():
-            claimed.extend(self.store.claim(capacity))
+            claimed.extend(self.store.claim(capacity,leased=True,busy=busy))
         try:
             await run_blocking(reserve)
         except asyncio.CancelledError:
             if claimed:
                 # Shutdown interrupted the poll before any execute task could start.
-                await run_blocking(self.store.release_unstarted, [row['task_id'] for row in claimed])
+                await run_blocking(self.store.release_unstarted, claimed)
             raise
         return claimed
 
     async def run(self):
+        next_heartbeat=0
         try:
             while True:
                 try:
                     active = {task.get_name().removeprefix('chat-') for task in self.tasks}
+                    if self.active_jobs and time.monotonic()>=next_heartbeat:
+                        jobs=[job for job,task in self.active_jobs.values() if not task.done() and not job.get('_generation_finished')]
+                        for tid in await run_blocking(self.store.heartbeat,jobs):
+                            current=self.active_jobs.get(tid)
+                            if current and not current[0].get('_generation_finished'):
+                                current[1].cancel()
+                        next_heartbeat=time.monotonic()+LEASE_SECONDS/3
                     capacity = self.concurrency - len(self.tasks)
                     queued = await run_blocking(self.store.recover, active)
                     rows = await self.claim(capacity) if queued and capacity > 0 else ()
