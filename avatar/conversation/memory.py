@@ -12,6 +12,7 @@ import uuid
 from dataclasses import dataclass
 from fastapi import HTTPException
 from avatar.core.db import now, dump
+from avatar.core.user_storage import ConversationBlobs
 
 
 # 职责：定义会话上下文预算、近期窗口和摘要长度。
@@ -80,6 +81,8 @@ class ConversationMemory:
                 row = db.execute('SELECT * FROM chat_conversations WHERE id=?', (conversation_id,)).fetchone()
             else:
                 raise HTTPException(404, '会话不存在')
+            if platform=='web' and row['parent_id'] is None:
+                ConversationBlobs(self.database).workspace(user_id,conversation_id,create=True)
         return dict(row)
 
     # 职责：列出本人 Web 频道会话及消息数量。
@@ -127,7 +130,7 @@ class ConversationMemory:
                     raise HTTPException(409,'分身正在回答，请等待完成后操作')
                 attachments=ChatFiles(self.database)
                 rows=db.execute('SELECT * FROM chat_files WHERE conversation_id=? OR conversation_id IN (SELECT id FROM chat_conversations WHERE parent_id=?)',(conversation_id,conversation_id)).fetchall()
-                files.enter_context(attachments.deleting(db,rows))
+                files.enter_context(attachments.deleting(db,rows,workspaces=[(row['user_id'],conversation_id)] if row and not clear else ()))
                 db.execute('DELETE FROM agent_intents WHERE conversation_id=? OR conversation_id IN (SELECT id FROM chat_conversations WHERE parent_id=?)',(conversation_id,conversation_id))
                 db.execute('DELETE FROM chat_messages WHERE conversation_id IN (SELECT id FROM chat_conversations WHERE parent_id=?)',(conversation_id,))
                 db.execute('DELETE FROM chat_conversations WHERE parent_id=?',(conversation_id,))

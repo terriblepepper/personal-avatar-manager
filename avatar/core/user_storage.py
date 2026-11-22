@@ -1,5 +1,6 @@
 """Private per-user storage; old files are moved once before services open them."""
 import hashlib
+import logging
 import re
 import stat
 from pathlib import Path
@@ -49,6 +50,64 @@ class UserBlobs:
         return self.database.data_dir/'users'/'.missing'/self.kind/name
 
 
+class ConversationBlobs:
+    """Private originals and previews keyed by owner, conversation and file ID."""
+    def __init__(self, database):
+        self.database = database
+
+    def workspace(self, owner, conversation, *, create=False):
+        if not isinstance(conversation, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,100}', conversation):
+            raise ValueError('Invalid storage conversation')
+        bucket = user_root(self.database.data_dir, owner) / 'chat_attachments'
+        directory = bucket / conversation
+        if bucket.is_symlink() or directory.is_symlink():
+            raise ValueError('Symlink conversation directory')
+        if create:
+            bucket.mkdir(parents=True, exist_ok=True, mode=0o700)
+            directory.mkdir(exist_ok=True, mode=0o700)
+        return directory
+
+    def path(self, owner, conversation, name, *, create=False):
+        if Path(name).name != name or name in ('.', '..'):
+            raise ValueError('Invalid original name')
+        directory = self.workspace(owner, conversation, create=create)
+        path = directory / name
+        if path.is_symlink():
+            raise ValueError('Symlink conversation original')
+        return path
+
+    def available_in(self, owner, conversation, identifier, size=None):
+        try:
+            info = self.path(owner, conversation, identifier + '.blob').lstat()
+        except (FileNotFoundError, NotADirectoryError, ValueError):
+            return False
+        return stat.S_ISREG(info.st_mode) and (size is None or info.st_size == size)
+
+    def remove_workspace(self, owner, conversation):
+        try:
+            self.workspace(owner, conversation).rmdir()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # A writer or a recovered orphan may still be present. Never remove a newly opened scope.
+            logging.getLogger(__name__).warning('Deferred conversation workspace cleanup')
+
+    def glob(self):
+        users = self.database.data_dir / 'users'
+        if users.is_symlink():
+            return
+        for bucket in users.glob('*/chat_attachments'):
+            if bucket.parent.is_symlink() or bucket.is_symlink():
+                continue
+            for path in bucket.iterdir():
+                if path.is_symlink():
+                    continue
+                if path.is_dir():
+                    yield from path.iterdir()
+                else:
+                    yield path
+
+
 def migrate_user_storage(database):
     """Idempotent rename; never overwrite a destination or delete unowned files."""
     base=database.data_dir
@@ -56,14 +115,26 @@ def migrate_user_storage(database):
         if (base/name).is_symlink():raise ValueError('Symlink legacy storage')
     with database.connect() as db:
         users=[row[0] for row in db.execute('SELECT id FROM users')]
-        blobs={table:list(db.execute('SELECT id,user_id FROM '+table)) for table in ('attachments','chat_files','knowledge_assets')}
+        blobs={table:list(db.execute('SELECT id,user_id FROM '+table)) for table in ('attachments','knowledge_assets')}
+        blobs['chat_files']=list(db.execute('SELECT id,user_id,conversation_id FROM chat_files'))
+    conversations = ConversationBlobs(database)
     for table,kind in (('attachments','attachments'),('chat_files','chat_attachments'),('knowledge_assets','knowledge')):
         for row in blobs[table]:
             old=base/kind
             if old.is_symlink():raise ValueError('Symlink legacy originals')
-            for source in old.glob('*'+row['id']+'*'):
-                destination=user_root(base,row['user_id'])/kind/source.name
-                move(source,destination)
+            if table == 'chat_files':
+                directory = conversations.workspace(row['user_id'],row['conversation_id'])
+                for suffix in ('.blob','.jpg'):
+                    name = row['id']+suffix
+                    if Path(name).name != name:
+                        raise ValueError('Invalid conversation original name')
+                    for source in (old/name,directory.parent/name):
+                        if source.exists() or source.is_symlink():
+                            move(source,directory/name)
+            else:
+                for source in old.glob('*'+row['id']+'*'):
+                    destination=user_root(base,row['user_id'])/kind/source.name
+                    move(source,destination)
     for uid in users:
         digest=hashlib.sha256(uid.encode()).hexdigest()
         for old,new in ((base/'everos'/digest,'everos'),(base/'file_rag'/digest,'file_rag'),(base/'user_skills'/uid,'skills'),(base/'avatar_identities'/uid,'identity')):

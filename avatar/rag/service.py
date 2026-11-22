@@ -171,7 +171,7 @@ class MaterialRag(MaterialReading,FileRag):
                 for row in rows:
                     row['source'] = 'profile'
             if selected:
-                fields = 'id,user_id,size,sha256,description' if revisions_only else '*'
+                fields = 'id,user_id,conversation_id,size,sha256,description' if revisions_only else '*'
                 parent = session.get('parent_id') or session['id']
                 selection = json.dumps([{'id': identifier, 'owner': user_id} for identifier, user_id in selected])
                 chat_rows = db.execute(f"SELECT {fields} FROM chat_files WHERE conversation_id=? AND referenced=1 "
@@ -181,7 +181,7 @@ class MaterialRag(MaterialReading,FileRag):
                 chats = {(row['id'], row['user_id']): dict(row, source='chat', caption=row['description']) for row in chat_rows}
                 rows.extend(chats[pair] for pair in selected if pair in chats)
         if originals:
-            return [row for row in rows if self.original_available(row['source'],row['user_id'],row['id'],row['size'])]
+            return [row for row in rows if self.original_available(row['source'],row['user_id'],row['id'],row['size'],row.get('conversation_id'))]
         return rows
 
     def _retrieval_indexes(self, owner, documents):
@@ -207,13 +207,13 @@ class MaterialRag(MaterialReading,FileRag):
         with self.database.connect() as db:
             rows = db.execute("""WITH wanted(owner,source,id,sha,public_only,conversation_id) AS
                 (SELECT * FROM unnest(?::text[],?::text[],?::text[],?::text[],?::boolean[],?::text[]))
-                SELECT w.owner,w.source,w.id,a.size FROM wanted w JOIN attachments a ON a.user_id=w.owner AND a.id=w.id
+                SELECT w.owner,w.source,w.id,a.size,w.conversation_id FROM wanted w JOIN attachments a ON a.user_id=w.owner AND a.id=w.id
                 WHERE w.source='profile' AND a.sha256=w.sha AND (NOT w.public_only OR a.visibility='public')
                 UNION ALL
-                SELECT w.owner,w.source,w.id,f.size FROM wanted w JOIN chat_files f ON f.user_id=w.owner AND f.id=w.id
+                SELECT w.owner,w.source,w.id,f.size,f.conversation_id FROM wanted w JOIN chat_files f ON f.user_id=w.owner AND f.id=w.id
                 WHERE w.source='chat' AND f.sha256=w.sha AND f.referenced=1 AND f.conversation_id=w.conversation_id
                 AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now'))""",columns)
-            return {(r['source'],r['id']) for r in rows if self.original_available(r['source'],r['owner'],r['id'],r['size'])}
+            return {(r['source'],r['id']) for r in rows if self.original_available(r['source'],r['owner'],r['id'],r['size'],r['conversation_id'])}
 
     async def retrieve(self,documents,query,plan=None,*,published_only=False):
         plan=plan or FileQuery(query=query);candidates=[];notices=[]
@@ -405,8 +405,7 @@ class MaterialRag(MaterialReading,FileRag):
                 if item['modality']!='image' or not item['page'] or len(images)>=5:continue
                 row=next(row for row in relevant if row['id']==item['file_id'])
                 if row['content_type']!='application/pdf':continue
-                directory=self.attachments.directory if row['source']=='profile' else self.chat.chat_files.directory
-                raw=await asyncio.to_thread(pdf_image,directory/(row['id']+'.blob'),item['page'])
+                raw=await asyncio.to_thread(pdf_image,self.original_path(row,row['source']),item['page'])
                 images.append({'mime_type':'image/jpeg','data':base64.b64encode(raw).decode()});item['image_order']=len(images)
             # 图片顺序与来源页码一起传入，嵌入向量本身不能替代视觉观察。
             if images:

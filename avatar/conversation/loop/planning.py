@@ -97,8 +97,15 @@ def final_reply_step(step):
     return step.get('tool')=='continue_answer' and all(name=='continue_answer' for name in step.get('tools',()))
 
 
-def validate_disclosure(value, choices, *, revise=False):
+def lookup_types(config, allowed):
     from avatar.conversation.tools.material_delivery import FindMaterial
+    planned = {name:FindMaterial for name in ('find_material','find_animation','find_public_material') if name in allowed}
+    planned.update((name,schema) for name,schema in config.get('_entry_lookup_types',{}).items() if name in allowed)
+    return planned
+
+
+def validate_disclosure(value, choices, *, lookups=None, revise=False):
+    lookups = lookups or {}
     fields = {'tools','steps','continue_draft'} if revise else {'tools','steps'}
     if not isinstance(value,dict) or set(value)-fields or not isinstance(value.get('steps'),list):
         raise ValueError('披露缺少子目标')
@@ -129,16 +136,12 @@ def validate_disclosure(value, choices, *, revise=False):
         if 'file_access' in s and (primary!='read_session_file' or s['file_access'] not in ('directory','content')):
             raise ValueError('会话文件目标须选择查目录或读原件')
         if 'lookup' in s:
-            if primary=='read_session_file':
-                from avatar.conversation.loop.entry_tools import SessionFileRequest
-                s['lookup']=SessionFileRequest.model_validate(s['lookup']).model_dump(exclude_unset=True)
-            elif primary=='list_avatars':
-                from avatar.conversation.avatar_assistant import CatalogArguments
-                s['lookup']=CatalogArguments.model_validate(s['lookup']).model_dump(exclude_unset=True)
-            elif primary in ('find_material','find_animation','find_public_material'):
-                s['lookup']=FindMaterial.model_validate(s['lookup']).model_dump(exclude_unset=True)
-            else:
-                raise ValueError('该子目标不支持检索参数')
+            proposed = s.pop('lookup')
+            if schema := lookups.get(primary):
+                try:
+                    s['lookup']=schema.model_validate(proposed).model_dump(exclude_unset=True)
+                except ValueError:
+                    pass  # The selected tool can ask the model for corrected parameters during execution.
         selected.extend(n for n in [primary,*tools] if n and n not in selected)
         text_parts.extend((s['goal'], s.get('criterion',''), s.get('lookup',{}).get('query') or ''))
         if not final_reply_step(s):
@@ -153,17 +156,17 @@ def validate_disclosure(value, choices, *, revise=False):
     return ret
 
 
-async def disclose_tools(model, settings, key, system, history, question, catalog, validate, *, revise=False):
-    from avatar.conversation.avatar_assistant import CatalogArguments
-    from avatar.conversation.loop.entry_tools import SessionFileRequest
-    from avatar.conversation.tools.material_delivery import FindMaterial
+async def disclose_tools(model, settings, key, system, history, question, catalog, validate, *, lookups=None, revise=False):
+    lookup_schemas = list(dict.fromkeys((lookups or {}).values()))
     name={'type':'string','enum':list(catalog)}
     names={'type':'array','items':name,'uniqueItems':True}
     steps={'type':'array','maxItems':16,'items':{'type':'object','properties':{
         'goal':{'type':'string','minLength':1,'description':TEXT_LIMIT},
         'criterion':{'type':'string','minLength':1,'description':TEXT_LIMIT},
-        'tool':name,'tools':names,'segmented':{'type':'boolean','description':'大型作品从第一段起以游标分片写作'},'lookup':{'anyOf':[FindMaterial.model_json_schema(),SessionFileRequest.model_json_schema(),CatalogArguments.model_json_schema()]},
+        'tool':name,'tools':names,'segmented':{'type':'boolean','description':'大型作品从第一段起以游标分片写作'},
         'file_access':{'type':'string','enum':['directory','content'],'description':'会话文件目标：查目录或读原件'}},'required':['goal'],'additionalProperties':False}}
+    if lookup_schemas:
+        steps['items']['properties']['lookup']={'anyOf':[schema.model_json_schema() for schema in lookup_schemas]}
     properties={'tools':names,'steps':steps}
     if revise:
         properties['continue_draft']={'type':'boolean','description':'当前草稿满足补充要求，继续从原游标写作'}
@@ -176,7 +179,7 @@ async def disclose_tools(model, settings, key, system, history, question, catalo
             '可用同一子目标的 tools 列出替代工具。先取证再创作时，将取证与交付分别列为前后两个子目标。'
             '通信、提交发言、等待用户、结束任务属于终态；应作为独立的最后一步。'
             '普通网页或动画如涉及复杂场景、交互或较长源码，可选 segmented=true 从第一段开始分段写作。'
-            '简单单次动作可只写 goal 和 tool。资料检索若已确定参数可填 lookup；有依赖时等前一结果再选。'
+            '简单单次动作可只写 goal 和 tool。已确定的只读参数可以填 lookup；有依赖或不确定时留待执行。'
             '每个独立作品只列一项生成目标。生成回执已经证明文件存在，无需另列目录查询或交付确认。只有用户要求检查内容时才规划复查。'
             '当前授权目录只列摘要；不可选择目录外工具。已关闭的能力如确实需要，可选择其 ID 以提示用户。'
             '只返回 plan_task 或相同结构的 JSON。'+json.dumps(catalog,ensure_ascii=False))
@@ -186,10 +189,11 @@ async def disclose_tools(model, settings, key, system, history, question, catalo
         prompt+='只规划剩余目标；说明是否保留当前草稿。'
     usage=None
     overflow=False
+    issue = '未得到有效披露'
     for attempt in range(2):
         await check_execution_async(validate)
         options=config if not attempt else {**config,'_tools':[]}
-        spec=prompt if not attempt else prompt+'\n上次未得到有效披露，请用简洁的 JSON 重试。'
+        spec=prompt if not attempt else prompt+'\n上次失败（数据）：'+json.dumps(issue,ensure_ascii=False)+'。请修正后用简洁的 JSON 返回。'
         room = max(0, input_budget(options)-estimate(spec))
         if overflow:
             room //= 2
@@ -226,9 +230,9 @@ async def disclose_tools(model, settings, key, system, history, question, catalo
                 proposal=result.tool_calls[0]['arguments']
             else:
                 proposal=json.loads(result.text.strip().removeprefix('```json').removesuffix('```'))
-            return validate_disclosure(proposal,catalog,revise=revise),usage
-        except (ValueError,TypeError):
-            continue
+            return validate_disclosure(proposal,catalog,lookups=lookups,revise=revise),usage
+        except (ValueError,TypeError) as error:
+            issue=bounded_excerpt(str(error),120)
     return None,usage
 
 REQUEST_TOOLS = {'name':'request_tools','description':'现有工具不足或需要补充子目标时，交给同一分身重新披露授权工具。',

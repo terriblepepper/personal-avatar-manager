@@ -104,8 +104,7 @@ class MaterialReading:
         rows = self.documents(*proof['scope'], file_keys=file_keys, originals=True)
         row = next(iter(rows), None)
         if not row:raise HTTPException(404,'资料文件不存在或未授权')
-        directory=self.attachments.directory if row['source']=='profile' else self.chat.chat_files.directory
-        path=directory/(row['id']+'.blob');extension=Path(row['filename']).suffix.lower()
+        path=self.original_path(row,row['source']);extension=Path(row['filename']).suffix.lower()
         if row.get('content_type','').startswith(('audio/','video/')):
             from avatar.rag.media import read_media
             result=await read_media(self,context,row,path,request,limit)

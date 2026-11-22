@@ -430,45 +430,34 @@ class PersonalTaskService:
         question = '\n\n用户补充：'.join(resume['inputs'])
         request = ChatRequest(channel='avatar', message=question)
         overview, model = self.chat.context(user, request, target, private_access=False)
-        run_state = store.load()
         model = ({**model[0], '_avatar_agent': True, '_agent_checkpoint':resume.get('checkpoint',{}),
                   '_run_store':store, '_run_input_id':resume['input_id'], '_run_supplement':resume['supplement'],
-                  '_auto_recover':resume['automatic'],
-                  '_resume_sandbox':bool(run_state.get('sandbox'))}, *model[1:])
+                  '_auto_recover':resume['automatic']}, *model[1:])
         caller = context.peer_aic if principal is None else 'visitor:' + principal['visitor_id']
         platform = 'acps-direct' if principal is None else 'town-guest' if principal.get('anonymous') else 'town-public'
-        if principal is not None or resume.get('clarification'):
-            config, key, system, history = model
-            prefix, raw = system.split('\n', 1)
-            background = json.loads(raw)
-            if principal is not None:
-                for name in ('available_skills', '_skills_revision'):
-                    background.pop(name, None)
-                prefix += ' 当前为公开访客问答，仅使用公开档案与公开附件；不得执行主人技能、私人工具、委派或管理操作。'
-            if resume.get('clarification'):
-                background['last_clarification'] = resume['clarification']
-                prefix += ' last_clarification 是上一轮你向用户提出的问题，只用于理解本轮补充。'
-            model = (config, key, prefix+'\n'+json.dumps(background,ensure_ascii=False), history)
+        config, key, system, history = model
+        prefix, raw = system.split('\n', 1)
+        background = json.loads(raw)
+        for name in ('available_skills', '_skills_revision'):
+            background.pop(name, None)
+        prefix += ' 当前为小镇问答。资料只通过混合检索获取，只交付文字答复。'
+        if resume.get('clarification'):
+            background['last_clarification'] = resume['clarification']
+            prefix += ' last_clarification 是上一轮你向用户提出的问题，只用于理解本轮补充。'
+        model = (config, key, prefix+'\n'+json.dumps(background,ensure_ascii=False), history)
         conversation_id = str(uuid.uuid5(uuid.NAMESPACE_URL, dump(['acps-direct', target['aic'], caller, context.group_id or '', session] if principal is None else [platform, target['aic'], context.peer_aic, caller, context.group_id or '', session])))
         memory = self.chat.memory
         conversation = memory.scope(user['id'], 'acps', target['aic'], conversation_id,
                                     caller_id=caller, platform=platform, title='小镇公开访客对话' if principal else '小镇分身对话', create=True)
         claim(conversation_id)
         try:
-            from avatar.conversation.loop.entry_tools import background, bind_entry_tools
+            from avatar.conversation.loop.entry_tools import bind_entry_tools
             from avatar.models.trace import model_io_scope
             with model_io_scope(progress,private=False):
                 model = await memory.prepare(conversation, overview['agent']['last_modified_at'], model, question,
                                              self.chat.model_client, user['id'], progress=progress)
-                if principal is None:
-                    model = await self.chat.skills.load_context(user['id'],model,question,self.chat.model_client,caller)
-                async def run_skill(context, objective):
-                    return await self.chat.skill_execution.enrich(user['id'],context,objective,self.chat.model_client,
-                        caller_id=caller,conversation_id=conversation['id'],progress=progress)
-                skills = principal is None and background(model[2]).get('installed_skills')
                 model = await bind_entry_tools(self.chat,model,user['id'],target['aic'],conversation,[],
-                    include_private=bool(overview.get('_private_context')),sandbox=run_skill if skills else None,progress=progress,
-                    directory_reply=self.chat.assistant_router.catalog_reply if principal is None else None)
+                    progress=progress,search_only=True)
                 result = await self.chat.rag.answer(model, question, progress=progress)
             if not result.text.strip():
                 raise HTTPException(502, '模型未返回有效回答')

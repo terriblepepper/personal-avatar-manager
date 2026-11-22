@@ -88,7 +88,8 @@ def sandbox_inputs(chat,user_id,parent_id,files,saved=(),pause_id=None):
                 row=db.execute("SELECT 1 FROM chat_files WHERE id=? AND user_id=? AND conversation_id=? AND referenced=1 AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))",(identifier,user_id,parent_id)).fetchone()
             if not row:raise HTTPException(409,'文件已删除或引用授权已撤销，未读取原件')
             try:
-                path=directory.new(user_id,identifier+'.blob')
+                path=(directory.new(user_id,identifier+'.blob') if source=='profile'
+                      else directory.path(user_id,parent_id,identifier+'.blob'))
                 with path.open('rb') as stream:return stream.read(8*1024*1024+1)
             except FileNotFoundError:raise HTTPException(404,'文件原件已删除') from None
     inputs={}
