@@ -464,7 +464,7 @@ onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
     <article v-if="runningTask" :key="runningTask.id + ':' + runningTask.active_speaker" class="peer-turn peer-pending"
       :class="runningTask.active_speaker_is_own ? 'peer-own' : 'peer-other'">
       <strong class="peer-speaker-name">{{ runningTask.active_speaker || '分身' }}</strong>
-      <div class="bubble"><ToolActivity :items="runningTask.tool_activity || []" pending="准备回答"/><ChatNotices :items="runningTask.tool_activity"/></div>
+      <div class="bubble"><ToolActivity :items="runningTask.tool_activity || []" :pending="activeStage"/><ChatNotices :items="runningTask.tool_activity"/></div>
     </article>
   </div><div class="peer-composer">
   <ComposerInput v-model="message" :catalog="skills" :session="taskId || current" :usage-url="current ? '/agent-sessions/'+encodeURIComponent(current)+'/compact'+(taskId?'?task_id='+encodeURIComponent(taskId):'') : ''" :usage-revision="(detail?.history_revision||'')+'/'+(detail?.summary_through||0)" :disabled="switching" label="分身会话消息" @submit="send()" :placeholder="pausedTask ? '补充任务所需信息…' : '输入消息或任务目标，$ 选择技能…'" @update:model-value="pending=''"/>
