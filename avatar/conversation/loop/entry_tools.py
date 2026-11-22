@@ -80,7 +80,7 @@ async def bind_entry_tools(chat, context, owner, aic, session, files, *, include
     if session_file_scope is not None:
         from avatar.files.conversation.session_files import SessionFiles
         session_files = SessionFiles(chat.chat_files, session_file_owner or owner, session_file_scope, previous_reads,
-                                    grants=session_file_grants, sandbox_ids=[f['id'] for f in (*files,*config.get('_agent_saved_files',()))])
+                                    grants=session_file_grants, sandbox_ids=[f['id'] for f in (*files,*config.get('_agent_saved_files',()))], outputs=outputs)
         config.update(_session_file_scope=session_file_scope, _load_session_source=session_files.html,
                       _session_read_proofs=session_files.proofs, _session_sandbox_inputs=session_files.sandbox_inputs,
                       _validate_session_files_in=session_files.validate_in)
@@ -110,7 +110,7 @@ async def bind_entry_tools(chat, context, owner, aic, session, files, *, include
     tool('search_materials', '混合检索已授权资料的正文片段，可指定目录。', SearchQuestion)
     tool('read_material', '按文件名、说明或问题定位授权资料并读取原文。')
     if session_files:
-        tool('read_session_file', '查找或读取本会话已授权的上传、生成或分享文件。query 查目录（空串浏览），file_id 读原件。按 next_offset 或 next 续读。', SessionFileRequest)
+        tool('read_session_file', '查找或读取本会话授权文件，也可复查本轮生成的 HTML。query 查目录，file_id 读原件。按返回游标续读。', SessionFileRequest)
     if status:
         tools.append({'name':'application_status','description':'查看本人的分身申请与审核状态。',
                       'parameters':{'type':'object','properties':{},'additionalProperties':False}})
@@ -153,7 +153,7 @@ async def bind_entry_tools(chat, context, owner, aic, session, files, *, include
         if name=='read_session_file' and session_files:
             request = SessionFileRequest.model_validate(args)
             if request.query is not None:
-                result = await run_blocking(session_files.discover, request.query, request.offset, outputs)
+                result = await run_blocking(session_files.discover, request.query, request.offset)
             else:
                 from avatar.conversation.working_context import input_budget
                 room = config.get('_session_page_bytes')

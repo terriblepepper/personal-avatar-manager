@@ -22,11 +22,12 @@ def usable_text(text):
 
 
 class SessionFiles:
-    def __init__(self, files, owner, conversation, proofs, *, grants=None, sandbox_ids=()):
+    def __init__(self, files, owner, conversation, proofs, *, grants=None, sandbox_ids=(), outputs=()):
         self.files, self.owner, self.conversation = files, owner, conversation
         self.grants, self.sandbox_ids = grants, set(sandbox_ids)
         self.proofs = {key:{'source':'chat', 'origin':'generated', **proof} for key,proof in proofs.items()}
         self.verified = {}
+        self.outputs = outputs
 
     def _rows(self, db, ids, *, lock=False):
         self.files.session(db, self.owner, self.conversation)
@@ -106,8 +107,15 @@ class SessionFiles:
                     raise HTTPException(409, '原任务目录已变化，请结束原任务后重新发送，以获取当前可用文件')
                 raise HTTPException(409, '此前读取的会话文件已过期、删除、改变或失去授权')
 
-    def discover(self, query, offset, outputs=()):
-        result = self.files.discover(self.owner,self.conversation,query,offset,outputs,grants=self.grants)
+    def staged_html(self, identifier):
+        # The list belongs to the authorized current run and contains only server-created outputs.
+        if self.grants is None:
+            return next((item for item in self.outputs if item['id']==identifier and
+                         item.get('html_mode') in ('html','2d','3d') and isinstance(item.get('data'),bytes)),None)
+        return None
+
+    def discover(self, query, offset):
+        result = self.files.discover(self.owner,self.conversation,query,offset,self.outputs,grants=self.grants)
         ids = [item['id'] for item in result['items'] if item['can_read']]
         if ids:
             with self.files.database.connect() as db:
@@ -121,6 +129,9 @@ class SessionFiles:
                     self.proofs.setdefault(row['id'],{**row,'listed_only':True,'read_content':False})
                 visible.append(item)
             result['items']=visible
+        for item in result['items']:
+            if item.get('delivery_state')=='staged' and self.staged_html(item['id']):
+                item['can_read']=True
         return {'kind':'directory','has_content':False,**result}
 
     def read(self, identifier, offset, page, *, sandbox, explicit=False, limit=None, vision=False):
@@ -130,7 +141,17 @@ class SessionFiles:
                 raise HTTPException(409,'本轮明确授权的文件已删除、过期或撤回')
         unavailable = '当前会话找不到此已交付且获准读取的文件，请核对目录中的 ID 和 can_read'
         if not row:
-            raise ValueError(unavailable)
+            staged = self.staged_html(identifier)
+            if staged is None:
+                raise ValueError(unavailable)
+            data=staged['data']
+            size=len(data)
+            self._check_text_cursor(offset,page,size)
+            chunk=data[offset:offset+(limit if limit is not None else 8192)]
+            text=self._text_page(chunk,offset,size)
+            return {'kind':'file','id':identifier,'filename':staged['filename'],'size':size,
+                    'content_type':'text/html','origin':'generated','source':'chat','delivery_state':'staged',
+                    'has_content':bool(text.get('text')),**text}
         try:
             path = self._original(row)
         except HTTPException as exc:
@@ -147,21 +168,11 @@ class SessionFiles:
         result['kind']='file'
         extension = Path(row['filename']).suffix.lower()
         if extension in PLAIN_TEXT_EXTENSIONS or extension in ('.htm','.html') or row['content_type'].startswith('text/'):
-            if page != 1 or (offset > 0 and offset >= row['size']):
-                raise ValueError('文本按 UTF-8 字节偏移读取，请使用返回的 next_offset')
+            self._check_text_cursor(offset,page,row['size'])
             with path.open('rb') as stream:
                 stream.seek(offset)
                 chunk = stream.read(limit if limit is not None else 8192)
-            try:
-                decoder = codecs.getincrementaldecoder('utf-8')()
-                text = decoder.decode(chunk, final=offset+len(chunk)==row['size'])
-            except UnicodeDecodeError:
-                if offset:
-                    raise ValueError('UTF-8 字节偏移无效，请使用上页返回的 next_offset') from None
-                result.update(coverage='metadata_only', parse_error='原件未使用 UTF-8 编码')
-            else:
-                end = offset + len(chunk) - len(decoder.getstate()[0])
-                result.update(text=text, offset=offset, next_offset=end if end<row['size'] else None)
+            result.update(self._text_page(chunk,offset,row['size']))
         elif extension in ('.pdf','.doc','.docx','.ppt','.pptx','.xlsx','.avanim'):
             from avatar.files.parsing.text_worker import read_original
             try:
@@ -215,6 +226,23 @@ class SessionFiles:
         if explicit or previous and previous.get('explicit_reference'):
             self.proofs[identifier]['explicit_reference'] = True
         return result
+
+    @staticmethod
+    def _check_text_cursor(offset,page,size):
+        if page != 1 or (offset > 0 and offset >= size):
+            raise ValueError('文本按 UTF-8 字节偏移读取，请使用返回的 next_offset')
+
+    @staticmethod
+    def _text_page(chunk,offset,size):
+        decoder = codecs.getincrementaldecoder('utf-8')()
+        try:
+            text=decoder.decode(chunk,final=offset+len(chunk)==size)
+        except UnicodeDecodeError:
+            if offset:
+                raise ValueError('UTF-8 字节偏移无效，请使用上页返回的 next_offset') from None
+            return {'coverage':'metadata_only','parse_error':'原件未使用 UTF-8 编码'}
+        end=offset+len(chunk)-len(decoder.getstate()[0])
+        return {'text':text,'offset':offset,'next_offset':end if end<size else None}
 
     def html(self, identifier, sha256):
         proof = self.proofs.get(identifier)

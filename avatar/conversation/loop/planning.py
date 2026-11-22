@@ -159,7 +159,7 @@ async def disclose_tools(model, settings, key, system, history, question, catalo
     config={**settings,'_tools':[form],'_batch_tools':True,'_optional_tools':True,'_call_purpose':'task_planning'}
     prompt=(system+'\n你担任当前分身的工具披露步骤。根据本轮用户的实际目标、已有证据和工具目录决定。'
             'tools 只选可能真正用到的工具 ID；不用工具且可直接回答时给空 tools 和 steps。'
-            '复杂任务拆为可分别核对的子目标，给出 goal 和 criterion（具体证据或交付条件）。'
+            '复杂任务拆为可核对的必要目标，给出 goal 和 criterion。先核对，再决定是否需要追加修订。'
             '可用同一子目标的 tools 列出替代工具。先取证再创作时，将取证与交付分别列为前后两个子目标。'
             '通信、提交发言、等待用户、结束任务属于终态；应作为独立的最后一步。'
             '普通网页或动画如涉及复杂场景、交互或较长源码，可选 segmented=true 从第一段开始分段写作。'

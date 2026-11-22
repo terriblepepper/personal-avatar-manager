@@ -850,7 +850,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                     raise pause('连续三次补充披露没有新增能力或取得可核验的进展。仍需要确认：'+need)
                 with trace.step('reason', {'operation':'disclose_tools','need':need,'tools':list(choices)}) as out:
                     addition,cost = await disclose_tools(rag.chat.model_client,settings,key,system,working_history,
-                        '请为当前证据缺口选择补充工具或新子目标。已经存在的目标无需重列。数据：'+
+                        '只为当前证据缺口披露工具或新增目标。已有目标与交付无需重列。若核对已有作品，只规划核对；有明确缺陷后再决定是否修订。数据：'+
                         json.dumps(focus,ensure_ascii=False),choices,validate)
                     account(cost)
                     if addition is None:
