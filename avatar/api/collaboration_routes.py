@@ -276,6 +276,11 @@ async def accept_agent_task(identifier:str,request:Request,body:DialogueResume|N
     """只由目标方接受当前任务，补充要求与附件随同意一起放行。"""
     return await request.app.state.dialogues.approve(user,identifier,body,initial=True)
 
+@router.post('/agent-dialogues/{identifier}/reject')
+def reject_agent_task(identifier: str, request: Request, user=Depends(current_user)):
+    return request.app.state.dialogues.reject(user,identifier)
+
+
 @router.post('/agent-sessions/{identifier}/accept')
 def accept_agent_session(identifier:str,request:Request,user=Depends(current_user)):
     return request.app.state.dialogues.accept(user,identifier)

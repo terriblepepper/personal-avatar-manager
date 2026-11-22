@@ -563,6 +563,13 @@ td > input[data-material-pick] { vertical-align: top; margin-block-start: .55em;
 .peer-window-heading h2 { max-width: 100%; }
 .peer-window-heading .dialogue-state { display: block; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; }
 .peer-task-context { flex: none; padding: .35rem .1rem .45rem; }
+.peer-request-bar {
+  display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap;
+  gap: .5rem; margin-block-start: .45rem; padding: .55rem .7rem; border: 1px solid var(--accent);
+  border-radius: .55rem; background: var(--accent-subtle); box-shadow: var(--el-box-shadow-light);
+}
+.peer-request-actions { display: flex; align-items: center; flex-wrap: wrap; gap: .4rem; }
+.notification-row:has(.notification-request-actions) { flex-wrap: wrap; }
 .peer-task-context h3 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin: 0; font-size: .8125rem; }
 .peer-feedback {
   display: flex; align-items: baseline; gap: .25rem .45rem; flex-wrap: wrap;

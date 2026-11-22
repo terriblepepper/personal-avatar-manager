@@ -125,7 +125,16 @@ class AgentInbox:
             else:
                 total,count=db.execute('SELECT COUNT(*),COUNT(*) FILTER (WHERE read_at IS NULL) FROM agent_notifications WHERE '+base,base_values).fetchone()
             offset=min(offset,((max(total,1)-1)//10)*10)
-            rows=db.execute('SELECT id,kind,category,target_page,admin_only,session_id,task_id,title,content,created_at,read_at FROM agent_notifications WHERE '+base+condition+' ORDER BY julianday(created_at) DESC,id DESC LIMIT 10 OFFSET ?',(*values,offset)).fetchall()
+            rows=db.execute("""SELECT id,kind,category,target_page,admin_only,session_id,task_id,title,content,created_at,read_at,
+                CASE WHEN kind='request' THEN (
+                    SELECT CASE WHEN d.rejected=1 THEN 'rejected' WHEN d.accepted=1 THEN 'accepted'
+                        WHEN d.status='awaiting_acceptance' THEN 'pending' END
+                    FROM agent_dialogues d JOIN agent_task_members m ON m.task_id=d.id AND m.user_id=d.target_user_id
+                    WHERE d.id=agent_notifications.task_id AND d.target_user_id=agent_notifications.user_id
+                      AND d.delivery_mode<>'message' AND m.hidden=0
+                ) END AS task_request_state
+                FROM agent_notifications WHERE """+base+condition+
+                ' ORDER BY julianday(created_at) DESC,id DESC LIMIT 10 OFFSET ?',(*values,offset)).fetchall()
         return {'items':[dict(r) for r in rows],'total':total,'unread':count,'offset':offset,'limit':10}
 
     def change(self,user_id,identifier,action):

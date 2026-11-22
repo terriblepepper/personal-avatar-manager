@@ -1,6 +1,7 @@
 """Independent task workspaces share the task's completion-based deadline."""
 
 def install_task_workspaces(connection):
+    connection.execute("ALTER TABLE agent_dialogues ADD COLUMN IF NOT EXISTS rejected INTEGER NOT NULL DEFAULT 0 CHECK(rejected IN (0,1))")
     connection.execute("""CREATE TABLE IF NOT EXISTS agent_peer_auto_accept (
         user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         peer_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
