@@ -272,4 +272,4 @@
 ### 聊天推理强度
 
 - 模型配置的可选字段 `reasoning_effort` 接受 `null` 或当前模型支持的等级。登录后可用 `GET /api/model-providers/effort-levels` 按 `provider`、`api_format`、`model` 查询等级。
-- `GET /api/conversations/{id}/reasoning-effort` 返回本会话选择 `selected`、账户默认值 `default` 和可选 `levels`。同路径 PATCH 接受 `{"reasoning_effort":"high"}`，传 `null` 恢复跟随账户设置。分身间会话使用本方的资源会话 ID。其他账户访问返回 404，处理中修改返回 409，等级不兼容返回 422。
+- `GET /api/conversations/{id}/reasoning-effort` 返回模型标识 `model`、本会话选择 `selected`、账户默认值 `default` 和可选 `levels`。同路径 PATCH 接受 `{"reasoning_effort":"high"}`，传 `null` 恢复跟随账户设置。分身间会话使用本方的资源会话 ID。其他账户访问返回 404，处理中修改返回 409，等级不兼容返回 422。

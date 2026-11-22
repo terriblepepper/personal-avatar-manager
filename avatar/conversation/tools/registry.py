@@ -41,7 +41,7 @@ class ConversationTools:
                 db.execute('UPDATE chat_conversations SET tools_config=? WHERE id=?', (dump(saved), conversation_id))
             current = saved.get('reasoning_effort')
             return {'selected': current if current in available else None,
-                    'default': config.get('reasoning_effort'), 'levels': available}
+                    'default': config.get('reasoning_effort'), 'levels': available, 'model': config.get('model', '')}
 
     # 职责：修改注册工具的布尔开关；未知字段、非布尔值和处理中修改均拒绝。
     def update(self,user_id,conversation_id,settings):
