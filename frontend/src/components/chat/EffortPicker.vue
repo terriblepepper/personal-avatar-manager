@@ -5,7 +5,7 @@ import AppIcon from '../AppIcon.vue'
 import { effortLabels, type Effort } from '../../utils/reasoningEffort'
 
 interface Settings { model: string; selected: Effort | null; default: Effort | null; levels: Effort[] }
-const props = defineProps<{ conversationId: string; busy: boolean }>()
+const props = defineProps<{ conversationId: string; busy: boolean; readOnly?: boolean }>()
 const emit = defineEmits<{ saving: [pending: boolean] }>()
 const settings = ref<Settings>(), saving = ref(false), failure = ref(false)
 const url = computed(() => '/conversations/' + encodeURIComponent(props.conversationId) + '/reasoning-effort')
@@ -53,7 +53,7 @@ watch(() => props.conversationId, (id, _, cleanup) => {
 
 async function select(level: Effort | null) {
   preview.value = undefined
-  if (!settings.value) return
+  if (!settings.value || props.readOnly) return
   requested.value = level
   if (saving.value) return
   const signal = controller.signal
@@ -81,7 +81,7 @@ async function select(level: Effort | null) {
 
 <template>
   <details v-if="conversationId" class="composer-menu composer-tool effort-picker">
-    <summary :title="modelLabel + ' · 调整推理强度'" :aria-label="modelLabel + '，推理强度：' + levelLabel">
+    <summary :title="readOnly ? modelLabel + ' · 推理强度' : modelLabel + ' · 调整推理强度'" :aria-label="modelLabel + '，推理强度：' + levelLabel">
       <span class="composer-model-name">{{ modelLabel }}</span><span v-if="settings?.model" class="composer-effort-level">{{ levelLabel }}</span>
     </summary>
     <div class="composer-popover effort-card" aria-label="推理强度">
@@ -90,7 +90,7 @@ async function select(level: Effort | null) {
       <template v-else>
         <div class="effort-heading">
           <strong>{{ shownLevel }}</strong>
-          <button v-if="settings.selected !== null || requested" type="button" class="effort-reset" aria-label="恢复模型默认" title="恢复模型默认" @click="select(null)"><AppIcon name="rebuild" :size="15"/></button>
+          <button v-if="settings.selected !== null || requested" type="button" class="effort-reset" :disabled="readOnly" aria-label="恢复模型默认" title="恢复模型默认" @click="select(null)"><AppIcon name="rebuild" :size="15"/></button>
           <RouterLink class="effort-model" to="/models" :title="'查看模型配置 · ' + modelLabel">
             <span>{{ modelLabel }}</span><AppIcon name="chevron" :size="12"/>
           </RouterLink>
@@ -100,7 +100,7 @@ async function select(level: Effort | null) {
             <div class="effort-ticks"><i v-for="(level, index) in stops" :key="level ?? 'default'" :class="{ filled: index <= position }"/></div>
           </div>
           <span class="effort-thumb-position" aria-hidden="true"><i/></span>
-          <input type="range" aria-label="推理强度" :aria-valuetext="shownLevel" min="0" :max="stops.length - 1" step="1"
+          <input type="range" aria-label="推理强度" :disabled="readOnly" :aria-valuetext="shownLevel" min="0" :max="stops.length - 1" step="1"
             :value="position" @input="preview = ($event.target as HTMLInputElement).valueAsNumber"
             @pointercancel="preview = undefined" @change="select(stops[($event.target as HTMLInputElement).valueAsNumber])">
         </div>
@@ -109,6 +109,7 @@ async function select(level: Effort | null) {
       </template>
     </div>
   </details>
+  <button v-else-if="readOnly" class="chat-command" type="button" disabled>推理强度</button>
 </template>
 
 <style scoped>
