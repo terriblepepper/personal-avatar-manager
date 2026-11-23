@@ -4,7 +4,7 @@ import json
 import asyncio
 from avatar.protocols.identity.acs import AcsPreviewRequest
 from fastapi import APIRouter, Body, Depends, Request, Response, Query, HTTPException
-from typing import Literal
+from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field
 from wit import __version__ as wit_version
 from fastapi.responses import FileResponse
@@ -42,10 +42,28 @@ def health(request: Request):
     return {"status": "ok", "mode": request.app.state.settings.provider, "framework": "wit", "framework_version": wit_version}
 
 @router.get('/help/{document}')
-def help_document(document:Literal['用户操作手册.md','知识库与soul.md','资料RAG与嵌入.md'],user=Depends(auth.current_user)):
+def help_document(
+    document: Literal['用户操作手册.md', '知识库与soul.md', '资料RAG与嵌入.md'],
+    request: Request,
+    picture: Annotated[str | None, Query(pattern=r'^[a-z0-9-]+\.png$', max_length=80)] = None,
+    user=Depends(auth.current_user),
+):
     """仅提供固定的用户帮助文档，不公开目录或接受任意文件路径。"""
     from avatar.core.config import ROOT
-    return FileResponse(ROOT/'docs'/document,media_type='text/markdown; charset=utf-8',filename=document)
+    directory = ROOT / 'docs'
+    headers = None
+    if document == '用户操作手册.md':
+        local = request.app.state.settings.data_dir / 'docs'
+        if (local / document).is_file():
+            directory = local
+        headers = {'Cache-Control': 'private, no-store'}
+    if picture is not None:
+        file = directory / 'picture' / '用户操作手册' / picture
+        if document != '用户操作手册.md' or not file.is_file():
+            raise HTTPException(404, '手册图片不存在')
+        return FileResponse(file, media_type='image/png', headers=headers)
+    return FileResponse(directory / document, media_type='text/markdown; charset=utf-8',
+                        filename=document, headers=headers)
 
 
 
