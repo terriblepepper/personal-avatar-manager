@@ -5,6 +5,7 @@ import json
 import importlib.util
 import io
 import zipfile
+from contextlib import nullcontext
 from functools import lru_cache
 import os
 from pathlib import Path, PurePosixPath
@@ -58,7 +59,7 @@ class LocalPythonSandbox:
         return base64.b64encode(buffer.getvalue()).decode('ascii')
 
     # 职责：执行调用方已授权的 Python 文件（技能脚本或任务代码），只接收字符串参数与有限资源，返回文字及 outputs 内文件。
-    async def execute(self, user_id, resources, script, args, *, timeout=60, https_inputs=None, authorize=None):
+    async def execute(self, user_id, resources, script, args, *, timeout=60, https_inputs=None, authorize=None, workspace=None):
         if script not in resources or not script.endswith('.py'):
             raise ValueError('只支持执行当前技能包内的 Python 脚本')
         if not isinstance(args,list) or len(args)>40 or any(not isinstance(a,str) or len(a)>2000 for a in args):
@@ -81,6 +82,8 @@ class LocalPythonSandbox:
                 code = await run_blocking(self.prepare, resources, script, args, remote)
                 if authorize:
                     await run_blocking(authorize)
+                if workspace is not None:
+                    return await self.run(code, timeout, workspace=workspace)
                 return await self.run(code, timeout)
         finally:
             _,count=self.users[user_id]
@@ -141,15 +144,18 @@ class LocalPythonSandbox:
         return code
 
     # 职责：在临时目录运行离线沙箱命令并收集有界输出；所有结束路径杀死并回收所属进程组。
-    async def run(self, code, timeout):
+    async def run(self, code, timeout, *, workspace=None):
         cache=RUNTIME/'cache'
-        with tempfile.TemporaryDirectory(prefix='avatar-python-') as work:
+        directory = nullcontext(workspace) if workspace is not None else tempfile.TemporaryDirectory(prefix='avatar-python-')
+        with directory as work:
             private_cache=Path(work)/'cache'
-            private_cache.mkdir(mode=0o700)
-            (private_cache/'npm').symlink_to(cache/'npm',target_is_directory=True)
+            private_cache.mkdir(parents=True, exist_ok=True, mode=0o700)
+            npm = private_cache/'npm'
+            if not npm.is_symlink():
+                npm.symlink_to(cache/'npm',target_is_directory=True)
             library=cache/'npm/registry.npmjs.org/pyodide/0.27.8'
             source=Path(work)/'request.py'
-            await asyncio.to_thread(source.write_text, code, encoding='utf-8')
+            await run_blocking(source.write_text, code, encoding='utf-8')
             source.chmod(0o600)
             command = [
                 '/usr/bin/prlimit', '--cpu=60', '--', str(Path(sys.prefix) / 'bin/deno'), 'run',
@@ -158,7 +164,7 @@ class LocalPythonSandbox:
                 '--node-modules-dir=none', '--v8-flags=--max-old-space-size=512',
                 str(Path(__file__).with_name('runtime.ts')), str(source),
             ]
-            process=await asyncio.create_subprocess_exec(*command,cwd=work,env={'DENO_DIR':str(private_cache),'PATH':str(Path(sys.prefix)/'bin')+':/usr/bin:/bin','HOME':work},stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE,start_new_session=True)
+            process=await asyncio.create_subprocess_exec(*command,cwd=work,env={'DENO_DIR':str(private_cache),'PATH':str(Path(sys.prefix)/'bin')+':/usr/bin:/bin','HOME':str(work)},stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE,start_new_session=True)
             # 职责：限制 stdout/stderr 管道，超出即终止而不是把无限输出读进 Web 服务内存。
             async def read(stream):
                 result=bytearray()

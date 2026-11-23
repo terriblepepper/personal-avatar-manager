@@ -38,7 +38,7 @@ def background(system):
 
 async def bind_entry_tools(chat, context, owner, aic, session, files, *, include_private=False,
                            sandbox=None, status=None, directory_reply=None, progress=None, session_file_scope=None,
-                           session_file_grants=None, session_file_owner=None, search_only=False):
+                           session_file_grants=None, session_file_owner=None, temporary_files=None):
     """Keep grants and source revisions in Python; only schemas and sanitized results reach the LLM."""
     config, key, system, history = context
     scope = (owner, aic, session, files, include_private)
@@ -53,7 +53,7 @@ async def bind_entry_tools(chat, context, owner, aic, session, files, *, include
     outputs = config.setdefault('_generated_files', [])
     tools = []
     lookup_types = {}
-    session_files = None
+    session_files = temporary_files
     read_images = {}
     other_images = list(config.get('_image_inputs', ()))
 
@@ -99,6 +99,8 @@ async def bind_entry_tools(chat, context, owner, aic, session, files, *, include
                 image = await run_blocking(session_files.read,identifier,0,1,sandbox=sandbox is not None,vision=True)
                 if binary := image.pop('image_input',None):
                     attach_image(identifier,binary)
+    elif temporary_files is not None:
+        config.update(_load_session_source=session_files.html,_has_html_source=session_files.has_html_source)
     elif previous_reads:
         raise HTTPException(409, '此前读取的原件已失去会话授权')
 
@@ -108,8 +110,7 @@ async def bind_entry_tools(chat, context, owner, aic, session, files, *, include
             lookup_types[name]=schema
 
     tool('search_materials', '混合检索已授权资料的正文片段，可指定目录。', SearchQuestion, prefill=True)
-    if not search_only:
-        tool('read_material', '按文件名、说明或问题定位授权资料并读取原文。', prefill=True)
+    tool('read_material', '按文件名、说明或问题定位授权资料并读取原文。', prefill=True)
     if session_files:
         tool('read_session_file', '查找或读取本会话授权文件，也可复查本轮生成的 HTML。query 查目录，file_id 读原件。按返回游标续读。', SessionFileRequest, prefill=True)
     if directory_reply:
@@ -140,7 +141,7 @@ async def bind_entry_tools(chat, context, owner, aic, session, files, *, include
         return json.dumps({'results':records}, ensure_ascii=False)
 
     # Recover files and recheck source grants even when the next model step only writes the final answer.
-    if not search_only and (state.get('sandbox') or config.get('_sandbox_receipts') or config.get('_agent_checkpoint',{}).get('sandbox_attempted')):
+    if state.get('sandbox') or config.get('_sandbox_receipts') or config.get('_agent_checkpoint',{}).get('sandbox_attempted'):
         if not sandbox:
             raise HTTPException(409, '此前沙箱权限已撤回，未恢复其结果')
         await run_python('', restoring=True)
@@ -192,7 +193,7 @@ async def bind_entry_tools(chat, context, owner, aic, session, files, *, include
             return await run_blocking(status)
         if name=='python':
             return await run_python(ToolQuestion.model_validate(args).query)
-        if name!='search_materials' and (search_only or name!='read_material'):
+        if name not in ('search_materials','read_material'):
             raise ValueError('当前会话未提供此工具')
         request = (SearchQuestion if name=='search_materials' else ToolQuestion).model_validate(args)
         route = {'mode':'search' if name=='search_materials' else 'read', **request.model_dump()}

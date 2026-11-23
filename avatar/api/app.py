@@ -135,6 +135,9 @@ def create_app(settings=None, provider=None, run_worker=True, model_client=None)
                         entity_lifecycle.run(), name="avatar-identity-maintenance"
                     )
                 )
+                if settings.entity_aip_enabled or settings.town_public_enabled:
+                    await asyncio.to_thread(personal_aip.tasks.files.clear_scratch)
+                    tasks.append(asyncio.create_task(personal_aip.tasks.files.janitor(),name='avatar-town-files'))
                 if settings.entity_aip_enabled:
                     tasks.append(
                         asyncio.create_task(

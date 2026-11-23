@@ -9,6 +9,8 @@ from avatar.core.db import now
 def redact(value,depth=0):
     if depth>8:return '[depth limit]'
     if isinstance(value,dict):
+        if value.get('type')=='file':
+            value = {**value, **{key:'[redacted]' for key in ('uri','bytes') if key in value}}
         return {str(k):('[redacted]' if any(s in str(k).lower() for s in ('token','secret','password','authorization','cookie','privatekey')) else {'chars':len(v),'sha256':hashlib.sha256(v.encode()).hexdigest()} if str(k).lower() in ('text','content','body','description') and isinstance(v,str) else redact(v,depth+1)) for k,v in list(value.items())[:50]}
     if isinstance(value,(list,tuple)):return [redact(v,depth+1) for v in value[:20]]
     if isinstance(value,str):return value[:1024]

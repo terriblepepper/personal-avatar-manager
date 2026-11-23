@@ -144,7 +144,7 @@ class SkillExecution:
                 {item['id'] for item in saved},set(config.get('_agent_persisted_file_ids',())))
             results.extend(recovered)
         from avatar.skills.https_inputs import configured_resources
-        https_names = list(configured_resources()) if allow_code else []
+        https_names = list(configured_resources()) if allow_code and config.get('_sandbox_https_enabled',True) else []
         # 职责：默认只接受已加载脚本；allow_code 仅由本人 Web 工具授权开启，允许 Python 代码，仍不接受宿主命令。
         def validate_receipts():
             journal.check_current()
@@ -350,7 +350,8 @@ class SkillExecution:
                               'steps':[{'time':now(),'message':'正在准备并执行 Python 脚本'}]})
                     progress({'type':'status','stage':'skill_execution','message':'Python 沙箱正在处理任务：'+record['name']})
                 try:
-                    execution=await self.sandbox.execute(user_id,resources,script,args,https_inputs=https_inputs,authorize=authorize)
+                    options = {'workspace':config['_sandbox_workspace']} if config.get('_sandbox_workspace') else {}
+                    execution=await self.sandbox.execute(user_id,resources,script,args,https_inputs=https_inputs,authorize=authorize,**options)
                 except (RuntimeError,ValueError,OSError) as exc:
                     unavailable=isinstance(exc,SandboxUnavailable)
                     if claimed and not unavailable:

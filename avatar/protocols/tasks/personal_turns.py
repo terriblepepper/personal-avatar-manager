@@ -33,8 +33,17 @@ def audit_outcome(document, run, reason, *, previous_run=None):
              document['status']['state'], reason)
 
 
+def without_file_products(products):
+    return [{**product,'dataItems':[item for item in product['dataItems'] if item['type']!='file']}
+            for product in products]
+
+
 def public_result(document):
-    return {key: value for key, value in document.items() if key not in ('_agent_resume','_audit_run_id')}
+    result = {key:value for key,value in document.items() if key not in
+              ('_agent_resume','_audit_run_id','_file_deliveries','_file_until')}
+    if document.get('_file_until',float('inf'))<=time.time():
+        result['products'] = without_file_products(result.get('products',()))
+    return result
 
 
 def source_revision(db, owner, aic):
@@ -63,6 +72,12 @@ def clear_run(db, row, run):
 def close_in(db, row, document, state, message=None, *, reason=None):
     run = document.pop('_agent_resume', {})
     previous_run = document.pop('_audit_run_id', None)
+    if document.get('_file_deliveries'):
+        if state=='completed':
+            document['_file_until'] = time.time()+30*60
+        else:
+            document.pop('_file_deliveries',None)
+            document['products'] = without_file_products(document.get('products',()))
     lease_release(db, run)
     clear_run(db, row, run)
     status = {'state':state,'stateChangedAt':now()}
@@ -71,7 +86,7 @@ def close_in(db, row, document, state, message=None, *, reason=None):
     document.update(id=uuid.uuid4().hex,sentAt=now(),status=status)
     db.execute('UPDATE avatar_aip_tasks SET document=?,deadline=NULL WHERE rowid=?',(dump(document),row['rowid']))
     audit_outcome(document, run, reason or state, previous_run=previous_run)
-    return document
+    return public_result(document)
 
 
 def expire_in(db, row, document):
@@ -94,6 +109,7 @@ def interrupt_in(db, row, document):
         state, message = 'awaiting-input', '上次请求的自动重试已用尽，请补充要求后继续'
     else:
         clear_run(db, row, run)
+        document.pop('_file_deliveries',None)
         state, message = 'failed', '上一次操作缺少可安全恢复的回执，请核对已有结果后重新发起任务'
     document.update(id=uuid.uuid4().hex, sentAt=now(), status={'state':state, 'stateChangedAt':now(),
                     'dataItems':[{'type':'text','text':message}]})
@@ -135,7 +151,7 @@ def renew(database, rowid, writer, run, conversation_id=None, *, work_until):
 # 输入：rowid 和当前 working 消息 ID 固定执行者，message 为产品或状态说明。
 # 结果与约束：只更新原任务，不覆盖已取消结果；成功等待 Leader 确认最多 300 秒。
 
-def finish_in(db, rowid, result, run, state, message, *, reason=None):
+def finish_in(db, rowid, result, run, state, message, *, reason=None, delivery=None, files=()):
     row = db.execute('SELECT rowid,document FROM avatar_aip_tasks WHERE rowid=?',(rowid,)).fetchone()
     if not row:
         raise RunConflict('原任务已删除')
@@ -146,11 +162,16 @@ def finish_in(db, rowid, result, run, state, message, *, reason=None):
     lease_release(db,current['_agent_resume'])
     if state=='awaiting-completion':
         document['_audit_run_id'] = run['run_id']
-        document['products']=[{'id':uuid.uuid4().hex,'dataItems':[{'type':'text','text':message}]}]
+        document['products']=[{'id':uuid.uuid4().hex,'dataItems':[{'type':'text','text':message}, *files]}]
+        deliveries = current.get('_file_deliveries',[]) + ([delivery] if delivery else [])
+        if deliveries:
+            document['_file_deliveries'] = deliveries
     else:
         document['status']['dataItems']=[{'type':'text','text':message}]
     if state=='awaiting-input':
         document['_agent_resume']={**current['_agent_resume'],**run}
+        if current.get('_file_deliveries'):
+            document['_file_deliveries'] = current['_file_deliveries']
     else:
         clear_run(db,row,run)
     db.execute('UPDATE avatar_aip_tasks SET document=?,deadline=? WHERE rowid=?',

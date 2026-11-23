@@ -3,9 +3,12 @@ import asyncio
 import json
 import secrets
 from types import SimpleNamespace
-from fastapi import APIRouter, HTTPException, Request, Response
+from urllib.parse import quote
+from fastapi import APIRouter, HTTPException, Path, Request, Response
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from avatar.core.text_budget import AgentText
+from avatar.protocols.tasks.town_files import NONCE
 from avatar.protocols.tasks.store import ManagementTaskError
 from avatar.core.db import now
 
@@ -100,6 +103,29 @@ class PublicTaskRequest(BaseModel):
         if self.question_id and (self.operation!='continue' or not self.message.strip()):
             raise ValueError('回答分身提问时请使用 continue 并填写回答')
         return self
+
+
+class TownFileResponse(StreamingResponse):
+    def __init__(self, stream, item):
+        self.stream = stream
+        super().__init__(iter(lambda:stream.read(256*1024),b''),media_type=item['mimeType'],headers={
+            'Content-Length':str(item['size']),
+            'Content-Disposition':"attachment; filename*=UTF-8''"+quote(item['name'],safe=''),
+            'Content-Security-Policy':"sandbox; default-src 'none'",
+        })
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope,receive,send)
+        finally:
+            self.stream.close()
+
+
+@router.get('/files/{rowid}/{token}/{identifier}', include_in_schema=False)
+def download_file(request: Request, rowid: int = Path(gt=0,le=2**63-1), token: str = Path(pattern='^'+NONCE+'$'),
+                  identifier: str = Path(pattern=r'^[0-9a-f-]{36}$')):
+    stream, item = service(request).download(rowid,token,identifier)
+    return TownFileResponse(stream,item)
 
 
 @router.post('/avatars/{target}/tasks')
