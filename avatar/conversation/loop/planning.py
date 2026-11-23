@@ -177,7 +177,7 @@ async def disclose_tools(model, settings, key, system, history, question, catalo
         'type':'object','properties':properties,'required':['steps'],'additionalProperties':False}}
     config={**settings,'_tools':[form],'_batch_tools':False,'_optional_tools':False,'_call_purpose':'task_planning'}
     prompt=(system+'\n你担任当前分身的工具披露步骤。根据本轮用户的实际目标、已有证据和工具目录决定。'
-            'tools 只选实际需要的工具。只需文字答复时提交空的 tools 和 steps，正文由下一阶段作答。'
+            'tools 只选实际需要的工具。仅需文字或 Mermaid 且已有足够信息时，不规划生成文件或检索。正文和 Mermaid 由下一阶段直接输出，协议要求的会话动作仍须规划。'
             '复杂任务拆为可核对的必要目标，给出 goal 和 criterion。先核对，再决定是否需要追加修订。'
             '可用同一子目标的 tools 列出替代工具。先取证再创作时，将取证与交付分别列为前后两个子目标。'
             '规划只选择一次终态动作，作为独立最后一步。需要发送最后发言并结束时，只规划 end_task，可附发言。'

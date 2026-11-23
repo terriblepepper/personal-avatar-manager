@@ -172,6 +172,10 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
     route_mode = route.get('mode')
     html_needed = ('create_html' in allowed and (animation_required or route_mode=='html')
                    and not any(item.get('html_mode') in ('html','2d','3d') for item in html_receipts))
+    html_goal = '生成并交付本轮动画' if animation_required else '生成并交付本轮要求的 HTML 文件'
+    if html_needed and animation_required:
+        system += ('\n用户已开启「制作动画」，本轮必须通过 create_html 生成动画并取得真实文件回执。'
+                   '以用户的主题和要求创作，按意图选择 2D 或 3D。文字和 Mermaid 可以辅助说明。')
     personal_conversation = config.get('_personal_conversation') if delivery and not domain else None
     disabled = {tool['id']: tool for tool in tools if tool['id'] != 'animation' and not tool['enabled']}
     prompt = (system + '\n当前是分身执行循环。根据真实输入、已确认回执和仍需完成的目标，'
@@ -181,10 +185,8 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
               '最终正文只交付所需结果和解释，作品自动预览，不重复源码、生成脚本、内部规划和平台状态。')
     if required:
         prompt += '本轮必须通过披露模型选择的协议任务函数返回。'
-    if html_needed:
+    if html_needed and not animation_required:
         prompt += '本轮须交付 HTML 文件。'
-    if animation_required:
-        prompt += '用户已开启制作动画。创作内容以本轮用户要求为准。'
     if config.get('_sandbox_succeeded'):
         prompt += '本轮已有成功的沙箱回执，可直接用已确认结果作答。'
     settings = {**config, '_retain_turn_fragments': True, '_tools': list(allowed.values()), '_optional_tools': not required}
@@ -257,8 +259,6 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
 
     choices = disclosure_catalog(config, allowed)
     planned_arguments = lookup_types(config, allowed)
-    if html_needed and animation_required:
-        choices['create_html'] += ' 用户已开启制作动画。'
     if required:
         choices = {k:v+('（本轮必须以一个任务函数交接）' if k in ARGUMENTS else '') for k,v in choices.items()}
     selected = []
@@ -315,11 +315,17 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         plan = planned
         if revise:
             draft.revise_goals(planned,keep_draft)
-        if html_needed and not any(step['tool']=='create_html' for step in planned):
-            planned.append({'tool':'create_html','goal':'生成并交付本轮要求的 HTML 文件'})
         pending = [dict(step, goal_no=index) for index,step in enumerate(planned,1)]
         plan = [dict(step) for step in planned]
         selected = list(dict.fromkeys([*selected,*(s['tool'] for s in planned if s['tool'])]))
+
+    if html_needed and not any(step['tool']=='create_html' for step in pending):
+        index = next((i for i,step in enumerate(pending) if step['tool'] in ARGUMENTS), len(pending))
+        step = {'tool':'create_html','goal':html_goal}
+        pending.insert(index, dict(step, goal_no=len(plan)+1))
+        plan = [*plan, step]
+        if 'create_html' not in selected:
+            selected.append('create_html')
 
     defaults = {REQUEST_TOOLS['name']: REQUEST_TOOLS}
     defaults.update((name,allowed[name]) for name in ('ask_user','search_materials') if name in allowed)
@@ -763,10 +769,12 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             continue
         terminal_match = stop_requested or action in ARGUMENTS and all(
             step['tool']==action or (action=='end_task' and step['tool'] in ARGUMENTS) for step in pending)
-        if pending and not terminal_match and (finishing or (action in domain and action not in ('find_public_material', 'wait_for_user') and not public_handoff)):
+        if ((html_needed and finishing and not stop_requested) or
+                (pending and not terminal_match and (finishing or
+                 (action in domain and action not in ('find_public_material', 'wait_for_user') and not public_handoff)))):
             premature+=1
             if premature>=3:
-                raise pause('仍未取得所需回执：'+pending[0]['goal'])
+                raise pause('仍未取得所需回执：'+(pending[0]['goal'] if pending else html_goal))
             trace.point('check', {'pending': len(pending)}, {'decision': '缺少回执，由模型重新选择动作'})
             observations.append('\n仍有目标未取得回执。请核对可用工具。'+missing_information)
             continue
