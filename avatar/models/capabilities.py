@@ -50,14 +50,18 @@ def automatic(db,user_id,config,*,embedding=False):
 
 
 def refresh_saved(db,user_id):
-    from avatar.rag.invalidation import invalidate
+    from avatar.rag.invalidation import chat_changed,invalidate
     for table,column,embedding in (('model_settings','model_config',False),('embedding_settings','config',True)):
         row=db.execute(f'SELECT {column} FROM {table} WHERE user_id=?',(user_id,)).fetchone()
         if not row:continue
         previous=json.loads(row[0]);config=automatic(db,user_id,previous,embedding=embedding)
-        keys=('multimodal_enabled',) if embedding else ('vision_enabled','audio_enabled')
         if config!=previous:db.execute(f'UPDATE {table} SET {column}=? WHERE user_id=?',(dump(config),user_id))
-        if any(bool(config.get(k))!=bool(previous.get(k)) for k in keys):invalidate(db,user_id,force=embedding)
+        if not embedding:
+            chat_changed(db,user_id,previous,config)
+        elif bool(config.get('multimodal_enabled'))!=bool(previous.get('multimodal_enabled')):
+            invalidate(db,user_id,force=True)
+            from avatar.knowledge.model_refresh import schedule
+            schedule(db,user_id,embedding=True)
 
 
 async def detect(database,user_id,config,client,vault):

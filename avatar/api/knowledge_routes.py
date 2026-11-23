@@ -123,6 +123,15 @@ def build(body:BuildRequest,request:Request,user=Depends(owner)):
     return request.app.state.knowledge.create(user,body.prompt,body.asset_ids,body.interview_rounds,body.conversation_ids,body.rebuild)
 
 
+class SoulRebuild(BaseModel):
+    model_config=ConfigDict(extra='forbid')
+
+
+@router.post('/rebuild',status_code=202)
+def rebuild(request:Request,body:SoulRebuild | None=None,user=Depends(owner)):
+    return request.app.state.knowledge.rebuild_index(user)
+
+
 @router.post('/builds/{identifier}/retry',status_code=202)
 def retry_build(identifier:str,request:Request,user=Depends(owner)):
     return request.app.state.knowledge.retry(user,identifier)

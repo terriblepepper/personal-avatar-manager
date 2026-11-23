@@ -76,11 +76,10 @@ class ModelSettingsService:
             raise HTTPException(409, '模型配置已变化，请刷新后重新保存')
         config = automatic(db,user['id'],resolved if resolved is not None else self.vault.resolve(input_config, json.loads(row['model_config']) if row else {}))
         previous=json.loads(row['model_config']) if row else {}
-        if any(previous.get(key)!=config.get(key) for key in ('provider','base_url','model','vision_enabled','audio_enabled','encrypted_key')):
-            from avatar.rag.invalidation import invalidate
-            invalidate(db,user['id'])
         modified = next_modified_at(row['updated_at'] if row else '')
         db.execute('INSERT INTO model_settings(user_id,model_config,updated_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET model_config=excluded.model_config,updated_at=excluded.updated_at', (user['id'],dump(config),modified))
+        from avatar.rag.invalidation import chat_changed
+        chat_changed(db,user['id'],previous,config)
         event(db,user['id'],user['username'],'保存模型配置（立即生效）', actor_id=user['id'])
 
     # 职责：独立保存用户模型配置并返回可显示结果。

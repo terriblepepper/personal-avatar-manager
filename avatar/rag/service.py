@@ -21,7 +21,8 @@ from avatar.conversation.working_context import fit_turn
 from avatar.models.embedding import EmbeddingSettings,embedding_window
 from avatar.models.limits import check_context
 from avatar.rag.reading import MaterialReading
-from avatar.rag.indexing.service import FileRag,revision,signature
+from avatar.rag.indexing.service import FileRag,revision
+from avatar.rag.invalidation import legacy_signature,signature
 from avatar.files.parsing.document_images import pdf_image
 from avatar.files.library.catalog import fit_catalog, fit_text_rows
 from avatar.rag.query import FileQuery,construct,file_catalog,directory_catalog,fit_directories
@@ -237,10 +238,10 @@ class MaterialRag(MaterialReading,FileRag):
             if queued:
                 indexes = self._retrieval_indexes(uid, owned)
             groups = {}
-            token = signature(config,model)
+            tokens = {signature(config,model),legacy_signature(config,model)}
             for row in owned:
                 index = indexes.get((row['source'],row['id']))
-                if not index or index['status']!='ready' or index['revision']!=revision(row) or index['signature']!=token:
+                if not index or index['status']!='ready' or index['revision']!=revision(row) or index['signature'] not in tokens:
                     notices.append(((row['source'],row['id']),('资料索引失败：'+index['error']+'；文件：' if index and index['status']=='failed' else '资料索引正在后台准备，可按需读取原件：')+row['filename']))
                     continue
                 if index['record_ids']:

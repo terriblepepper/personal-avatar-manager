@@ -18,9 +18,11 @@ def auto_style_advance(db, owner, previous, checksum, current):
         WHERE id=? AND user_id=? AND status='approved'
         UNION
         SELECT b.id,b.document,b.parent_build,b.origin FROM lineage head
-        JOIN style_learning_runs r ON r.build_id=head.id AND r.user_id=? AND r.mode='auto'
-        JOIN soul_builds b ON b.id=head.parent_build AND b.user_id=r.user_id AND b.status='approved'
-        WHERE head.origin='learning' AND head.id IS DISTINCT FROM ?::text
+        JOIN soul_builds b ON b.id=head.parent_build AND b.user_id=? AND b.status='approved'
+        WHERE head.id IS DISTINCT FROM ?::text AND (
+            (head.origin='model_refresh' AND head.document=b.document)
+            OR (head.origin='learning' AND EXISTS (
+                SELECT 1 FROM style_learning_runs r WHERE r.build_id=head.id AND r.user_id=b.user_id AND r.mode='auto')))
     )
     SELECT 1 FROM lineage b WHERE (b.id=? AND md5(b.document)=?)
        OR (?::text IS NULL AND b.parent_build='' AND b.origin='learning' AND EXISTS (
@@ -84,9 +86,9 @@ class StyleLearning:
                 if automatic:return {'queued':False,'reason':'no_active_soul'}
                 raise HTTPException(409,NEEDS_ACTIVE_SOUL)
             if automatic and db.execute("SELECT 1 FROM style_learning_runs WHERE user_id=? AND day=? AND mode='auto'",(user['id'],day)).fetchone():return {'queued':False,'reason':'today'}
-            if db.execute("SELECT 1 FROM soul_builds WHERE user_id=? AND origin='learning' AND status IN ('queued','running')",(user['id'],)).fetchone():
+            if db.execute("SELECT 1 FROM soul_builds WHERE user_id=? AND origin IN ('learning','model_refresh') AND status IN ('queued','running')",(user['id'],)).fetchone():
                 if automatic:return {'queued':False,'reason':'running'}
-                raise HTTPException(409,'已有学习任务正在执行')
+                raise HTTPException(409,'请等待当前风格学习或索引重构完成')
             if identifier:
                 db.execute('INSERT OR IGNORE INTO style_learning_settings VALUES(?,?,0,0,?)',(identifier,user['id'],now()))
             clauses=['c.user_id=?','s.user_id=c.user_id',"c.caller_id=c.user_id", "c.platform='web'",'c.parent_id IS NULL',"c.channel IN ('avatar','assistant')",

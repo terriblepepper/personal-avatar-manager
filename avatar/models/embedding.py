@@ -85,8 +85,16 @@ class EmbeddingSettings:
             old_config=json.loads(previous[0]) if previous else {}
             if not previous or body.api_key or any(config.get(key)!=old_config.get(key) for key in config if key!='encrypted_key'):
                 invalidate(db,user['id'],force=bool(old_config.get('multimodal_enabled'))!=bool(config.get('multimodal_enabled')))
+            if index_identity(old_config)!=index_identity(config):
+                from avatar.knowledge.model_refresh import schedule
+                schedule(db,user['id'],embedding=True)
             event(db,user['id'],user['username'],'保存嵌入模型配置',actor_id=user['id'])
         return self.get(user['id'])
+
+
+def index_identity(config):
+    return {key:config.get(key) for key in
+            ('provider','base_url','model','dimensions','context_tokens','context_enabled','multimodal_enabled')}
 
 
 def embedding_window(config):
