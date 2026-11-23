@@ -228,8 +228,10 @@ class PersonalTaskService:
                 if not row:
                     raise ManagementTaskError(-32001, '当前调用者和会话中没有该任务')
                 document = json.loads(row['document'])
-                if ((row['deadline'] is None or row['deadline'] > time.time()) and not turns.work_expired(document)
-                        and not document.get('_agent_resume', {}).get('restart')):
+                saved = document.get('_agent_resume', {})
+                work_expired = document['status']['state']=='working' and turns.work_expired(document)
+                if ((row['deadline'] is None or row['deadline'] > time.time()) and not work_expired
+                        and not (saved.get('restart') or saved.get('user_question'))):
                     return self.working_view((*scope[:3],row['session_id'],scope[4]),turns.public_result(document))
         with self.database.connect(write=True) as db:
             row = self.task_row(db, scope)
@@ -257,6 +259,8 @@ class PersonalTaskService:
                     job = self.pending.get(scope)
                     if job: job.cancel()
                     return result
+                if state == 'awaiting-input' and run.get('user_question'):
+                    return turns.close_in(db,row,document,'failed',turns.QUESTION_UNAVAILABLE,reason='interactive_question_disabled')
                 restarting = operation == 'get' and state == 'awaiting-input' and run.get('restart')
                 if restarting:
                     if turns.work_expired(document):
@@ -286,14 +290,7 @@ class PersonalTaskService:
                 answers=[item for item in items if item.get('type')=='data' and isinstance(item.get('data'),dict)
                          and set(item['data'])=={'question_id'}]
                 if answers:
-                    pending=run.get('user_question')
-                    if len(answers)!=1 or not pending or answers[0]['data']['question_id']!=pending['id']:
-                        raise ManagementTaskError(-32009,'分身提问已改变，请查询当前任务')
-                    items=[item for item in items if item is not answers[0]]
-                if run.get('user_question') and not any(item.get('type')=='text' and isinstance(item.get('text'),str)
-                                                        and item['text'].strip() for item in items):
-                    raise ManagementTaskError(-32602,'请填写对分身提问的回答')
-                run.pop('user_question',None)
+                    raise ManagementTaskError(-32009,'小镇会话不支持中途提问，请补充信息并重新发起任务')
                 question = self.question(items, self.approved_skills(target, selected), selected=selected)
                 inputs = [*run.get('inputs', ()), question]
                 if sum(len(text) + 8 for text in inputs) > 16000:
@@ -389,14 +386,21 @@ class PersonalTaskService:
                 validate(db)
         store = RunStore(self.database, owner, 'protocol', str(rowid), run['run_id'], writer, validate)
         committed = None
+        def pause_result(pause):
+            if pause.user_question:
+                return 'failed', turns.QUESTION_UNAVAILABLE
+            run['checkpoint'] = pause.checkpoint
+            return 'awaiting-input', str(pause)
+
         def commit(db, reply, pause=None):
             nonlocal committed
             store.check_in(db)
+            state = 'awaiting-completion'
             if pause:
-                run.update(checkpoint=pause.checkpoint,clarification=pause.question,user_question=pause.user_question)
+                state, reply = pause_result(pause)
                 if pause.usage:
                     store.mark_usage_recorded_in(db)
-            committed = turns.finish_in(db,rowid,result,run,'awaiting-input' if pause else 'awaiting-completion',reply)
+            committed = turns.finish_in(db,rowid,result,run,state,reply)
         async def work():
             await self.limit.acquire()
             try:
@@ -428,8 +432,8 @@ class PersonalTaskService:
                 raise RunConflict('缺少本次回答的提交回执')
             return committed
         except AgentNeedsInput as exc:
-            run.update(checkpoint=exc.checkpoint,clarification=exc.question,user_question=exc.user_question)
-            return turns.finish(self.database,rowid,result,run,'awaiting-input',exc.question or str(exc))
+            state, message = pause_result(exc)
+            return turns.finish(self.database,rowid,result,run,state,message)
         except asyncio.CancelledError:
             # Fence the writer before draining an interrupted provider or a blocking tool.
             with self.database.connect(write=True) as db:
@@ -467,7 +471,8 @@ class PersonalTaskService:
         question = '\n\n用户补充：'.join(resume['inputs'])
         request = ChatRequest(channel='avatar', message=question)
         overview, model = self.chat.context(user, request, target, private_access=False)
-        model = ({**model[0], '_avatar_agent': True, '_agent_checkpoint':resume.get('checkpoint',{}),
+        model = ({**model[0], '_avatar_agent': True, '_allow_user_questions':False,
+                  '_agent_checkpoint':resume.get('checkpoint',{}),
                   '_run_store':store, '_run_input_id':resume['input_id'], '_run_supplement':resume['supplement'],
                   '_auto_recover':resume['automatic']}, *model[1:])
         caller = context.peer_aic if principal is None else 'visitor:' + principal['visitor_id']
@@ -477,7 +482,7 @@ class PersonalTaskService:
         background = json.loads(raw)
         for name in ('available_skills', '_skills_revision'):
             background.pop(name, None)
-        prefix += ' 当前为小镇问答。资料只通过混合检索获取，只交付文字答复。'
+        prefix += ' 当前为小镇问答。资料只通过混合检索获取，只交付文字答复。无法中途提问；缺少信息时，在最终答复中说明缺口。'
         if resume.get('clarification'):
             background['last_clarification'] = resume['clarification']
             prefix += ' last_clarification 是上一轮你向用户提出的问题，只用于理解本轮补充。'
