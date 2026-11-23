@@ -1,4 +1,4 @@
-"""待审角标的可重建快照。审核操作始终使用业务数据库。"""
+"""资料和 Soul 的待审角标快照。审核操作始终使用业务数据库。"""
 import hashlib
 import json
 from threading import Lock
@@ -11,7 +11,6 @@ from redis.retry import Retry
 def pending_count(db):
     return db.execute(
         "SELECT (SELECT count(*) FROM profile_submissions WHERE status='pending')"
-        "+(SELECT count(*) FROM users WHERE person_type='teacher' AND account_status='pending')"
         "+(SELECT count(*) FROM soul_builds WHERE status='pending')"
     ).fetchone()[0]
 

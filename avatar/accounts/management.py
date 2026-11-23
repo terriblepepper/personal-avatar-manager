@@ -44,7 +44,7 @@ class AccountManagement:
             require_admin(current if current else {'role':'user'})
             account=db.execute("SELECT u.id,u.username,u.person_type,u.student_id,u.teacher_id,u.email,u.phone,u.account_status,u.created_at,i.username identity_username,COALESCE(json_extract(p.draft,'$.name'),'') name FROM users u LEFT JOIN oidc_identities i ON i.user_id=u.id LEFT JOIN profile_records p ON p.user_id=u.id WHERE u.id=?",(target_id,)).fetchone()
             if not account:raise HTTPException(404,'账户不存在')
-            if account['account_status']!='active':raise HTTPException(409,'账户尚未通过注册审核')
+            if account['account_status']!='active':raise HTTPException(409,'账户未激活')
             approved=db.execute("SELECT snapshot,reviewed_at FROM profile_submissions WHERE user_id=? AND status='approved' ORDER BY reviewed_at DESC,submitted_at DESC,id DESC LIMIT 1",(target_id,)).fetchone()
             if approved:profile=json.loads(approved['snapshot']);approved_at=approved['reviewed_at']
             else:
@@ -71,7 +71,7 @@ class AccountManagement:
                 if target['is_root']:
                     raise HTTPException(403,'根管理员 admin 保留管理权限，不能降级')
             elif target['account_status'] != 'active':
-                raise HTTPException(409,'账户须完成注册审核后才能成为管理员')
+                raise HTTPException(409,'只有已激活账户可以成为管理员')
             if target['role'] == role:
                 return {'id':target_id,'role':role,'changed':False}
             db.execute('UPDATE users SET role=? WHERE id=?',(role,target_id))

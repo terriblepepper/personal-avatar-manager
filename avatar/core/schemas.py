@@ -323,7 +323,7 @@ class SubmitRequest(BaseModel):
     last_modified_at: ModifiedAt
 
 
-# 职责：定义教师注册或分身资料的审核决定。
+# 职责：定义分身资料审核决定。
 # 输入：approve 表示通过，reason 为最多 1000 字符的原因。
 # 结果与约束：驳回原因必填的业务约束由相应服务检查，路由负责管理员授权。
 class ReviewRequest(BaseModel):

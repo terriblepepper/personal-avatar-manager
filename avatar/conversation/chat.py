@@ -170,7 +170,7 @@ class AvatarChat:
         if request.channel != 'avatar' and target_row is None:
             return overview, None
         if user['account_status'] != 'active':
-            raise HTTPException(403, '教师注册尚未审核通过')
+            raise HTTPException(403, '当前账户无法使用分身对话')
         if not agent and target_row is None:
             raise HTTPException(409, '审核并创建成功后才能与分身对话')
         with self.service.database.connect() as db:

@@ -11,11 +11,11 @@ import MarkdownContent from '../MarkdownContent.vue'
 import { request, notifyError } from '../../api/client'
 interface Review { id:string; kind:string; name:string; username:string; avatar_name:string; category:string; status:string; created_at:string;last_modified_at?:string }
 const props=withDefaults(defineProps<{initialCategory?:string}>(),{initialCategory:'all'})
-const categories:Record<string,string>={all:'全部审核',teacher:'教师注册',create:'分身创建',update:'资料更新',soul:'分身 Soul'}
+const categories:Record<string,string>={all:'全部审核',teacher:'教师注册（历史）',create:'分身创建',update:'资料更新',soul:'分身 Soul'}
 const statuses:Record<string,string>={pending:'待审核',approved:'已通过',rejected:'已退回',all:'全部记录'}
 const processed=(row:Review)=>['approved','rejected'].includes(row.status)
 let ticket=0, detailTicket=0
-const rows=ref<Review[]>([]), selected=ref<string[]>([]), category=ref(props.initialCategory), status=ref('pending'), search=ref(''), offset=ref(0), total=ref(0), detail=ref<unknown>(null), selectedRow=ref<Review|null>(null), decision=ref<boolean|null>(null), reason=ref(''), busy=ref(false)
+const rows=ref<Review[]>([]), selected=ref<string[]>([]), category=ref(props.initialCategory), status=ref(props.initialCategory==='teacher'?'all':'pending'), search=ref(''), offset=ref(0), total=ref(0), detail=ref<unknown>(null), selectedRow=ref<Review|null>(null), decision=ref<boolean|null>(null), reason=ref(''), busy=ref(false)
 const preview=ref<{id:string;filename:string;url:string}|null>(null)
 const record=computed(()=>detail.value && typeof detail.value==='object'?detail.value as Record<string,unknown>:{})
 const registration=computed(()=>record.value.registration as {id:string;status:string;registration_phase:string;error:string}|undefined)

@@ -46,7 +46,7 @@ def bootstrap(database, data_dir):
 
 # 职责：注册普通学生或教师账户并初始化资料。
 # 输入：credentials 为已校验的注册请求，包含登录联系方式、身份及可选平台入口令牌。
-# 结果与约束：学生激活、教师待审核；平台绑定在同一事务中完成，失败整体回滚；返回用户 ID，唯一性冲突返回 409。
+# 结果与约束：学生与教师注册后均激活；平台绑定在同一事务中完成，失败整体回滚；返回用户 ID，唯一性冲突返回 409。
 def create_user(database, credentials):
     user_id = str(uuid.uuid4())
     # Reject existing contact conflicts cheaply; recheck under the write lock after hashing.
@@ -56,9 +56,8 @@ def create_user(database, credentials):
     try:
         with database.connect(write=True) as db:
             _check_contact_conflicts(db, credentials.email, credentials.phone, user_id, credentials.username)
-            status = "pending" if credentials.person_type == "teacher" else "active"
-            db.execute("INSERT INTO users(id,username,password,role,created_at,person_type,student_id,teacher_id,account_status,email,phone,onboarding_stage) VALUES(?,?,?,?,?,?,?,?,?,?,?,'welcome')",
-                       (user_id, credentials.username, password_hash, "user", now(), credentials.person_type, credentials.student_id or None, None, status, credentials.email, credentials.phone or None))
+            db.execute("INSERT INTO users(id,username,password,role,created_at,person_type,student_id,teacher_id,email,phone,onboarding_stage) VALUES(?,?,?,?,?,?,?,?,?,?,'welcome')",
+                       (user_id, credentials.username, password_hash, "user", now(), credentials.person_type, credentials.student_id or None, None, credentials.email, credentials.phone or None))
             modified = now()
             db.execute("INSERT INTO profile_records(user_id,draft,last_modified_at,updated_at) VALUES(?,?,?,?)", (user_id, dump({"person_type": credentials.person_type, "student_id": credentials.student_id, "name": credentials.name.strip(), "email": credentials.email, "phone": credentials.phone}), modified,modified))
             event(db, user_id, credentials.username, "账户注册", actor_id=user_id)
@@ -156,7 +155,7 @@ def current_user(request: Request):
         raise HTTPException(401, '请通过统一认证重新登录')
     # 入口会话使用路径白名单缩小能力，即便关联的是根管理员，也不能继承完整控制台权限。
     if user['access_scope']=='profile':
-        allowed={'/api/me/onboarding/tour','/api/me/onboarding/done','/api/help/用户操作手册.md','/api/records/history','/api/records/events','/api/auth/me','/api/auth/logout','/api/me','/api/me/profile','/api/me/submit','/api/me/account-resubmit','/api/me/acs','/api/me/acs/preview','/api/me/attachments','/api/me/material-folders','/api/me/model-settings','/api/me/model-options','/api/profile-fields','/api/model-providers','/api/platform/binding'}
+        allowed={'/api/me/onboarding/tour','/api/me/onboarding/done','/api/help/用户操作手册.md','/api/records/history','/api/records/events','/api/auth/me','/api/auth/logout','/api/me','/api/me/profile','/api/me/submit','/api/me/acs','/api/me/acs/preview','/api/me/attachments','/api/me/material-folders','/api/me/model-settings','/api/me/model-options','/api/profile-fields','/api/model-providers','/api/platform/binding'}
         import re
         attachment_path = re.fullmatch(r'/api/me/attachments/[0-9a-f-]{36}', request.url.path)
         if request.url.path not in allowed and not attachment_path:raise HTTPException(403,'临时入口仅允许个人资料管理；其他操作请使用账号密码登录')

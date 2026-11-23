@@ -65,7 +65,7 @@ onBeforeUnmount(() => { listRequest++; profileRequest++ })
         <option value="all">全部角色</option><option value="user">普通用户</option><option value="admin">管理员</option>
       </select>
     </div>
-    <p class="sub">共 {{ total }} 个账户。教师须先完成注册审核，才能被授予管理员权限。</p>
+    <p class="sub">共 {{ total }} 个账户。管理员可为已激活账户授予管理权限。</p>
     <div v-if="rows.length" class="tablewrap compact-record-table">
       <table>
         <thead><tr><th>姓名 / 用户名</th><th>身份 / 学号或工号</th><th>登记联系方式</th><th>角色 / 注册状态</th><th>操作</th></tr></thead>
@@ -74,7 +74,7 @@ onBeforeUnmount(() => { listRequest++; profileRequest++ })
           <td>{{ item.person_type === 'teacher' ? '教师' : '学生' }}<small>{{ (item.person_type === 'teacher' ? item.employee_id : item.student_id) || '未填写学号或工号' }}</small></td>
           <td>{{ item.email || '未绑定邮箱' }}<small>{{ item.phone || '未绑定手机号' }}</small></td>
           <td><span class="tag" :class="{ active: item.role === 'admin' }">{{ item.is_root ? '根管理员' : item.role === 'admin' ? '管理员' : '普通用户' }}</span>
-            <small>{{ item.account_status === 'active' ? '注册已通过' : statusLabel(item.account_status) }}</small></td>
+            <small>{{ item.account_status === 'active' ? '已激活' : statusLabel(item.account_status) }}</small></td>
           <td><div class="admin-row-actions">
             <button v-if="item.account_status === 'active'" type="button" class="button small" :disabled="loadingProfile === item.id" @click="profile(item)">查看资料</button>
             <button v-if="item.role === 'user' && item.account_status === 'active'" type="button" class="button small" @click="setRole(item, 'admin')">设为管理员</button>

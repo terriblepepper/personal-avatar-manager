@@ -1395,6 +1395,10 @@ def install_schema(connection):
     connection.execute("""ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_stage
         TEXT NOT NULL DEFAULT 'done' CHECK (onboarding_stage IN ('welcome','tour','done'))""")
 
+    # 解除旧教师注册审核的账户限制，资料及历史审核记录留在原表。
+    connection.execute("""UPDATE users SET account_status='active', account_reason=''
+        WHERE person_type='teacher' AND account_status IN ('pending','rejected')""")
+
     connection.execute("""CREATE TABLE IF NOT EXISTS town_access_limits (
         owner_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
         visitor_daily_limit BIGINT CHECK(visitor_daily_limit BETWEEN 0 AND 9007199254740991),

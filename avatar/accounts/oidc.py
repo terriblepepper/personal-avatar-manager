@@ -193,10 +193,8 @@ class OidcService:
                     person_type = 'student'
                     username = 'kc_' + uuid.uuid4().hex
                     # 本地不可知随机密码仅兼容旧表 NOT NULL，不接受该账户本地密码登录。
-                    db.execute("INSERT INTO users(id,username,password,role,created_at,person_type,teacher_id,account_status,onboarding_stage) VALUES(?,?,?,?,?,?,?,?,'welcome')",
-                               (user_id, username, hash_password(secrets.token_urlsafe(48)), 'user', now(), person_type,
-                                None,
-                                'pending' if person_type == 'teacher' else 'active'))
+                    db.execute("INSERT INTO users(id,username,password,role,created_at,person_type,onboarding_stage) VALUES(?,?,?,?,?,?,'welcome')",
+                               (user_id, username, hash_password(secrets.token_urlsafe(48)), 'user', now(), person_type))
                     modified = now()
                     name = claims.get('name', '')
                     name = name[:80] if isinstance(name, str) else ''

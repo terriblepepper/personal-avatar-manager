@@ -10,10 +10,10 @@ from avatar.profiles.review_queue import ReviewQueue
 router=APIRouter(prefix='/api/admin/review-queue',tags=['统一审核'])
 
 
-# 客户端不能指定审核人或账户所有权；批量只允许教师待审与个人资料申请。
+# 客户端不能指定审核人或账户所有权；批量只允许资料和 Soul 申请。
 class ReviewItem(BaseModel):
     model_config=ConfigDict(extra='forbid')
-    kind:Literal['teacher','profile','soul']
+    kind:Literal['profile','soul']
     id:str=Field(min_length=1,max_length=80)
 
 
@@ -25,7 +25,7 @@ class ReviewBatch(BaseModel):
 
 
 class ReviewDeletionItem(ReviewItem):
-    kind:Literal['teacher','profile','teacher_history','soul']
+    kind:Literal['profile','teacher_history','soul']
 
 
 class ReviewDeletion(BaseModel):
@@ -56,7 +56,7 @@ def decide(body:ReviewBatch,request:Request,user=Depends(admin)):
 
 
 @router.get('/{kind}/{identifier}')
-def detail(kind:Literal['teacher','profile','teacher_history','soul'],identifier:str,request:Request,user=Depends(admin)):
+def detail(kind:Literal['profile','teacher_history','soul'],identifier:str,request:Request,user=Depends(admin)):
     return ReviewQueue(request.app.state.service).detail(user,kind,identifier)
 
 

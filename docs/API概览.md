@@ -57,7 +57,7 @@
 - `GET /api/auth/config`、`POST /api/auth/oidc/start`、`GET /api/auth/oidc/callback`（OIDC 三个端点在 `oidc_routes.py`）。登录配置中的 `version` 为当前服务启动版本，由 `AVATAR_VERSION` 或项目包版本确定。
 - `GET /api/profile-fields` — 资料字段定义
 - `GET /api/me`、`PUT /api/me/profile`
-- `POST /api/me/submit`、`POST /api/me/account-resubmit` — 提交审核 / 重新提交
+- `POST /api/me/submit` — 学生和教师均在此提交分身资料审核
 - `GET /api/me/acs`、`POST /api/me/acs/preview` — 分身 ACS 描述与预览
 - `GET /api/model-providers` — 可用模型平台预设
 - `GET /api/avatars/{aic}/public` — 按 AIC 取公开头像
@@ -106,10 +106,9 @@
 - `GET /api/admin/settings` 返回平台 URL、注册模式及环境信息。
 - `GET /api/admin/agents/operations?search=&offset=0` 每页返回最多 10 个分身及其最新适用身份任务，并附端口池状态。`GET /api/admin/agents/{user_id}/detail` 返回单个分身的完整管理视图。
 - `GET /api/admin/dashboard` 保留完整管理概览，供已有客户端使用。
-- `GET /api/admin/pending-count` 返回 `{"pending": 整数}`，合计教师、资料和 Soul 待审记录，完整管理员会话可用。
+- `GET /api/admin/pending-count` 返回 `{"pending": 整数}`，合计资料和 Soul 待审记录，完整管理员会话可用。
   - `environment` 为本次启动的环境快照：实际注册适配器与模式、配置的通信地址/端口、已安装框架版本和真实手册路径；缺失元数据或手册返回空值。仅管理员可读取，通信配置不表示实时监听状态。
 - `GET /api/admin/accounts`、`GET /api/admin/accounts/{user_id}/profile`、`PUT /api/admin/accounts/{user_id}/role`
-- `POST /api/admin/accounts/{user_id}/review`
 - `POST /api/admin/reviews/{submission_id}`
 - `POST /api/admin/jobs/{job_id}/retry`
 - `POST /api/admin/agents/{user_id}/health`、`POST /api/admin/agents/{user_id}/renew`
