@@ -91,6 +91,7 @@ class ModelExchange:
         purpose = config.get('_call_purpose', 'answer')
         self.kind = 'artifact' if purpose in ('segmented_writing','html_generation','animation') else 'text'
         self.name = PURPOSES.get(purpose, '模型调用')
+        self.purpose = purpose if purpose in PURPOSES else 'answer'
         self.event = None
         self.prefix = ''
         self.characters = 0
@@ -118,7 +119,7 @@ class ModelExchange:
             # Only text from the actual last user-role message. System, history, media and headers stay private.
             message = parts if isinstance(parts,str) else next((p['text'] for p in parts if isinstance(p.get('text'),str)), '')
             inputs.update(message=preview(message,self.secret),message_chars=len(message))
-        self.event = {'type':'tool','group':'model_io','id':uuid4().hex,'name':self.name,'input':inputs}
+        self.event = {'type':'tool','group':'model_io','id':uuid4().hex,'name':self.name,'purpose':self.purpose,'input':inputs}
         self.send('running', {'kind':self.kind})
 
     def send(self, status, output):
@@ -182,7 +183,7 @@ class ModelExchange:
         self.send('completed', output)
         self.event = None
 
-    def fail(self, exc):
+    def fail(self, exc, *, retry=None):
         if not self.event:
             return
         status = 'error' if isinstance(exc, Exception) else 'interrupted'
@@ -192,6 +193,10 @@ class ModelExchange:
                   '模型响应流中断' if getattr(exc,'stream_interrupted',False) else
                   model_failure(exc)['reason'])
         output = {**self.last_output, 'reason':preview(detail,self.secret), 'attempt':self.attempt}
+        if getattr(exc,'stream_interrupted',False):
+            output['stream_interrupted'] = True
+        if retry:
+            output['retry'], output['retry_limit'] = retry
         if isinstance(getattr(exc,'status_code',None),int):
             output['status_code'] = exc.status_code
         self.send(status, output)

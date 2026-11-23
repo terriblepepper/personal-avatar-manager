@@ -239,8 +239,9 @@ async def stream_response(model, config, api_key, system, history, message, *, c
             exchange.fail(error)
             raise
         except HTTPException as error:
-            exchange.fail(error)
-            if not getattr(error,'stream_interrupted',False):
+            interrupted = getattr(error,'stream_interrupted',False)
+            exchange.fail(error, retry=(attempt+1,attempts-1) if interrupted and attempt+1<attempts else None)
+            if not interrupted:
                 raise
             logging.getLogger(__name__).warning('Model stream interrupted purpose=%s attempt=%d/6',
                                                 config.get('_call_purpose','answer'),attempt+1)
