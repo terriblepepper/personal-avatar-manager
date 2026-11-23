@@ -12,6 +12,14 @@ HTML_SOURCE_LANGUAGES = HTML_LANGUAGES | PYTHON_LANGUAGES | {'css', 'javascript'
 RAW_PAGE = re.compile(r'(?ims)^ {0,3}(?=<!doctype\s+html\b|<html(?=[\s>])).*?(?:</html\s*>|\Z)')
 
 
+def without_source_footer(text):
+    """Remove the generated RAG citation block while retaining prose and delivery markers."""
+    footer = re.search(r'(?m)^> 引用来源[：:][ \t]*\r?\n(?:> [^\r\n]+ · (?:RAG|源文件)[ \t]*(?:\r?\n|\Z))+\s*\Z', text)
+    if footer and not any(block.start() <= footer.start() < block.end() for block in FENCE.finditer(text)):
+        return text[:footer.start()].rstrip()
+    return text
+
+
 def is_html_output(item):
     return not item.get('public_material_id') and item['filename'].lower().endswith(('.html', '.htm'))
 

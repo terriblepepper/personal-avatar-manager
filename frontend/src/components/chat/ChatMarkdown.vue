@@ -10,7 +10,7 @@ import MarkdownContent from '../MarkdownContent.vue'
 import MaterialFileDialog from '../MaterialFileDialog.vue'
 import type { ChatFile, FilePromotion, ToolEvent } from '../../types'
 
-const props = withDefaults(defineProps<{ source: string; events?: ToolEvent[]; attachments?: ChatFile[]; conversationId?: string; diagrams?: boolean; artifactReply?: boolean }>(), { diagrams:true, artifactReply:true })
+const props = withDefaults(defineProps<{ source: string; events?: ToolEvent[]; attachments?: ChatFile[]; conversationId?: string; diagrams?: boolean; artifactReply?: boolean; hideCitations?: boolean }>(), { diagrams:true, artifactReply:true })
 const emit = defineEmits<{ preview: [file: ChatFile] }>()
 const panel = ref<HTMLElement>(), trigger = ref<HTMLButtonElement>(), open = ref(false)
 const saved = ref(new Set<string>()), promoting = ref<ChatFile>()
@@ -59,7 +59,7 @@ const content = computed(() => {
     const [heading, ...lines] = last.raw.trimEnd().split(/\r?\n/).map(line => line.replace(/^>\s?/, '').trim())
     const sources = lines.map(line => /^(.+) · (RAG|源文件)$/.exec(line))
     if (/^引用来源[：:]$/.test(heading) && sources.length && sources.every(Boolean)) {
-      for (const source of sources) if (source) {
+      for (const source of sources) if (source && !props.hideCitations) {
         const types = citations.get(source[1]) || new Set<string>()
         types.add(source[2])
         citations.set(source[1],types)
@@ -114,10 +114,10 @@ function preview(file: ChatFile) {
         <span v-for="entry in content.entries.slice(0, 3)" :key="entry.key" class="source-avatar" :data-kind="entry.file ? 'original' : 'rag'">
           <AppIcon :name="entry.file ? 'import' : 'book'"/>
         </span>
-      </span>{{ content.entries.length }} 份资料
+      </span>{{ content.entries.length }} {{ hideCitations ? '份文件' : '份资料' }}
     </button>
-    <div ref="panel" class="source-popover" popover="auto" role="dialog" aria-label="引用来源" @toggle="sourceToggled">
-      <div class="source-popover-head"><strong>资料与来源 · {{ content.entries.length }}</strong></div>
+    <div ref="panel" class="source-popover" popover="auto" role="dialog" :aria-label="hideCitations ? '交付文件' : '引用来源'" @toggle="sourceToggled">
+      <div class="source-popover-head"><strong>{{ hideCitations ? '交付文件' : '资料与来源' }} · {{ content.entries.length }}</strong></div>
       <div class="source-chips">
         <template v-for="entry in content.entries" :key="entry.key">
           <span v-if="entry.file" class="source-file"><button type="button" class="source-chip" :disabled="!entry.url" :title="entry.name" aria-haspopup="menu"

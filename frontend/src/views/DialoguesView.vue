@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { SKILLS_PAUSED } from '../skillPolicy'
 import { defineAsyncComponent, computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElButton, ElMessage } from 'element-plus'
@@ -429,7 +430,9 @@ watch(()=>[route.query.session,route.query.task], ([session,task], previous)=>{
   else if (previous?.[0] && current.value) closeSession()
 }, {immediate:true})
 onMounted(async () => {
-  try { skills.value = await request<Skill[]>('/me/skills') } catch(e) { if (!disposed) notifyError(e) }
+  if (!SKILLS_PAUSED) {
+    try { skills.value = await request<Skill[]>('/me/skills') } catch(e) { if (!disposed) notifyError(e) }
+  }
   try { rounds.value = (await request<{max_rounds:number}>('/agent-dialogue-settings')).max_rounds } catch(e) { if (!disposed) notifyError(e) }
 })
 onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
@@ -511,13 +514,13 @@ onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
     <template v-for="{ item, task, starts, ends, files, feedback } in transcriptRows" v-memo="[item, task, starts, ends, files, resourceId, shownTask, item.turn === compactedAfter]" :key="shownTask+':'+item.turn">
       <div v-if="starts" class="peer-request-boundary" role="separator" :title="task?.objective">请求开始 · {{ task?.delivery_mode==='message'?'发送消息':'任务' }}<template v-if="task?.created_at"> · {{ date(task?.created_at) }}</template></div>
       <article v-if="item.speaker_role==='user'" class="peer-user-note" :data-history-message="item.turn" data-copy-message tabindex="0" aria-haspopup="menu" :class="item.is_own?'peer-own':'peer-other'">
-        <small>{{ item.is_own?'我':item.speaker_name }}补充要求</small><ChatMarkdown :artifact-reply="false" :source="item.content" :attachments="files" :conversation-id="resourceId" @preview="filePreview=$event"/>
+        <small>{{ item.is_own?'我':item.speaker_name }}补充要求</small><ChatMarkdown hide-citations :artifact-reply="false" :source="item.content" :attachments="files" :conversation-id="resourceId" @preview="filePreview=$event"/>
       </article>
       <article v-else class="peer-turn peer-message" :data-history-message="item.turn" data-copy-message tabindex="0" aria-haspopup="menu" :class="item.is_own?'peer-own':'peer-other'">
         <strong class="peer-speaker-name">{{ item.speaker_name }}</strong>
         <div class="bubble">
           <ToolActivity v-if="item.tool_activity?.length" :items="item.tool_activity"/>
-          <ChatMarkdown :source="feedback.body" :events="item.tool_activity" :attachments="files" :conversation-id="resourceId" @preview="filePreview=$event"/>
+          <ChatMarkdown hide-citations :source="feedback.body" :events="item.tool_activity" :attachments="files" :conversation-id="resourceId" @preview="filePreview=$event"/>
           <ChatNotices :items="item.tool_activity" :message="feedback.state ? feedback.detail || (feedback.state==='ended'?'任务已结束':'等待用户') : undefined"/>
         </div>
       </article>
@@ -532,10 +535,10 @@ onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
   </div><div class="peer-composer">
   <AgentQuestionPrompt v-if="!taskClosed" ref="questionPrompt" :key="current+'/'+shownTask" :scope="'peer:'+current+'/'+shownTask" :question="userQuestion"
     :disabled="commandsDisabled || toolsSaving" @answer="send"/>
-  <ComposerInput v-model="message" :catalog="detail?.embedding_status?.configured === false ? [] : skills" :session="taskId || current" :usage-url="current ? '/agent-sessions/'+encodeURIComponent(current)+'/compact'+(taskId?'?task_id='+encodeURIComponent(taskId):'') : ''" :usage-revision="(detail?.history_revision||'')+'/'+(detail?.summary_through||0)" :disabled="switching || taskClosed" label="分身会话消息" @submit="send()" :placeholder="taskClosed ? '任务已结束' : runningTask || pausedTask ? '补充任务所需信息…' : '输入消息或任务目标，$ 选择技能…'" @update:model-value="pending=''"/>
+  <ComposerInput v-model="message" :catalog="detail?.embedding_status?.configured === false ? [] : skills" :session="taskId || current" :usage-url="current ? '/agent-sessions/'+encodeURIComponent(current)+'/compact'+(taskId?'?task_id='+encodeURIComponent(taskId):'') : ''" :usage-revision="(detail?.history_revision||'')+'/'+(detail?.summary_through||0)" :disabled="switching || taskClosed" label="分身会话消息" @submit="send()" :placeholder="taskClosed ? '任务已结束' : runningTask || pausedTask ? '补充任务所需信息…' : SKILLS_PAUSED ? '输入消息或任务目标…' : '输入消息或任务目标，$ 选择技能…'" @update:model-value="pending=''"/>
   <div class="chat-compose-actions">
   <ComposerToolbar class="peer-composer-toolbar" label="分身会话工具栏">
-    <details v-if="detail?.embedding_status?.configured !== false" class="composer-menu composer-tool">
+    <details v-if="!SKILLS_PAUSED && detail?.embedding_status?.configured !== false" class="composer-menu composer-tool">
       <summary class="chat-command" title="管理当前任务技能"><span aria-hidden="true">✧</span><span>技能</span><small>{{ activeSkills.length }}</small></summary>
       <div class="composer-popover">
         <h3>当前任务技能</h3>

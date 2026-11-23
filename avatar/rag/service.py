@@ -47,6 +47,8 @@ class MaterialRag(MaterialReading,FileRag):
 
     @staticmethod
     def source_footer(context):
+        if context[0].get('_omit_source_citations'):
+            return ''
         sources=context[0].get('_material_sources',[])
         if not sources:return ''
         # 来源由本轮真正交给回答模型的证据生成；不把目录或未读取附件当作引用。

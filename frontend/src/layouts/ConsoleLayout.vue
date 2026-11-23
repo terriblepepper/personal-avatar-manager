@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { ElTooltip } from 'element-plus'
+import { SKILLS_PAUSED, SKILL_PAUSE_NOTICE } from '../skillPolicy'
 import { computed, defineAsyncComponent, nextTick, onMounted, onUnmounted, provide, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
@@ -70,7 +72,7 @@ const tabHelp: Record<string,string> = {
   knowledge: '用自己的写作样本和问答构建 Soul，让分身保留你的措辞与表达习惯。',
   chat: '直接向自己的分身提问。需要它参考指定文件时，从资料库引用到本次对话。',
   models: '配置对话模型生成回答，配置嵌入模型用于资料检索。调用费用归对应配置的所有者。',
-  skills: '管理分身可以使用的技能。在对话中引入所需技能后，可以用 $技能名称 调用。',
+  skills: SKILLS_PAUSED ? SKILL_PAUSE_NOTICE : '管理分身可以使用的技能。在对话中引入所需技能后，可以用 $技能名称 调用。',
   dialogues: '查看与其他分身的消息，跟进需要确认、补充或结束的独立任务。',
 }
 const guideSteps = computed(() => [
@@ -229,9 +231,16 @@ async function logout() { try { await session.logout() } catch (e) { notifyError
       </header>
       <main :data-guide-page="route.path" ref="mainContent" class="content" tabindex="-1">
         <div v-if="notice" class="notice" :class="{ error: notice.error }">{{ notice.text }}<button v-if="notice.error" type="button" class="button small" @click="resubmit">重新提交注册审核</button></div>
-        <div v-if="inHub" class="heading"><div><h1 data-guide-target="hub">我的分身</h1><p class="sub">集中管理分身、资料文件、知识库、模型、技能和任务；对话中可用 $技能名称 加可选参数调用技能。</p></div></div>
+        <div v-if="inHub" class="heading"><div><h1 data-guide-target="hub">我的分身</h1><p class="sub">集中管理分身、资料文件、知识库、模型、技能和任务。</p></div></div>
         <nav v-if="inHub" class="avatar-tabs" aria-label="我的分身功能">
-          <button v-for="[key, label] in hubTabs" :key="key" :data-hub="key" type="button" :class="{ active: route.path === '/' + key }" :aria-current="route.path === '/' + key ? 'page' : undefined" @click="go('/' + key)">{{ label }}</button>
+          <ElTooltip v-for="[key, label] in hubTabs" :key="key" :disabled="!SKILLS_PAUSED || key !== 'skills'"
+            :content="SKILL_PAUSE_NOTICE" :trigger="['hover', 'focus']" placement="bottom">
+            <button :data-hub="key" type="button"
+              :class="{ active: route.path === '/' + key, 'paused-skill-tab': SKILLS_PAUSED && key === 'skills' }"
+              :aria-current="route.path === '/' + key ? 'page' : undefined"
+              :aria-description="SKILLS_PAUSED && key === 'skills' ? SKILL_PAUSE_NOTICE : undefined"
+              @click="go('/' + key)">{{ label }}</button>
+          </ElTooltip>
         </nav>
         <div v-if="inHub" class="avatar-panel" :style="{ '--avatar-view-offset': 24 * direction + 'px' }"><Transition name="avatar-view" appear><div :key="viewKey"><slot/></div></Transition></div>
         <Transition v-else name="avatar-view" appear><div :key="viewKey" class="workspace-page"><slot/></div></Transition>
@@ -248,6 +257,7 @@ async function logout() { try { await session.logout() } catch (e) { notifyError
 </template>
 
 <style scoped>
+.avatar-tabs .paused-skill-tab { color: var(--muted); }
 .sidebar.guide-drawer { transition:none; }
 .touring :deep(.avatar-view-enter-active),.touring :deep(.sidebar-actions.avatar-pop-enter-active) { animation:none; }
 @media (prefers-reduced-motion: no-preference) {

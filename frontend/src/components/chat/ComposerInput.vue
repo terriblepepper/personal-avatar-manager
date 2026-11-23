@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { SKILLS_PAUSED } from '../../skillPolicy'
 import { computed, nextTick, ref, shallowRef, useId, watch } from 'vue'
 import { chatTextFits } from '../../chatTextBudget'
 import { ElMessage, ElTooltip } from 'element-plus'
@@ -58,6 +59,7 @@ function closePicker() { token.value=undefined; slashOpen.value=false }
 const popup = useId()
 const storageKey = computed(() => 'avatar.hidden-skill-shortcuts.' + props.session)
 watch(storageKey, key => {
+  if (SKILLS_PAUSED) return
   try {
     const value: unknown = JSON.parse(localStorage.getItem(key) || '[]')
     hidden.value = Array.isArray(value) ? value.filter((item): item is string => typeof item==='string') : []
@@ -72,7 +74,7 @@ function refresh() {
   const input = field.value
   if (!input || document.activeElement!==input) return
   slashOpen.value = !props.disabled && !compact.value && input.value.startsWith('/') && input.value !== '/compact' && '/compact'.startsWith(input.value)
-  if (compact.value || slashOpen.value) {token.value=undefined; return}
+  if (SKILLS_PAUSED || compact.value || slashOpen.value) {token.value=undefined; return}
   const prefix = input.value.slice(0,input.selectionStart ?? input.value.length)
   const match = /(^|\s)\$("(?:\\.|[^"\\])*|[^\s$()]*)$/u.exec(prefix)
   token.value = match ? {start:match.index+match[1].length,query:match[2].replace(/^"/,'').toLocaleLowerCase()} : undefined

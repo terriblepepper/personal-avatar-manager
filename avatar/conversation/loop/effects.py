@@ -8,6 +8,7 @@ from fastapi import HTTPException
 
 from avatar.core.execution import AgentNeedsInput, check_execution
 from avatar.skills.https_inputs import configured_resources
+from avatar.skills.policy import require_skills_enabled
 
 
 def _digest(data):
@@ -45,6 +46,9 @@ class SandboxEffects:
         self.state = store.load().get('sandbox')
         if self.state and self.state.get('scope') != scope:
             raise HTTPException(409, '沙箱任务的账户、会话或发言人已变化')
+        for effect in [*self.receipts, ((self.state or {}).get('in_flight') or {})]:
+            if effect.get('sources', {}).get('skill') or effect.get('record', {}).get('skill_id'):
+                require_skills_enabled()
         if self.state and self.state.get('in_flight'):
             raise AgentNeedsInput('上次沙箱操作结果未确认，已暂停等待核对', checkpoint=checkpoint)
         if self.state is None and checkpoint['sandbox_attempted']:

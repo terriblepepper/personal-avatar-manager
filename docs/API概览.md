@@ -134,6 +134,8 @@
 
 **用户技能**
 
+上传技能暂停期间，高权限登录也只能读取本人已安装记录。安装、启停、卸载和会话技能修改返回 403。
+
 - `GET|POST /me/skills`、`POST /me/skills/source`、`POST /me/skills/batch`
 - `GET|PATCH|DELETE /me/skills/{skill_id}`、`GET /me/skills/{skill_id}/files/{resource:path}`
 

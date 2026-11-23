@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { SKILLS_PAUSED } from '../../skillPolicy'
 import AppIcon from '../AppIcon.vue'
 import { computed, onUnmounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
@@ -21,8 +22,8 @@ async function load() {
   const signal=controller.signal, path=endpoint.value
   try {
     const [catalog,session,status]=await Promise.all([
-      request<Skill[]>('/me/skills','GET',undefined,signal),
-      request<Skill[]>(path+'/skills','GET',undefined,signal),
+      SKILLS_PAUSED ? [] : request<Skill[]>('/me/skills','GET',undefined,signal),
+      SKILLS_PAUSED ? [] : request<Skill[]>(path+'/skills','GET',undefined,signal),
       request<Learning>(path+'/style-learning','GET',undefined,signal),
     ])
     if(signal.aborted) return
@@ -66,7 +67,7 @@ onUnmounted(()=>controller.abort())
 </script>
 
 <template>
-  <details class="composer-menu composer-tool">
+  <details v-if="!SKILLS_PAUSED" class="composer-menu composer-tool">
     <summary title="管理本会话技能"><span aria-hidden="true">✧</span><span>技能</span><small>{{ enabledCount }}</small></summary>
     <div class="composer-popover">
       <h3>本会话技能</h3>
