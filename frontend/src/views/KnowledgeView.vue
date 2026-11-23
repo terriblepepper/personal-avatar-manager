@@ -34,6 +34,7 @@ const editable = computed(() => data.value?.builds.find(item => ['ready','pendin
 let knownAssets = new Set<string>(), conversationsLoaded = false, disposed = false
 const autoShown = new Set<string>()
 const isRunning = (status?: string) => status === 'queued' || status === 'running'
+const reindexing = computed(() => data.value?.builds.some(item => item.origin === 'model_refresh' && isRunning(item.status)))
 function pollDelay() {
   const value = data.value
   return value?.builds.some(build => isRunning(build.status)) || isRunning(value?.learning?.status) || value?.folders?.pending ? 3000 : 30000
@@ -107,7 +108,7 @@ onBeforeUnmount(() => { disposed = true })
 <section class="soul-persona"><h3 data-guide-target="knowledge">个人形象概览</h3><div v-if="active" class="soul-document"><section v-for="(label,key) in labels" :key="key" class="soul-section"><h3>{{ label }}</h3><MarkdownContent :source="active.document[key] || '尚未形成明确偏好。'" :diagrams="false"/></section></div><p v-else class="sub">完成构建后展示个人形象。</p>
 <MemoryEditor v-if="editable" :build="editable" @saved="reload" />
 <div v-if="!active || rebuilding"><label class="field">塑造提示词<ElInput placeholder=" " v-model="prompt" type="textarea" maxlength="20000" /></label><label class="field">了解程度<ElSelect v-model="rounds"><ElOption :value="3" label="基础了解 · 每类 3 道"/><ElOption :value="5" label="深入了解 · 每类 5 道"/></ElSelect></label><details><summary>选择本人聊天记录</summary><ElCheckbox v-for="chat in filteredChats.slice(chatOffset,chatOffset+10)" :key="chat.id" :model-value="chats.includes(chat.id)" @change="value => { chats=value ? [...chats,chat.id] : chats.filter(id=>id!==chat.id) }">{{ chat.title }} · {{ chat.message_count }} 条</ElCheckbox><RecordPagination v-model:offset="chatOffset" :total="filteredChats.length" :search="chatSearch" label="本人聊天分页" @update:search="chatSearch=$event;chatOffset=0"/></details><p class="sub">当前模型：{{ data?.model?.model || '未配置' }}</p></div>
-<div class="actions"><ElButton type="primary" :loading="busy" @click="build">{{ editable && !rebuilding ? '继续完善 Soul' : '开始构建 Soul' }}</ElButton><ElButton v-if="active" @click="rebuilding=!rebuilding">{{ rebuilding ? '取消重新创建' : '重新创建 Soul' }}</ElButton><ElButton v-if="active" @click="remove('/me/knowledge/active','停用当前 Soul？')">停用当前 Soul</ElButton></div></section>
+<div class="actions"><ElButton type="primary" :loading="busy" @click="build">{{ editable && !rebuilding ? '继续完善 Soul' : '开始构建 Soul' }}</ElButton><ElButton v-if="active" :disabled="busy || reindexing" title="沿用已获批的原输入，重构完成自动生效" @click="act('/me/knowledge/rebuild')">重构 Soul</ElButton><ElButton v-if="active" @click="rebuilding=!rebuilding">{{ rebuilding ? '取消重新创建' : '重新创建 Soul' }}</ElButton><ElButton v-if="active" @click="remove('/me/knowledge/active','停用当前 Soul？')">停用当前 Soul</ElButton></div></section>
 <AssetLibrary v-if="data" v-model:selected="selected" :assets="data.assets" :quota="data.quota" @refresh="reload"/>
 <section class="soul-build-history">
   <div class="cardhead"><h3>构建与修订记录</h3><button type="button" class="button small danger" @click="remove('/me/knowledge/builds/delete-all','删除所有可删除的构建记录？','POST')">删除全部记录</button></div>

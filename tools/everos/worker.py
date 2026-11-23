@@ -293,7 +293,8 @@ async def compile_memory(payload,root,files):
     await pg('ensure');index_scope=checked(root,root.root/'.avatar-worker')
     async with storage_lock(index_scope):
         root.ensure();await seed_tree(root,payload['owner'],payload.get('source_project'),payload['project']);await memory_tree(root,payload['owner'],payload['project'],payload.get('edits',[]))
-    if payload.get('source_project') and payload['source_project']!=payload['project']:await pg('copy_vectors',source=payload['source_project'])
+    if payload.get('source_project') and payload['source_project']!=payload['project'] and not payload.get('reindex_only'):
+        await pg('copy_vectors',source=payload['source_project'])
     directory=root.users_dir('avatar-soul',payload['project'])/payload['owner']/'episodes';directory.mkdir(parents=True,exist_ok=True)
     manifest=directory/'.avatar-sources.json';saved=manifest_data(json.loads(manifest.read_text()) if manifest.is_file() else [])
     processed=set(saved.get('processed',[]));profile_signature=saved.get('profile_signature','');items=evidence_items(payload['evidence']);delta={key:value for key,value in items.items() if key not in processed}

@@ -17,7 +17,7 @@ from avatar.files.uploads.buffer import upload_work
 from avatar.files.parsing import text_worker
 from avatar.core.config import ROOT
 from avatar.core.performance import measure
-from avatar.rag.invalidation import invalidate
+from avatar.rag.invalidation import invalidate, legacy_signature, signature
 from avatar.files.parsing.images import image_input
 from avatar.core.db import dump,now
 from avatar.models.embedding import EmbeddingSettings,embed,embedding_window,require_embedding
@@ -27,13 +27,6 @@ from avatar.models.artifact_cache import ArtifactCache,fingerprint
 
 def revision(row):
     return hashlib.sha256(dump([row['sha256'],row.get('caption',row.get('description',''))]).encode()).hexdigest()
-
-
-def signature(embedding,model):
-    fields=('provider','base_url','model','dimensions','context_tokens','context_enabled','multimodal_enabled')
-    # The historical parser signature keeps previously published embeddings valid.
-    return hashlib.sha256(dump(['unstructured-chroma-document-images-v2',{key:embedding.get(key) for key in fields},
-        {key:model.get(key) for key in ('provider','base_url','model','vision_enabled','audio_enabled')}]).encode()).hexdigest()
 
 
 @measure('rag_parse')
@@ -140,7 +133,8 @@ class FileRag:
             if force:
                 invalidate(db,user['id'],force=True)
             else:
-                token=signature(embedding,self.chat.service.models.current(db,user['id']))
+                model=self.chat.service.models.current(db,user['id'])
+                tokens={signature(embedding,model),legacy_signature(embedding,model)}
                 for document in db.execute('SELECT * FROM file_rag_documents WHERE user_id=?',(user['id'],)).fetchall():
                     if document['status'] in ('queued','running'):continue
                     try:row=self.file(db,document['source'],document['file_id'],user['id'])
@@ -149,7 +143,7 @@ class FileRag:
                         db.execute('DELETE FROM file_rag_documents WHERE source=? AND file_id=?',(document['source'],document['file_id']))
                         continue
                     if document['source']=='chat' and not row['referenced']:continue
-                    if document['status']=='ready' and not document['force_rebuild'] and document['revision']==revision(row) and document['signature']==token:
+                    if document['status']=='ready' and not document['force_rebuild'] and document['revision']==revision(row) and document['signature'] in tokens:
                         nodes=db.execute('SELECT ordinal,collection,record_id FROM file_rag_nodes WHERE source=? AND file_id=? AND user_id=? ORDER BY ordinal',(document['source'],document['file_id'],user['id'])).fetchall()
                         if nodes and all(node['ordinal']==index and node['collection']==document['collection'] for index,node in enumerate(nodes)) and self.store.contains(user['id'],document['collection'],[node['record_id'] for node in nodes],db):continue
                     db.execute("UPDATE file_rag_documents SET status='queued',error='',generation=generation+1 WHERE source=? AND file_id=?",(document['source'],document['file_id']))

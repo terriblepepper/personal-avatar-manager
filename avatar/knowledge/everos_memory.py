@@ -64,6 +64,11 @@ class EverOSMemory:
         tree=row.get('memory_tree') or {}
         if isinstance(tree,str):tree=json.loads(tree)
         if tree.get('edits') and tree.get('base_build','')!=(base['id'] if base else ''):raise HTTPException(409,'生效记忆已更新，请重新打开记忆树后修订')
+        refresh=tree.get('refresh')
+        if refresh:
+            from avatar.knowledge.model_refresh import target
+            if target(embedding)!=refresh['target']:
+                raise HTTPException(409,'模型索引配置已变化，已保留当前 Soul')
         new_evidence=dict(evidence)
         if base and row['origin']=='refine':
             previous=k.decode(base)
@@ -77,13 +82,21 @@ class EverOSMemory:
         if embedding.get('multimodal_enabled'):
             from avatar.files.parsing.images import image_input
             with k.database.connect() as db:
-                assets=[dict(asset) for asset in db.execute("SELECT * FROM knowledge_assets WHERE user_id=? AND mime LIKE 'image/%' AND (id IN (SELECT value FROM json_each(?)) OR id IN (SELECT a.value FROM soul_builds b,json_each(b.asset_ids) a WHERE b.user_id=? AND b.status='approved'))",(row['user_id'],dump(row.get('asset_ids',[])),row['user_id']))]
+                sources="id IN (SELECT value FROM json_each(?))"
+                params=[row['user_id'],dump(row.get('asset_ids',[]))]
+                if not refresh:
+                    sources+=" OR id IN (SELECT a.value FROM soul_builds b,json_each(b.asset_ids) a WHERE b.user_id=? AND b.status='approved')"
+                    params.append(row['user_id'])
+                assets=[dict(asset) for asset in db.execute(
+                    "SELECT * FROM knowledge_assets WHERE user_id=? AND mime LIKE 'image/%' AND ("+sources+")",params)]
             for asset in assets:
                 marker='AVATAR_MEDIA_'+asset['id'].replace('-','')
                 path=k.directory/(asset['id']+'.blob')
                 if path.is_file():
                     media_inputs[marker]=await asyncio.to_thread(image_input,path)
-                    if asset['id'] in row.get('asset_ids',[]):media.append({'marker':marker,'filename':asset['filename'],'caption':asset['caption']})
+                    if asset['id'] in row.get('asset_ids',[]) and (not refresh or refresh['embedding']):
+                        caption=row.get('asset_captions',{}).get(asset['id'],asset['caption']) if refresh else asset['caption']
+                        media.append({'marker':marker,'filename':asset['filename'],'caption':caption})
         # 自动学习只存通过封闭词表校验的风格，避免混入其他素材或历史自由文本。
         source=''
         if not row.get('rebuild'):
@@ -103,12 +116,19 @@ class EverOSMemory:
                 if not matches or any(item['memory_fingerprint'] for item in matches):
                     raise HTTPException(409,'记忆源目录缺失，请恢复已确认的源项目')
                 source=''
+                if refresh:
+                    new_evidence={'prompt':row['prompt'],'observations':row['observations'],
+                                  'answers':row['interview'],'source_assets':row['asset_ids'],
+                                  'draft_style':row['document']}
         tree={**tree,'project':project,'source_project':source}
         inputs={'owner':owner,'project':project,'engine':'everos-native-v2','approved_style_signature':cache_signature(approved),
             'source_project':source,'edits':tree.get('edits',[]),
             'model_signature':cache_signature({name:config.get(name) for name in ('provider','api_format','base_url','model')}),
             'media':media,'evidence':new_evidence,'embedding_enabled':bool(embedding),'embedding_model':embedding.get('model','keyword-only'),
             'dimensions':embedding.get('dimensions',1024),'index_signature':hashlib.sha256(dump(identity).encode()).hexdigest()[:24]}
+        if refresh:
+            inputs['reindex_only']=True
+            embedding={**embedding,'_cache_epoch':row['id']}
         fingerprint=hashlib.sha256(json.dumps(inputs,sort_keys=True).encode()).hexdigest()
         if row.get('memory_fingerprint')==fingerprint:
             return json.loads(row['memory_context']) if isinstance(row['memory_context'],str) else row['memory_context']

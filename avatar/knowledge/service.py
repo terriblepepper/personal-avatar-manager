@@ -16,6 +16,7 @@ from avatar.models.model_config import require_complete
 from avatar.models.embedding import EmbeddingSettings,require_embedding
 from avatar.knowledge.question_bank import QuestionBank
 from avatar.knowledge.learning import StyleLearning
+from avatar.knowledge import model_refresh
 from avatar.knowledge.everos_memory import EverOSMemory
 from avatar.knowledge.style_traits import extract_style,style_evidence
 
@@ -81,7 +82,7 @@ class KnowledgeService:
             learned=db.execute('SELECT updated_at FROM style_learning_memory WHERE user_id=?',(user_id,)).fetchone()
             learning=db.execute("SELECT id,status,stage,error,updated_at FROM soul_builds WHERE user_id=? AND origin='learning' ORDER BY created_at DESC LIMIT 1",(user_id,)).fetchone()
             categories=[{'id':r['id'],'name':r['name'],'count':r['available']} for r in self.bank.categories(db) if r['active']]
-            previous=db.execute("SELECT prompt FROM soul_builds WHERE user_id=? AND origin!='learning' ORDER BY created_at DESC LIMIT 1",(user_id,)).fetchone()
+            previous=db.execute("SELECT prompt FROM soul_builds WHERE user_id=? AND origin NOT IN ('learning','model_refresh') ORDER BY created_at DESC LIMIT 1",(user_id,)).fetchone()
         for item in builds:
             if item['question_plan'] and not item['bank_answers']:
                 item['bank_answers']={turn['id']:{'choice':turn.get('choice','E'),'other':turn.get('other',turn['answer']) if turn.get('choice','E')=='E' else ''}
@@ -217,7 +218,7 @@ class KnowledgeService:
             if not account or account[0]!='active' or not profile:raise HTTPException(409,'请先完成个人资料审核并创建分身')
             if db.execute("SELECT 1 FROM soul_builds WHERE user_id=? AND status IN ('queued','running','waiting_user','ready','pending')",(user['id'],)).fetchone():
                 raise HTTPException(409,'已有进行中的构建，请继续问答、提交审核或先取消')
-            if db.execute("SELECT COUNT(*) FROM soul_builds WHERE user_id=? AND origin!='learning'",(user['id'],)).fetchone()[0]>=100:
+            if db.execute("SELECT COUNT(*) FROM soul_builds WHERE user_id=? AND origin NOT IN ('learning','model_refresh')",(user['id'],)).fetchone()[0]>=100:
                 raise HTTPException(409,'构建记录已达 100 项，请先删除不需要的历史记录')
             from avatar.files.library.folders import with_folder_caption
             captions = {}
@@ -244,12 +245,24 @@ class KnowledgeService:
             if rebuild:db.execute("UPDATE soul_builds SET document='{}' WHERE id=?",(identifier,))
         return {'id':identifier,'status':'queued'}
 
+    def rebuild_index(self,user):
+        with self.database.connect(write=True) as db:
+            identifier=model_refresh.schedule(db,user['id'],manual=True)
+            event(db,user['id'],user['username'],'重构已获批的 Soul 索引',identifier,actor_id=user['id'])
+            status=db.execute('SELECT status FROM soul_builds WHERE id=?',(identifier,)).fetchone()[0]
+        return {'id':identifier,'status':status}
+
     def retry(self,user,identifier):
         """Resume the failed snapshot without redrawing questions or discarding answers."""
         with self.database.connect(write=True) as db:
             row=db.execute('SELECT * FROM soul_builds WHERE id=? AND user_id=?',(identifier,user['id'])).fetchone()
             if not row:raise HTTPException(404,'构建记录不存在')
             if row['status']!='failed' or row['origin']=='learning':raise HTTPException(409,'只能重试失败的 soul 构建')
+            if row['origin']==model_refresh.ORIGIN:
+                flags=json.loads(row['memory_tree'])['refresh']
+                queued=model_refresh.schedule(db,user['id'],embedding=flags['embedding'],visual=flags['visual'],manual=flags['manual'])
+                if not queued:raise HTTPException(409,'当前 Soul 没有符合条件的素材或嵌入模型')
+                return {'id':queued,'status':'queued'}
             if db.execute("SELECT 1 FROM soul_builds WHERE user_id=? AND status IN ('queued','running','waiting_user','ready','pending')",(user['id'],)).fetchone():
                 raise HTTPException(409,'已有进行中的构建，请先处理该构建')
             profile=db.execute('SELECT a.profile,u.account_status FROM avatar_records a JOIN users u ON u.id=a.user_id WHERE a.user_id=?',(user['id'],)).fetchone()
@@ -369,7 +382,7 @@ class KnowledgeService:
                 updates.update(notes='[]',observations='[]')
             if record['status'] in ('approved','rejected'):
                 if db.execute("SELECT 1 FROM soul_builds WHERE user_id=? AND status IN ('queued','running','waiting_user','ready','pending')",(user['id'],)).fetchone():raise HTTPException(409,'已有进行中的修订，请先处理该修订')
-                if db.execute("SELECT COUNT(*) FROM soul_builds WHERE user_id=? AND origin!='learning'",(user['id'],)).fetchone()[0]>=100:raise HTTPException(409,'修订记录已达上限，请先清理历史记录')
+                if db.execute("SELECT COUNT(*) FROM soul_builds WHERE user_id=? AND origin NOT IN ('learning','model_refresh')",(user['id'],)).fetchone()[0]>=100:raise HTTPException(409,'修订记录已达上限，请先清理历史记录')
                 profile=db.execute('SELECT profile,last_modified_at FROM avatar_records WHERE user_id=?',(user['id'],)).fetchone()
                 if not profile:raise HTTPException(409,'请先完成个人资料审核')
                 original=identifier;identifier=str(uuid.uuid4())
@@ -466,7 +479,7 @@ class KnowledgeService:
             path,asset=self.file(row['user_id'],identifier)
             caption=row['asset_captions'].get(identifier,asset['caption'])
             if asset['mime'].startswith('image/') and embedding.get('multimodal_enabled'):
-                return ({'id':identifier,'filename':asset['filename'],'caption':caption,'coverage':'原图直接由多模态嵌入模型处理，无预先文字转写','parts':1},
+                return ({'id':identifier,'filename':asset['filename'],'caption':caption,'coverage':'原图直接由多模态嵌入模型处理，无预先文字转写','parts':1,'visual':True},
                         ['原图已交由 EverOS 多模态索引；素材说明仅是用户描述：'+caption])
             parts,coverage=await self.chat.rag.work.execute(row['user_id'],'parse',extract,path,asset['filename'],asset['kind'],config)
             observations=[]
@@ -484,7 +497,7 @@ class KnowledgeService:
                     if not text.strip():raise HTTPException(502,'素材分析未返回内容')
                     self.chat.rag.cache.put(row['user_id'],'soul_asset_analysis',target,cache_key,text[:3000])
                 observations.append(text[:3000])
-            return {'id':identifier,'filename':asset['filename'],'caption':caption,'coverage':coverage,'parts':len(parts)},observations
+            return {'id':identifier,'filename':asset['filename'],'caption':caption,'coverage':coverage,'parts':len(parts),'visual':any(part.get('images') for part in parts)},observations
 
     async def analyse_assets(self,row,config,key,embedding,notes,summaries):
         original_notes=list(notes);original_summaries=list(summaries);results={}
@@ -522,6 +535,16 @@ class KnowledgeService:
             embedding=EmbeddingSettings.current(db,row['user_id'])
         self._build_progress.set((0,'准备构建'))
         try:
+            if row['origin']==model_refresh.ORIGIN:
+                with self.database.connect(write=True) as db:
+                    raw=db.execute("SELECT * FROM soul_builds WHERE id=? AND status='running'",(row['id'],)).fetchone()
+                    if not raw:return True
+                    row=self.decode(model_refresh.rebase(db,raw))
+                    config=self.chat.service.models.current(db,row['user_id'])
+                    embedding=EmbeddingSettings.current(db,row['user_id'])
+                require_embedding(embedding)
+                await model_refresh.rebuild(self,row,config,self.chat.service.vault.decrypt(config['encrypted_key']),embedding)
+                return True
             require_complete(config);require_embedding(embedding);key=self.chat.service.vault.decrypt(config['encrypted_key'])
             if row['origin']=='learning':
                 async with self.chat.rag.work.slot(row['user_id']):
