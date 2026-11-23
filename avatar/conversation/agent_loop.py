@@ -320,6 +320,8 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
     defaults = {tool['name']:tool for tool in (REQUEST_TOOLS, allowed['ask_user'])}
     if 'search_materials' in allowed:
         defaults['search_materials'] = allowed['search_materials']
+    if required and 'end_task' in domain:
+        defaults['end_task'] = domain['end_task']
 
     def selected_definitions(*, final=False):
         definitions = dict(defaults)
@@ -750,7 +752,12 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         finishing=not calls or (len(calls)==1 and calls[0].get('name') in ('continue_answer','end_task','send_message'))
         action = calls[0].get('name') if len(calls) == 1 else None
         public_handoff = action == 'send_public_material' and all(step['tool'] == action for step in pending)
-        terminal_match = action in ARGUMENTS and all(s['tool']==action for s in pending)
+        stop_requested = action=='end_task' and isinstance(calls[0].get('arguments'),dict) and calls[0]['arguments'].get('stop_requested') is True
+        if stop_requested and not config.get('_peer_can_stop'):
+            repair_call('只有本人最新补充明确要求结束时可设置 stop_requested',tool=action)
+            continue
+        terminal_match = stop_requested or action in ARGUMENTS and all(
+            step['tool']==action or (action=='end_task' and step['tool'] in ARGUMENTS) for step in pending)
         if pending and not terminal_match and (finishing or (action in domain and action not in ('find_public_material', 'wait_for_user') and not public_handoff)):
             premature+=1
             if premature>=3:
@@ -882,6 +889,8 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             if name in {t['name'] for t in config.get('_entry_tools',())}:
                 argument_id = sha256(json.dumps(args,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest()
                 identity = ('entry',name,revision,argument_id)
+                if name=='read_session_file':
+                    identity += (current.get('goal_no'),)
                 if identity in seen:
                     repair_call('该参数已执行。请使用现有回执，或更换查询、目录、文件 ID 或游标',tool=name)
                     continue

@@ -33,7 +33,7 @@ const IntentDialog = defineAsyncComponent(() => import('../components/collaborat
 interface Session { session_id:string; peer_name:string; messages?: Pick<Message, 'speaker_role' | 'content'>[] }
 interface Message { dialogue_id:string; turn:number; speaker_name:string; speaker_role:string; speaker_user_id?:string; content:string; state?:string; state_detail?:string; task_action?:string; tool_activity?:ToolEvent[]; is_own:boolean }
 interface TaskFile extends ChatFile {message_id:number|null;sender_user_id:string}
-interface Task { rejected?:boolean; sending_prepared?:boolean; expires_at?:string | null; workspace_expired?:boolean; user_question?:AgentQuestion; can_supplement?:boolean; revision?:number; files?:TaskFile[];id:string; objective:string; status:string; can_accept?:boolean; needs_confirmation?:boolean; delivery_mode:string; can_retry?:boolean; auto_retrying?:boolean; error?:string; rounds_done?:number; round_limit?:number;tool_activity?:ToolEvent[];skill_commands?:string;created_at?:string;ended_at?:string;returned_summary?:string;waiting_reason?:string;waiting_for_other?:boolean; end_reason?:string; reason?:string; message_delivered?:boolean; active_speaker?:string; active_speaker_is_own?:boolean }
+interface Task { rejected?:boolean; sending_prepared?:boolean; expires_at?:string | null; workspace_expired?:boolean; user_question?:AgentQuestion; can_supplement?:boolean; revision?:number; files?:TaskFile[];id:string; objective:string; status:string; can_accept?:boolean; needs_confirmation?:boolean; delivery_mode:string; can_retry?:boolean; auto_retrying?:boolean; error?:string; rounds_done?:number; round_limit?:number;tool_activity?:ToolEvent[];skill_commands?:string;created_at?:string;ended_at?:string;returned_summary?:string;waiting_reason?:string;waiting_label?:string;waiting_for_other?:boolean; end_reason?:string; reason?:string; message_delivered?:boolean; active_speaker?:string; active_speaker_is_own?:boolean }
 interface Intent {id:string;conversation_id:string;target_query:string;target_aic:string;objective:string;shared_content:string}
 interface Detail { auto_accept?:boolean; auto_accept_available?:boolean; settings_conversation_id?:string|null; legacy_file_conversation_id?:string|null; summary_through?:number; history_revision?:string; task_page?:Page<Task>; embedding_status?:{configured?:boolean;peerConfigured?:boolean}; resource_conversation_id:string | null; current_transport_mode?:string; chat?:Task; peer_name:string; messages:Message[]; message_tasks?:Task[]; tasks:Task[]; task?:Task; has_more:boolean }
 interface Skill {id:string;name:string;enabled:boolean}
@@ -70,6 +70,7 @@ const progress=computed(()=>{
   if (task.rejected) return {label:'任务已拒绝',tone:'error',note:''}
   if (task.auto_retrying || task.status==='awaiting_identity') return {label:'正在自动重试',tone:'waiting',note:task.error || task.waiting_reason || ''}
   if (task.can_retry) return {label:'重试已超时',tone:'error',note:task.error || ''}
+  if (task.status==='awaiting_input' && task.waiting_label) return {label:task.waiting_label,tone:'waiting',note:task.waiting_reason || ''}
   if (task.status==='awaiting_input' && typeof task.can_supplement === 'boolean') return {label:task.can_supplement?'等待本人补充信息':'等待对方补充信息',tone:'waiting',note:task.waiting_reason || ''}
   if (task.status==='awaiting_input') return {label:task.needs_confirmation?'等待本人确认':task.waiting_for_other?'等待对方确认':'等待用户',tone:'waiting',note:task.waiting_reason || ''}
   if (task.status==='ended') return {label:task.message_delivered?'已回复':'任务已结束',tone:'success',note:task.end_reason || task.reason || ''}
@@ -106,6 +107,11 @@ const activeSkills = computed(() => {
   return skills.value.filter(skill => names.some(name=>name.toLocaleLowerCase()===skill.name.toLocaleLowerCase()))
 })
 const resourceId = computed(() => detail.value?.resource_conversation_id || '')
+const sharedFilesRevision = computed(() => {
+  const view=detail.value
+  const tasks=view?.task ? [view.task] : [view?.chat,...(view?.message_tasks || [])]
+  return [...new Set(tasks.flatMap(task => task?.files?.map(file => file.id) || []))].sort().join(':')
+})
 const settingsId = computed(() => detail.value?.settings_conversation_id ?? resourceId.value)
 const intent=ref<Intent|null>(null), drafting=ref(false), fileIds=ref<string[]>([]), draftRequest=ref(''), older=ref<Message[]>([])
 let disposed = false, scope = 0, pending = '', olderRequest:AbortController|undefined
@@ -292,14 +298,17 @@ function send(answer?: QuestionReply) {
       else if (transcript.value) transcript.value.scrollTop = transcript.value.scrollHeight
     })
   }
+  const steering = !answer && !!runningTask.value
   const token = answer?.request_id || (pending ||= id())
-  const target = pausedTask.value?.id || taskId.value
+  const target = pausedTask.value?.id || runningTask.value?.id || taskId.value
   const path = target ? '/agent-dialogues/'+encodeURIComponent(target)+'/resume'
     : '/agent-sessions/'+encodeURIComponent(current.value)+'/messages'
-  return action(path,'POST',{message:answer?.message ?? message.value,file_ids:answer ? [] : fileIds.value,request_id:token,
+  return action(path,'POST',{message:answer?.message ?? message.value,file_ids:answer || steering ? [] : fileIds.value,request_id:token,
+    ...(steering ? {steer:true} : {}),
     ...(question ? {question_id:question.id} : {}),
     ...(pausedTask.value ? {expected_revision:pausedTask.value.revision} : target ? {} : {new_task:true,delivery_mode:'message'})}, () => {
     if (!answer) finishMessage(token)
+    if (steering) ElMessage.success('补充已提交，将在当前分身发言后处理。')
     if (question && activeTask.value?.user_question?.id === question.id) delete activeTask.value.user_question
   }, 'sending')
 }
@@ -312,6 +321,7 @@ function removeSkill(skill:Skill) {
 function taskAction(name:string) {
   const target = name === 'cancel' ? runningTask.value?.id || taskId.value : taskId.value
   if (!target || busy.value || switching.value || resourceBusy.value) return
+  if (name==='end' && !confirm('结束当前任务？聊天记录将保留。')) return
   const confirms = name==='accept' || name==='confirm'
   if (confirms && !chatTextFits(message.value)) {
     ElMessage.warning('消息超过 64 KiB（UTF-8），请缩短后发送。')
@@ -476,10 +486,11 @@ onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
         <button type="button" class="button primary" :disabled="commandsDisabled" @click="taskAction('accept')">同意任务</button>
       </div>
     </div>
-    <div v-else-if="progress.note || detail.task.rejected" class="peer-feedback" :data-tone="progress.tone" role="status">
+    <div v-else-if="progress.note || detail.task.rejected || detail.task.status==='awaiting_input'" class="peer-feedback" :data-tone="progress.tone" role="status">
       <strong>{{ progress.label }}</strong>
       <span v-if="progress.note">{{ progress.note }}</span>
     </div>
+    <button v-if="!taskClosed && !detail.task.can_accept" type="button" class="button danger small" :disabled="commandsDisabled" @click="taskAction('end')">结束任务</button>
     <p v-if="detail.task.workspace_expired" class="sub" role="status">任务文件已过期。聊天记录可继续查看。</p>
     <p v-else-if="detail.task.expires_at" class="sub" role="status">
       任务文件将于 {{ date(detail.task.expires_at) }} 自动删除。需要保留请转存到资料库。
@@ -489,7 +500,7 @@ onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
       <MarkdownContent :source="detail.task.returned_summary" :diagrams="false"/>
     </details>
   </section>
-  <p v-else-if="detail?.chat?.status==='awaiting_input' && detail.chat.waiting_reason" class="notice" role="status">{{ detail.chat.waiting_reason }}</p>
+  <p v-else-if="detail?.chat?.status==='awaiting_input'" class="notice" role="status">{{ progress.label }}<template v-if="progress.note"> · {{ progress.note }}</template></p>
   <p v-else-if="detail?.chat?.error" class="notice error">{{ detail.chat.error }}</p>
   <ElButton v-if="activeTask?.can_retry" size="small" :disabled="switching" @click="retry(activeTask)">重新编辑并发送</ElButton>
   <EmbeddingNotice v-bind="detail?.embedding_status" :peer-name="detail?.peer_name"/>
@@ -521,7 +532,7 @@ onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
   </div><div class="peer-composer">
   <AgentQuestionPrompt v-if="!taskClosed" ref="questionPrompt" :key="current+'/'+shownTask" :scope="'peer:'+current+'/'+shownTask" :question="userQuestion"
     :disabled="commandsDisabled || toolsSaving" @answer="send"/>
-  <ComposerInput v-if="!taskClosed" v-model="message" :catalog="skills" :session="taskId || current" :usage-url="current ? '/agent-sessions/'+encodeURIComponent(current)+'/compact'+(taskId?'?task_id='+encodeURIComponent(taskId):'') : ''" :usage-revision="(detail?.history_revision||'')+'/'+(detail?.summary_through||0)" :disabled="switching" label="分身会话消息" @submit="send()" :placeholder="pausedTask ? '补充任务所需信息…' : '输入消息或任务目标，$ 选择技能…'" @update:model-value="pending=''"/>
+  <ComposerInput v-if="!taskClosed" v-model="message" :catalog="skills" :session="taskId || current" :usage-url="current ? '/agent-sessions/'+encodeURIComponent(current)+'/compact'+(taskId?'?task_id='+encodeURIComponent(taskId):'') : ''" :usage-revision="(detail?.history_revision||'')+'/'+(detail?.summary_through||0)" :disabled="switching" label="分身会话消息" @submit="send()" :placeholder="runningTask || pausedTask ? '补充任务所需信息…' : '输入消息或任务目标，$ 选择技能…'" @update:model-value="pending=''"/>
   <div class="chat-compose-actions">
   <ComposerToolbar class="peer-composer-toolbar" label="分身会话工具栏">
     <details v-if="!taskClosed" class="composer-menu composer-tool">
@@ -535,7 +546,7 @@ onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
         </div>
       </div>
     </details>
-    <ChatFilesManager v-if="resourceId" :conversation-id="resourceId" label="共享文件" :read-only="taskClosed" :busy="busy || switching || detail?.task?.status==='running'" @selected="fileIds=$event" @uploading="resourceBusy=$event"/>
+    <ChatFilesManager v-if="resourceId" :conversation-id="resourceId" label="共享文件" :shared-revision="sharedFilesRevision" :read-only="taskClosed" :busy="busy || switching || detail?.task?.status==='running'" @selected="fileIds=$event" @uploading="resourceBusy=$event"/>
     <ChatFilesManager v-if="detail?.legacy_file_conversation_id" :conversation-id="detail.legacy_file_conversation_id" label="旧私有文件" read-only/>
     <ConversationTools v-if="!taskClosed" :conversation-id="settingsId" @saving="toolPending=$event" :busy="busy || switching || resourceBusy || detail?.task?.status==='running'"/>
     <details class="composer-tool chat-command-menu">
@@ -553,8 +564,8 @@ onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
     <button v-if="detail?.task?.needs_confirmation" type="button" class="button chat-command" :disabled="commandsDisabled" @click="taskAction('confirm')">确认并补充意图</button>
     <div v-if="!taskClosed" class="composer-primary-actions">
       <EffortPicker :conversation-id="settingsId" :busy="!!runningTask" @saving="effortPending=$event"/>
-      <ComposerAction v-if="runningTask" label="暂停任务" stop :disabled="commandsDisabled" @click="taskAction('cancel')"/>
-      <ComposerAction v-else :resume="!!pausedTask" :label="pausedTask ? (message.trim() ? '补充并继续' : '继续任务') : '发送'" :aria-busy="writeState==='sending'" :disabled="sendDisabled" @click="send()"/>
+      <ComposerAction v-if="runningTask && !message.trim()" label="暂停任务" stop :disabled="commandsDisabled" @click="taskAction('cancel')"/>
+      <ComposerAction v-else :resume="!!pausedTask && !message.trim()" :label="runningTask ? '发送补充' : pausedTask ? (message.trim() ? '补充并继续' : '继续任务') : '发送'" :aria-busy="writeState==='sending'" :disabled="sendDisabled" @click="send()"/>
     </div>
   </ComposerToolbar>
   </div>

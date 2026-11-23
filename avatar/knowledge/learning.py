@@ -28,6 +28,9 @@ def auto_style_advance(db, owner, previous, checksum, current):
     LIMIT 1""",(current,owner,owner,previous,previous,checksum,previous,owner)).fetchone())
 
 
+NEEDS_ACTIVE_SOUL = '请先创建 Soul 并通过审核，待生效后再使用表达风格学习。'
+
+
 class StyleLearning:
     def __init__(self,knowledge):self.knowledge=knowledge;self.database=knowledge.database;self.checked=0
 
@@ -37,17 +40,30 @@ class StyleLearning:
         if not row:raise HTTPException(404,'本人对话不存在')
         return row
 
+    @staticmethod
+    def active_build(db, owner):
+        row=db.execute("SELECT b.id FROM active_souls a JOIN soul_builds b ON b.id=a.build_id AND b.user_id=a.user_id "
+                       "WHERE a.user_id=? AND b.status='approved'",(owner,)).fetchone()
+        return row[0] if row else None
+
+    @staticmethod
+    def reset_settings(db, owner):
+        db.execute('UPDATE style_learning_settings SET enabled=0,updated_at=? WHERE user_id=? AND enabled=1',(now(),owner))
+
     def status(self,user,identifier):
         with self.database.connect() as db:
             self.conversation(db,user['id'],identifier)
+            can_enable=self.active_build(db,user['id']) is not None
             setting=db.execute('SELECT * FROM style_learning_settings WHERE conversation_id=? AND user_id=?',(identifier,user['id'])).fetchone()
             last=db.execute("SELECT b.id,b.status,b.stage,b.error,b.updated_at FROM style_learning_runs r JOIN soul_builds b ON b.id=r.build_id,json_each(r.sources) s WHERE r.user_id=? AND json_extract(s.value,'$.conversation_id')=? ORDER BY r.created_at DESC LIMIT 1",(user['id'],identifier)).fetchone()
             memory=db.execute('SELECT updated_at FROM style_learning_memory WHERE user_id=?',(user['id'],)).fetchone()
-        return {'enabled':bool(setting and setting['enabled']),'last':dict(last) if last else None,'learned_at':memory[0] if memory else None}
+        return {'enabled':can_enable and bool(setting and setting['enabled']),'can_enable':can_enable,'last':dict(last) if last else None,'learned_at':memory[0] if memory else None}
 
     def configure(self,user,identifier,enabled):
         with self.database.connect(write=True) as db:
             self.conversation(db,user['id'],identifier)
+            if enabled and not self.active_build(db,user['id']):
+                raise HTTPException(409,NEEDS_ACTIVE_SOUL)
             db.execute('INSERT INTO style_learning_settings VALUES(?,?,?,0,?) ON CONFLICT(conversation_id) DO UPDATE SET enabled=excluded.enabled,updated_at=excluded.updated_at',
                 (identifier,user['id'],int(enabled),now()))
             if not enabled:
@@ -63,6 +79,10 @@ class StyleLearning:
         with self.database.connect(write=True) as db:
             if identifier:self.conversation(db,user['id'],identifier)
             for cid in conversation_ids or ():self.conversation(db,user['id'],cid)
+            parent=self.active_build(db,user['id'])
+            if not parent:
+                if automatic:return {'queued':False,'reason':'no_active_soul'}
+                raise HTTPException(409,NEEDS_ACTIVE_SOUL)
             if automatic and db.execute("SELECT 1 FROM style_learning_runs WHERE user_id=? AND day=? AND mode='auto'",(user['id'],day)).fetchone():return {'queued':False,'reason':'today'}
             if db.execute("SELECT 1 FROM soul_builds WHERE user_id=? AND origin='learning' AND status IN ('queued','running')",(user['id'],)).fetchone():
                 if automatic:return {'queued':False,'reason':'running'}
@@ -89,10 +109,9 @@ class StyleLearning:
             require_complete(self.knowledge.chat.service.models.current(db,user['id']))
             require_embedding(EmbeddingSettings.current(db,user['id']))
             build_id=str(uuid.uuid4());stamp=now()
-            parent=db.execute('SELECT build_id FROM active_souls WHERE user_id=?',(user['id'],)).fetchone()
             db.execute("""INSERT INTO soul_builds(id,user_id,prompt,asset_ids,profile_snapshot,profile_revision,status,stage,phase,origin,parent_build,created_at,updated_at)
               VALUES(?,?,?,'[]',?,?,'queued','等待学习新的本人气泡','learning','learning',?,?,?)""",
-              (build_id,user['id'],'从新的本人气泡持续学习表达风格',profile['profile'],profile['last_modified_at'],parent[0] if parent else '',stamp,stamp))
+              (build_id,user['id'],'从新的本人气泡持续学习表达风格',profile['profile'],profile['last_modified_at'],parent,stamp,stamp))
             db.execute('INSERT INTO style_learning_runs VALUES(?,?,?,?,?,?,?)',(build_id,user['id'],'auto' if automatic else 'manual',day,
                 dump([{'conversation_id':key,'through':value} for key,value in sources.items()]),dump(samples),stamp))
             event(db,user['id'],user['username'],'soul 持续学习开始',build_id,actor_id=user['id'])
@@ -111,7 +130,10 @@ class StyleLearning:
         if day is None and time.monotonic()-self.checked<60:return
         self.checked=time.monotonic()
         with self.database.connect() as db:
-            users=[dict(r) for r in db.execute("SELECT DISTINCT u.id,u.username FROM style_learning_settings s JOIN users u ON u.id=s.user_id WHERE s.enabled=1 AND u.account_status='active'")]
+            users=[dict(r) for r in db.execute('''SELECT DISTINCT u.id,u.username
+                FROM style_learning_settings s JOIN users u ON u.id=s.user_id
+                JOIN active_souls a ON a.user_id=u.id JOIN soul_builds b ON b.id=a.build_id AND b.user_id=u.id
+                WHERE s.enabled=1 AND u.account_status='active' AND b.status='approved' ''')]
         for user in users:
             try:self.queue(user,automatic=True,day=day)
             except HTTPException:continue
@@ -120,6 +142,9 @@ class StyleLearning:
         from avatar.knowledge.service import FIELDS,approved_style
         k=self.knowledge
         with self.database.connect() as db:
+            parent=self.active_build(db,row['user_id'])
+            if not parent:raise HTTPException(409,NEEDS_ACTIVE_SOUL)
+            if parent!=row['parent_build']:raise HTTPException(409,'生效 Soul 已变化，请重新发起风格学习')
             run=db.execute('SELECT * FROM style_learning_runs WHERE build_id=?',(row['id'],)).fetchone()
             if not run:raise HTTPException(409,'学习任务不存在')
             samples=json.loads(run['samples']);memory=db.execute('SELECT document FROM style_learning_memory WHERE user_id=?',(row['user_id'],)).fetchone()
@@ -145,10 +170,10 @@ class StyleLearning:
         with self.database.connect(write=True) as db:
             state=db.execute('SELECT status FROM soul_builds WHERE id=?',(row['id'],)).fetchone()
             if not state or state[0]!='running':return
-            latest=db.execute('SELECT build_id FROM active_souls WHERE user_id=?',(row['user_id'],)).fetchone()
+            latest=self.active_build(db,row['user_id'])
             account=db.execute('SELECT account_status FROM users WHERE id=?',(row['user_id'],)).fetchone()
-            if (latest[0] if latest else '')!=row['parent_build'] or not account or account[0]!='active':raise HTTPException(409,'生效版本或账户状态已变化，未覆盖新版本')
-            inherited=db.execute('SELECT asset_ids,asset_captions,notes FROM soul_builds WHERE id=? AND user_id=?',(latest[0] if latest else '',row['user_id'])).fetchone()
+            if latest!=parent or not account or account[0]!='active':raise HTTPException(409,'生效版本或账户状态已变化，未覆盖新版本')
+            inherited=db.execute('SELECT asset_ids,asset_captions,notes FROM soul_builds WHERE id=? AND user_id=?',(latest,row['user_id'])).fetchone()
             if inherited:db.execute('UPDATE soul_builds SET asset_ids=?,asset_captions=? WHERE id=?',(inherited['asset_ids'],inherited['asset_captions'],row['id']))
             stamp=now();notes=[{'filename':'本人对话用户气泡','coverage':f'本次 {len(samples)} 条；未使用助手、其他用户、任务或访客气泡'}]
             if inherited:notes=[*json.loads(inherited['notes']),*notes]

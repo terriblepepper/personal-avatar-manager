@@ -77,7 +77,8 @@ class PeerAcpsTransport:
         if result.get('status',{}).get('state')=='awaiting-input':
             items=result['status'].get('dataItems',[])
             attempted=any(i.get('type')=='data' and isinstance(i.get('data'),dict) and i['data'].get('sandbox_attempted') is True for i in items)
-            return {'needs_input':'等待当前分身的所有人补充信息','checkpoint':{'v':1,'sandbox_attempted':attempted}}
+            reason=next((item['text'] for item in items if item.get('type')=='text' and isinstance(item.get('text'),str)), '')
+            return {'needs_input':reason or '等待当前分身的所有人处理','checkpoint':{'v':1,'sandbox_attempted':attempted}}
         if result.get('status',{}).get('state')!='awaiting-completion':
             items=result.get('status',{}).get('dataItems',[])+[i for p in result.get('products',[]) for i in p.get('dataItems',[])]
             detail='；'.join(i['text'] for i in items if i.get('type')=='text' and isinstance(i.get('text'),str))[:1000] if result.get('status',{}).get('state')=='failed' else ''

@@ -3,7 +3,7 @@ import { computed, onUnmounted, ref, watch } from 'vue'
 import AppIcon from '../AppIcon.vue'
 import { request, notifyError } from '../../api/client'
 
-interface Tool { id: string; name: string; description?: string; enabled: boolean }
+interface Tool { id: string; name: string; description?: string; enabled: boolean; locked?: boolean }
 const props = defineProps<{ conversationId: string; busy: boolean }>()
 const emit = defineEmits<{saving:[pending:boolean]}>()
 const tools = ref<Tool[]>([]), saving = ref(false), loading = ref(false), failure = ref('')
@@ -32,7 +32,7 @@ async function change(tool: Tool, event: Event) {
   const input = event.target
   if (!(input instanceof HTMLInputElement)) return
   const checked = input.checked
-  if (props.busy || saving.value) { input.checked = tool.enabled; return }
+  if (props.busy || saving.value || tool.locked) { input.checked = tool.enabled; return }
   const signal = controller.signal, previous = tools.value
   saving.value = true
   const enableSandbox = tool.id === 'animation' && checked
@@ -59,8 +59,8 @@ onUnmounted(() => { controller.abort(); emit('saving', false) })
       <p v-else-if="loading" class="sub" role="status">正在读取…</p>
       <p v-else-if="!tools.length" class="sub">暂无可用工具。</p>
       <label v-for="tool in tools" :key="tool.id" class="conversation-tool">
-        <input type="checkbox" :checked="tool.enabled" :disabled="busy || saving" @change="change(tool,$event)">
-        <span><strong>{{ tool.name }}</strong><small v-if="tool.description">{{ tool.description }}</small></span>
+        <input type="checkbox" :checked="tool.enabled" :disabled="busy || saving || tool.locked" @change="change(tool,$event)">
+        <span><strong>{{ tool.name }}</strong><small v-if="tool.locked">始终开启</small><small v-if="tool.description">{{ tool.description }}</small></span>
       </label>
     </div>
   </details>
