@@ -532,23 +532,23 @@ onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
   </div><div class="peer-composer">
   <AgentQuestionPrompt v-if="!taskClosed" ref="questionPrompt" :key="current+'/'+shownTask" :scope="'peer:'+current+'/'+shownTask" :question="userQuestion"
     :disabled="commandsDisabled || toolsSaving" @answer="send"/>
-  <ComposerInput v-if="!taskClosed" v-model="message" :catalog="skills" :session="taskId || current" :usage-url="current ? '/agent-sessions/'+encodeURIComponent(current)+'/compact'+(taskId?'?task_id='+encodeURIComponent(taskId):'') : ''" :usage-revision="(detail?.history_revision||'')+'/'+(detail?.summary_through||0)" :disabled="switching" label="分身会话消息" @submit="send()" :placeholder="runningTask || pausedTask ? '补充任务所需信息…' : '输入消息或任务目标，$ 选择技能…'" @update:model-value="pending=''"/>
+  <ComposerInput v-model="message" :catalog="skills" :session="taskId || current" :usage-url="current ? '/agent-sessions/'+encodeURIComponent(current)+'/compact'+(taskId?'?task_id='+encodeURIComponent(taskId):'') : ''" :usage-revision="(detail?.history_revision||'')+'/'+(detail?.summary_through||0)" :disabled="switching || taskClosed" label="分身会话消息" @submit="send()" :placeholder="taskClosed ? '任务已结束' : runningTask || pausedTask ? '补充任务所需信息…' : '输入消息或任务目标，$ 选择技能…'" @update:model-value="pending=''"/>
   <div class="chat-compose-actions">
   <ComposerToolbar class="peer-composer-toolbar" label="分身会话工具栏">
-    <details v-if="!taskClosed" class="composer-menu composer-tool">
+    <details class="composer-menu composer-tool">
       <summary class="chat-command" title="管理当前任务技能"><span aria-hidden="true">✧</span><span>技能</span><small>{{ activeSkills.length }}</small></summary>
       <div class="composer-popover">
         <h3>当前任务技能</h3>
         <p class="sub">在输入框键入 $ 选择技能。移出仅影响当前任务。</p>
         <p v-if="!activeSkills.length" class="sub">尚无已加载技能。</p>
         <div v-for="skill in activeSkills" :key="skill.id" class="session-skill">
-          <span>{{ skill.name }}</span><button type="button" class="button small" :disabled="busy || switching || detail?.task?.status==='ended'" @click="removeSkill(skill)">移出本任务</button>
+          <span>{{ skill.name }}</span><button type="button" class="button small" :disabled="busy || switching || taskClosed" @click="removeSkill(skill)">移出本任务</button>
         </div>
       </div>
     </details>
-    <ChatFilesManager v-if="resourceId" :conversation-id="resourceId" label="共享文件" :shared-revision="sharedFilesRevision" :read-only="taskClosed" :busy="busy || switching || detail?.task?.status==='running'" @selected="fileIds=$event" @uploading="resourceBusy=$event"/>
+    <ChatFilesManager v-if="resourceId || taskClosed" :conversation-id="resourceId" label="共享文件" :shared-revision="sharedFilesRevision" :read-only="taskClosed" :busy="busy || switching || detail?.task?.status==='running'" @selected="fileIds=$event" @uploading="resourceBusy=$event"/>
     <ChatFilesManager v-if="detail?.legacy_file_conversation_id" :conversation-id="detail.legacy_file_conversation_id" label="旧私有文件" read-only/>
-    <ConversationTools v-if="!taskClosed" :conversation-id="settingsId" @saving="toolPending=$event" :busy="busy || switching || resourceBusy || detail?.task?.status==='running'"/>
+    <ConversationTools :conversation-id="settingsId" @saving="toolPending=$event" :busy="taskClosed || busy || switching || resourceBusy || detail?.task?.status==='running'"/>
     <details class="composer-tool chat-command-menu">
       <summary class="chat-command chat-icon-command" aria-label="会话操作" title="会话操作"><AppIcon name="more" :size="18"/></summary>
       <div class="composer-popover chat-command-panel">
@@ -562,8 +562,8 @@ onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
     </details>
     <span v-if="writeState==='sending'" role="status">正在发送…</span>
     <button v-if="detail?.task?.needs_confirmation" type="button" class="button chat-command" :disabled="commandsDisabled" @click="taskAction('confirm')">确认并补充意图</button>
-    <div v-if="!taskClosed" class="composer-primary-actions">
-      <EffortPicker :conversation-id="settingsId" :busy="!!runningTask" @saving="effortPending=$event"/>
+    <div class="composer-primary-actions">
+      <EffortPicker :conversation-id="settingsId" :busy="!!runningTask" :read-only="taskClosed" @saving="effortPending=$event"/>
       <ComposerAction v-if="runningTask && !message.trim()" label="暂停任务" stop :disabled="commandsDisabled" @click="taskAction('cancel')"/>
       <ComposerAction v-else :resume="!!pausedTask && !message.trim()" :label="runningTask ? '发送补充' : pausedTask ? (message.trim() ? '补充并继续' : '继续任务') : '发送'" :aria-busy="writeState==='sending'" :disabled="sendDisabled" @click="send()"/>
     </div>
