@@ -403,6 +403,7 @@ class KnowledgeService:
     def disable(self,user):
         with self.database.connect(write=True) as db:
             db.execute('DELETE FROM active_souls WHERE user_id=?',(user['id'],))
+            self.learning.reset_settings(db,user['id'])
             event(db,user['id'],user['username'],'停用分身 soul',actor_id=user['id'])
         return {'active_build_id':None}
 
@@ -417,12 +418,13 @@ class KnowledgeService:
         profile=db.execute('SELECT profile FROM avatar_records WHERE user_id=?',(row['user_id'],)).fetchone()
         if decision.approve and (not profile or json.loads(profile[0])!=json.loads(row['profile_snapshot'])):
             raise HTTPException(409,'构建后个人资料已经改变，请退回后重新构建')
-        tree=json.loads(row['memory_tree']);active=db.execute('SELECT build_id FROM active_souls WHERE user_id=?',(row['user_id'],)).fetchone()
-        if decision.approve and tree.get('edits') and tree.get('base_build','')!=(active[0] if active else ''):raise HTTPException(409,'生效记忆已改变，请退回后基于新记忆重新修订')
+        tree=json.loads(row['memory_tree']);active=self.learning.active_build(db,row['user_id'])
+        if decision.approve and tree.get('edits') and tree.get('base_build','')!=(active or ''):raise HTTPException(409,'生效记忆已改变，请退回后基于新记忆重新修订')
         status='approved' if decision.approve else 'rejected';stamp=now()
         db.execute('UPDATE soul_builds SET status=?,stage=?,reviewer=?,reason=?,reviewed_at=?,updated_at=? WHERE id=?',
                    (status,'审核通过' if decision.approve else '审核退回',admin['id'],decision.reason,stamp,stamp,identifier))
         if decision.approve:
+            if not active:self.learning.reset_settings(db,row['user_id'])
             db.execute('INSERT INTO active_souls VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET build_id=excluded.build_id',(row['user_id'],identifier))
             db.execute('UPDATE style_learning_memory SET document=?,updated_at=? WHERE user_id=?',(row['document'],stamp,row['user_id']))
         event(db,row['user_id'],admin['username'],'soul 审核通过' if decision.approve else 'soul 审核退回',decision.reason,actor_id=admin['id'])

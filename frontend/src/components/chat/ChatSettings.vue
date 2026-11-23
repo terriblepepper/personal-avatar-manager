@@ -4,7 +4,7 @@ import { computed, onUnmounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { request, notifyError } from '../../api/client'
 interface Skill {id:string;name:string;description?:string;enabled:boolean|number;installed_enabled?:boolean|number}
-interface Learning {enabled:boolean;learned_at?:string;last?:{status:string;error?:string}|null}
+interface Learning {enabled:boolean;can_enable?:boolean;learned_at?:string;last?:{status:string;error?:string}|null}
 const props=defineProps<{conversationId:string;busy:boolean;revision:number}>()
 const emit=defineEmits<{catalog:[skills:Skill[]]}>()
 const installed=ref<Skill[]>([]), authorized=ref<Skill[]>([])
@@ -41,7 +41,7 @@ async function skill(item:Skill) {
   finally { if(!signal.aborted) saving.value=false }
 }
 async function learn(event?:Event) {
-  if(saving.value || props.busy) return
+  if(saving.value || props.busy || !learning.value.can_enable) return
   saving.value=true
   const signal=controller.signal, path=endpoint.value+'/style-learning'
   try {
@@ -58,7 +58,7 @@ async function learn(event?:Event) {
   finally { if(!signal.aborted) saving.value=false }
 }
 watch(()=>props.conversationId,()=>{
-  installed.value=[]; authorized.value=[]; saving.value=false; publishCatalog()
+  installed.value=[]; authorized.value=[]; learning.value={enabled:false}; saving.value=false; publishCatalog()
   if(props.conversationId) void load()
 },{immediate:true})
 watch(()=>props.revision,()=>{if(props.conversationId && !saving.value)void load()})
@@ -82,8 +82,9 @@ onUnmounted(()=>controller.abort())
     <details class="chat-menu-section">
       <summary class="chat-menu-item"><AppIcon name="settings" :size="16"/>表达风格学习<AppIcon name="chevron" :size="14"/></summary>
       <div class="conversation-learning chat-menu-subpanel">
-        <label><input type="checkbox" :checked="learning.enabled" :disabled="busy||saving" @change="learn">自动学习本人表达</label>
-        <button type="button" class="button small" :disabled="busy||saving" @click="learn()">立即学习</button>
+        <label><input type="checkbox" :checked="learning.enabled" :disabled="busy||saving||!learning.can_enable" @change="learn">自动学习本人表达</label>
+        <button type="button" class="button small" :disabled="busy||saving||!learning.can_enable" @click="learn()">立即学习</button>
+        <small v-if="learning.can_enable===false" class="sub">请先创建 Soul 并通过审核，待生效后再学习。</small>
         <small v-if="learning.last" class="sub">{{ learning.last.status }} {{ learning.last.error }}</small>
       </div>
     </details>

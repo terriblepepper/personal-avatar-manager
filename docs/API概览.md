@@ -125,8 +125,8 @@
 
 ## 风格学习（`style_learning_routes.py`，前缀 `/api/conversations`）
 
-- `GET|PATCH /{identifier}/style-learning`
-- `POST /{identifier}/style-learning/learn`
+- `GET|PATCH /{identifier}/style-learning` — 状态中的 `can_enable` 表示当前有已审核生效的 Soul。开启时缺少生效 Soul 返回 409。
+- `POST /{identifier}/style-learning/learn` — 立即学习需要已审核生效的 Soul。
 
 ## 分身协作（`collaboration_routes.py`，前缀 `/api`）
 
