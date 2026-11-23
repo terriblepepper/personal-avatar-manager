@@ -299,7 +299,7 @@ onUnmounted(()=>{destroyed=true;olderRequest?.abort();controller.abort();generat
         </details>
       </ComposerToolbar>
     </header>
-    <p class="sub">{{ current?.message_count || 0 }} 条消息 · {{ current?.memory_active?'已启用压缩记忆':'较早对话按需压缩' }}<template v-if="embedding"> · 可检索本人公开及私密资料</template></p>
+    <p class="sub">{{ current?.message_count || 0 }} 条消息<template v-if="embedding"> · {{ current?.memory_active?'已启用压缩记忆':'较早对话按需压缩' }} · 可检索本人公开及私密资料</template></p>
     <EmbeddingNotice :configured="embedding"/>
     <MessageCopyMenu :key="conversationId" ref="copyMenu"/>
     <p v-if="error" class="notice error" role="alert">{{ error }} <ElButton size="small" @click="load">重新连接</ElButton></p><p v-if="loading" role="status">正在读取会话…</p>
@@ -323,7 +323,7 @@ onUnmounted(()=>{destroyed=true;olderRequest?.abort();controller.abort();generat
     <AgentQuestionPrompt ref="questionPrompt" :key="conversationId" :scope="'chat:'+conversationId" :question="userQuestion"
       :disabled="busy || uploading || toolsSaving || loading" @answer="answer => send('continue', answer)"/>
     <form id="personal-chat-compose" data-guide-target="chat" class="personal-compose" @submit.prevent="send()">
-      <ComposerInput ref="input" v-model="draft" :catalog="skillCatalog" :session="conversationId" :usage-url="conversationId ? selectedURL(conversationId)+'/compact' : ''" :usage-revision="(messages.at(-1)?.id || 0)+'/'+compressionThrough" label="聊天消息" :placeholder="pauseId ? (pending?.stream_retryable ? '可直接重试，也可补充要求后继续…' : '补充任务所需信息…') : '向自己的分身提问，或输入 $ 选择技能…'" :disabled="busy||loading||!conversationId" submit-on-enter @submit="send()"/>
+      <ComposerInput ref="input" v-model="draft" :catalog="embedding === false ? [] : skillCatalog" :session="conversationId" :usage-url="conversationId ? selectedURL(conversationId)+'/compact' : ''" :usage-revision="(messages.at(-1)?.id || 0)+'/'+compressionThrough" label="聊天消息" :placeholder="pauseId ? (pending?.stream_retryable ? '可直接重试，也可补充要求后继续…' : '补充任务所需信息…') : '向自己的分身提问…'" :disabled="busy||loading||!conversationId" submit-on-enter @submit="send()"/>
     </form>
     <div class="chat-compose-actions">
       <ComposerToolbar class="personal-chat-toolbar">
@@ -332,7 +332,7 @@ onUnmounted(()=>{destroyed=true;olderRequest?.abort();controller.abort();generat
             <summary title="常用提问" aria-label="常用提问">常用提问</summary>
             <div class="composer-popover quick chat-command-panel"><button v-for="text in quickPrompts" :key="text" type="button" class="chat-menu-item" :disabled="busy||uploading" @click="ask(text)">{{ text }}</button></div>
           </details>
-          <ChatSettings :conversation-id="conversationId" :busy="busy||uploading" :revision="messages.length" @catalog="skillCatalog=$event"/>
+          <ChatSettings v-if="embedding !== false" :conversation-id="conversationId" :busy="busy||uploading" :revision="messages.length" @catalog="skillCatalog=$event"/>
           <ChatFilesManager :conversation-id="conversationId" :busy="busy" @selected="value=>selectedFiles=value" @uploading="value=>uploading=value"/>
           <ConversationTools :conversation-id="conversationId" :busy="busy||uploading" @saving="toolPending=$event"/>
         </template>

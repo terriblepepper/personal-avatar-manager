@@ -1138,6 +1138,8 @@ class AgentDialogues:
             rows=self.memory_rows(db,session_id,task_id,through,uid)
             if not rows:return {'message':'没有新的消息需要压缩。'}
         overview,context=self.chat.context(user,ChatRequest(channel='avatar',message='/compact'))
+        if context[0].get('_direct_chat'):
+            return {'message':'普通聊天使用近期消息，无需调用模型压缩。','compressed':False}
         speaker=overview['agent']
         workspace = memory['resource_conversation_id']
         if workspace:
@@ -1208,13 +1210,32 @@ class AgentDialogues:
         config,key,system,_=context
         preferences = self.chat.tools.get(speaker_id, run.settings_workspace)
         config = with_chat_effort(config, preferences.get('reasoning_effort'))
+        config['_run_store'] = store
+        if config.get('_direct_chat'):
+            from avatar.conversation.working_context import fit_turn
+
+            system += '\n以分身身份回应最新来信或用户补充，仅返回本轮文字。'
+            history = [{'role':'user','content':row['speaker_name']+'：'+row['content']}
+                       for row in rows[-self.chat.memory.policy.recent_messages:]
+                       if row['speaker_name']!='用户授权共享资料']
+            message = '当前会话请求：'+job['objective']
+            history, _ = fit_turn(config,system,history,message,[])
+            progress({'type':'status','stage':'result_writing','message':'正在根据已审核资料作答'})
+            result=await self.billed(job,speaker,config,self.chat.model_client.generate(config,key,system,history,message),'agent_dialogue')
+            text=result.text.strip()
+            if not text:
+                raise HTTPException(502,'模型未返回有效发言')
+            # Plain chat owes at most one answer; the turn ledger still delivers newer supplements before closing.
+            action=None if ordinary else {'name':'end_task','arguments':{'reason':'普通聊天答复已交付','content':text[:60000]}}
+            if action:
+                text=action['arguments']['content']
+            return self._commit_peer_reply(job,config,workspace,(),result,text,action,progress)
         tools = preferences['items']
         settings={item['id']:item['enabled'] for item in tools}
         prefix,raw=system.split('\n',1)
         config={**config,'_mermaid_enabled':True,'_avatar_agent':True,'_conversation_tools':tools,'_html_enabled':True,
                 '_conversation_tool_owner':'initiator' if speaker_id==job['user_id'] else 'target'}
         checkpoint=json.loads(job['agent_checkpoint']) if job.get('agent_checkpoint') else None
-        config['_run_store'] = store
         with self.database.connect() as db:
             last_input = db.execute("SELECT MAX(id) FROM agent_dialogue_messages WHERE dialogue_id=? AND speaker_role='user'",(job['id'],)).fetchone()[0]
         config['_agent_input_revision'] = last_input or 'original'
@@ -1409,9 +1430,14 @@ class AgentDialogues:
         from avatar.conversation.tools.reply_artifacts import reply_with_artifacts
         text = reply_with_artifacts(text, outputs, events, saved=saved)
         if action:action['arguments']['content']=text
-        answer = {'text':text,'usage':result.usage,'task_action':action}
         if validate_sandbox := context[0].get('_validate_sandbox'):
             validate_sandbox()
+        return self._commit_peer_reply(job,context[0],workspace,saved,result,text,action,progress)
+
+    def _commit_peer_reply(self,job,config,workspace,saved,result,text,action,progress):
+        run=job['_peer_run']
+        speaker_id=run.owner
+        outputs=config.get('_generated_files',[])
         with ExitStack() as stack, self.database.connect(write=True) as db:
             run.commit(db)
             public=[item for item in outputs if item.get('public_material_id')]
@@ -1419,12 +1445,12 @@ class AgentDialogues:
             generated=[item for item in outputs if not item.get('public_material_id') and item['id'] not in saved_ids]
             if generated:
                 stack.enter_context(self.chat.chat_files.storing_outputs(db,speaker_id,workspace,None,generated))
-            answer['usage'] = run.settle(db)
+            answer = {'text':text,'usage':run.settle(db),'task_action':action}
             # 本地交付与已验证的答复共用一个事务，重启后只提取收据。
             delivery={'speaker':speaker_id,'revision':job['revision'],'reply_sha':hashlib.sha256(text.encode()).hexdigest(),
                       'source_revision':job['_output_source_revision'],'authority':run.source,'peer_style':run.style,'workspace':workspace,'answer':answer,
                       'public':public,'file_ids':list(dict.fromkeys(item['id'] for item in [*saved,*outputs]))}
-            if proofs:=context[0].get('_session_read_proofs'):
+            if proofs:=config.get('_session_read_proofs'):
                 delivery['session_file_reads']=proofs
             db.execute('UPDATE agent_dialogues SET pending_file_delivery=? WHERE id=?',(dump(delivery),job['id']))
         progress({'type': 'status', 'stage': 'result_ready',
