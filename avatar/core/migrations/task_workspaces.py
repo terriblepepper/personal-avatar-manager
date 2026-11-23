@@ -41,7 +41,11 @@ def install_task_workspaces(connection):
             FROM agent_shared_workspaces w
             LEFT JOIN agent_dialogues d ON w.scope='task' AND d.id=w.scope_id
             WHERE w.conversation_id=NEW.conversation_id;
-            IF shared_scope IS NOT NULL THEN RETURN NEW; END IF;
+            IF shared_scope = 'session' THEN
+                NEW.expires_at := coalesce(supplied_deadline,datetime('now','+7 days'));
+                RETURN NEW;
+            END IF;
+            IF shared_scope = 'task' THEN RETURN NEW; END IF;
             SELECT d.expires_at INTO NEW.expires_at
             FROM agent_task_members m JOIN agent_dialogues d ON d.id=m.task_id
             JOIN chat_conversations c ON c.id=m.resource_conversation_id AND c.user_id=m.user_id AND c.channel='peer'
@@ -89,3 +93,11 @@ def install_task_workspaces(connection):
                 WHERE m.resource_conversation_id=f.conversation_id AND m.user_id=f.user_id
                     AND d.delivery_mode<>'message' AND m.hidden=0 AND f.expires_at IS DISTINCT FROM d.expires_at
                     AND NOT EXISTS(SELECT 1 FROM agent_session_members s WHERE s.resource_conversation_id=c.id)""")
+
+    restored = connection.execute("""INSERT INTO data_migrations(name,applied_at)
+        VALUES('shared_session_workspace_deadlines',now()::text) ON CONFLICT DO NOTHING RETURNING name""").fetchone()
+    if restored:
+        for table in ('chat_files','conversation_diagrams'):
+            connection.execute(f"""UPDATE {table} f SET expires_at=datetime('now','+7 days')
+                FROM agent_shared_workspaces w WHERE w.scope='session'
+                  AND w.conversation_id=f.conversation_id AND f.expires_at IS NULL""")

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { fileSizeMB } from '../../utils/format'
+import { date, fileSizeMB } from '../../utils/format'
 import RecordPagination from '../RecordPagination.vue'
 import { defineAsyncComponent, computed, onBeforeUnmount, ref, shallowRef, watch } from 'vue'
 import { ElButton, ElInput, ElMessageBox } from 'element-plus'
@@ -17,7 +17,7 @@ import { submitAnimationPromotion } from '../../utils/animationPromotion'
 const FilePreview = defineAsyncComponent(() => import('../FilePreview.vue'))
 const props=defineProps<{conversationId:string;busy?:boolean;readOnly?:boolean;temporary?:boolean;includeConversationFiles?:boolean;selectedIds?:string[];label?:string;sharedRevision?:string}>()
 const emit=defineEmits<{selected:[ids:string[]];uploading:[value:boolean]}>()
-interface ChatFile {id:string;filename:string;content_type:string;size:number;description:string;referenced:boolean;download_url:string;origin?:string;source_label?:string;expires_at?:string;shared_attachment?:boolean;promoted_id?:string|null}
+interface ChatFile {id:string;filename:string;content_type:string;size:number;description:string;referenced:boolean;download_url:string;origin?:string;source_label?:string;expires_at?:string|null;shared_attachment?:boolean;promoted_id?:string|null}
 interface LibraryFile extends AnimationMetadata {id:string;filename:string;source:'folder'|'profile';path?:string;relative_path?:string;description:string;size:number;sha256?:string;already_referenced?:boolean}
 interface LibraryPage {items:LibraryFile[];total:number;offset:number;limit:number}
 interface Result {items:ChatFile[];file_id?:string}
@@ -36,6 +36,9 @@ const libraryLoading = ref(false), libraryError = ref(false)
 const segments = computed(() => folder.value.split('/').filter(Boolean).map((name, i, parts) => ({name, path:parts.slice(0, i+1).join('/')})))
 let generation=0, controller=new AbortController(), librarySequence=0
 const endpoint=(id:string)=>'/conversations/'+encodeURIComponent(id)+'/files'
+function expiryTimestamp(value: string) {
+  return /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(value) ? value.replace(' ','T')+'Z' : value
+}
 function emitSelection(){emit('selected',active.value.map(file=>file.id))}
 function update(items:ChatFile[],ticket:number,addedId?:string){
   if(ticket!==generation)return
@@ -186,7 +189,12 @@ async function promote(value:FilePromotion) {
 </div>
 <p v-if="!readOnly" class="sub">{{ temporary?'发送选中的原件副本，最多五份。':'后续提问最多同时引用五份，超过时可继续上传。其他会话临时文件需先转存为资料；索引与检索使用模型额度。' }} HTML 与动画单件最多 100 MiB。</p>
 <p v-if="status" class="sub" role="status">{{ status }}</p>
-<article v-for="file in page" :key="file.id" class="chat-file compact-chat-file"><label><input v-if="!temporary && !readOnly && file.origin!=='attachment'" type="checkbox" :checked="included(file)" :disabled="busy||working" @change="toggle(file,$event)"><MaterialTypeIcon :filename="file.filename"/> {{ file.filename }}</label><div class="actions"><el-button @click="preview=file">{{ /\.(mmd|avanim)$/i.test(file.filename) ? '预览与下载' : '预览' }}</el-button>
+<article v-for="file in page" :key="file.id" class="chat-file compact-chat-file"><label><input v-if="!temporary && !readOnly && file.origin!=='attachment'" type="checkbox" :checked="included(file)" :disabled="busy||working" @change="toggle(file,$event)"><MaterialTypeIcon :filename="file.filename"/> {{ file.filename }}</label>
+    <div v-if="sharedRevision !== undefined" class="sub">
+      <template v-if="file.expires_at"><time :datetime="expiryTimestamp(file.expires_at)">{{ date(expiryTimestamp(file.expires_at)) }}</time> 到期自动删除</template>
+      <template v-else>未设到期时间</template>
+    </div>
+    <div class="actions"><el-button @click="preview=file">{{ /\.(mmd|avanim)$/i.test(file.filename) ? '预览与下载' : '预览' }}</el-button>
     <el-button v-if="temporary" :disabled="busy||working" @click="toggleAttachment(file)">{{ included(file) ? '移除附件' : '添加为附件' }}</el-button>
     <template v-else><el-button v-if="!readOnly" @click="openDetail(file)">详情与说明</el-button><el-button v-if="!/\.(mmd|avanim)$/i.test(file.filename)" tag="a" :href="file.download_url" :download="file.filename">下载</el-button><el-button :disabled="busy||working||!!file.promoted_id" @click="openPromotion(file)">{{ file.promoted_id?'已转存':'转存资料' }}</el-button><el-button v-if="!readOnly" :disabled="busy||working" @click="remove(file)">删除</el-button></template></div></article>
 <p v-if="!visible.length" class="sub">{{ temporary ? '暂无发送附件。' : '本会话暂无文件。' }}</p>
