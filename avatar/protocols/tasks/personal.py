@@ -28,14 +28,16 @@ PUBLIC_STAGES = {
     'tool_selection': '判断所需工具', 'rag_retrieving': '检索相关资料',
     'material_reading': '读取相关资料', 'tool_catalog': '查询候选资料',
     'tool_action': '执行已选择的操作', 'skill_execution': '运行已选技能',
-    'result_writing': '整理最终答复',
+    'result_writing': '整理最终答复', 'model_stream': '模型响应流已连接',
 }
 
 
 class WorkingProgress:
-    def __init__(self, result, run_id):
+    def __init__(self, result, run):
         self.result_id = result['id']
-        self.ids = result['taskId'], result['sessionId'], run_id
+        self.ids = result['taskId'], result['sessionId'], run['run_id']
+        self.run = run
+        self.streaming = False
         self.started = time.monotonic()
         self.message = '任务已接收，等待可用执行资源'
         self.revision = 0
@@ -61,6 +63,25 @@ class WorkingProgress:
         if stage and stage != self.message:
             self.message = stage
             self.revision += 1
+
+    def stream_state(self, active):
+        now_at = time.time()
+        if active == self.streaming or (active and self.run['work_until'] <= now_at):
+            return
+        self.streaming = active
+        # A recovered stream starts with a full waiting budget after it closes again.
+        self.run['work_until'] = now_at+WORKING_TIMEOUT
+        if active:
+            self.update({'type':'status','stage':'model_stream'})
+
+    def deadline(self):
+        now_at = time.time()
+        if self.streaming:
+            return now_at+WORKING_TIMEOUT
+        until = self.run['work_until']
+        if until <= now_at:
+            raise turns.WorkDeadlineExceeded
+        return until
 
     def view(self, result):
         # Progress is a new message, while the ledger retains the working ID used by finish().
@@ -229,9 +250,10 @@ class PersonalTaskService:
                     raise ManagementTaskError(-32001, '当前调用者和会话中没有该任务')
                 document = json.loads(row['document'])
                 saved = document.get('_agent_resume', {})
-                work_expired = document['status']['state']=='working' and turns.work_expired(document)
-                if ((row['deadline'] is None or row['deadline'] > time.time()) and not work_expired
-                        and not (saved.get('restart') or saved.get('user_question'))):
+                working = document['status']['state']=='working'
+                deadline = row['deadline']
+                lease_valid = deadline > time.time() if deadline is not None else not working
+                if lease_valid and not (saved.get('restart') or saved.get('user_question')):
                     return self.working_view((*scope[:3],row['session_id'],scope[4]),turns.public_result(document))
         with self.database.connect(write=True) as db:
             row = self.task_row(db, scope)
@@ -242,12 +264,8 @@ class PersonalTaskService:
                 document = json.loads(row['document'])
                 expired = row['deadline'] is not None and row['deadline'] <= time.time()
                 state = document['status']['state']
-                if state == 'working' and turns.work_expired(document):
-                    result = turns.expire_in(db,row,document)
-                    if job := self.pending.get(scope):
-                        job.cancel()
-                    return result
-                if expired and state == 'working' and operation != 'cancel':
+                # The lease holder can have newer model progress than the last persisted checkpoint.
+                if state == 'working' and (expired or row['deadline'] is None) and operation != 'cancel':
                     turns.interrupt_in(db, row, document)
                     state = document['status']['state']
                 run = document.get('_agent_resume', {})
@@ -310,7 +328,7 @@ class PersonalTaskService:
             if context.group_id:
                 result['groupId'] = context.group_id
             stored = dump({**result, '_agent_resume':run})
-            deadline = min(accepted_at+turns.LEASE_SECONDS,run['work_until'])
+            deadline = accepted_at+turns.LEASE_SECONDS
             if row:
                 rowid = row['rowid']
                 db.execute('UPDATE avatar_aip_tasks SET command_id=?,document=?,deadline=? WHERE rowid=?',
@@ -323,7 +341,7 @@ class PersonalTaskService:
         # Return a status before a slow model outlives the caller's HTTP timeout.
         if restarting and scope in self.pending:
             self.pending[scope].cancel()
-        progress = WorkingProgress(result,run['run_id'])
+        progress = WorkingProgress(result,run)
         self.progress[scope] = progress
         task=asyncio.create_task(self.generate(scope,rowid,result,context,principal,run,progress))
         self.pending[scope]=task
@@ -374,8 +392,11 @@ class PersonalTaskService:
 
     async def generate(self,scope,rowid,result,context,principal,run,progress):
         writer, owner = result['id'], run['owner']
+        def renew(conversation_id=None):
+            turns.renew(self.database,rowid,writer,run,conversation_id,work_until=progress.deadline())
         def validate(db):
             document = turns.current_in(db,rowid,writer,run)
+            progress.deadline()
             lease = document['_agent_resume'].get('lease')
             if lease and not db.execute('SELECT 1 FROM chat_conversations WHERE id=? AND lease_until=?',lease).fetchone():
                 raise RunConflict('原任务的会话执行权已变更')
@@ -414,19 +435,16 @@ class PersonalTaskService:
                 with execution_guard(guard):
                     return await self.answer(active,context,result['sessionId'],principal=principal,
                                              resume=run,store=store,progress=progress.update,commit=commit,
-                                             claim=lambda cid:turns.renew(self.database,rowid,writer,run,cid))
+                                             stream_state=progress.stream_state,claim=renew)
             finally:
                 self.limit.release()
         task = asyncio.create_task(work())
         try:
-            try:
-                async with asyncio.timeout(max(0,run['work_until']-time.time())):
-                    while not task.done():
-                        completed, _ = await asyncio.wait((task,),timeout=turns.RENEW_INTERVAL)
-                        if not completed:
-                            turns.renew(self.database,rowid,writer,run)
-            except TimeoutError:
-                raise turns.WorkDeadlineExceeded from None
+            while not task.done():
+                remaining = progress.deadline()-time.time()
+                completed, _ = await asyncio.wait((task,),timeout=min(remaining,turns.RENEW_INTERVAL))
+                if not completed:
+                    renew()
             task.result()
             if committed is None:
                 raise RunConflict('缺少本次回答的提交回执')
@@ -466,12 +484,13 @@ class PersonalTaskService:
     # 职责：使用已通过本人鉴权的所有者资料和模型配置生成个人回答。
     # 输入：target 为服务端固定目标，context 是认证 peer/group，session 来自协议会话。
     # 结果与约束：不创建或绑定小镇用户账号；协议会话不混入 Web 历史，计费和压缩费用归目标所有者。
-    async def answer(self, target, context, session, *, principal=None, resume, store, progress, commit, claim):
+    async def answer(self, target, context, session, *, principal=None, resume, store, progress, commit, stream_state, claim):
         user = {'id': target['user_id'], 'username': target['username'], 'account_status': target['account_status']}
         question = '\n\n用户补充：'.join(resume['inputs'])
         request = ChatRequest(channel='avatar', message=question)
         overview, model = self.chat.context(user, request, target, private_access=False)
         config, key, system, history = model
+        config = {**config, '_aip_stream_state':stream_state}
         if not config.get('_direct_chat'):
             config = {**config, '_avatar_agent':True, '_allow_user_questions':False,
                       '_agent_checkpoint':resume.get('checkpoint',{}),
@@ -485,7 +504,8 @@ class PersonalTaskService:
             if resume.get('clarification'):
                 background['last_clarification'] = resume['clarification']
                 prefix += ' last_clarification 是上一轮你向用户提出的问题，只用于理解本轮补充。'
-            model = (config, key, prefix+'\n'+json.dumps(background,ensure_ascii=False), history)
+            system = prefix+'\n'+json.dumps(background,ensure_ascii=False)
+        model = (config, key, system, history)
         caller = context.peer_aic if principal is None else 'visitor:' + principal['visitor_id']
         platform = 'acps-direct' if principal is None else 'town-guest' if principal.get('anonymous') else 'town-public'
         conversation_id = str(uuid.uuid5(uuid.NAMESPACE_URL, dump(['acps-direct', target['aic'], caller, context.group_id or '', session] if principal is None else [platform, target['aic'], context.peer_aic, caller, context.group_id or '', session])))

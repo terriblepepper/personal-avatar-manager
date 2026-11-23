@@ -13,13 +13,13 @@ from avatar.protocols.tasks.store import ManagementTaskError
 
 RENEW_INTERVAL = 30
 LEASE_SECONDS = 3 * RENEW_INTERVAL
-TIMEOUT_MESSAGE = '本轮任务执行超时，尚未生成可交付结果。请使用新任务重试。'
+TIMEOUT_MESSAGE = '本轮任务长时间未取得有效进展，已超时。请使用新任务重试。'
 QUESTION_UNAVAILABLE = '本轮信息不足，未生成答复。请补充必要信息后重新发起任务。'
 log = logging.getLogger('uvicorn.error.' + __name__)
 
 
 class WorkDeadlineExceeded(TimeoutError):
-    """Personal AIP work exceeded its active-turn budget."""
+    """Personal AIP work exceeded its inactivity deadline."""
 
 
 def work_expired(document):
@@ -107,18 +107,17 @@ def current_in(db, rowid, writer, run):
         doc = json.loads(row['document'])
         if (doc['status']['state']=='working' and doc['id']==writer and
                 doc.get('_agent_resume',{}).get('run_id')==run['run_id']):
-            if work_expired(doc):
-                raise WorkDeadlineExceeded
             return doc
     raise RunConflict('当前任务已结束或已被其他执行者接管')
 
 
-def renew(database, rowid, writer, run, conversation_id=None):
+def renew(database, rowid, writer, run, conversation_id=None, *, work_until):
     with database.connect(write=True, account_scope=run['owner']) as db:
         doc = current_in(db, rowid, writer, run)
         saved = doc['_agent_resume']
         current = time.time()
-        until = min(current+LEASE_SECONDS, saved.get('work_until', float('inf')))
+        saved['work_until'] = work_until
+        until = current+LEASE_SECONDS
         if conversation_id:
             if not db.execute('UPDATE chat_conversations SET lease_until=? WHERE id=? AND user_id=? AND lease_until<?',
                               (until,conversation_id,run['owner'],current)).rowcount:
