@@ -107,18 +107,16 @@ def current_in(db, rowid, writer, run):
         doc = json.loads(row['document'])
         if (doc['status']['state']=='working' and doc['id']==writer and
                 doc.get('_agent_resume',{}).get('run_id')==run['run_id']):
-            if run['work_until'] <= time.time():
-                raise WorkDeadlineExceeded
             return doc
     raise RunConflict('当前任务已结束或已被其他执行者接管')
 
 
-def renew(database, rowid, writer, run, conversation_id=None):
+def renew(database, rowid, writer, run, conversation_id=None, *, work_until):
     with database.connect(write=True, account_scope=run['owner']) as db:
         doc = current_in(db, rowid, writer, run)
         saved = doc['_agent_resume']
         current = time.time()
-        saved['work_until'] = run['work_until']
+        saved['work_until'] = work_until
         until = current+LEASE_SECONDS
         if conversation_id:
             if not db.execute('UPDATE chat_conversations SET lease_until=? WHERE id=? AND user_id=? AND lease_until<?',

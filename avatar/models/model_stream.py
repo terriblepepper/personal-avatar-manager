@@ -219,15 +219,15 @@ class ToolFragments:
 async def stream_response(model, config, api_key, system, history, message, *, collect=False):
     from avatar.core.execution import check_execution_async
     attempts = 6
-    report_output = config.get('_aip_stream_progress')
-    # AIP owns its inactivity budget. The per-attempt watchdog and retry limit still apply.
-    expires = None if report_output else asyncio.get_running_loop().time() + attempts * generation_deadline(config)
+    report_stream = config.get('_aip_stream_state')
+    # AIP pauses its task timer while the upstream stream is open. The per-attempt watchdog and retry limit still apply.
+    expires = None if report_stream else asyncio.get_running_loop().time() + attempts * generation_deadline(config)
     for attempt in range(attempts):
         await check_execution_async()
         from avatar.models.trace import ModelExchange
         exchange = ModelExchange(config, api_key, attempt+1)
         try:
-            async with asyncio.timeout_at(expires), aclosing(_stream_once(model,config,api_key,system,history,message,collect,exchange,report_output)) as source:
+            async with asyncio.timeout_at(expires), aclosing(_stream_once(model,config,api_key,system,history,message,collect,exchange,report_stream)) as source:
                 async for event in source:
                     yield event
             return
@@ -269,7 +269,7 @@ def usage_event(result, config):
 # 职责：请求上游模型并解析为平台无关的可见事件。
 # 输入：model 提供请求构建、解析器及传输；其余参数为已审核模型上下文。
 # 结果与约束：HTTPS 固定公网 IP 并保留原 Host/SNI，输出连接/生成状态、文本与用量；过滤思考内容，完整 JSON 一次输出，缺终止标记拒绝作为成功结果。
-async def _stream_once(model, config, api_key, system, history, message, collect, exchange, report_output):
+async def _stream_once(model, config, api_key, system, history, message, collect, exchange, report_stream):
     fmt, endpoint, headers, body = model.build_request(config, api_key, system, history, message, streaming=True)
     exchange.start(fmt,body)
     url = httpx.URL(endpoint)
@@ -288,6 +288,8 @@ async def _stream_once(model, config, api_key, system, history, message, collect
                 from avatar.models.diagnostics import check_response,empty_response,request_id
                 await check_response(response,api_key)
                 receiving = True
+                if report_stream:
+                    report_stream(True)
                 yield {'type': 'status', 'stage': 'generating', 'message': '生成回答'}
                 content_limit = response_limit(config)
                 if 'text/event-stream' not in response.headers.get('content-type', ''):
@@ -303,8 +305,6 @@ async def _stream_once(model, config, api_key, system, history, message, collect
                     except HTTPException:
                         exchange.proposed(fmt,data)
                         raise
-                    if report_output and (result.text.strip() or result.tool_calls):
-                        report_output(idle_limit)
                     exchange.complete(result)
                     if collect:
                         yield {'type':'result','result':result}
@@ -386,8 +386,6 @@ async def _stream_once(model, config, api_key, system, history, message, collect
                     if text or thought or fragments.size > size_before:
                         timestamp = loop.time()
                         watchdog.reschedule(timestamp + idle_limit)
-                        if report_output and (thought or fragments.size > size_before or isinstance(text,str) and text.strip()):
-                            report_output(idle_limit)
                         if collect and timestamp - last_update >= 10:
                             last_update = timestamp
                             yield {'type': 'status', 'stage': 'model_progress',
@@ -432,3 +430,6 @@ async def _stream_once(model, config, api_key, system, history, message, collect
         raise transport_failure(error,read_timeout=timeout.read) from None
     except (ValueError, KeyError, IndexError, TypeError, AttributeError):
         raise HTTPException(502, '模型流式响应格式与所选接口不匹配')
+    finally:
+        if report_stream and receiving:
+            report_stream(False)

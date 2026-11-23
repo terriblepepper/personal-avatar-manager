@@ -28,7 +28,7 @@ PUBLIC_STAGES = {
     'tool_selection': '判断所需工具', 'rag_retrieving': '检索相关资料',
     'material_reading': '读取相关资料', 'tool_catalog': '查询候选资料',
     'tool_action': '执行已选择的操作', 'skill_execution': '运行已选技能',
-    'result_writing': '整理最终答复', 'model_output': '正在接收模型输出',
+    'result_writing': '整理最终答复', 'model_stream': '模型响应流已连接',
 }
 
 
@@ -37,6 +37,7 @@ class WorkingProgress:
         self.result_id = result['id']
         self.ids = result['taskId'], result['sessionId'], run['run_id']
         self.run = run
+        self.streaming = False
         self.started = time.monotonic()
         self.message = '任务已接收，等待可用执行资源'
         self.revision = 0
@@ -63,13 +64,24 @@ class WorkingProgress:
             self.message = stage
             self.revision += 1
 
-    def model_output(self, idle_limit):
+    def stream_state(self, active):
         now_at = time.time()
+        if active == self.streaming or (active and self.run['work_until'] <= now_at):
+            return
+        self.streaming = active
+        # A recovered stream starts with a full waiting budget after it closes again.
+        self.run['work_until'] = now_at+WORKING_TIMEOUT
+        if active:
+            self.update({'type':'status','stage':'model_stream'})
+
+    def deadline(self):
+        now_at = time.time()
+        if self.streaming:
+            return now_at+WORKING_TIMEOUT
         until = self.run['work_until']
-        if now_at < until:
-            self.run['work_until'] = max(until, now_at + idle_limit)
-            if self.message != PUBLIC_STAGES['model_output']:
-                self.update({'type':'status','stage':'model_output'})
+        if until <= now_at:
+            raise turns.WorkDeadlineExceeded
+        return until
 
     def view(self, result):
         # Progress is a new message, while the ledger retains the working ID used by finish().
@@ -380,8 +392,11 @@ class PersonalTaskService:
 
     async def generate(self,scope,rowid,result,context,principal,run,progress):
         writer, owner = result['id'], run['owner']
+        def renew(conversation_id=None):
+            turns.renew(self.database,rowid,writer,run,conversation_id,work_until=progress.deadline())
         def validate(db):
             document = turns.current_in(db,rowid,writer,run)
+            progress.deadline()
             lease = document['_agent_resume'].get('lease')
             if lease and not db.execute('SELECT 1 FROM chat_conversations WHERE id=? AND lease_until=?',lease).fetchone():
                 raise RunConflict('原任务的会话执行权已变更')
@@ -420,18 +435,16 @@ class PersonalTaskService:
                 with execution_guard(guard):
                     return await self.answer(active,context,result['sessionId'],principal=principal,
                                              resume=run,store=store,progress=progress.update,commit=commit,
-                                             model_output=progress.model_output,claim=lambda cid:turns.renew(self.database,rowid,writer,run,cid))
+                                             stream_state=progress.stream_state,claim=renew)
             finally:
                 self.limit.release()
         task = asyncio.create_task(work())
         try:
             while not task.done():
-                remaining = run['work_until']-time.time()
-                if remaining <= 0:
-                    raise turns.WorkDeadlineExceeded
+                remaining = progress.deadline()-time.time()
                 completed, _ = await asyncio.wait((task,),timeout=min(remaining,turns.RENEW_INTERVAL))
                 if not completed:
-                    turns.renew(self.database,rowid,writer,run)
+                    renew()
             task.result()
             if committed is None:
                 raise RunConflict('缺少本次回答的提交回执')
@@ -471,13 +484,13 @@ class PersonalTaskService:
     # 职责：使用已通过本人鉴权的所有者资料和模型配置生成个人回答。
     # 输入：target 为服务端固定目标，context 是认证 peer/group，session 来自协议会话。
     # 结果与约束：不创建或绑定小镇用户账号；协议会话不混入 Web 历史，计费和压缩费用归目标所有者。
-    async def answer(self, target, context, session, *, principal=None, resume, store, progress, commit, model_output, claim):
+    async def answer(self, target, context, session, *, principal=None, resume, store, progress, commit, stream_state, claim):
         user = {'id': target['user_id'], 'username': target['username'], 'account_status': target['account_status']}
         question = '\n\n用户补充：'.join(resume['inputs'])
         request = ChatRequest(channel='avatar', message=question)
         overview, model = self.chat.context(user, request, target, private_access=False)
         config, key, system, history = model
-        config = {**config, '_aip_stream_progress':model_output}
+        config = {**config, '_aip_stream_state':stream_state}
         if not config.get('_direct_chat'):
             config = {**config, '_avatar_agent':True, '_allow_user_questions':False,
                       '_agent_checkpoint':resume.get('checkpoint',{}),
