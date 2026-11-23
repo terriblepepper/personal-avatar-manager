@@ -2,14 +2,16 @@
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from fastapi import HTTPException
 from avatar.core.text_budget import fits_text_budget
 from avatar.core.db import dump, now
 from avatar.core.schemas import ChatRequest
-from avatar.core.execution import AgentNeedsInput, execution_guard
+from avatar.core.execution import AgentNeedsInput, execution_guard, run_blocking
 from avatar.conversation.loop.runtime import resume_safe
 from avatar.conversation.loop.store import RunConflict, RunStore
 from avatar.protocols.identity.ontology import AVATAR_SKILL_IDS
@@ -17,6 +19,7 @@ from avatar.protocols.tasks import personal_turns as turns
 from avatar.protocols.tasks.store import ManagementTaskError
 from avatar.protocols.tasks.town_auth import TownUserAuthorization
 from avatar.protocols.tasks.town_public import TownPublicAuthorization
+from avatar.protocols.tasks.town_files import TownFiles
 
 
 WORKING_TIMEOUT = 480
@@ -110,6 +113,10 @@ class PersonalTaskService:
         self.authorization = TownUserAuthorization(self.database, settings)
         self.public_authorization = TownPublicAuthorization(self.database, settings)
         self.settings = settings
+        self.files = TownFiles(chat, settings)
+
+    def download(self, rowid, token, identifier):
+        return self.files.download(rowid, token, identifier)
 
     def expire_guests(self):
         from datetime import datetime,timedelta,timezone
@@ -255,15 +262,19 @@ class PersonalTaskService:
                 lease_valid = deadline > time.time() if deadline is not None else not working
                 if lease_valid and not (saved.get('restart') or saved.get('user_question')):
                     return self.working_view((*scope[:3],row['session_id'],scope[4]),turns.public_result(document))
-        with self.database.connect(write=True) as db:
+        with ExitStack() as cleanup, self.database.connect(write=True) as db:
             row = self.task_row(db, scope)
             run = {}
+            deliveries = []
             restarting = False
             if row:
                 scope = (*scope[:3], row['session_id'], scope[4])
                 document = json.loads(row['document'])
                 expired = row['deadline'] is not None and row['deadline'] <= time.time()
                 state = document['status']['state']
+                deliveries = document.get('_file_deliveries',[])
+                if deliveries and (expired or operation=='cancel'):
+                    cleanup.callback(self.files.discard_previous,row['rowid'],deliveries)
                 # The lease holder can have newer model progress than the last persisted checkpoint.
                 if state == 'working' and (expired or row['deadline'] is None) and operation != 'cancel':
                     turns.interrupt_in(db, row, document)
@@ -327,7 +338,9 @@ class PersonalTaskService:
                       'sessionId': session or uuid.uuid4().hex, 'status': {'state': 'working', 'stateChangedAt': now()}, 'products': []}
             if context.group_id:
                 result['groupId'] = context.group_id
-            stored = dump({**result, '_agent_resume':run})
+            if deliveries:
+                run['previous_deliveries'] = deliveries
+            stored = dump({**result, '_agent_resume':run, **({'_file_deliveries':deliveries} if deliveries else {})})
             deadline = accepted_at+turns.LEASE_SECONDS
             if row:
                 rowid = row['rowid']
@@ -413,7 +426,7 @@ class PersonalTaskService:
             run['checkpoint'] = pause.checkpoint
             return 'awaiting-input', str(pause)
 
-        def commit(db, reply, pause=None):
+        def commit(db, reply, pause=None, files=None):
             nonlocal committed
             store.check_in(db)
             state = 'awaiting-completion'
@@ -421,7 +434,8 @@ class PersonalTaskService:
                 state, reply = pause_result(pause)
                 if pause.usage:
                     store.mark_usage_recorded_in(db)
-            committed = turns.finish_in(db,rowid,result,run,state,reply)
+            record, items = self.files.publish(db,rowid,owner,files)
+            committed = turns.finish_in(db,rowid,result,run,state,reply,delivery=record,files=items)
         async def work():
             await self.limit.acquire()
             try:
@@ -475,6 +489,8 @@ class PersonalTaskService:
             if not task.done():
                 task.cancel()
             await asyncio.gather(task,return_exceptions=True)
+            if committed is None and (previous := run.get('previous_deliveries')):
+                await run_blocking(self.files.discard_previous,rowid,previous)
 
     # 控制命令没有 dataItems；只在已存在的配对任务中选择分身鉴权路径，随后仍核对 TLS peer。
     def is_peer_task(self,command):
@@ -500,7 +516,10 @@ class PersonalTaskService:
             background = json.loads(raw)
             for name in ('available_skills', '_skills_revision'):
                 background.pop(name, None)
-            prefix += ' 当前为小镇问答。资料只通过混合检索获取，只交付文字答复。无法中途提问；缺少信息时，在最终答复中说明缺口。'
+            prefix += (' 当前为小镇临时会话，可检索和读取公开资料，按用户需求生成和交付文件。'
+                       '文件随协议回复交付，正文写结果和必要说明，不贴生成源码或虚构链接。'
+                       '工具按需使用，工作区只含本次任务文件，Python 和 HTML 预览均离线。'
+                       '无法中途提问；缺少信息时，在最终答复中说明缺口。')
             if resume.get('clarification'):
                 background['last_clarification'] = resume['clarification']
                 prefix += ' last_clarification 是上一轮你向用户提出的问题，只用于理解本轮补充。'
@@ -514,7 +533,6 @@ class PersonalTaskService:
                                     caller_id=caller, platform=platform, title='小镇公开访客对话' if principal else '小镇分身对话', create=True)
         claim(conversation_id)
         try:
-            from avatar.conversation.loop.entry_tools import bind_entry_tools
             from avatar.models.trace import model_io_scope
             with model_io_scope(progress,private=False):
                 if config.get('_direct_chat'):
@@ -524,18 +542,35 @@ class PersonalTaskService:
                 else:
                     model = await memory.prepare(conversation, overview['agent']['last_modified_at'], model, question,
                                                  self.chat.model_client, user['id'], progress=progress)
-                    model = await bind_entry_tools(self.chat,model,user['id'],target['aic'],conversation,[],
-                        progress=progress,search_only=True)
-                    result = await self.chat.rag.answer(model, question, progress=progress)
+                    from avatar.conversation.loop.town import bind_town_tools
+                    previous = await run_blocking(self.files.files_from_previous,int(store.scope_id),
+                                                  resume.get('previous_deliveries',()))
+                    async with self.files.workspace() as path:
+                        model = await bind_town_tools(self.chat,model,{**user,'aic':target['aic']},caller,
+                            conversation,path,store,progress,previous)
+                        result = await self.chat.rag.answer(model, question, progress=progress)
             if not result.text.strip():
                 raise HTTPException(502, '模型未返回有效回答')
             validate_sandbox = model[0].get('_validate_sandbox')
             if validate_sandbox:
                 validate_sandbox()
+            outputs = model[0].get('_generated_files',())
+            originals = model[0].get('_town_exports',())
+            reply = result.text
+            if not config.get('_direct_chat'):
+                from avatar.conversation.tools.reply_artifacts import reply_with_artifacts
+                attempted = model[0].get('_agent_checkpoint',{}).get('sandbox_attempted')
+                events = [{'group':'sandbox'}] if attempted else ()
+                reply = reply_with_artifacts(reply, outputs, events)
+                reply = re.sub(r'\[\[attachment:[^\]\r\n]+\]\]', '', reply).strip()
+            if not reply and (outputs or originals):
+                reply = '文件已随本轮答复交付。'
             overview['_target'] = {'aic': target['aic'], 'name': overview['agent']['profile']['avatar_name']}
-            self.chat.save(user, request.model_copy(update={'channel': 'acps', 'conversation_id': conversation_id}),
-                           overview, result.text, result.usage, caller_id=caller, commit_in=lambda db:commit(db,result.text))
-            return result.text
+            async with self.files.prepare(int(store.scope_id), outputs, originals) as delivery:
+                self.chat.save(user, request.model_copy(update={'channel': 'acps', 'conversation_id': conversation_id}),
+                               overview, reply, result.usage, caller_id=caller,
+                               commit_in=lambda db:commit(db,reply,files=delivery) if delivery else commit(db,reply))
+            return reply
         except AgentNeedsInput as exc:
             with self.database.connect(write=True) as db:
                 store.check_in(db)
