@@ -13,7 +13,7 @@ const AnimationDiagram = defineAsyncComponent(() => import('./AnimationDiagram.v
 const GeneratedImage = defineAsyncComponent(() => import('./chat/GeneratedImage.vue'))
 const AnimationAttachments = defineAsyncComponent(() => import('./chat/AnimationAttachments.vue'))
 
-const props = withDefaults(defineProps<{ source: string; documentMode?: boolean; diagrams?: boolean; animations?: boolean; conversationId?: string; files?: ChatFile[]; artifactReply?: boolean; sandboxSources?: string[]; savedFileIds?: ReadonlySet<string> }>(), { diagrams: true, animations: undefined })
+const props = withDefaults(defineProps<{ source: string; documentMode?: boolean; manualPictures?: boolean; diagrams?: boolean; animations?: boolean; conversationId?: string; files?: ChatFile[]; artifactReply?: boolean; sandboxSources?: string[]; savedFileIds?: ReadonlySet<string> }>(), { diagrams: true, animations: undefined })
 const emit = defineEmits<{ preview: [file: ChatFile]; promote: [file: ChatFile] }>()
 function fileLink(node: HTMLAnchorElement | HTMLImageElement, url: URL) {
   if (!props.files || url.origin !== location.origin) return false
@@ -52,7 +52,21 @@ function clean(tokens: Token[]) {
     catch { link.removeAttribute('href') }
   }
   for (const image of fragment.querySelectorAll('img')) {
-    try { const url = new URL(image.getAttribute('src') || '', location.href); if (props.documentMode || url.origin !== location.origin || !url.pathname.startsWith('/api/') || url.username || url.password) throw Error(); if (fileLink(image,url)) continue; image.src = url.href; image.loading = 'lazy'; image.referrerPolicy = 'no-referrer' }
+    try {
+      const src = image.getAttribute('src') || ''
+      if (props.manualPictures) {
+        const picture = /^(?:\.\/)?picture\/用户操作手册\/([a-z0-9-]+\.png)$/.exec(decodeURIComponent(src))?.[1]
+        if (!picture) throw Error()
+        image.src = '/api/help/用户操作手册.md?picture=' + picture
+      } else {
+        const url = new URL(src, location.href)
+        if (props.documentMode || url.origin !== location.origin || !url.pathname.startsWith('/api/') || url.username || url.password) throw Error()
+        if (fileLink(image,url)) continue
+        image.src = url.href
+      }
+      image.loading = 'lazy'
+      image.referrerPolicy = 'no-referrer'
+    }
     catch { image.replaceWith(document.createTextNode(`[图片：${image.alt || '外部图片未自动加载'}]`)) }
   }
   if (props.artifactReply && props.sandboxSources?.length) {
@@ -163,7 +177,7 @@ const rendered = computed(() => {
 </script>
 
 <template>
-  <div class="markdown-content" @click="preview">
+  <div class="markdown-content" :class="{ 'manual-pictures': manualPictures }" @click="preview">
     <template v-for="(block, index) in rendered.blocks" :key="block.kind === 'file' ? block.file.id : index">
       <MermaidDiagram v-if="block.kind === 'diagram'" :source="block.source" :conversation-id="conversationId" />
       <AnimationDiagram v-else-if="block.kind === 'animation'" :source="block.source" :conversation-id="conversationId" />
@@ -184,6 +198,7 @@ const rendered = computed(() => {
 </template>
 
 <style scoped>
+.manual-pictures :deep(img) { max-height: none; }
 .expired-file { overflow-wrap:anywhere; margin-block:0.65rem; }
 .markdown-content :is(audio,video) { max-inline-size:100%; max-block-size:60dvh; }
 .markdown-content :deep(.file-link) { max-inline-size:100%; overflow-wrap:anywhere; text-align:start; }

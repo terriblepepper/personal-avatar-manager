@@ -49,6 +49,8 @@ const diagramImage = computed(() => props.imageData?.startsWith('data:image/png;
 const downloadURL = computed(() => diagramImage.value || safeURL.value)
 const manual = computed(() => !!safeURL.value && new URL(safeURL.value).pathname.startsWith('/api/help/')
   && ['md', 'markdown'].includes(extension.value))
+const manualPictures = computed(() => manual.value && props.file.filename === '用户操作手册.md'
+  && new URL(safeURL.value).pathname === '/api/help/' + encodeURIComponent(props.file.filename))
 const chapters = computed(() => {
   if (!manual.value) return []
   const tokens = marked.lexer(text.value)
@@ -296,7 +298,7 @@ onUnmounted(cleanup)
           <thead><tr><th v-for="(cell,index) in tabular[0]" :key="index" scope="col">{{ cell }}</th></tr></thead>
           <tbody><tr v-for="(row,index) in visibleRows" :key="index"><td v-for="(cell,column) in row" :key="column">{{ cell }}</td></tr></tbody>
         </table>
-        <MarkdownContent v-else-if="!source && ['md','markdown'].includes(extension)" :source="shownText"/><pre v-else>{{ shownText }}</pre></div>
+        <MarkdownContent v-else-if="!source && ['md','markdown'].includes(extension)" :source="shownText" :manual-pictures="manualPictures"/><pre v-else>{{ shownText }}</pre></div>
       <mark v-for="(box, index) in boxes" :key="index" class="preview-pdf-match" aria-label="搜索匹配" :style="box"/>
       </div></div>
       <template v-else-if="kind === 'html' && !loading && !error">
