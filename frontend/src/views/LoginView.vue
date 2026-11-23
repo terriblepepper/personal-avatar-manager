@@ -13,7 +13,7 @@ const mode = ref<'login' | 'register' | 'recover'>('login'), busy = ref(false), 
 const local = ref(route.path.startsWith('/admin') || route.query.login === 'local')
 const form = reactive({ username: local.value ? 'admin' : '', password: '', confirm_password: '', email: '', phone: '', person_type: 'student', student_id: '', name: '', contact: '', new_password: '' })
 const title = computed(() => mode.value === 'register' ? '创建你的账户' : mode.value === 'recover' ? '找回密码' : '登录镜像')
-const subtitle = computed(() => mode.value === 'register' ? '学号选填，教师注册需管理员审核。' : mode.value === 'recover' ? '填写注册邮箱或手机号，匹配后即可设置新密码。' : '支持用户名、注册邮箱或手机号登录。')
+const subtitle = computed(() => mode.value === 'register' ? '选择学生或教师身份后填写注册表单。' : mode.value === 'recover' ? '填写注册邮箱或手机号，匹配后即可设置新密码。' : '支持用户名、注册邮箱或手机号登录。')
 async function authenticated(result: SessionResponse) {
   session.accept(result)
   if (props.platformToken && result.user.access_scope !== 'profile') await request('/platform/bind', 'POST', { token: props.platformToken })
@@ -83,7 +83,7 @@ onMounted(async () => {
           </div>
           <form @submit.prevent="submit">
             <template v-if="mode === 'register'">
-              <label class="field">身份类型<select class="form-control" name="person_type" v-model="form.person_type"><option value="student">学生</option><option value="teacher">教师（管理员审核）</option></select></label>
+              <label class="field">身份类型<select class="form-control" name="person_type" v-model="form.person_type"><option value="student">学生</option><option value="teacher">教师</option></select></label>
               <label class="field">姓名<input placeholder=" " class="form-control" name="name" v-model="form.name" maxlength="80" :required="form.person_type === 'teacher'"></label>
               <label v-if="form.person_type !== 'teacher'" class="field">学号（选填）<input class="form-control" name="student_id" v-model="form.student_id" maxlength="80" placeholder="选填，不作为登录账号"></label>
               <label class="field">邮箱 *<input placeholder=" " class="form-control" name="email" v-model="form.email" type="email" required maxlength="160" autocomplete="email"></label>

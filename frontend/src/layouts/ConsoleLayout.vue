@@ -93,14 +93,6 @@ const guideSteps = computed(() => [
   },
 ])
 const runtimePill = computed(() => (({ demo: 'DEMO · 本地演示', 'acps-direct': 'ACPS · 独立实体模式', 'acps-entity': 'ACPS · 派生实体模式' }) as Record<string, string>)[session.authConfig?.runtime_mode || ''] || '服务已启动')
-const notice = computed(() => {
-  const user = session.user
-  if (!user || admin.value || user.person_type !== 'teacher' || user.account_status === 'active') return null
-  return user.account_status === 'pending'
-    ? { error: false, text: '教师注册待管理员审核，可先填写资料；通过后方可提交分身申请。' }
-    : { error: true, text: '教师注册被退回：' + (user.account_reason || '') }
-})
-async function resubmit() { try { await request('/me/account-resubmit', 'POST'); await session.refresh() } catch (e) { notifyError(e) } }
 function closeMore(restoreFocus = false) {
   more.value = false
   if (restoreFocus) menuTrigger.value?.focus()
@@ -230,7 +222,6 @@ async function logout() { try { await session.logout() } catch (e) { notifyError
         <span class="pill" data-runtime-mode><span class="dot"></span>{{ runtimePill }}</span>
       </header>
       <main :data-guide-page="route.path" ref="mainContent" class="content" tabindex="-1">
-        <div v-if="notice" class="notice" :class="{ error: notice.error }">{{ notice.text }}<button v-if="notice.error" type="button" class="button small" @click="resubmit">重新提交注册审核</button></div>
         <div v-if="inHub" class="heading"><div><h1 data-guide-target="hub">我的分身</h1><p class="sub">集中管理分身、资料文件、知识库、模型、技能和任务。</p></div></div>
         <nav v-if="inHub" class="avatar-tabs" aria-label="我的分身功能">
           <ElTooltip v-for="[key, label] in hubTabs" :key="key" :disabled="!SKILLS_PAUSED || key !== 'skills'"

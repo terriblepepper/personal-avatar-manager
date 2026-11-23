@@ -57,9 +57,7 @@ async def oidc_callback(request: Request, state: str = Query(default='', max_len
         from avatar.accounts.login_devices import device_context
         identifier=request.cookies.get('avatar_device','')
         if not re.fullmatch(r'[A-Za-z0-9_-]{43}',identifier):identifier=secrets.token_urlsafe(32)
-        (token, csrf, user, duration), target = await request.app.state.oidc.finish(state, code, browser, iss, device_context(request,identifier))
-        if user.get('person_type') == 'teacher' and user.get('account_status') == 'pending':
-            await asyncio.to_thread(request.app.state.pending_reviews.invalidate)
+        (token, _, _, duration), target = await request.app.state.oidc.finish(state, code, browser, iss, device_context(request,identifier))
         response = RedirectResponse(target, status_code=303)
         response.set_cookie('avatar_session', token, max_age=duration, httponly=True, samesite='strict',
                             secure=request.app.state.settings.secure_cookie)

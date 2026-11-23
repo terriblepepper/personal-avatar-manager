@@ -51,21 +51,19 @@ def help_document(document:Literal['用户操作手册.md','知识库与soul.md'
 
 # 职责：注册本地账户，按有效平台入口可同时绑定并登录。
 # 输入：body 为注册请求，request 提供数据库与配置，response 用于写 Cookie。
-# 结果与约束：普通注册只返回提示；带入口注册成功后设置 30 分钟 profile Cookie 并返回受限账户及 CSRF，教师仍需审核。
+# 结果与约束：普通注册只返回提示；带入口注册成功后设置 30 分钟 profile Cookie 并返回受限账户及 CSRF。
 @router.post("/auth/register", status_code=201)
 def register(body: RegistrationRequest, request: Request, response: Response):
     if request.app.state.settings.oidc_enabled:
         from fastapi import HTTPException
         raise HTTPException(403, '请通过 Keycloak 注册并登录')
     user_id=auth.create_user(request.app.state.database, body)
-    if body.person_type == "teacher":
-        request.app.state.pending_reviews.invalidate()
     if body.platform_entry_token:
         with request.app.state.database.connect(write=True) as db:
             token,csrf,user=auth.issue_session(db,user_id,1800,'profile')
         response.set_cookie('avatar_session',token,httponly=True,samesite='strict',secure=request.app.state.settings.secure_cookie,max_age=1800)
         return {'message':'注册并绑定成功','user':user,'csrf':csrf}
-    return {"message": "教师注册已提交，请登录查看管理员审核状态" if body.person_type == "teacher" else "注册成功，请登录"}
+    return {"message": "注册成功，请登录"}
 
 
 # 职责：预览临时入口对应的绑定状态。
@@ -151,16 +149,6 @@ def public_avatar(aic: str, request: Request):
     return request.app.state.service.public_avatar(aic)
 
 
-# 职责：执行管理员对教师注册的审核。
-# 输入：user_id 为申请账户，body 为审核决定，user 经 admin 依赖授权。
-# 结果与约束：委托业务服务更新审核状态和记录；通过不等于授予管理员身份。
-@router.post("/admin/accounts/{user_id}/review")
-def account_review(user_id: str, body: ReviewRequest, request: Request, user=Depends(admin)):
-    result = request.app.state.service.review_account(user, user_id, body)
-    request.app.state.pending_reviews.invalidate()
-    return result
-
-
 # 职责：撤销当前服务端会话并清除浏览器 Cookie。
 # 输入：user 依赖完成登录与 CSRF 校验，request 提供原 Cookie，response 删除 Cookie。
 # 结果与约束：按 Cookie 哈希删除当前会话，不注销其他会话，返回退出提示。
@@ -209,30 +197,18 @@ def model_effort_levels(provider: str, api_format: Literal['openai','anthropic',
 
 # 职责：保存当前账户的个人资料草稿。
 # 输入：body 含 Profile、修改日期和旧客户端可选模型配置，user 经过会话与 CSRF 检查。
-# 结果与约束：委托服务校验身份、选填学号、状态和修改日期后保存；独立文件及模型设置不参与身份审核。
+# 结果与约束：委托服务校验身份、选填学号、状态和修改日期后保存；独立文件及模型设置沿用各自入口。
 @router.put("/me/profile")
 def profile(body: DraftRequest, request: Request, user=Depends(auth.current_user)):
-    result = request.app.state.service.save_draft(user, body)
-    request.app.state.pending_reviews.invalidate()
-    return result
+    return request.app.state.service.save_draft(user, body)
 
 
 # 职责：提交当前账户指定修改日期的资料进行审核。
 # 输入：body.last_modified_at 为读取的草稿修改日期，user 为本人账户。
-# 结果与约束：委托业务服务创建审核快照并返回概览，教师注册须先通过，不能直接创建分身。
+# 结果与约束：委托业务服务创建审核快照并返回概览；审核通过后进入分身创建。
 @router.post("/me/submit")
 def submit(body: SubmitRequest, request: Request, user=Depends(auth.current_user)):
     result = request.app.state.service.submit(user, body.last_modified_at)
-    request.app.state.pending_reviews.invalidate()
-    return result
-
-
-# 职责：重新提交本人被驳回的教师注册审核。
-# 输入：user 为登录账户，request 提供服务。
-# 结果与约束：仅服务确认 rejected 教师时转为 pending，其他情况拒绝。
-@router.post("/me/account-resubmit")
-def account_resubmit(request: Request, user=Depends(auth.current_user)):
-    result = request.app.state.service.resubmit_account(user)
     request.app.state.pending_reviews.invalidate()
     return result
 

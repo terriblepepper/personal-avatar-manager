@@ -170,37 +170,6 @@ class AvatarService:
                                   for item in self.attachments.public_context(row['user_id'])]
         return {'aic': aic, 'profile': visible}
 
-    # 职责：处理待审核教师注册并记录审核结果。
-    # 输入：admin 为管理员，user_id 为教师账户，decision 含通过标志和理由；权限由路由校验。
-    # 结果与约束：仅处理 pending 教师，驳回理由必填；原子更新账户状态、审核记录及事件，不授予管理员身份。
-    def review_account(self, admin, user_id, decision,db=None):
-        reason = decision.reason.strip()
-        if not decision.approve and not reason:
-            raise HTTPException(422, "驳回教师注册时必须填写原因")
-        with (nullcontext(db) if db is not None else self.database.connect(write=True)) as db:
-            account = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
-            if not account or account["person_type"] != "teacher":
-                raise HTTPException(404, "教师申请不存在")
-            if account["account_status"] != "pending":
-                raise HTTPException(409, "教师注册已处理")
-            status = "active" if decision.approve else "rejected"
-            db.execute("UPDATE users SET account_status=?,account_reason=? WHERE id=?", (status, reason, user_id))
-            db.execute("INSERT INTO account_reviews(user_id,reviewer,approved,reason,created_at) VALUES(?,?,?,?,?)", (user_id, admin["id"], decision.approve, reason, now()))
-            event(db, user_id, admin["username"], "教师注册审核通过" if decision.approve else "教师注册驳回", reason, actor_id=admin['id'])
-        return {"status": status}
-
-    # 职责：让被驳回的教师重新提交注册审核。
-    # 输入：user 为当前教师账户。
-    # 结果与约束：仅 rejected 教师可恢复 pending，清空原因并记事件；其他状态返回 409。
-    def resubmit_account(self, user):
-        with self.database.connect(write=True) as db:
-            row = db.execute("SELECT account_status FROM users WHERE id=? AND person_type='teacher'", (user["id"],)).fetchone()
-            if not row or row[0] != "rejected":
-                raise HTTPException(409, "只有被驳回的教师注册可重新申请")
-            db.execute("UPDATE users SET account_status='pending',account_reason='' WHERE id=?", (user["id"],))
-            event(db, user["id"], user["username"], "重新提交教师注册审核", actor_id=user['id'])
-        return {"status": "pending"}
-
     # 职责：解析数据库分身记录，排除旧模型配置副本。
     # 输入：row 为可选 SQLite Row。
     # 结果与约束：存在时返回证书和资料字典；不存在返回 None；当前模型配置由账户设置服务另行读取。
@@ -225,7 +194,7 @@ class AvatarService:
 
     # 职责：保存本人资料草稿，兼容旧客户端同时独立保存模型设置。
     # 输入：user 为当前账户，request 含资料日期、Profile 和旧客户端可选模型配置。
-    # 结果与约束：检查状态及修改日期，允许本人选择资料身份并保持教师审核；姓名和分身名称固定公开且文字可编辑，既有学号不自动合并；加密 Key 后更新草稿，返回最新概览。
+    # 结果与约束：检查状态及修改日期，允许本人选择资料身份；姓名和分身名称固定公开且文字可编辑，既有学号不自动合并；加密 Key 后更新草稿，返回最新概览。
     def save_draft(self, user, request):
         with self.database.connect(write=True) as db:
             p = db.execute("SELECT * FROM profile_records WHERE user_id=?", (user["id"],)).fetchone()
@@ -280,11 +249,11 @@ class AvatarService:
         return self.overview(user["id"], access_scope=user.get("access_scope", "full"))
 
     # 职责：将当前修改日期对应资料生成不可变审核申请。
-    # 输入：user 为注册审核已通过账户，last_modified_at 为前端读取的资料日期。
+    # 输入：user 为当前激活账户，last_modified_at 为前端读取的资料日期。
     # 结果与约束：校验日期、状态和完整性；申请使用随机 ID，提交不改变资料日期，重复或并发提交仍受状态约束。
     def submit(self, user, last_modified_at):
         if user["account_status"] != "active":
-            raise HTTPException(403, "教师注册须先经管理员审核通过，才能提交分身申请")
+            raise HTTPException(403, "当前账户无法提交分身申请")
         with self.database.connect(write=True) as db:
             p = db.execute("SELECT * FROM profile_records WHERE user_id=?", (user["id"],)).fetchone()
             if not p:
@@ -381,7 +350,7 @@ class AvatarService:
             event(db, user_id, user["username"], "更新演示证书", f"证书代次 {certificate['generation']}", actor_id=user['id'])
         return certificate
 
-    # 职责：汇总管理后台统计、申请、任务、教师注册和事件。
+    # 职责：汇总管理后台统计、申请、任务、历史注册记录和事件。
     # 输入：当前管理员账户 ID，仅由已验证管理员的路由调用；登录审计始终限定本人。
     # 结果与约束：返回有数量上限的后台记录及配置，解码快照并脱敏 Key；mode 反映注册器配置，逐个证书仍保留其真实类型。
     def dashboard(self,user_id):

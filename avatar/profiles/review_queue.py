@@ -1,4 +1,4 @@
-"""统一教师、分身创建及资料更新审核；列表只读投影，批量操作复用原审核事务。"""
+"""统一分身创建、资料更新和 Soul 审核，并展示历史教师审核记录。"""
 import json
 from fastapi import HTTPException
 from avatar.accounts.auth import require_admin
@@ -13,9 +13,7 @@ SOURCE="""SELECT 'profile' AS kind,s.id,s.user_id,u.username,
  CASE WHEN EXISTS(SELECT 1 FROM avatar_records a WHERE a.user_id=s.user_id AND julianday(a.created_at)<julianday(s.submitted_at)) OR EXISTS(SELECT 1 FROM profile_submissions p WHERE p.user_id=s.user_id
  AND p.status='approved' AND p.submitted_at<s.submitted_at) THEN 'update' ELSE 'create' END AS category,s.last_modified_at
  FROM profile_submissions s JOIN users u ON u.id=s.user_id
- UNION ALL SELECT 'teacher',u.id,u.id,u.username,COALESCE(json_extract(p.draft,'$.name'),''),'',
- p.updated_at,'pending',u.account_reason,NULL,'teacher',p.last_modified_at
- FROM users u JOIN profile_records p ON p.user_id=u.id WHERE u.person_type='teacher' AND u.account_status='pending'
+
  UNION ALL SELECT 'teacher_history',CAST(r.id AS TEXT),u.id,u.username,
  COALESCE(json_extract(p.draft,'$.name'),''),'',r.created_at,
  CASE WHEN r.approved=1 THEN 'approved' ELSE 'rejected' END,r.reason,r.created_at,'teacher',COALESCE(p.last_modified_at,'')
@@ -61,7 +59,7 @@ class ReviewQueue:
                 if row:
                     job=db.execute('SELECT id,status,registration_phase,error FROM provision_jobs WHERE submission_id=?',(identifier,)).fetchone()
                     return {'kind':kind,**self.service._submission(row,admin=True),'registration':dict(job) if job else None}
-            elif kind in ('teacher','teacher_history'):
+            elif kind=='teacher_history':
                 row=db.execute('SELECT * FROM ('+SOURCE+') WHERE kind=? AND id=?',(kind,identifier)).fetchone()
                 if row:
                     profile=db.execute('SELECT draft FROM profile_records WHERE user_id=?',(row['user_id'],)).fetchone()
@@ -77,8 +75,7 @@ class ReviewQueue:
             if not current:raise HTTPException(403,'需要管理员权限')
             require_admin(current)
             for kind,identifier in identifiers:
-                if kind=='teacher':self.service.review_account(user,identifier,decision,db=db)
-                elif kind=='profile':self.service.review(user,identifier,decision,db=db)
+                if kind=='profile':self.service.review(user,identifier,decision,db=db)
                 elif kind=='soul':self.service.knowledge.review(user,identifier,decision,db)
                 else:raise HTTPException(422,'只能处理待审核记录')
         return {'updated':len(identifiers)}

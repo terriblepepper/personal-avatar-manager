@@ -5,10 +5,6 @@ REVIEW_REQUEST = """(
  (e.action IN ('提交创建审核','提交更新审核') AND EXISTS (
    SELECT 1 FROM profile_submissions s WHERE s.user_id=e.user_id AND s.status='pending'
    AND e.detail='资料修改于 '||s.last_modified_at))
- OR (e.action IN ('提交教师注册审核','重新提交教师注册审核','选择资料身份','账户注册') AND EXISTS (
-   SELECT 1 FROM users u WHERE u.id=e.user_id AND u.person_type='teacher' AND u.account_status='pending')
-   AND e.id=(SELECT MAX(t.id) FROM audit_events t WHERE t.user_id=e.user_id
-     AND t.action IN ('提交教师注册审核','重新提交教师注册审核','选择资料身份','账户注册')))
 )"""
 
 
