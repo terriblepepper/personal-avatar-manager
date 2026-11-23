@@ -138,8 +138,32 @@ class TownFiles:
         record = {'token':delivery['token'], 'files':items, 'owner':owner}
         root = self.public_url.rstrip('/') + f'/api/town/files/{rowid}/{delivery["token"]}'
         return record, [{'type':'file', 'name':item['name'], 'mimeType':item['mimeType'],
-                         'uri':root+'/'+item['id'], 'metadata':{'size':item['size'], 'sha256':item['sha256']}}
+                         'uri':root+'/'+item['id'], 'metadata':{'size':item['size'], 'sha256':item['sha256'],
+                            **({'inlineHtml':True} if 'original' not in item and item['mimeType']=='text/html' else {})}}
                         for item in items]
+
+    def with_html_body(self, result):
+        prefix = self.public_url.rstrip('/') + '/api/town/files/'
+        for product in (result.get('products') or ()):
+            items = product['dataItems']
+            blocks = []
+            for item in items:
+                if (item['type']!='file' or not (item.get('metadata') or {}).get('inlineHtml')
+                        or not item['uri'].startswith(prefix)):
+                    continue
+                rowid,token,identifier = item['uri'][len(prefix):].split('/')
+                try:
+                    source = self.download(int(rowid),token,identifier)[0]
+                    with source:
+                        html = source.read().decode('utf-8')
+                except (HTTPException, UnicodeDecodeError):
+                    continue
+                fence = chr(96)*max(3,1+max((len(match.group(1)) for match in re.finditer(
+                    r'(?m)^ {0,3}('+chr(96)+r'{3,})[ \t]*\r?$',html)),default=0))
+                blocks.append(f'{fence}html\n{html}\n{fence}')
+            if blocks:
+                items[0] = {**items[0],'text':'\n\n'.join([items[0]['text'],*blocks])}
+        return result
 
     @staticmethod
     def live(db, rowid, token):

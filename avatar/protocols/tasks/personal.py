@@ -229,6 +229,14 @@ class PersonalTaskService:
     # 输入：command、context 已由真实传输认证，aic/user_id 为固定端点身份。
     # 结果与约束：长模型调用在事务外；重复命令不重复计费；continue 在原 taskId/session 下生成下一轮，不暴露其他 peer 或 session 的任务。
     async def handle(self, command, context, user_id, aic):
+        result = await self._handle(command, context, user_id, aic)
+        if command['command'] in ('start','get','continue') and any(
+                (item.get('metadata') or {}).get('inlineHtml') for product in (result.get('products') or ())
+                for item in product.get('dataItems',())):
+            return await run_blocking(self.files.with_html_body,result)
+        return result
+
+    async def _handle(self, command, context, user_id, aic):
         target = self.target(user_id, aic)
         headers={k.lower():v for k,v in getattr(context,'headers',{}).items()}
         public = headers.get('x-avatar-access')=='public' or not headers.get('authorization')
