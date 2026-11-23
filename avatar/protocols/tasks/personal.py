@@ -21,6 +21,7 @@ from avatar.protocols.tasks.town_public import TownPublicAuthorization
 
 WORKING_TIMEOUT = 480
 PROGRESS_INTERVAL = 8
+log = logging.getLogger('uvicorn.error.' + __name__)
 PUBLIC_STAGES = {
     'memory': '读取会话上下文', 'compressing': '整理会话上下文',
     'intent_analysis': '判断任务目标', 'thinking': '分析任务和已有信息',
@@ -32,8 +33,9 @@ PUBLIC_STAGES = {
 
 
 class WorkingProgress:
-    def __init__(self, result_id):
-        self.result_id = result_id
+    def __init__(self, result, run_id):
+        self.result_id = result['id']
+        self.ids = result['taskId'], result['sessionId'], run_id
         self.started = time.monotonic()
         self.message = '任务已接收，等待可用执行资源'
         self.revision = 0
@@ -41,9 +43,21 @@ class WorkingProgress:
         self.envelope = {}
 
     def update(self, event):
-        if event.get('type') != 'status':
+        if event.get('group') == 'model_io':
+            status = event['status']
+            if status not in ('completed','error','interrupted'):
+                return
+            attempt = event['input']['attempt']
+            output = event['output']
+            log.info('Personal AIP model taskId=%r sessionId=%r run_id=%s purpose=%s attempt=%d status=%s interrupted=%s elapsed_ms=%d',
+                     *self.ids, event['purpose'], attempt, status, output.get('stream_interrupted', False),
+                     round(1000*(time.monotonic()-self.started)))
+            stage = (f"模型响应流中断，正在进行第 {output['retry']}/{output['retry_limit']} 次重试"
+                     if output.get('retry') else None)
+        elif event.get('type') == 'status':
+            stage = PUBLIC_STAGES.get(event.get('stage'))
+        else:
             return
-        stage = PUBLIC_STAGES.get(event.get('stage'))
         if stage and stage != self.message:
             self.message = stage
             self.revision += 1
@@ -204,13 +218,18 @@ class PersonalTaskService:
         scope = (aic, scope_peer, context.group_id or '', session, command.get('taskId'))
         if operation not in ('start', 'continue', 'get', 'complete', 'cancel') or not scope[-1]:
             raise ManagementTaskError(-32602, '需要带 taskId 的 start/continue/get/complete/cancel')
+        if operation in ('get','cancel'):
+            audit = log.info if operation == 'cancel' else log.debug
+            audit('Personal AIP control operation=%s taskId=%r sessionId=%r commandId=%r entry=%s',
+                  operation, scope[-1], session, command['id'], 'town-http' if context.peer_aic == 'town-http' else 'direct')
         if operation == 'get':
             with self.database.connect() as db:
                 row = self.task_row(db, scope)
                 if not row:
                     raise ManagementTaskError(-32001, '当前调用者和会话中没有该任务')
                 document = json.loads(row['document'])
-                if (row['deadline'] is None or row['deadline'] > time.time()) and not document.get('_agent_resume', {}).get('restart'):
+                if ((row['deadline'] is None or row['deadline'] > time.time()) and not turns.work_expired(document)
+                        and not document.get('_agent_resume', {}).get('restart')):
                     return self.working_view((*scope[:3],row['session_id'],scope[4]),turns.public_result(document))
         with self.database.connect(write=True) as db:
             row = self.task_row(db, scope)
@@ -221,6 +240,11 @@ class PersonalTaskService:
                 document = json.loads(row['document'])
                 expired = row['deadline'] is not None and row['deadline'] <= time.time()
                 state = document['status']['state']
+                if state == 'working' and turns.work_expired(document):
+                    result = turns.expire_in(db,row,document)
+                    if job := self.pending.get(scope):
+                        job.cancel()
+                    return result
                 if expired and state == 'working' and operation != 'cancel':
                     turns.interrupt_in(db, row, document)
                     state = document['status']['state']
@@ -229,13 +253,16 @@ class PersonalTaskService:
                         or operation == 'complete' and state == 'awaiting-completion'
                         or expired and state == 'awaiting-completion'):
                     final = 'canceled' if operation == 'cancel' else 'failed' if expired else 'completed'
-                    result = turns.close_in(db,row,document,final)
+                    result = turns.close_in(db,row,document,final,reason='confirmation_timeout' if final=='failed' else None)
                     job = self.pending.get(scope)
                     if job: job.cancel()
                     return result
                 restarting = operation == 'get' and state == 'awaiting-input' and run.get('restart')
-                if restarting and public and self.visitor_busy(db,aic,scope_peer):
-                    return turns.public_result(document)
+                if restarting:
+                    if turns.work_expired(document):
+                        return turns.expire_in(db,row,document)
+                    if public and self.visitor_busy(db,aic,scope_peer):
+                        return turns.public_result(document)
                 if not restarting:
                     if operation != 'continue':
                         return self.working_view(scope,turns.public_result(document))
@@ -275,6 +302,9 @@ class PersonalTaskService:
                     self.charge_visitor(db, user_id, aic, scope_peer, principal['visitor_id'])
                 run.update(run_id=run.get('run_id') or uuid.uuid4().hex, owner=user_id, sources=revision, skills=selected,
                            inputs=inputs, input_id=command['id'], supplement=question if len(inputs)>1 else '')
+            accepted_at = time.time()
+            if not restarting or 'work_until' not in run:
+                run['work_until'] = accepted_at + WORKING_TIMEOUT
             run['automatic'] = bool(restarting)
             run.pop('restart', None)
             result = {'type': 'task-result', 'id': uuid.uuid4().hex, 'sentAt': now(), 'senderRole': 'partner',
@@ -283,7 +313,7 @@ class PersonalTaskService:
             if context.group_id:
                 result['groupId'] = context.group_id
             stored = dump({**result, '_agent_resume':run})
-            deadline = time.time()+turns.LEASE_SECONDS
+            deadline = min(accepted_at+turns.LEASE_SECONDS,run['work_until'])
             if row:
                 rowid = row['rowid']
                 db.execute('UPDATE avatar_aip_tasks SET command_id=?,document=?,deadline=? WHERE rowid=?',
@@ -296,7 +326,7 @@ class PersonalTaskService:
         # Return a status before a slow model outlives the caller's HTTP timeout.
         if restarting and scope in self.pending:
             self.pending[scope].cancel()
-        progress = WorkingProgress(result['id'])
+        progress = WorkingProgress(result,run['run_id'])
         self.progress[scope] = progress
         task=asyncio.create_task(self.generate(scope,rowid,result,context,principal,run,progress))
         self.pending[scope]=task
@@ -305,7 +335,8 @@ class PersonalTaskService:
                 self.pending.pop(scope,None)
                 self.progress.pop(scope,None)
             if not job.cancelled() and job.exception():
-                logging.getLogger(__name__).error('个人协议后台任务失败：%s',type(job.exception()).__name__)
+                log.error('Personal AIP worker taskId=%r sessionId=%r run_id=%s error=%s',
+                          *progress.ids, type(job.exception()).__name__)
         task.add_done_callback(done)
         try:return await asyncio.wait_for(asyncio.shield(task),timeout=1)
         except TimeoutError:return progress.view(result)
@@ -367,8 +398,7 @@ class PersonalTaskService:
                     store.mark_usage_recorded_in(db)
             committed = turns.finish_in(db,rowid,result,run,'awaiting-input' if pause else 'awaiting-completion',reply)
         async def work():
-            async with asyncio.timeout(WORKING_TIMEOUT):
-                await self.limit.acquire()
+            await self.limit.acquire()
             try:
                 state = store.acquire()
                 if not resume_safe(state, initial=not run.get('claimed'), automatic=run['automatic']):
@@ -385,10 +415,14 @@ class PersonalTaskService:
                 self.limit.release()
         task = asyncio.create_task(work())
         try:
-            while not task.done():
-                completed, _ = await asyncio.wait((task,),timeout=turns.RENEW_INTERVAL)
-                if not completed:
-                    turns.renew(self.database,rowid,writer,run)
+            try:
+                async with asyncio.timeout(max(0,run['work_until']-time.time())):
+                    while not task.done():
+                        completed, _ = await asyncio.wait((task,),timeout=turns.RENEW_INTERVAL)
+                        if not completed:
+                            turns.renew(self.database,rowid,writer,run)
+            except TimeoutError:
+                raise turns.WorkDeadlineExceeded from None
             task.result()
             if committed is None:
                 raise RunConflict('缺少本次回答的提交回执')
@@ -405,17 +439,20 @@ class PersonalTaskService:
                     if doc['id']==writer and doc['status']['state']=='working':
                         turns.interrupt_in(db,row,doc)
             raise
+        except turns.WorkDeadlineExceeded:
+            return turns.finish(self.database,rowid,result,run,'failed',turns.TIMEOUT_MESSAGE,reason='working_timeout')
         except (RunConflict, TimeoutError, HTTPException, ManagementTaskError) as exc:
             message = (str(exc.detail) if isinstance(exc,HTTPException) else
-                       '等待模型并发资源超时，请稍后再试' if isinstance(exc,TimeoutError) else str(exc))
-            return turns.finish(self.database,rowid,result,run,'failed',message)
+                       '此次模型或工具调用超时，请重新发起任务' if isinstance(exc,TimeoutError) else str(exc))
+            return turns.finish(self.database,rowid,result,run,'failed',message,reason=type(exc).__name__)
         except Exception as exc:
-            logging.getLogger(__name__).error('个人协议任务生成失败：writer=%s type=%s',writer,type(exc).__name__)
+            log.error('Personal AIP generation taskId=%r sessionId=%r run_id=%s error=%s',
+                      *progress.ids, type(exc).__name__)
             return turns.finish(self.database,rowid,result,run,'failed','模型问答失败，请检查目标分身的模型配置或稍后再试')
         finally:
             if not task.done():
                 task.cancel()
-                await asyncio.gather(task,return_exceptions=True)
+            await asyncio.gather(task,return_exceptions=True)
 
     # 控制命令没有 dataItems；只在已存在的配对任务中选择分身鉴权路径，随后仍核对 TLS peer。
     def is_peer_task(self,command):

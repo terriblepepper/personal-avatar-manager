@@ -1,6 +1,7 @@
 """小镇个人任务的执行权、恢复条件和原子协议回执。"""
 import hashlib
 import json
+import logging
 import time
 import uuid
 
@@ -12,10 +13,27 @@ from avatar.protocols.tasks.store import ManagementTaskError
 
 RENEW_INTERVAL = 30
 LEASE_SECONDS = 3 * RENEW_INTERVAL
+TIMEOUT_MESSAGE = '本轮任务执行超时，尚未生成可交付结果。请使用新任务重试。'
+log = logging.getLogger('uvicorn.error.' + __name__)
+
+
+class WorkDeadlineExceeded(TimeoutError):
+    """Personal AIP work exceeded its active-turn budget."""
+
+
+def work_expired(document):
+    until = document.get('_agent_resume', {}).get('work_until')
+    return until is not None and until <= time.time()
+
+
+def audit_outcome(document, run, reason, *, previous_run=None):
+    log.info('Personal AIP outcome taskId=%r sessionId=%r run_id=%s state=%s reason=%s',
+             document['taskId'], document['sessionId'], run.get('run_id', previous_run),
+             document['status']['state'], reason)
 
 
 def public_result(document):
-    return {key: value for key, value in document.items() if key != '_agent_resume'}
+    return {key: value for key, value in document.items() if key not in ('_agent_resume','_audit_run_id')}
 
 
 def source_revision(db, owner, aic):
@@ -41,8 +59,9 @@ def clear_run(db, row, run):
         RunStore.clear_in(db, run['owner'], 'protocol', str(row['rowid']), run['run_id'])
 
 
-def close_in(db, row, document, state, message=None):
+def close_in(db, row, document, state, message=None, *, reason=None):
     run = document.pop('_agent_resume', {})
+    previous_run = document.pop('_audit_run_id', None)
     lease_release(db, run)
     clear_run(db, row, run)
     status = {'state':state,'stateChangedAt':now()}
@@ -50,10 +69,17 @@ def close_in(db, row, document, state, message=None):
         status['dataItems']=[{'type':'text','text':message}]
     document.update(id=uuid.uuid4().hex,sentAt=now(),status=status)
     db.execute('UPDATE avatar_aip_tasks SET document=?,deadline=NULL WHERE rowid=?',(dump(document),row['rowid']))
+    audit_outcome(document, run, reason or state, previous_run=previous_run)
     return document
 
 
+def expire_in(db, row, document):
+    return close_in(db, row, document, 'failed', TIMEOUT_MESSAGE, reason='working_timeout')
+
+
 def interrupt_in(db, row, document):
+    if work_expired(document):
+        return expire_in(db, row, document)
     run = document.pop('_agent_resume', {})
     started = run.get('claimed', False)
     lease_release(db, run)
@@ -71,6 +97,7 @@ def interrupt_in(db, row, document):
     document.update(id=uuid.uuid4().hex, sentAt=now(), status={'state':state, 'stateChangedAt':now(),
                     'dataItems':[{'type':'text','text':message}]})
     db.execute('UPDATE avatar_aip_tasks SET document=?,deadline=NULL WHERE rowid=?', (dump(document), row['rowid']))
+    audit_outcome(document, run, 'writer_interrupted')
 
 
 def current_in(db, rowid, writer, run):
@@ -79,6 +106,8 @@ def current_in(db, rowid, writer, run):
         doc = json.loads(row['document'])
         if (doc['status']['state']=='working' and doc['id']==writer and
                 doc.get('_agent_resume',{}).get('run_id')==run['run_id']):
+            if work_expired(doc):
+                raise WorkDeadlineExceeded
             return doc
     raise RunConflict('当前任务已结束或已被其他执行者接管')
 
@@ -88,7 +117,7 @@ def renew(database, rowid, writer, run, conversation_id=None):
         doc = current_in(db, rowid, writer, run)
         saved = doc['_agent_resume']
         current = time.time()
-        until = current+LEASE_SECONDS
+        until = min(current+LEASE_SECONDS, saved.get('work_until', float('inf')))
         if conversation_id:
             if not db.execute('UPDATE chat_conversations SET lease_until=? WHERE id=? AND user_id=? AND lease_until<?',
                               (until,conversation_id,run['owner'],current)).rowcount:
@@ -106,7 +135,7 @@ def renew(database, rowid, writer, run, conversation_id=None):
 # 输入：rowid 和当前 working 消息 ID 固定执行者，message 为产品或状态说明。
 # 结果与约束：只更新原任务，不覆盖已取消结果；成功等待 Leader 确认最多 300 秒。
 
-def finish_in(db, rowid, result, run, state, message):
+def finish_in(db, rowid, result, run, state, message, *, reason=None):
     row = db.execute('SELECT rowid,document FROM avatar_aip_tasks WHERE rowid=?',(rowid,)).fetchone()
     if not row:
         raise RunConflict('原任务已删除')
@@ -116,6 +145,7 @@ def finish_in(db, rowid, result, run, state, message):
     document = {**result,'id':uuid.uuid4().hex,'sentAt':now(),'status':{'state':state,'stateChangedAt':now()}}
     lease_release(db,current['_agent_resume'])
     if state=='awaiting-completion':
+        document['_audit_run_id'] = run['run_id']
         document['products']=[{'id':uuid.uuid4().hex,'dataItems':[{'type':'text','text':message}]}]
     else:
         document['status']['dataItems']=[{'type':'text','text':message}]
@@ -127,9 +157,12 @@ def finish_in(db, rowid, result, run, state, message):
         clear_run(db,row,run)
     db.execute('UPDATE avatar_aip_tasks SET document=?,deadline=? WHERE rowid=?',
                (dump(document),time.time()+300 if state=='awaiting-completion' else None,rowid))
+    audit_outcome(document, run, reason or state)
     return public_result(document)
 
 
-def finish(database, rowid, result, run, state, message):
+def finish(database, rowid, result, run, state, message, *, reason=None):
     with database.connect(write=True) as db:
-        return finish_in(db,rowid,result,run,state,message)
+        if run.get('work_until', float('inf')) <= time.time():
+            state, message, reason = 'failed', TIMEOUT_MESSAGE, 'working_timeout'
+        return finish_in(db,rowid,result,run,state,message,reason=reason)
