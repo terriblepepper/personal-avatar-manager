@@ -327,9 +327,10 @@ def create_app(settings=None, provider=None, run_worker=True, model_client=None)
         return response
 
     app.include_router(migration_router)
-    from avatar.api.town_routes import router as town_router
+    from avatar.api.town_routes import account_router as town_account_router, router as town_router
 
     app.include_router(town_router)
+    app.include_router(town_account_router)
     app.include_router(oidc_router)
     app.include_router(router)
     from avatar.api.knowledge_routes import router as knowledge_router

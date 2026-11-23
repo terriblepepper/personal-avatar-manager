@@ -82,7 +82,13 @@ const guideSteps = computed(() => [
       title, detail: tabHelp[key], target: key === 'avatar' ? 'avatar-summary' : key, path: '/' + key,
     }))]
   }),
-  { title: '账户与帮助', detail: '在这里打开帮助文档，按任务查找操作步骤。同一菜单还可以切换主题或退出登录。', target: 'help', path: profileScope.value ? '/profile' : '/' },
+  {
+    title: '账户与帮助',
+    detail: profileScope.value
+      ? '在这里打开帮助文档，按任务查找操作步骤。同一菜单还可以切换主题或退出登录。'
+      : '在这里打开帮助文档，按任务查找操作步骤。菜单中的「账户设置」可分别设置小镇的单访客和总日额度，两项默认不限。',
+    target: 'help', path: profileScope.value ? '/profile' : '/',
+  },
 ])
 const runtimePill = computed(() => (({ demo: 'DEMO · 本地演示', 'acps-direct': 'ACPS · 独立实体模式', 'acps-entity': 'ACPS · 派生实体模式' }) as Record<string, string>)[session.authConfig?.runtime_mode || ''] || '服务已启动')
 const notice = computed(() => {

@@ -1395,6 +1395,11 @@ def install_schema(connection):
     connection.execute("""ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_stage
         TEXT NOT NULL DEFAULT 'done' CHECK (onboarding_stage IN ('welcome','tour','done'))""")
 
+    connection.execute("""CREATE TABLE IF NOT EXISTS town_access_limits (
+        owner_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        visitor_daily_limit BIGINT CHECK(visitor_daily_limit BETWEEN 0 AND 9007199254740991),
+        total_daily_limit BIGINT CHECK(total_daily_limit BETWEEN 0 AND 9007199254740991))""")
+
     connection.execute("ALTER TABLE agent_dialogues ADD COLUMN IF NOT EXISTS agent_checkpoint TEXT, ADD COLUMN IF NOT EXISTS pending_file_delivery TEXT, ADD COLUMN IF NOT EXISTS message_prepared INTEGER NOT NULL DEFAULT 0 CHECK(message_prepared IN (0,1))")
     connection.execute("ALTER TABLE agent_task_files ADD COLUMN IF NOT EXISTS source_file_id TEXT")
     connection.execute("ALTER TABLE profile_records ADD COLUMN IF NOT EXISTS reuse_signed_acs INTEGER")
