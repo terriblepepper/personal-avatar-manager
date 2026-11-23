@@ -888,7 +888,7 @@ class AgentDialogues:
 
     def close_record(self,db,identifier,reason,action='complete',remember=True,*,rejected=False):
         stamp=now()
-        deadline=(datetime.fromisoformat(stamp)+timedelta(days=7)).isoformat(timespec='microseconds').replace('+00:00','Z') if action=='complete' else None
+        deadline=(datetime.fromisoformat(stamp)+timedelta(days=7)).isoformat(timespec='microseconds').replace('+00:00','Z')
         task=db.execute("""UPDATE agent_dialogues SET status='ended',agent_checkpoint=NULL,ended_at=?,end_reason=?,
             expires_at=CASE WHEN delivery_mode='message' THEN NULL ELSE ? END,active_speaker='',error='',
             waiting_reason='',confirmation_required=0,rejected=?,updated_at=? WHERE id=? AND status!='ended' RETURNING *""",
@@ -902,17 +902,15 @@ class AgentDialogues:
             result_title='任务已拒绝'
         db.execute('INSERT OR IGNORE INTO agent_protocol_controls(task_id,action) VALUES(?,?)',(identifier,action))
         if task['delivery_mode']=='message':return
-        if deadline:
-            self.resources.sync_task_expiry(db,identifier)
-            for owner in (task['user_id'],task['target_user_id']):
-                cards=self.resources.expired_cards(db,identifier,owner)
-                if cards:
-                    db.execute('UPDATE agent_task_members SET expired_files=? WHERE task_id=? AND user_id=?',
-                               (dump(cards),identifier,owner))
+        self.resources.sync_task_expiry(db,identifier)
+        for owner in (task['user_id'],task['target_user_id']):
+            cards=self.resources.expired_cards(db,identifier,owner)
+            if cards:
+                db.execute('UPDATE agent_task_members SET expired_files=? WHERE task_id=? AND user_id=?',
+                           (dump(cards),identifier,owner))
         for member in db.execute('SELECT * FROM agent_session_members WHERE session_id=?',(task['session_id'],)).fetchall():
-            if task['delivery_mode']!='message' or member['user_id']==task['user_id']:
-                notify(db,member['user_id'],'result',task['session_id'],identifier,result_title,
-                       ('任务文件将在完成七天后清理，需要保留请转存到资料库。\n' if deadline else '')+reason,'result:'+identifier)
+            notify(db,member['user_id'],'result',task['session_id'],identifier,result_title,
+                   '任务文件将在结束七天后清理，需要保留请转存到资料库。\n'+reason,'result:'+identifier)
             if not remember:continue
             own_aic=task['own_aic'] if member['user_id']==task['user_id'] else task['target_aic']
             messages=db.execute("SELECT m.content,m.task_action FROM agent_dialogue_messages m WHERE dialogue_id=? AND m.id>? AND speaker_aic=? AND speaker_role='agent' ORDER BY id DESC LIMIT 1",(identifier,member['cleared_through'],own_aic)).fetchall()
