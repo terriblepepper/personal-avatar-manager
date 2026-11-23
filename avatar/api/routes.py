@@ -44,25 +44,23 @@ def health(request: Request):
 @router.get('/help/{document}')
 def help_document(
     document: Literal['用户操作手册.md', '知识库与soul.md', '资料RAG与嵌入.md'],
-    request: Request,
     picture: Annotated[str | None, Query(pattern=r'^[a-z0-9-]+\.png$', max_length=80)] = None,
     user=Depends(auth.current_user),
 ):
     """仅提供固定的用户帮助文档，不公开目录或接受任意文件路径。"""
     from avatar.core.config import ROOT
-    directory = ROOT / 'docs'
+    path = ROOT / 'docs' / document
     headers = None
     if document == '用户操作手册.md':
-        local = request.app.state.settings.data_dir / 'docs'
-        if (local / document).is_file():
-            directory = local
+        if not path.is_file():
+            path = path.with_stem('用户操作手册-purge')
         headers = {'Cache-Control': 'private, no-store'}
     if picture is not None:
-        file = directory / 'picture' / '用户操作手册' / picture
+        file = path.parent / 'picture' / path.stem / picture
         if document != '用户操作手册.md' or not file.is_file():
             raise HTTPException(404, '手册图片不存在')
         return FileResponse(file, media_type='image/png', headers=headers)
-    return FileResponse(directory / document, media_type='text/markdown; charset=utf-8',
+    return FileResponse(path, media_type='text/markdown; charset=utf-8',
                         filename=document, headers=headers)
 
 

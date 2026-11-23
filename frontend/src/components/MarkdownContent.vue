@@ -55,7 +55,7 @@ function clean(tokens: Token[]) {
     try {
       const src = image.getAttribute('src') || ''
       if (props.manualPictures) {
-        const picture = /^(?:\.\/)?picture\/用户操作手册\/([a-z0-9-]+\.png)$/.exec(decodeURIComponent(src))?.[1]
+        const picture = /^(?:\.\/)?picture\/用户操作手册(?:-purge)?\/([a-z0-9-]+\.png)$/.exec(decodeURIComponent(src))?.[1]
         if (!picture) throw Error()
         image.src = '/api/help/用户操作手册.md?picture=' + picture
       } else {

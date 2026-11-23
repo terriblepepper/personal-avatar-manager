@@ -17,10 +17,12 @@ class BuildPlatform(build_py):
             rmtree(resources)  # Drop generated files from earlier builds before assembling the wheel.
         if frontend.is_dir():
             copytree(frontend, resources / 'frontend' / 'dist')
-        for document in ('用户操作手册.md', '操作手册.md', '知识库与soul.md', '资料RAG与嵌入.md'):
+        for document in ('用户操作手册-purge.md', '操作手册.md', '知识库与soul.md', '资料RAG与嵌入.md'):
             target = resources / 'docs' / document
             target.parent.mkdir(parents=True, exist_ok=True)
             copy2(root / 'docs' / document, target)
+        pictures = Path('docs') / 'picture' / '用户操作手册-purge'
+        copytree(root / pictures, resources / pictures)
         target = resources / 'tools' / 'everos'
         target.mkdir(parents=True, exist_ok=True)
         copy2(root / 'tools' / 'everos' / 'worker.py', target / 'worker.py')

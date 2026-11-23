@@ -52,6 +52,8 @@ node_modules/
 
 # ---------- 运行数据（私有：账号、资料、索引、Soul、证书、维护备份）----------
 /data/
+/docs/用户操作手册.md
+/docs/picture/用户操作手册/
 /redis/redis.sock
 /redis/redis.pid
 /redis/redis.lock
