@@ -34,6 +34,7 @@ class DialogueRequest(BaseModel):
 
 
 class DialogueResume(BaseModel):
+    steer: StrictBool=False
     question_id: str|None=Field(default=None,pattern=r'^[0-9a-f]{32}$')
     expected_revision: int|None=Field(default=None,ge=0)
     model_config=ConfigDict(extra='forbid',str_strip_whitespace=True)

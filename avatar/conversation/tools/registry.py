@@ -21,8 +21,13 @@ class ConversationTools:
         with self.files.database.connect() as db:
             row=self.files.session(db,user_id,conversation_id)
             saved=json.loads(row['tools_config'])
-        return {'items':[{'id':key,**value,'enabled':saved.get(key,value['default']) is True} for key,value in TOOL_CATALOG.items()],
-                'updated_at':row['tools_updated_at'], 'reasoning_effort':saved.get('reasoning_effort')}
+        items=[]
+        for key,value in TOOL_CATALOG.items():
+            item={'id':key,**value,'enabled':saved.get(key,value['default']) is True}
+            if row['channel']=='peer' and key=='python':
+                item.update(enabled=True,locked=True)
+            items.append(item)
+        return {'items':items,'updated_at':row['tools_updated_at'],'reasoning_effort':saved.get('reasoning_effort')}
 
     def effort(self, user_id, conversation_id, *, selected=...):
         with self.files.database.connect(write=selected is not ...) as db:
@@ -46,9 +51,14 @@ class ConversationTools:
             raise HTTPException(422,'请选择有效工具和布尔开关')
         with self.files.database.connect(write=True) as db:
             row=self.files.session(db,user_id,conversation_id,editable=True)
-            saved=json.loads(row['tools_config'])
-            if settings.get('animation') is True:
-                saved['python'] = True
-            saved.update(settings)
-            db.execute('UPDATE chat_conversations SET tools_config=?,tools_updated_at=? WHERE id=?',(dump(saved),now(),conversation_id))
+            if row['channel']=='peer':
+                if settings.get('python') is False:
+                    raise HTTPException(409,'分身间会话的 Python 沙箱始终开启')
+                settings={key:value for key,value in settings.items() if key!='python'}
+            if settings:
+                saved=json.loads(row['tools_config'])
+                if row['channel']!='peer' and settings.get('animation') is True:
+                    saved['python'] = True
+                saved.update(settings)
+                db.execute('UPDATE chat_conversations SET tools_config=?,tools_updated_at=? WHERE id=?',(dump(saved),now(),conversation_id))
         return self.get(user_id,conversation_id)

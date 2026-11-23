@@ -177,12 +177,12 @@ async def disclose_tools(model, settings, key, system, history, question, catalo
             'tools 只选实际需要的工具。只需文字答复时提交空的 tools 和 steps，正文由下一阶段作答。'
             '复杂任务拆为可核对的必要目标，给出 goal 和 criterion。先核对，再决定是否需要追加修订。'
             '可用同一子目标的 tools 列出替代工具。先取证再创作时，将取证与交付分别列为前后两个子目标。'
-            '通信、提交发言、等待用户、结束任务属于终态；应作为独立的最后一步。'
+            '规划只选择一次终态动作，作为独立最后一步。需要发送最后发言并结束时，只规划 end_task，可附发言。'
             '普通网页或动画如涉及复杂场景、交互或较长源码，可选 segmented=true 从第一段开始分段写作。'
             '简单单次动作可只写 goal 和 tool。已确定的只读参数可以填 lookup；有依赖或不确定时留待执行。'
             '每个独立作品只列一项生成目标。生成回执已经证明文件存在，无需另列目录查询或交付确认。只有用户要求检查内容时才规划复查。'
             '当前授权目录只列摘要；不可选择目录外工具。已关闭的能力如确实需要，可选择其 ID 以提示用户。'
-            '只返回 plan_task 或相同结构的 JSON。'+json.dumps(catalog,ensure_ascii=False))
+            '当前只规划工具和目标，调用 plan_task 或返回相同结构的 JSON。最终发言留到执行阶段。'+json.dumps(catalog,ensure_ascii=False))
     if 'read_session_file' in catalog:
         prompt+='read_session_file 用 query 查目录，用 file_id 读原件。仅需目录时为目标设置 file_access=directory；需要正文时用 content，目录只是定位。修订作品时先读原件，再提交局部修改。'
     if revise:
@@ -192,7 +192,7 @@ async def disclose_tools(model, settings, key, system, history, question, catalo
     issue = '未得到有效披露'
     for attempt in range(2):
         await check_execution_async(validate)
-        options=config if not attempt else {**config,'_tools':[]}
+        options={**config,'_tools':[]} if attempt and (overflow or 'end_task' not in catalog) else config
         spec=prompt if not attempt else prompt+'\n上次失败（数据）：'+json.dumps(issue,ensure_ascii=False)+'。请修正后用简洁的 JSON 返回。'
         room = max(0, input_budget(options)-estimate(spec))
         if overflow:

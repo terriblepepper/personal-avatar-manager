@@ -117,7 +117,7 @@
 
 ## 会话文件与工具（`chat_file_routes.py`，前缀 `/api/conversations`）
 
-- `GET|PATCH /{conversation_id}/tools` — 会话工具授权
+- `GET|PATCH /{conversation_id}/tools` — 会话工具授权。分身间会话的 Python 返回 `enabled: true`、`locked: true`。关闭请求返回 409。
 - `GET /{conversation_id}/file-library` — 可选文件库
 - `GET|POST /{conversation_id}/files`、`GET|PATCH|DELETE /{conversation_id}/files/{file_id}`
 - `POST /{conversation_id}/files/reference`、`PATCH /{conversation_id}/files/{file_id}/reference`
@@ -129,6 +129,8 @@
 - `POST /{identifier}/style-learning/learn` — 立即学习需要已审核生效的 Soul。
 
 ## 分身协作（`collaboration_routes.py`，前缀 `/api`）
+
+运行中向 `POST /agent-dialogues/{id}/resume` 提交 `steer: true` 和补充文字，当前发言结束后按已认证发送方入列。参与方可用 `POST /agent-dialogues/{id}/end` 直接结束，协议取消回执由后台处理。
 
 **用户技能**
 

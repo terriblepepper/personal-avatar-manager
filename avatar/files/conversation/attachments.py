@@ -124,7 +124,6 @@ class ChatFiles(ConversationResources):
                 originals=chat_rows+shared_rows
                 params+=owner,conversation,owner
             else:
-                outputs=()
                 originals=chat_rows+""" AND EXISTS(SELECT 1 FROM jsonb_each_text(?::jsonb) g
                     WHERE g.key=chat_files.id AND g.value=chat_files.sha256)"""
                 params+=(json.dumps(grants(db)),)
@@ -151,6 +150,8 @@ class ChatFiles(ConversationResources):
                 f.description,f.origin,f.source_label,f.expires_at,f.referenced,f.animation_metadata,
                 length(f.extracted_text)>0 AS text_available,
                 EXISTS(SELECT 1 FROM chat_file_usages u WHERE u.file_id=f.id) AS sent,
+                f.origin='attachment' AND EXISTS(SELECT 1 FROM agent_shared_workspaces w WHERE w.conversation_id=f.conversation_id)
+                  AND EXISTS(SELECT 1 FROM agent_task_files a WHERE a.file_id=f.id) AS shared_attachment,
                 CASE WHEN f.content_type=? THEN (SELECT a.id FROM attachments a WHERE a.user_id=?
                         AND a.animation_digest<>'' AND a.animation_digest=f.animation_digest AND a.saved_at IS NOT NULL
                         ORDER BY a.id LIMIT 1)

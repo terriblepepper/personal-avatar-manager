@@ -28,7 +28,7 @@ class SessionFiles:
         self.proofs = {key:{'source':'chat', 'origin':'generated', **proof} for key,proof in proofs.items()}
         self.verified = {}
         self.outputs = outputs
-        self.staged_reads = dict(staged_reads or {}) if grants is None else {}
+        self.staged_reads = dict(staged_reads or {})
         self.staged_digests = {}
 
     def _rows(self, db, ids, *, lock=False):
@@ -118,10 +118,8 @@ class SessionFiles:
 
     def staged_html(self, identifier):
         # The list belongs to the authorized current run and contains only server-created outputs.
-        if self.grants is None:
-            return next((item for item in self.outputs if item['id']==identifier and
-                         item.get('html_mode') in ('html','2d','3d') and isinstance(item.get('data'),bytes)),None)
-        return None
+        return next((item for item in self.outputs if item['id']==identifier and
+                     item.get('html_mode') in ('html','2d','3d') and isinstance(item.get('data'),bytes)),None)
 
     def staged_digest(self, item):
         data = item['data']

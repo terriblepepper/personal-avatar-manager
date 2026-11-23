@@ -79,6 +79,8 @@ class PeerRequest:
             payload.pop('question_id', None)
         if payload.get('expected_revision') is None:
             payload.pop('expected_revision', None)
+        if payload.get('steer') is False:
+            payload.pop('steer')
         raw = json.dumps(payload, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
         return cls(scope, key, hashlib.sha256(raw.encode()).hexdigest())
 
@@ -219,11 +221,12 @@ class AgentDialogues:
                 if private_draft and not taken:
                     db.execute('UPDATE agent_task_members SET resource_conversation_id=? WHERE task_id=? AND user_id=?',(draft_workspace,identifier,user['id']))
                     self.resources.sync_task_expiry(db,identifier)
+            proposal_id=None
             if prepared and mode!='message':
-                db.execute('''INSERT INTO agent_dialogue_messages
+                proposal_id=db.execute('''INSERT INTO agent_dialogue_messages
                     (dialogue_id,turn,speaker_aic,speaker_name,speaker_user_id,content,usage,created_at,state,task_action)
                     VALUES(?,1,?,?,?,?,'null',?,'awaiting_acceptance','send_message')''',
-                    (identifier,own['aic'],json.loads(own['profile']).get('avatar_name','分身'),user['id'],objective+shared,stamp))
+                    (identifier,own['aic'],json.loads(own['profile']).get('avatar_name','分身'),user['id'],objective+shared,stamp)).lastrowid
             elif shared and mode!='message':
                 db.execute("INSERT INTO agent_dialogue_messages(dialogue_id,turn,speaker_aic,speaker_name,speaker_role,content,usage,created_at) VALUES(?,1,?,'用户授权共享资料','user',?,'null',?)",(identifier,own['aic'],'任务：'+objective+'\n\n'+shared,stamp))
             auto_accept = mode!='message' and self.auto_accept_enabled(db,target['user_id'],own['user_id'])
@@ -233,6 +236,9 @@ class AgentDialogues:
             file_ids=getattr(body,'file_ids',[])
             file_source=source_conversation_id or (self.resources.workspace(db,user['id'],sid) if file_ids else None)
             self.resources.share(db,user,identifier,file_ids,file_source,attachments=request.scope=='intent')
+            if proposal_id is not None and file_ids:
+                db.execute('UPDATE agent_task_files SET message_id=? WHERE task_id=? AND source_user_id=? AND message_id IS NULL',
+                           (proposal_id,identifier,user['id']))
             if auto_accept:
                 self.accept({'id':target['user_id']},sid,identifier,transaction=db)
                 notify(db,target['user_id'],'accepted',sid,identifier,'已自动同意分身任务',objective,'auto-accept:'+identifier)
@@ -309,12 +315,19 @@ class AgentDialogues:
         result['can_accept']=row['delivery_mode']!='message' and row['status']=='awaiting_acceptance' and row['target_user_id']==user['id']
         result['needs_confirmation']=row['delivery_mode']!='message' and row['status']=='awaiting_input' and bool(row['confirmation_required']&bit)
         result['waiting_for_other']=row['status'] in ('awaiting_acceptance','awaiting_input') and not (result['can_accept'] or result['needs_confirmation'])
-        if row['status']=='awaiting_input' and row['agent_checkpoint']:
-            checkpoint=json.loads(row['agent_checkpoint'])
-            result['can_supplement']=checkpoint['speaker_id']==user['id']
-            result['waiting_for_other']=not result['can_supplement']
-            if result['can_supplement'] and checkpoint.get('user_question'):
-                result['user_question']=checkpoint['user_question']
+        if row['status']=='awaiting_input':
+            checkpoint=json.loads(row['agent_checkpoint'] or '{}')
+            if checkpoint and not row['confirmation_required']:
+                mine=checkpoint['speaker_id']==user['id']
+                question=checkpoint.get('user_question')
+                result.update(can_supplement=mine,waiting_for_other=not mine)
+                result['waiting_label']=('等待本人补充信息' if mine else '等待对方补充信息') if question else ('等待本人继续或结束' if mine else '等待对方处理')
+                if mine and question:
+                    result['user_question']=question
+                elif not mine:
+                    result['waiting_reason']=''
+            elif row['confirmation_required']:
+                result['waiting_label']='等待双方确认' if row['confirmation_required']==3 else ('等待本人确认' if result['needs_confirmation'] else '等待对方确认')
         return result
 
     @staticmethod
@@ -659,12 +672,13 @@ class AgentDialogues:
         if not previous:
             waiting=self.check_supplement(initial,user,body,body.message)
             asking=waiting and bool(json.loads(initial['agent_checkpoint']).get('user_question'))
-            commands,message=('',body.message.strip()) if asking else self.chat.skills.split_commands(user['id'],body.message)
+            steering=getattr(body,'steer',False)
+            commands,message=('',body.message.strip()) if asking or steering else self.chat.skills.split_commands(user['id'],body.message)
             removed=getattr(body,'remove_skills',[])
             for skill_id in removed:self.chat.skills.get(user['id'],skill_id)
             if initial['status']=='awaiting_identity':raise HTTPException(409,'正在自动重试通信入口，超时后可重新编辑并发送')
             if initial['status']=='ended':raise HTTPException(409,'该任务已完成，请在同一分身会话创建新任务')
-            booking=not asking and not approval and bool(message) and initial['delivery_mode']!='message' and await self.intent.requires_confirmation(user,message)
+            booking=not (asking or approval or steering) and bool(message) and initial['delivery_mode']!='message' and await self.intent.requires_confirmation(user,message)
             previous = self._queue_input(user, identifier, body, request, approval, commands, message, removed, booking)
         if previous != identifier and not request.scope.startswith('session:'):
             return {'id': previous, 'session_id': initial['session_id']}
@@ -696,6 +710,12 @@ class AgentDialogues:
             if previous:
                 return previous
             if row['status']=='ended':raise HTTPException(409,'该任务已完成，请在同一分身会话创建新任务')
+            steering=getattr(body,'steer',False)
+            if steering:
+                if approval or not row['accepted'] or row['status'] not in ('running','queued'):
+                    raise HTTPException(409,'本轮已暂停或结束，请刷新后补充')
+                if not message or removed or getattr(body,'file_ids',[]) or getattr(body,'question_id',None):
+                    raise HTTPException(422,'生成中补充只接收文字')
             if approval == 'accept' and (row['target_user_id'] != user['id'] or row['accepted']):
                 raise HTTPException(409, '任务已处理或无需本人接受')
             if approval == 'confirm' and not row['confirmation_required'] & (1 if row['user_id'] == user['id'] else 2):
@@ -716,7 +736,7 @@ class AgentDialogues:
                 self.resources.share(db,user,identifier,getattr(body,'file_ids',[]))
                 request.remember(db,user,identifier)
                 return identifier
-            if row['delivery_mode']=='message' and message and not waiting and row['status']!='paused':
+            if row['delivery_mode']=='message' and message and not (waiting or steering) and row['status']!='paused':
                 peer=row['target_aic'] if row['user_id']==user['id'] else row['own_aic']
                 task_id=self.create(user,SimpleNamespace(target_aic=peer,objective=body.message,request_id=body.request_id,delivery_mode='message',file_ids=getattr(body,'file_ids',[])),db=db,request=request)
                 # 一次消息交付中的补充另发一条，不能把尚未发送的内容写成上一条的送达结果。
@@ -739,7 +759,7 @@ class AgentDialogues:
             request.remember(db, user, identifier)
             if booking:
                 db.execute("UPDATE agent_dialogues SET task_kind='booking',initiator_confirmed=0,target_confirmed=0 WHERE id=?",(identifier,))
-            if row['status']!='running' and accepted and not (approval or row['status']=='awaiting_input' and row['confirmation_required']):
+            if row['status']!='running' and accepted and not (approval or steering and row['message_prepared'] or row['status']=='awaiting_input' and row['confirmation_required']):
                 self.apply_inputs(db,identifier)
                 if removed and not commands and not message:
                     db.execute('UPDATE agent_dialogues SET updated_at=? WHERE id=?',(now(),identifier))
@@ -897,7 +917,7 @@ class AgentDialogues:
             source_message_id=None
             avatar=db.execute('SELECT aic,profile,last_modified_at FROM avatar_records WHERE user_id=?',(member['user_id'],)).fetchone()
             if destination and avatar:
-                source=db.execute("INSERT INTO chat_messages(user_id,channel,role,content,created_at,profile_modified_at,conversation_id,responder_aic,responder_name) VALUES(?,'assistant','assistant',?,?,?,?,?,?)",(member['user_id'],('委派子任务已完成' if task['delivery_mode']!='message' else result_title)+'：'+task['objective']+'\n\n'+content[:6000],now(),avatar['last_modified_at'],destination['id'],avatar['aic'],json.loads(avatar['profile']).get('avatar_name','我的分身')))
+                source=db.execute("INSERT INTO chat_messages(user_id,channel,role,content,created_at,profile_modified_at,conversation_id,responder_aic,responder_name) VALUES(?,'assistant','assistant',?,?,?,?,?,?)",(member['user_id'],result_title+'：'+task['objective']+'\n\n'+content[:6000],now(),avatar['last_modified_at'],destination['id'],avatar['aic'],json.loads(avatar['profile']).get('avatar_name','我的分身')))
                 source_message_id=source.lastrowid
                 conclusion=messages[0]['content'] if messages[0]['task_action'] else reply_status(messages[0]['content'],0)[0]
                 db.execute('UPDATE chat_messages SET task_event=? WHERE id=?',(dump({'kind':'end','task_id':identifier,'title':task['objective'],'mode':task['delivery_mode'],'state':'ended','reason':reason,'summary':conclusion}),source_message_id))
@@ -909,10 +929,11 @@ class AgentDialogues:
             row=self.owned(db,user,identifier)
             if expected_revision is not None and (row['revision']!=expected_revision or row['status']!='awaiting_input'):
                 raise HTTPException(409,'任务状态已改变，请刷新后再结束')
-            self.close_record(db,identifier,'用户结束当前任务','cancel')
-            db.execute('UPDATE agent_dialogues SET revision=revision+1 WHERE id=?',(identifier,))
-        await self.interrupt(identifier)
-        await self.flush_controls(identifier)
+            if row['status']!='ended':
+                self.close_record(db,identifier,'用户结束当前任务','cancel')
+                db.execute('UPDATE agent_dialogues SET revision=revision+1 WHERE id=?',(identifier,))
+        if call:=self.calls.get(identifier):
+            call.cancel()
         return self.get(user,identifier)
 
     # 只有双方均清理的原文才物理回收；个人记忆清理绝不触及另一方保留记录。
@@ -970,6 +991,13 @@ class AgentDialogues:
           AND u.speaker_role='user' AND u.speaker_name!='用户授权共享资料'
           AND NOT EXISTS(SELECT 1 FROM agent_dialogue_messages a WHERE a.dialogue_id=u.dialogue_id
             AND a.speaker_role='agent' AND a.speaker_aic!=? AND a.id>u.id) LIMIT 1""",(identifier,speaker_aic)).fetchone())
+
+    @staticmethod
+    def owner_can_stop(db,identifier,speaker):
+        last=db.execute('SELECT speaker_user_id,speaker_aic,speaker_role,speaker_name FROM agent_dialogue_messages WHERE dialogue_id=? ORDER BY id DESC LIMIT 1',(identifier,)).fetchone()
+        if not last or last['speaker_role']!='user' or last['speaker_name']!='用户补充要求':
+            return False
+        return last['speaker_user_id']==speaker['user_id'] if last['speaker_user_id'] else last['speaker_aic']==speaker['aic']
 
     # 接收方独立加载本人公开资料、本人技能与本人会话摘要；不读取对方私密档案。
     async def answer_peer(self,job,speaker_id):
@@ -1154,6 +1182,7 @@ class AgentDialogues:
             sending=ordinary and speaker_id==job['user_id']
             reply_owed=not ordinary and self.needs_peer_reply(db,job['id'],speaker['aic'])
             response_owed=not ordinary and self.needs_peer_reply(db,job['id'],peer['aic'])
+            may_stop=not ordinary and self.owner_can_stop(db,job['id'],speaker)
             memory=member if ordinary else task_member
             through=max(member['cleared_through'],memory['summary_through']) if ordinary else memory['summary_through']
             rows=self.memory_rows(db,job['session_id'],None if ordinary else job['id'],through,speaker_id)
@@ -1220,14 +1249,29 @@ class AgentDialogues:
             else:
                 policy+='本轮你是接收方，应优先回应对方本轮最新发言；旧对话及摘要仅作必要背景，不能用旧话题覆盖本轮消息。'
         else:
-            policy+='你在独立任务内协作，必须选择一个原生函数调用：send_message 向对方发送本轮发言；end_task 在对方已收到并回应最新补充后完成任务；wait_for_user 等待本人意图。不要在正文写状态标记或代替函数调用。已完成、没有新事项或对方告别时调用 end_task，不要继续互相确认。本轮执行缺少本人才能提供的信息时使用 ask_user 私下提问。需要流程中的参与方确认时用 wait_for_user 指定 initiator（发起人）、target（接收人）或 both。content 只写本轮正文，原因填写 reason。'
+            policy+='你在独立任务内协作，必须选择一个原生函数调用：send_message 向对方发送本轮发言；end_task 在完成本轮交付后结束任务，可同时发送最后的答复；wait_for_user 等待本人意图。不要在正文写状态标记或代替函数调用。已完成、没有新事项或对方告别时调用 end_task，不要继续互相确认。本轮执行缺少本人才能提供的信息时使用 ask_user 私下提问。需要流程中的参与方确认时用 wait_for_user 指定 initiator（发起人）、target（接收人）或 both。content 只写本轮正文，原因填写 reason。'
             policy+='确认按钮仅授权继续处理，不代表用户接受或拒绝预约；真实意图以用户明确填写的补充内容为准。确认时留空表示委托你自行判断和推进，不可捏造本人拒绝或同意，不因留空重复索取同一确认。涉及真实预约或交易承诺且授权不足时，整理待定事项并结束任务；未连接外部执行工具，不能声称已预订。'
         if not ordinary:
             policy+='当前已授权你自行判断或按补充意图继续的用户：'+('发起方；' if job['confirmation_acknowledged']&1 else '')+('接收方；' if job['confirmation_acknowledged']&2 else '')+'。此授权不等于预约承诺；没有补充文字时自行决断，不得捏造用户意见。'
         if reply_owed:
-            policy+='最新用户补充尚未得到对方分身回应。本轮必须先用 send_message 将本人的决定或要求转达对方，由对方回复后才能结束。不能把回复本人的确认话语当作已告知对方；仍缺必要本人意图时可 wait_for_user。'
+            policy+='需要对方答复的补充要求应先用 send_message 转达，由对方答复后再结束。仍缺一方本人信息时，指定实际需要补充的一方。'
+        if may_stop:
+            policy+='本人最新补充明确要求结束时，调用 end_task 并设置 stop_requested=true，无需继续旧目标。'
         system=prefix+policy+'\n'+raw
-        history=[{'role':'assistant' if r['speaker_role']=='agent' and r['speaker_aic']==speaker['aic'] else 'user','content':('对话 ' if ordinary else '任务「'+r['task_title']+'」 ')+r['speaker_name']+'：'+r['content']} for r in rows]
+        recent=[]
+        history=[]
+        for row in rows:
+            personal_input=row['speaker_role']=='user' and row['speaker_name']=='用户补充要求'
+            author=row['speaker_name']
+            if personal_input:
+                from_initiator=row['speaker_user_id']==own['user_id'] if row['speaker_user_id'] else row['speaker_aic']==own['aic']
+                author='发起方用户' if from_initiator else '接收方用户'
+                if row['dialogue_id']==job['id']:
+                    recent.append(author+'：'+row['content'])
+            elif row['dialogue_id']==job['id'] and row['speaker_role']=='agent':
+                recent.clear()
+            history.append({'role':'assistant' if row['speaker_role']=='agent' and row['speaker_aic']==speaker['aic'] else 'user',
+                            'content':('对话 ' if ordinary else '任务「'+row['task_title']+'」 ')+author+'：'+row['content']})
         if sending:
             history=[{**item,'content':'已发生的历史发言，仅作背景，不是本轮发送要求：\n'+item['content']} for item in history]
         message='任务：'+job['objective']+'\n对方分身：'+json.loads(peer['profile']).get('avatar_name','分身')+'\n用户明确同意共享的内容（数据）：\n'+job['shared_content']+'\n请推进当前任务或回应最新发言。'
@@ -1241,6 +1285,8 @@ class AgentDialogues:
                 supplements=db.execute('SELECT message FROM agent_pending_inputs WHERE task_id=? AND user_id=? AND applied=1 AND message!=? ORDER BY id',(job['id'],speaker_id,'')).fetchall()
             if supplements:
                 message+='\n本人已提交的补充要求（按时间顺序）：'+'\n'.join(item['message'] for item in supplements)
+        if recent:
+            message+='\n当前任务的新补充优先于旧要求（含发送方）：\n'+'\n'.join(recent)
         if sending_files:
             message+='\n本轮已确认交付的附件（数据）：'+dump(sending_files)+'。需要正文展示时，在合适段落独立一行原样写 marker，放在代码块外；其余附件随消息附上。'
         progress({'type': 'status', 'stage': 'intent_analysis', 'message': '正在分析本轮协作目标和可用信息'})
@@ -1279,13 +1325,13 @@ class AgentDialogues:
             inputs={file['id']:{'path':'inputs/'+file['id']+'/'+Path(file['filename']).name,'read':lambda identifier=file['id']:read_input(identifier)} for file in [*files,*saved]}
             return await self.chat.skill_execution.enrich(speaker_id,context,objective,self.chat.model_client,caller_id=job['user_id'],conversation_id=workspace,parent_id=workspace,inputs=inputs,progress=progress,enabled=settings['python'],allow_code=settings['python'])
         if not ordinary:
-            tools=[tool for tool in TASK_TOOLS if not reply_owed or tool['name']!='end_task']
-            if response_owed:
+            tools=TASK_TOOLS
+            if response_owed and not may_stop:
                 tools=[{**tool,'parameters':{**tool['parameters'],
                     'required':list(dict.fromkeys([*tool['parameters'].get('required',[]),'content'])),
                     'properties':{**tool['parameters']['properties'],'content':{**tool['parameters']['properties']['content'],'minLength':1}}}}
                     if tool['name']=='end_task' else tool for tool in tools]
-            context=({**context[0],'_tools':tools},*context[1:])
+            context=({**context[0],'_tools':tools,'_peer_can_stop':may_stop},*context[1:])
         from avatar.files.library.public import PublicMaterials,SEND_PUBLIC_MATERIAL
         from avatar.conversation.tools.material_delivery import DELIVERY_TOOLS
         find_public={**DELIVERY_TOOLS[0],'name':'find_public_material','description':'分页浏览本人已公开目录，按路径、模糊名称或正文主题查找可发送原件。'}
@@ -1416,11 +1462,18 @@ class AgentDialogues:
             current=db.execute('SELECT * FROM agent_dialogues WHERE id=?',(job['id'],)).fetchone()
             if not current or current['revision']!=job['revision'] or current['status']!='running':return
             pending=bool(db.execute("SELECT 1 FROM agent_pending_inputs WHERE task_id=? AND applied=0 AND (message!='' OR skill_commands!='' OR removed_skills='[]')",(job['id'],)).fetchone())
-            reply_owed=not ordinary and self.needs_peer_reply(db,job['id'],speaker['aic'])
-            action_name='send_message' if confirmed is not None else (result.get('task_action') or {}).get('name','')
-            if done and not ordinary and not text.strip() and self.needs_peer_reply(db,job['id'],peer['aic']):
+            reply_owed=self.needs_peer_reply(db,job['id'],speaker['aic'])
+            response_owed=self.needs_peer_reply(db,job['id'],peer['aic'])
+            task_action=result.get('task_action') or {}
+            action_name='send_message' if confirmed is not None else task_action.get('name','')
+            explicit_stop=not ordinary and done and action_name=='end_task' and task_action['arguments'].get('stop_requested') is True
+            if explicit_stop and not self.owner_can_stop(db,job['id'],speaker):
+                raise HTTPException(409,'当前发言方没有新的本人补充可授权停止任务')
+            if ordinary and response_owed:
+                done=True
+            if done and not ordinary and not explicit_stop and not text.strip() and response_owed:
                 raise HTTPException(502,'分身未返回对最新补充的回复正文，任务未结束')
-            if done and (reply_owed or pending):
+            if done and (pending or reply_owed and not explicit_stop):
                 if not text.strip():raise HTTPException(502,'最新补充尚未得到对方回复，分身未返回可转达的正文，任务未结束')
                 done=False;state='queued';waiting='';required=0;action_name='send_message'
             turn=db.execute('SELECT COALESCE(MAX(turn),0)+1 FROM agent_dialogue_messages WHERE dialogue_id=?',(job['id'],)).fetchone()[0]
@@ -1483,9 +1536,11 @@ class AgentDialogues:
             if ordinary:
                 notify(db,peer['user_id'],'message',job['session_id'],job['id'],'收到分身回复' if job['next_speaker'] else '收到分身消息',text,'message:'+str(message_id))
             self.apply_inputs(db,job['id'])
-            if pending:
+            if pending and not required:
                 db.execute("UPDATE agent_dialogues SET status='queued',rounds_done=0 WHERE id=?",(job['id'],))
-            elif done:self.close_record(db,job['id'],'双方分身已完成本轮聊天' if ordinary else waiting or '分身判断当前委派任务已完成')
+            elif done:
+                reason='双方分身已完成本轮聊天' if ordinary else waiting or '分身判断当前委派任务已完成'
+                self.close_record(db,job['id'],reason,'cancel' if explicit_stop else 'complete')
             db.execute('UPDATE agent_peer_sessions SET updated_at=? WHERE id=?',(now(),job['session_id']))
         if done and not pending:await self.flush_controls(job['id'])
 
