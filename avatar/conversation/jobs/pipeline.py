@@ -4,6 +4,7 @@ import hashlib
 import re
 from contextlib import contextmanager
 from avatar.core.execution import current_generation, authorization
+from avatar.skills.policy import SKILLS_PAUSED, require_skills_enabled
 
 
 @contextmanager
@@ -19,11 +20,9 @@ def generation_scope(job,database=None):
 
 
 def capture_authorization(db,user_id,body):
-    from avatar.skills.service import UserSkills
-    rows=db.execute('SELECT id,name,updated_at FROM agent_skills WHERE user_id=? AND enabled=1',(user_id,)).fetchall()
-    active={row['skill_id'] for row in db.execute('SELECT skill_id FROM chat_session_skills WHERE conversation_id=? AND enabled=1 AND authorized=1',(body.conversation_id,))}
-    names={name.casefold() for name in UserSkills.command_names([dict(row) for row in rows],body.message)}
-    skills={row['id']:row['updated_at'] for row in rows if row['id'] in active or row['name'].casefold() in names or re.search(r'(?<![\w-])/'+re.escape(row['name'])+r'(?![\w-])',body.message)}
+    skills={}
+    if not SKILLS_PAUSED:
+        skills=capture_skills(db,user_id,body)
     files=[row['id'] for row in db.execute('SELECT id FROM chat_files WHERE user_id=? AND conversation_id=? AND referenced=1',(user_id,body.conversation_id))]
     materials=[row['id'] for row in db.execute("SELECT id FROM attachments WHERE visibility='public' OR user_id=?",(user_id,))]
     versions={}
@@ -34,6 +33,14 @@ def capture_authorization(db,user_id,body):
                               (body.conversation_id,user_id)).fetchone()
     effort = json.loads(conversation[0]).get('reasoning_effort') if conversation else None
     return dict(skills=skills,files=files,materials=materials,versions=versions,reasoning_effort=effort)
+
+
+def capture_skills(db,user_id,body):
+    from avatar.skills.service import UserSkills
+    rows=db.execute('SELECT id,name,updated_at FROM agent_skills WHERE user_id=? AND enabled=1',(user_id,)).fetchall()
+    active={row['skill_id'] for row in db.execute('SELECT skill_id FROM chat_session_skills WHERE conversation_id=? AND enabled=1 AND authorized=1',(body.conversation_id,))}
+    names={name.casefold() for name in UserSkills.command_names([dict(row) for row in rows],body.message)}
+    return {row['id']:row['updated_at'] for row in rows if row['id'] in active or row['name'].casefold() in names or re.search(r'(?<![\w-])/'+re.escape(row['name'])+r'(?![\w-])',body.message)}
 
 
 def validate_versions(db,user_id,scope):
@@ -62,6 +69,7 @@ def validate_authorization(db,job=None,*,lock=False):
     if job.get('_source_guard'):
         job['_source_guard'](db,full=lock)
     for identifier,version in scope.get('skills',{}).items():
+        require_skills_enabled()
         row=db.execute('SELECT enabled,updated_at FROM agent_skills WHERE id=? AND user_id=?',(identifier,uid)).fetchone()
         session=db.execute('SELECT enabled,authorized FROM chat_session_skills WHERE conversation_id=? AND skill_id=?',(job['conversation_id'],identifier)).fetchone()
         if not row or not row['enabled'] or row['updated_at']!=version or session and not(session['enabled'] and session['authorized']):

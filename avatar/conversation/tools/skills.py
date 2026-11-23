@@ -1,6 +1,7 @@
 # 模块说明：会话内技能移出/恢复与实际使用记录，不改变用户安装目录或全局启用状态。
 from fastapi import HTTPException
 from avatar.core.db import now
+from avatar.skills.policy import SKILLS_PAUSED, require_skills_enabled
 
 
 # 职责：管理本人 Web 父会话的技能集合，作为上下文过滤与界面展示的共同来源。
@@ -24,6 +25,8 @@ class SessionSkills:
     def list(self,user_id,conversation_id):
         with self.database.connect() as db:
             self.owned(db,user_id,conversation_id)
+            if SKILLS_PAUSED:
+                return []
             rows=db.execute('SELECT s.id,s.name,s.enabled AS installed_enabled,(CASE WHEN c.enabled=1 AND c.authorized=1 THEN 1 ELSE 0 END) AS enabled,c.last_used_at FROM chat_session_skills c JOIN agent_skills s ON s.id=c.skill_id WHERE c.conversation_id=? AND s.user_id=? ORDER BY c.enabled,c.last_used_at DESC,s.name',(conversation_id,user_id)).fetchall()
         return [dict(row) for row in rows]
 
@@ -31,17 +34,22 @@ class SessionSkills:
     # 输入：事务、本人父会话 ID。
     # 结果与约束：返回 ID 集合和日期，后续只从已验证的本人技能目录过滤。
     def excluded(self,db,conversation_id):
+        if SKILLS_PAUSED:
+            return set()
         return {row['skill_id'] for row in db.execute('SELECT skill_id FROM chat_session_skills WHERE conversation_id=? AND enabled=0',(conversation_id,))}
 
     # 职责：读取本人会话持续使用的技能，最近使用优先；全局停用、卸载或会话移出立即失效。
     # 结果与约束：只返回当前账户安装且启用的 ID，不携带其他用户的技能或历史正文。
     def active(self,db,user_id,conversation_id):
+        if SKILLS_PAUSED:
+            return []
         return [r['skill_id'] for r in db.execute('SELECT c.skill_id FROM chat_session_skills c JOIN agent_skills s ON s.id=c.skill_id WHERE c.conversation_id=? AND s.user_id=? AND c.enabled=1 AND c.authorized=1 AND s.enabled=1 ORDER BY c.last_used_at DESC,c.skill_id',(conversation_id,user_id))]
 
     # 职责：只在指定会话移出或恢复已安装技能。
     # 输入：用户 ID、会话、本人技能 ID 及布尔启用值，调用者应持有会话租约。
     # 结果与约束：不删除安装文件或全局配置，清除旧摘要以避免沿用先前技能指令。
     def set_enabled(self,user_id,conversation_id,skill_id,enabled):
+        require_skills_enabled()
         with self.database.connect(write=True) as db:
             self.owned(db,user_id,conversation_id)
             skill=db.execute('SELECT enabled FROM agent_skills WHERE id=? AND user_id=?',(skill_id,user_id)).fetchone()
@@ -55,6 +63,8 @@ class SessionSkills:
     # 输入：写事务、认证账户、父会话 ID 与本轮有限技能元数据。
     # 结果与约束：再次核对所有人；停用状态不会因旧回答回写而重新启用。
     def used(self,db,user_id,conversation_id,skills):
+        if SKILLS_PAUSED:
+            return
         self.owned(db,user_id,conversation_id)
         for skill in skills:
             if db.execute('SELECT 1 FROM agent_skills WHERE id=? AND user_id=?',(skill['id'],user_id)).fetchone():

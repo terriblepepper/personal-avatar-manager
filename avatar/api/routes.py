@@ -797,6 +797,8 @@ class SessionSkillToggle(BaseModel):
 # 结果与约束：会话生成期间拒绝修改，变更仅影响当前父会话的技能加载与旧摘要。
 @router.patch('/conversations/{conversation_id}/skills/{skill_id}')
 def conversation_skill_update(conversation_id: str,skill_id: str,body: SessionSkillToggle,request: Request,user=Depends(auth.current_user)):
+    from avatar.skills.policy import require_skills_enabled
+    require_skills_enabled()
     chat=request.app.state.chat
     with request.app.state.database.connect() as db:chat.session_skills.owned(db,user['id'],conversation_id)
     chat.memory.acquire(conversation_id)

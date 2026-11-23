@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints
 from avatar.core.text_budget import AgentText
 from avatar.accounts.auth import current_user
 from avatar.skills.packages import MAX_UPLOAD
+from avatar.skills.policy import require_skills_enabled
 
 router=APIRouter(prefix='/api',tags=['个人技能与分身任务'])
 
@@ -63,6 +64,7 @@ def skills(request: Request,user=Depends(current_user)):
 @router.post('/me/skills',status_code=201)
 async def install_skill(request: Request,file: UploadFile=File(...),user=Depends(current_user)):
     try:
+        require_skills_enabled()
         content=await file.read(MAX_UPLOAD+1)
         from starlette.concurrency import run_in_threadpool
         identifiers=await run_in_threadpool(request.app.state.chat.skills.install_many,user['id'],file.filename,content)
@@ -84,6 +86,7 @@ class SkillSource(BaseModel):
 # 结果与约束：与文件上传复用解析及批量事务；网络失败不改变现有技能，无 staff 或 shell 操作。
 @router.post('/me/skills/source',status_code=201)
 async def install_skill_source(body: SkillSource,request: Request,user=Depends(current_user)):
+    require_skills_enabled()
     from avatar.skills.sources import download_repository
     from starlette.concurrency import run_in_threadpool
     content=await download_repository(body.url)

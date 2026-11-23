@@ -13,6 +13,7 @@ from avatar.core.db import dump, now
 from avatar.core.schemas import ChatRequest
 from avatar.core.execution import AgentNeedsInput, execution_guard, run_blocking
 from avatar.conversation.loop.runtime import resume_safe
+from avatar.conversation.tools.reply_artifacts import reply_with_artifacts, without_source_footer
 from avatar.conversation.loop.store import RunConflict, RunStore
 from avatar.protocols.identity.ontology import AVATAR_SKILL_IDS
 from avatar.protocols.tasks import personal_turns as turns
@@ -31,7 +32,7 @@ PUBLIC_STAGES = {
     'intent_analysis': '判断任务目标', 'thinking': '分析任务和已有信息',
     'tool_selection': '判断所需工具', 'rag_retrieving': '检索相关资料',
     'material_reading': '读取相关资料', 'tool_catalog': '查询候选资料',
-    'tool_action': '执行已选择的操作', 'skill_execution': '运行已选技能',
+    'tool_action': '执行已选择的操作', 'skill_execution': '运行 Python 沙箱',
     'result_writing': '整理最终答复', 'model_stream': '模型响应流已连接',
 }
 
@@ -231,6 +232,10 @@ class PersonalTaskService:
     # 结果与约束：长模型调用在事务外；重复命令不重复计费；continue 在原 taskId/session 下生成下一轮，不暴露其他 peer 或 session 的任务。
     async def handle(self, command, context, user_id, aic):
         result = await self._handle(command, context, user_id, aic)
+        for product in result.get('products') or ():
+            for index, item in enumerate(product.get('dataItems', ())):
+                if item.get('type') == 'text' and '引用来源' in item['text']:
+                    product['dataItems'][index] = {**item, 'text': without_source_footer(item['text'])}
         if command['command'] in ('start','get','continue') and any(
                 (item.get('metadata') or {}).get('inlineHtml') for product in (result.get('products') or ())
                 for item in product.get('dataItems',())):
@@ -511,7 +516,7 @@ class PersonalTaskService:
         request = ChatRequest(channel='avatar', message=question)
         overview, model = self.chat.context(user, request, target, private_access=False)
         config, key, system, history = model
-        config = {**config, '_aip_stream_state':stream_state}
+        config = {**config, '_aip_stream_state':stream_state, '_omit_source_citations':True}
         if not config.get('_direct_chat'):
             config = {**config, '_avatar_agent':True, '_allow_user_questions':False,
                       '_agent_checkpoint':resume.get('checkpoint',{}),
@@ -522,7 +527,7 @@ class PersonalTaskService:
             for name in ('available_skills', '_skills_revision'):
                 background.pop(name, None)
             prefix += (' 当前为小镇临时会话，可检索和读取公开资料，按用户需求生成和交付文件。'
-                       '文件随协议回复交付，正文写结果和必要说明，不贴生成源码或虚构链接。'
+                       '文件随协议回复交付，正文写结果和必要说明，不列 RAG 或源文件引用，不贴生成源码或虚构链接。'
                        '工具按需使用，工作区只含本次任务文件，Python 和 HTML 预览均离线。'
                        '无法中途提问；缺少信息时，在最终答复中说明缺口。')
             if resume.get('clarification'):
@@ -561,9 +566,8 @@ class PersonalTaskService:
                 validate_sandbox()
             outputs = model[0].get('_generated_files',())
             originals = model[0].get('_town_exports',())
-            reply = result.text
+            reply = without_source_footer(result.text)
             if not config.get('_direct_chat'):
-                from avatar.conversation.tools.reply_artifacts import reply_with_artifacts
                 attempted = model[0].get('_agent_checkpoint',{}).get('sandbox_attempted')
                 events = [{'group':'sandbox'}] if attempted else ()
                 reply = reply_with_artifacts(reply, outputs, events)

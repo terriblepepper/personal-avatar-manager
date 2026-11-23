@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { SKILLS_PAUSED } from '../skillPolicy'
 import { defineAsyncComponent, computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElButton, ElOption, ElSelect, ElMessage, ElMessageBox } from 'element-plus'
@@ -273,7 +274,7 @@ watch(conversationId,id=>{
   if(id)void loadConversation(id)
 })
 watch(()=>route.query.conversation,value=>{if(typeof value==='string'&&value!==conversationId.value&&conversations.value.some(row=>row.id===value))conversationId.value=value})
-watch(()=>route.query.skill,value=>{if(typeof value==='string'&&value)invoke(value)},{immediate:true})
+watch(()=>route.query.skill,value=>{if(!SKILLS_PAUSED&&typeof value==='string'&&value)invoke(value)},{immediate:true})
 onMounted(()=>{void load();window.addEventListener('online',resume);window.addEventListener('pageshow',resume);document.addEventListener('visibilitychange',resume)})
 onUnmounted(()=>{destroyed=true;olderRequest?.abort();controller.abort();generation?.abort();window.removeEventListener('online',resume);window.removeEventListener('pageshow',resume);document.removeEventListener('visibilitychange',resume)})
 </script>

@@ -7,6 +7,7 @@ from fastapi import HTTPException
 from avatar.conversation.jobs.pipeline import validate_authorization
 from avatar.conversation.loop.store import RunStore
 from avatar.knowledge.learning import auto_style_advance
+from avatar.skills.policy import SKILLS_PAUSED, require_skills_enabled
 
 
 STYLE_FIELDS = ('soul', 'soul_version')
@@ -33,7 +34,7 @@ def source_snapshot(db, user_id, parent_id, owner, aic):
         FROM attachments WHERE user_id=? AND (user_id=? OR visibility='public')""",(owner,user_id))
     folders = db.execute("""SELECT path,md5(jsonb_build_array(caption,visibility)::text) AS version
         FROM material_folders WHERE user_id=? AND (user_id=? OR visibility='public')""",(owner,user_id))
-    skills = db.execute("""SELECT s.id,s.updated_at FROM agent_skills s LEFT JOIN chat_session_skills c
+    skills = [] if SKILLS_PAUSED else db.execute("""SELECT s.id,s.updated_at FROM agent_skills s LEFT JOIN chat_session_skills c
         ON c.skill_id=s.id AND c.conversation_id=? WHERE s.user_id=? AND s.enabled=1
         AND (c.skill_id IS NULL OR (c.enabled=1 AND c.authorized=1))""",(parent_id,owner))
     return {'identity':dict(row),'files':{r['id']:[r['sha256'],r['description'],r['filename']] for r in files},
@@ -43,6 +44,8 @@ def source_snapshot(db, user_id, parent_id, owner, aic):
 
 
 def check_sources(db, owner, expected, actual):
+    if expected.get('skills'):
+        require_skills_enabled()
     prior, current = expected['identity'], actual['identity']
     def stable(identity):
         return {key:value for key,value in identity.items() if key not in STYLE_FIELDS}

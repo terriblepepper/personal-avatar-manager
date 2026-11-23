@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { SKILLS_PAUSED } from '../../skillPolicy'
 import RecordPagination from '../RecordPagination.vue'
 import { onMounted, ref } from 'vue'
 import { ElButton, ElInput, ElOption, ElSelect } from 'element-plus'
@@ -40,10 +41,10 @@ async function send() {
     busy.value = false
   }
 }
-onMounted(()=>{void find();if(!directMessage)void request<Skill[]>('/me/skills').then(value=>{skills.value=value}).catch(notifyError)})
+onMounted(()=>{void find();if(!SKILLS_PAUSED&&!directMessage)void request<Skill[]>('/me/skills').then(value=>{skills.value=value}).catch(notifyError)})
 </script>
 <template><AppDialog :model-value="true" append-to-body class="agent-intent-dialog" :title="intent.delivery_mode==='message'?'发送分身消息':'发起分身任务'" width="min(46rem, calc(100vw - 2rem))" :close-on-click-modal="false" :before-close="()=>cancel()"><ElSelect v-model="target" placeholder="选择目标分身"><ElOption v-for="item in items" :key="item.aic" :value="item.aic" :label="item.name+' · '+item.aic"/></ElSelect><RecordPagination :offset="offset" :total="total" :search="search" label="目标分身分页" @update:offset="offset=$event;find()" @update:search="search=$event;offset=0;find()"/><label class="field" for="peer-intent-objective">任务或消息内容</label><div class="actions"><ElButton @click="sourceView=false">预览</ElButton><ElButton @click="sourceView=true">源码编辑</ElButton></div><ElInput v-if="sourceView" id="peer-intent-objective" v-model="objective" type="textarea" placeholder="填写目标、要求和期望结果…" maxlength="62000" :rows="6"/><MarkdownContent v-else :source="objective"/><ComposerToolbar class="intent-composer-toolbar">
-  <details v-if="!directMessage" class="composer-menu composer-tool">
+  <details v-if="!SKILLS_PAUSED && !directMessage" class="composer-menu composer-tool">
     <summary title="选择本人的已安装技能"><span aria-hidden="true">✧</span><span>技能</span><small>{{ skills.length }}</small></summary>
     <div class="composer-popover">
       <h3>已安装技能</h3>
