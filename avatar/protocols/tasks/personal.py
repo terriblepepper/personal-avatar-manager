@@ -20,6 +20,7 @@ from avatar.protocols.tasks.store import ManagementTaskError
 from avatar.protocols.tasks.town_auth import TownUserAuthorization
 from avatar.protocols.tasks.town_public import TownPublicAuthorization
 from avatar.protocols.tasks.town_files import TownFiles
+from avatar.protocols.tasks.visitor_quota import check_quota
 
 
 WORKING_TIMEOUT = 480
@@ -386,18 +387,14 @@ class PersonalTaskService:
                 return turns.public_result(json.loads(row['document']))
 
     def charge_visitor(self, db, owner, aic, scope_peer, visitor):
-        from datetime import datetime, timedelta, timezone
-        day = now()[:10]
-        cutoff = (datetime.now(timezone.utc)-timedelta(days=7)).isoformat()
-        db.execute('DELETE FROM town_visitor_requests WHERE created_at<?', (cutoff,))
-        if (db.execute('SELECT COUNT(*) FROM town_visitor_requests WHERE owner_id=? AND visitor_id=? AND created_at>=?',
-                       (owner, visitor, day)).fetchone()[0] >= self.settings.town_visitor_daily_limit
-                or db.execute('SELECT COUNT(*) FROM town_visitor_requests WHERE owner_id=? AND created_at>=?',
-                              (owner, day)).fetchone()[0] >= self.settings.town_owner_daily_limit):
-            raise ManagementTaskError(-32010, '今日公开对话额度已用完')
+        from datetime import timedelta
+        timestamp = now()
+        check_quota(db,owner,visitor,timestamp[:10])
         if self.visitor_busy(db, aic, scope_peer):
             raise ManagementTaskError(-32010, '该访客已有请求正在处理')
-        db.execute('INSERT INTO town_visitor_requests VALUES(?,?,?)', (owner, visitor, now()))
+        cutoff = (datetime.fromisoformat(timestamp)-timedelta(days=7)).isoformat()
+        db.execute('DELETE FROM town_visitor_requests WHERE created_at<?', (cutoff,))
+        db.execute('INSERT INTO town_visitor_requests VALUES(?,?,?)', (owner,visitor,timestamp))
 
     @staticmethod
     def visitor_busy(db, aic, peer):

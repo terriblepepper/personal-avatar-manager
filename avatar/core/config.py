@@ -109,8 +109,6 @@ class Settings:
     town_public_enabled: bool = False
     town_oidc_issuer: str = ''
     town_oidc_audiences: tuple[str, ...] = ()
-    town_visitor_daily_limit: int = 20
-    town_owner_daily_limit: int = 200
     database_url: str = field(default="", repr=False)
     redis_socket: str = ""
     town_oidc_client_id: str = ""
@@ -148,8 +146,6 @@ class Settings:
                    os.getenv('AVATAR_TOWN_PUBLIC_ENABLED', '0') == '1',
                    os.getenv('AVATAR_TOWN_OIDC_ISSUER', '').rstrip('/'),
                    tuple(v.strip() for v in os.getenv('AVATAR_TOWN_OIDC_AUDIENCES', '').split(',') if v.strip()),
-                   int(os.getenv('AVATAR_TOWN_VISITOR_DAILY_LIMIT', '20')),
-                   int(os.getenv('AVATAR_TOWN_OWNER_DAILY_LIMIT', '200')),
                    require_database_url(os.getenv('DATABASE_URL')),
                    os.getenv('AVATAR_REDIS_SOCKET', '').strip(),
                    os.getenv('AVATAR_TOWN_OIDC_CLIENT_ID', '').strip())

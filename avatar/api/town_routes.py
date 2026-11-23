@@ -4,15 +4,31 @@ import json
 import secrets
 from types import SimpleNamespace
 from urllib.parse import quote
-from fastapi import APIRouter, HTTPException, Path, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Path, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from avatar.accounts.auth import current_user
 from avatar.core.text_budget import AgentText
+from avatar.protocols.tasks.visitor_quota import TownAccessLimits, get_limits, save_limits
 from avatar.protocols.tasks.town_files import NONCE
 from avatar.protocols.tasks.store import ManagementTaskError
 from avatar.core.db import now
 
 router = APIRouter(prefix='/api/town', tags=['小镇公开接入'])
+account_router = APIRouter(prefix='/api/me', tags=['小镇访问额度'])
+
+
+@account_router.get('/town-access-limits')
+def own_access_limits(request: Request, user=Depends(current_user)):
+    with request.app.state.database.connect() as db:
+        return get_limits(db,user['id'])
+
+
+@account_router.put('/town-access-limits')
+def update_access_limits(body: TownAccessLimits, request: Request, user=Depends(current_user)):
+    with request.app.state.database.connect(write=True,account_scope=user['id']) as db:
+        save_limits(db,user['id'],body)
+    return body
 
 
 def service(request):
