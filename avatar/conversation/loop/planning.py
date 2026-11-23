@@ -35,8 +35,11 @@ def available_tools(config):
                 or (personal and name=='contact_avatar')):
             allowed[name] = tool
     disabled = {t['id']: t for t in config.get('_conversation_tools', ()) if t['id'] != 'animation' and not t['enabled']}
-    allowed['ask_user'] = {'name':'ask_user', 'description':'需要用户补充时提出一个具体问题。可给最多三个简短建议，用户也可自由回答。',
-        'parameters':AskUser.model_json_schema()}
+    if config.get('_allow_user_questions', True):
+        allowed['ask_user'] = {'name':'ask_user', 'description':'需要用户补充时提出一个具体问题。可给最多三个简短建议，用户也可自由回答。',
+            'parameters':AskUser.model_json_schema()}
+    else:
+        allowed.pop('ask_user', None)
     if disabled:
         allowed['require_conversation_tool'] = {'name':'require_conversation_tool','description':'提示用户开启当前确实需要的已关闭工具。',
             'parameters':{'type':'object','properties':{'tool_id':{'type':'string','enum':list(disabled)}},

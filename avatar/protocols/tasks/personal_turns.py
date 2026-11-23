@@ -14,6 +14,7 @@ from avatar.protocols.tasks.store import ManagementTaskError
 RENEW_INTERVAL = 30
 LEASE_SECONDS = 3 * RENEW_INTERVAL
 TIMEOUT_MESSAGE = '本轮任务执行超时，尚未生成可交付结果。请使用新任务重试。'
+QUESTION_UNAVAILABLE = '本轮信息不足，未生成答复。请补充必要信息后重新发起任务。'
 log = logging.getLogger('uvicorn.error.' + __name__)
 
 
@@ -150,8 +151,6 @@ def finish_in(db, rowid, result, run, state, message, *, reason=None):
     else:
         document['status']['dataItems']=[{'type':'text','text':message}]
     if state=='awaiting-input':
-        if run.get('user_question'):
-            document['status']['dataItems'].append({'type':'data','data':{'user_question':run['user_question']}})
         document['_agent_resume']={**current['_agent_resume'],**run}
     else:
         clear_run(db,row,run)

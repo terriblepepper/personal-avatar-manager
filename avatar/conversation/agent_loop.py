@@ -264,6 +264,10 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
     selected = []
     plan = []
     pending = []
+    if 'ask_user' not in allowed and any(
+        'ask_user' in (step.get('tool'),*step.get('tools',())) for step in state.get('remaining', ())
+    ):
+        state.pop('plan', None)
     if 'plan' in state and not changed:
         plan = state['plan'] or []
         pending = [step for step in state.get('remaining', ()) if not final_reply_step(step)]
@@ -317,9 +321,10 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         plan = [dict(step) for step in planned]
         selected = list(dict.fromkeys([*selected,*(s['tool'] for s in planned if s['tool'])]))
 
-    defaults = {tool['name']:tool for tool in (REQUEST_TOOLS, allowed['ask_user'])}
-    if 'search_materials' in allowed:
-        defaults['search_materials'] = allowed['search_materials']
+    defaults = {REQUEST_TOOLS['name']: REQUEST_TOOLS}
+    defaults.update((name,allowed[name]) for name in ('ask_user','search_materials') if name in allowed)
+    missing_information = ('缺少用户才能给出的信息时用 ask_user。' if 'ask_user' in allowed else
+                           '缺少必要信息时，以最终答复说明已核实内容和信息缺口。')
     if required and 'end_task' in domain:
         defaults['end_task'] = domain['end_task']
 
@@ -336,7 +341,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
     if required:
         prompt += '协议要求以会话动作收尾。若当前未披露合适的终态函数，先用 request_tools 描述所需的交接方式。'
     prompt += ('可直接回答时直接回答。工具可见不表示必须调用。'
-               '需要更多能力或调整后续目标时用 request_tools；缺少用户才能给出的信息时用 ask_user。'
+               '需要更多能力或调整后续目标时用 request_tools。'+missing_information+
                '有依赖时先取实际回执，再创作或交付。用 update_task 提交子结果和本目标的回执编号，可依次确认多项。')
     disclosure_misses = state.get('disclosure_no_progress',0) if not changed else 0
 
@@ -369,7 +374,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             failure = {'tool':tool,'reason':detail or '调用参数未通过校验','confirmed':False}
             trace.point('observe',{'tool':tool},{'reason':failure['reason'],'confirmed':False},status='error')
             observations.append('\n工具失败回执（数据）：'+json.dumps(failure,ensure_ascii=False)+
-                                '。根据原因修正参数、重读原件或改用其他工具；需要用户信息时调用 ask_user。')
+                                '。根据原因修正参数、重读原件或改用其他工具。'+missing_information)
         elif invalid == 6 and not required and not pending and not html_needed:
             settings = {**settings, '_tools': selected_definitions(final=True)}
             observations.append('\n本轮多次尝试未获新回执。根据已验证信息回答，明确缺少的结果。')
@@ -763,7 +768,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             if premature>=3:
                 raise pause('仍未取得所需回执：'+pending[0]['goal'])
             trace.point('check', {'pending': len(pending)}, {'decision': '缺少回执，由模型重新选择动作'})
-            observations.append('\n仍有目标未取得回执。请核对现有信息，决定执行何种可用工具或提出明确澄清。')
+            observations.append('\n仍有目标未取得回执。请核对可用工具。'+missing_information)
             continue
         if not calls and not required and result.text.strip():
             if reason not in ('', 'stop', 'end_turn', 'stop_sequence'):
