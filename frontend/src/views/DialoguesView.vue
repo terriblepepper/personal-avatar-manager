@@ -110,7 +110,7 @@ const resourceId = computed(() => detail.value?.resource_conversation_id || '')
 const sharedFilesRevision = computed(() => {
   const view=detail.value
   const tasks=view?.task ? [view.task] : [view?.chat,...(view?.message_tasks || [])]
-  return [...new Set(tasks.flatMap(task => task?.files?.map(file => file.id) || []))].sort().join(':')
+  return JSON.stringify([view?.task?.expires_at, [...new Set(tasks.flatMap(task => task?.files?.map(file => file.id) || []))].sort()])
 })
 const settingsId = computed(() => detail.value?.settings_conversation_id ?? resourceId.value)
 const intent=ref<Intent|null>(null), drafting=ref(false), fileIds=ref<string[]>([]), draftRequest=ref(''), older=ref<Message[]>([])
