@@ -3,6 +3,7 @@ import json
 from fastapi import HTTPException
 from avatar.core.db import dump, now
 from avatar.models.effort import levels
+from avatar.models.embedding import EmbeddingSettings
 
 TOOL_CATALOG = {
     'python': {'name': 'Python 沙箱', 'description': '计算、分析数据、绘制图表、处理选中文件并生成下载文件。支持 NumPy、pandas、Matplotlib、Pillow 和 pypdf。', 'default': False},
@@ -21,13 +22,16 @@ class ConversationTools:
         with self.files.database.connect() as db:
             row=self.files.session(db,user_id,conversation_id)
             saved=json.loads(row['tools_config'])
+            agent_enabled=EmbeddingSettings.configured(db,user_id)
         items=[]
         for key,value in TOOL_CATALOG.items():
             item={'id':key,**value,'enabled':saved.get(key,value['default']) is True}
-            if row['channel']=='peer' and key=='python':
+            if not agent_enabled:
+                item.update(enabled=False,locked=True)
+            elif row['channel']=='peer' and key=='python':
                 item.update(enabled=True,locked=True)
             items.append(item)
-        return {'items':items,'updated_at':row['tools_updated_at'],'reasoning_effort':saved.get('reasoning_effort')}
+        return {'items':items,'updated_at':row['tools_updated_at'],'reasoning_effort':saved.get('reasoning_effort'),'agent_enabled':agent_enabled}
 
     def effort(self, user_id, conversation_id, *, selected=...):
         with self.files.database.connect(write=selected is not ...) as db:
@@ -51,7 +55,10 @@ class ConversationTools:
             raise HTTPException(422,'请选择有效工具和布尔开关')
         with self.files.database.connect(write=True) as db:
             row=self.files.session(db,user_id,conversation_id,editable=True)
-            if row['channel']=='peer':
+            agent_enabled=EmbeddingSettings.configured(db,user_id)
+            if not agent_enabled and any(settings.values()):
+                raise HTTPException(409,'普通聊天模式下工具不可用，请先配置 Embedding 模型')
+            if row['channel']=='peer' and agent_enabled:
                 if settings.get('python') is False:
                     raise HTTPException(409,'分身间会话的 Python 沙箱始终开启')
                 settings={key:value for key,value in settings.items() if key!='python'}

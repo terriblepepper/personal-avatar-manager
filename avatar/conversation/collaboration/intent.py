@@ -297,7 +297,11 @@ class DialogueIntent:
         tools=[declaration('require_owner_confirmation','涉及本人预约、承诺、交易等，须本人明确确认。',{'type':'object','properties':{},'additionalProperties':False}),
                declaration('continue_chat','普通聊天、转发或一般任务，不要求本人承诺。',{'type':'object','properties':{},'additionalProperties':False})]
         service=self.dialogues.chat.service
-        with self.dialogues.database.connect() as db:config=service.models.current(db,user['id'])
+        from avatar.models.embedding import EmbeddingSettings
+        with self.dialogues.database.connect() as db:
+            if not EmbeddingSettings.configured(db,user['id']):
+                return True
+            config=service.models.current(db,user['id'])
         from avatar.models.model_config import require_complete
         require_complete(config)
         result=await self.model_selection(user['id'],None,{**config,'_tools':tools},service.vault.decrypt(config['encrypted_key']),'你是本人的分身，目标会话已经由用户选择。请选择当前要求是否需要本人确认。只选择工具，不执行任务。',[],message)

@@ -86,6 +86,11 @@ class MaterialRag(MaterialReading,FileRag):
         return replace(answer,text=answer.text+self.source_footer(context),material_sources=tuple(context[0].get('_material_sources',[])))
 
     async def stream(self,context,message,*,progress=None):
+        if context[0].get('_direct_chat'):
+            async with aclosing(self.chat.model_client.stream(*context,message)) as source:
+                async for event in source:
+                    yield event
+            return
         self.validate(context)
         agent = context[0].get('_avatar_agent')
         if not agent:

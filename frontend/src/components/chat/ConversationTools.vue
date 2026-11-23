@@ -7,6 +7,7 @@ interface Tool { id: string; name: string; description?: string; enabled: boolea
 const props = defineProps<{ conversationId: string; busy: boolean }>()
 const emit = defineEmits<{saving:[pending:boolean]}>()
 const tools = ref<Tool[]>([]), saving = ref(false), loading = ref(false), failure = ref('')
+const agentEnabled = ref<boolean>()
 const enabled = computed(() => tools.value.filter(tool => tool.enabled).length)
 const endpoint = computed(() => '/conversations/' + encodeURIComponent(props.conversationId) + '/tools')
 let controller = new AbortController()
@@ -16,13 +17,17 @@ async function load() {
   controller = new AbortController()
   const signal = controller.signal
   tools.value = []
+  agentEnabled.value = undefined
   failure.value = ''
   saving.value = false
   loading.value = !!props.conversationId
   if (!props.conversationId) return
   try {
-    const result = await request<{items:Tool[]}>(endpoint.value,'GET',undefined,signal)
-    if (!signal.aborted) tools.value = result.items
+    const result = await request<{items:Tool[];agent_enabled?:boolean}>(endpoint.value,'GET',undefined,signal)
+    if (!signal.aborted) {
+      tools.value = result.items
+      agentEnabled.value = result.agent_enabled
+    }
   }
   catch (error) { if (!signal.aborted) failure.value = error instanceof Error ? error.message : '读取会话工具失败' }
   finally { if (!signal.aborted) loading.value = false }
@@ -57,10 +62,11 @@ onUnmounted(() => { controller.abort(); emit('saving', false) })
       <p v-if="saving" class="sub" role="status">正在保存工具设置…</p>
       <p v-if="failure" class="error-text" role="alert">{{ failure }} <button type="button" class="button small" @click="load">重试</button></p>
       <p v-else-if="loading" class="sub" role="status">正在读取…</p>
+      <p v-else-if="agentEnabled === false" class="sub">普通聊天模式下工具已禁用。配置嵌入模型后可使用。</p>
       <p v-else-if="!tools.length" class="sub">暂无可用工具。</p>
       <label v-for="tool in tools" :key="tool.id" class="conversation-tool">
         <input type="checkbox" :checked="tool.enabled" :disabled="busy || saving || tool.locked" @change="change(tool,$event)">
-        <span><strong>{{ tool.name }}</strong><small v-if="tool.locked">始终开启</small><small v-if="tool.description">{{ tool.description }}</small></span>
+        <span><strong>{{ tool.name }}</strong><small v-if="tool.locked && tool.enabled">始终开启</small><small v-if="tool.description">{{ tool.description }}</small></span>
       </label>
     </div>
   </details>
