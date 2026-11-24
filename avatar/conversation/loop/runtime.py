@@ -72,7 +72,7 @@ class LoopState:
         final = {'name': name, 'size': len(data.encode()), 'finish_reason': result.finish_reason,
                  'has_material': result.material_delivery is not None}
         await run_blocking(self.store.append, name, 0, data, patch={
-            'final': final, 'usage': result.usage, 'material': list(result.material_delivery or ()), 'phase': 'decision',
+            'final': final, 'usage': result.usage, 'material': list(result.material_delivery or ()), 'phase': 'decision', 'remaining': [],
         })
 
     async def file(self, item, args_hash, goal_no, fields):
