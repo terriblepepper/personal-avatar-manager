@@ -174,8 +174,6 @@ class TownFiles:
         state = document['status']['state']
         if state=='awaiting-completion':
             deadline = row['deadline']
-        elif state=='completed':
-            deadline = document.get('_file_until')
         elif state in ('working','awaiting-input'):
             deadline = document.get('_agent_resume',{}).get('work_until')
         else:

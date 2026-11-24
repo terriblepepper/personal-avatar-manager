@@ -39,11 +39,7 @@ def without_file_products(products):
 
 
 def public_result(document):
-    result = {key:value for key,value in document.items() if key not in
-              ('_agent_resume','_audit_run_id','_file_deliveries','_file_until')}
-    if document.get('_file_until',float('inf'))<=time.time():
-        result['products'] = without_file_products(result.get('products',()))
-    return result
+    return {key:value for key,value in document.items() if not key.startswith('_')}
 
 
 def source_revision(db, owner, aic):
@@ -72,12 +68,8 @@ def clear_run(db, row, run):
 def close_in(db, row, document, state, message=None, *, reason=None):
     run = document.pop('_agent_resume', {})
     previous_run = document.pop('_audit_run_id', None)
-    if document.get('_file_deliveries'):
-        if state=='completed':
-            document['_file_until'] = time.time()+30*60
-        else:
-            document.pop('_file_deliveries',None)
-            document['products'] = without_file_products(document.get('products',()))
+    if document.pop('_file_deliveries', None):
+        document['products'] = without_file_products(document.get('products',()))
     lease_release(db, run)
     clear_run(db, row, run)
     status = {'state':state,'stateChangedAt':now()}

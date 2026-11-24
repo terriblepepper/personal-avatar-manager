@@ -287,7 +287,8 @@ class PersonalTaskService:
                 expired = row['deadline'] is not None and row['deadline'] <= time.time()
                 state = document['status']['state']
                 deliveries = document.get('_file_deliveries',[])
-                if deliveries and (expired or operation=='cancel'):
+                if deliveries and (expired or operation=='cancel'
+                                   or operation=='complete' and state=='awaiting-completion'):
                     cleanup.callback(self.files.discard_previous,row['rowid'],deliveries)
                 # The lease holder can have newer model progress than the last persisted checkpoint.
                 if state == 'working' and (expired or row['deadline'] is None) and operation != 'cancel':
