@@ -1,5 +1,7 @@
 """文件 RAG：Unstructured 分片、PostgreSQL 增量队列与明确的解析降级。"""
 import asyncio
+
+from avatar.core.dispatch import begin_work, wait_work
 from contextlib import aclosing
 import base64
 import hashlib
@@ -409,6 +411,7 @@ class FileRag:
         pending={};heartbeat=0
         try:
             while True:
+                latch = begin_work(self.database, 'index')
                 for task in list(pending):
                     if not task.done():continue
                     pending.pop(task)
@@ -428,7 +431,7 @@ class FileRag:
                 except Exception as error:
                     logging.getLogger(__name__).warning('Index queue temporarily unavailable (%s)',type(error).__name__)
                 if pending:await asyncio.wait(pending,timeout=1,return_when=asyncio.FIRST_COMPLETED)
-                else:await asyncio.sleep(1)
+                else:await wait_work(latch, 1.)
         finally:
             active=tuple(pending)
             for task in active:task.cancel()

@@ -1,5 +1,7 @@
 # 模块说明：管理员管理个人正式身份的持久队列；Demo 迁移与日常资料审核相互独立。
 import asyncio
+
+from avatar.core.dispatch import begin_work, wait_work
 import json
 import logging
 import time
@@ -223,12 +225,13 @@ class EntityLifecycleService:
             db.execute("UPDATE avatar_identity_jobs SET status='failed',error='续期被中断，请先使用 wit status 核对证书代次，再决定是否重试' WHERE status='running' AND action='renew'")
         next_scan = 0.0
         while True:
+            latch = begin_work(self.database, 'identity')
             try:
                 if time.monotonic() >= next_scan:
                     next_scan = time.monotonic() + RENEWAL_SCAN_SECONDS
                     await asyncio.to_thread(self.schedule_renewals)
                 if not await self.once():
-                    await asyncio.sleep(1)
+                    await wait_work(latch, 1.)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

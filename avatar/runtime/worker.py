@@ -1,5 +1,7 @@
 # 模块说明：后台创建任务：执行审核通过的持久化队列，单进程轮询 Demo 或正式本体派生注册器。
 import asyncio
+
+from avatar.core.dispatch import begin_work, wait_work
 import logging
 import time
 from datetime import datetime
@@ -164,9 +166,10 @@ class ProvisionWorker:
     async def run(self):
         self.recover()
         while True:
+            latch = begin_work(self.database, 'provision')
             try:
                 if not await self.once():
-                    await asyncio.sleep(1)
+                    await wait_work(latch, 1.)
             except asyncio.CancelledError:
                 raise
             except Exception:

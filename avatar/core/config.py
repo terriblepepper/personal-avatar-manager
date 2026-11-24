@@ -112,6 +112,7 @@ class Settings:
     database_url: str = field(default="", repr=False)
     redis_socket: str = ""
     town_oidc_client_id: str = ""
+    kafka_bootstrap: str = ""
 
     # 职责：从环境变量构建启动配置。
     # 输入：cls 为配置类型；读取 AVATAR_DATA_DIR、模型、记忆、OIDC 和 AVATAR_SYSTEM_AIP_* 环境变量。
@@ -148,4 +149,5 @@ class Settings:
                    tuple(v.strip() for v in os.getenv('AVATAR_TOWN_OIDC_AUDIENCES', '').split(',') if v.strip()),
                    require_database_url(os.getenv('DATABASE_URL')),
                    os.getenv('AVATAR_REDIS_SOCKET', '').strip(),
-                   os.getenv('AVATAR_TOWN_OIDC_CLIENT_ID', '').strip())
+                   os.getenv('AVATAR_TOWN_OIDC_CLIENT_ID', '').strip(),
+                   os.getenv('AVATAR_KAFKA_BOOTSTRAP', '').strip())

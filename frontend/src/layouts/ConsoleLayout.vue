@@ -10,6 +10,7 @@ import ThemePicker from '../components/ThemePicker.vue'
 import { createNotificationInbox, notificationInboxKey } from '../composables/useNotificationInbox'
 import NotificationBell from '../components/NotificationBell.vue'
 import { request, notifyError } from '../api/client'
+import { createPlatformUpdates, platformUpdatesKey } from '../composables/usePlatformUpdates'
 import { useSessionStore } from '../stores/session'
 
 const FilePreview = defineAsyncComponent(() => import('../components/FilePreview.vue'))
@@ -24,6 +25,8 @@ const narrowNav = ref(navMedia?.matches ?? false)
 const direction = ref(1)
 const admin = computed(() => route.path.startsWith('/admin'))
 const profileScope = computed(() => session.user?.access_scope === 'profile')
+const updates = createPlatformUpdates(() => !profileScope.value ? session.user?.id : undefined)
+provide(platformUpdatesKey, updates)
 const hubPages = ['/avatar', '/files', '/knowledge', '/chat', '/models', '/skills', '/dialogues']
 const inHub = computed(() => !admin.value && hubPages.includes(route.path))
 
@@ -148,18 +151,22 @@ function menuKeys(event: KeyboardEvent) {
   items[next]?.focus()
 }
 const controller = new AbortController()
-let polling = false
-async function pollSidebar() {
-  if (document.hidden || polling) return
+let polling = false, pendingRefresh = false
+async function pollSidebar(fetchPending = true) {
+  if (document.hidden) return
+  if (polling) { pendingRefresh ||= fetchPending; return }
   polling = true
   try {
     await session.refresh()
     const user = session.user
-    if (!admin.value || user?.role !== 'admin' || user.access_scope === 'profile') return
+    if (!fetchPending || !admin.value || user?.role !== 'admin' || user.access_scope === 'profile') return
     const { pending } = await request<{ pending: number }>('/admin/pending-count', 'GET', undefined, controller.signal)
     if (!controller.signal.aborted && admin.value && session.user?.id === user.id && session.user.role === 'admin') session.pending = pending
   } catch { /* 短暂断连时保留最后一次成功结果。 */ }
-  finally { polling = false }
+  finally {
+    polling = false
+    if (pendingRefresh) { pendingRefresh = false; void pollSidebar() }
+  }
 }
 function dismissMore(event: MouseEvent) { if (more.value && event.target instanceof Element && !event.target.closest('.sidebar-menu-anchor')) closeMore() }
 let timer: ReturnType<typeof setInterval>
@@ -169,11 +176,17 @@ onMounted(() => {
     mobile.value = false
   }, { signal: controller.signal })
   void pollSidebar()
-  timer = setInterval(pollSidebar, 8000)
-  document.addEventListener('visibilitychange', pollSidebar, { signal: controller.signal })
+  let nextPending = 0
+  timer = setInterval(() => {
+    const shouldRead = !updates.connected.value || Date.now() >= nextPending
+    if (shouldRead) nextPending = Date.now() + 60000
+    void pollSidebar(shouldRead)
+  }, 8000)
+  document.addEventListener('visibilitychange', () => { void pollSidebar() }, { signal: controller.signal })
   document.addEventListener('click', dismissMore)
   document.addEventListener('keydown', menuKeys)
 })
+updates.on('reviews', () => { void pollSidebar() })
 watch(admin, () => { void pollSidebar() })
 onUnmounted(() => { controller.abort(); clearInterval(timer); document.removeEventListener('click', dismissMore); document.removeEventListener('keydown', menuKeys) })
 async function logout() { try { await session.logout() } catch (e) { notifyError(e) } }

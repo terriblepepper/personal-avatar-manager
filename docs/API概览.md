@@ -16,6 +16,8 @@
 - 长耗时聊天不走「请求-等待-响应」，而是 **202 + 轮询**：`POST /api/chat/generations` 立即返回受理，结果按 `request_id` 查询；`POST /api/chat/stream` 提供 SSE 流式投递。
 - 分身对外的 ACPS RPC 不在本文范围，见 [小镇接入交接](小镇接入交接.md)。
 
+`GET /api/updates` 为站内实时更新流，要求完整登录态。`ready` 表示可刷新当前快照，`change` 返回有变化的类型（`inbox`、`dialogue`、管理员的 `reviews`）。客户端沿用各自 API 获取数据。实时服务未就绪返回 503，客户端暂用原有轮询。
+
 ## 路由模块一览
 
 | 模块 | 前缀 | 接口数 | 主要职责 |

@@ -3,7 +3,7 @@ import { defineAsyncComponent, nextTick, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { request } from '../api/client'
 import { useNotificationInbox } from '../composables/useNotificationInbox'
-import { usePolling } from '../composables/usePolling'
+import { useLivePolling } from '../composables/usePlatformUpdates'
 import WindowControls from './WindowControls.vue'
 import WindowClose from './WindowClose.vue'
 const MessagesView = defineAsyncComponent(() => import('../views/MessagesView.vue'))
@@ -20,7 +20,7 @@ async function toggle() {
   await nextTick()
   panel.value?.focus()
 }
-usePolling(async signal => {
+useLivePolling('inbox', async signal => {
   const update = inbox.readUnread()
   try {
     const value = await request<{unread:number}>('/notifications/unread-count', 'GET', undefined, signal)

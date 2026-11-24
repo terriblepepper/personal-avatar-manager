@@ -1488,3 +1488,6 @@ def install_schema(connection):
     initialize_system_tasks(connection)
     install_vector_schema(connection)
     ensure_schema(connection)
+
+    from avatar.core.dispatch_schema import install_dispatch
+    install_dispatch(connection)

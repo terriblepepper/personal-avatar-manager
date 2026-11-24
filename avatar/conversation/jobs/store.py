@@ -154,6 +154,8 @@ class GenerationStore:
                 from avatar.conversation.jobs.pipeline import validate_authorization
                 validate_authorization(db,job)
             db.execute('INSERT OR REPLACE INTO chat_pending VALUES(?,?,?,?)',(row[0],user_id,canonical({**snapshot,'request_id':request_id}),time.time()))
+        if changes := getattr(self.database, 'changes', None):
+            changes.generation_committed(user_id, request_id)
         return True
 
     def finish(self,user_id,request_id,state,result=None,error=''):

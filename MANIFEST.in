@@ -1,6 +1,7 @@
 include README.md pyproject.toml setup.py uv.lock .env.example
 include run.sh service.sh
 include redis/redis.conf redis/service.sh redis/redis-*.whl
+include kafka/broker.env kafka/service.sh
 include *.whl
 recursive-include avatar *.py *.ts
 include avatar/conversation/tools/animation_clock.js

@@ -14,7 +14,7 @@ def status(request:Request,user=Depends(admin)):
     from avatar.core.performance import snapshot
     state = request.app.state
     return {**state.rag_resources.status(), 'performance': snapshot(),
-            'rag_cache': state.chat.rag.store.cache_stats()}
+            'rag_cache': state.chat.rag.store.cache_stats(), 'dispatch': dict(state.changes.health)}
 
 
 @router.put('')

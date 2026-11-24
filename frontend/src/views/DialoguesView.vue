@@ -4,7 +4,7 @@ import { defineAsyncComponent, computed, nextTick, onBeforeUnmount, onMounted, r
 import { useRoute, useRouter } from 'vue-router'
 import { ElButton, ElMessage } from 'element-plus'
 import { request, notifyError } from '../api/client'
-import { usePolling } from '../composables/usePolling'
+import { useLivePolling } from '../composables/usePlatformUpdates'
 import { useHistoryScroll } from '../composables/useHistoryScroll'
 import ToolActivity from '../components/chat/ToolActivity.vue'
 import MessageCopyMenu from '../components/chat/MessageCopyMenu.vue'
@@ -246,7 +246,7 @@ async function refresh(signal: AbortSignal) {
 function pathForTasks(session:string) {
   return '/agent-sessions/' + encodeURIComponent(session) + '/tasks?' + new URLSearchParams({offset:String(taskOffset.value),search:taskSearch.value})
 }
-const polling = usePolling(refresh, () => {
+const polling = useLivePolling('dialogue', refresh, () => {
   const tasks = [activeTask.value,...(detail.value?.tasks || [])]
   return tasks.some(t => t && (t.auto_retrying || ['queued','running','awaiting_identity'].includes(t.status))) ? 1500 : 30000
 })

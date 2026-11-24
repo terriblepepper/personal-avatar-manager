@@ -48,6 +48,9 @@ def create_app(settings=None, provider=None, run_worker=True, model_client=None)
     from avatar.conversation.jobs.runner import GenerationRunner
     generations=GenerationRunner(runtime,resources.database)
     pending_reviews = PendingReviews(resources.database, settings.redis_socket)
+    from avatar.core.dispatch import Changes
+    changes = Changes(resources.database, settings.redis_socket, settings.kafka_bootstrap, pending_reviews.invalidate)
+    resources.database.changes = changes
     rag_resources=resources.chat.rag.resources
     from avatar.knowledge.service import KnowledgeService
 
@@ -87,6 +90,8 @@ def create_app(settings=None, provider=None, run_worker=True, model_client=None)
             resources.database.close()
             raise
         tasks = [asyncio.create_task(sample_loop_lag(),name="avatar-event-loop-lag")]
+        if settings.redis_socket or settings.kafka_bootstrap:
+            tasks.append(asyncio.create_task(changes.run(), name='avatar-commit-dispatch'))
         try:
             if settings.system_atr_enabled:
                 await system_registration.start()
@@ -183,6 +188,9 @@ def create_app(settings=None, provider=None, run_worker=True, model_client=None)
     )
     app.state.animation_requests = asyncio.Semaphore(2)
     app.state.pending_reviews = pending_reviews
+    app.state.changes = changes
+    from avatar.api.update_routes import router as update_router
+    app.include_router(update_router)
     app.state.settings, app.state.database = settings, resources.database
     from avatar.core.config import runtime_environment
     app.state.environment = runtime_environment(settings, resources.provider)
