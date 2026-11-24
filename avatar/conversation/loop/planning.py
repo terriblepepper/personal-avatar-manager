@@ -18,6 +18,7 @@ def available_tools(config):
     from avatar.conversation.tools.html import CREATE_HTML
     from avatar.conversation.tools.material_delivery import DELIVERY_TOOLS
     from avatar.conversation.loop.context import READ_STEP_RECEIPT
+    from avatar.conversation.tools.builtin import CURRENT_TIME
 
     domain = config.get('_tools', ())
     allowed = {tool['name']: tool for tool in domain}
@@ -45,6 +46,7 @@ def available_tools(config):
             'parameters':{'type':'object','properties':{'tool_id':{'type':'string','enum':list(disabled)}},
                           'required':['tool_id'],'additionalProperties':False}}
     allowed['read_step_receipt'] = READ_STEP_RECEIPT
+    allowed[CURRENT_TIME['name']] = CURRENT_TIME
     return allowed
 
 
@@ -290,7 +292,21 @@ def revise_goals(plan, pending, selected, addition, replace_goals):
 # Alternative read methods can satisfy the evidence requirement of a composite delivery.
 EVIDENCE_TOOLS = {'search_materials','read_material','find_material','find_animation','find_public_material',
                   'read_session_file','list_avatars'}
-WRITING_CONTROLS = EVIDENCE_TOOLS | {'ask_user','request_tools','read_step_receipt'}
+READ_ONLY_GOALS = EVIDENCE_TOOLS | {'get_current_time'}
+WRITING_CONTROLS = READ_ONLY_GOALS | {'ask_user','request_tools','read_step_receipt'}
+
+
+def read_goals_verified(pending, receipts):
+    """A model's final answer can close single-tool reads backed by this plan's real evidence."""
+    verified = {(receipt.get('goal_no'), receipt['tool'], receipt.get('mode')) for receipt in receipts}
+    for step in pending:
+        tool = step['tool']
+        if tool not in READ_ONLY_GOALS or any(name != tool for name in step.get('tools', ())):
+            return False
+        mode = step.get('file_access', 'content') if tool == 'read_session_file' else None
+        if (step['goal_no'], tool, mode) not in verified:
+            return False
+    return bool(pending)
 
 
 def confirm_goal(args, pending, log, revision):

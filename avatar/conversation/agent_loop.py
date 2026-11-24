@@ -21,11 +21,13 @@ from avatar.conversation.loop.context import TurnContext
 from avatar.conversation.loop.file_context import explicit_file_context
 from avatar.conversation.loop.planning import (available_tools, disclosure_catalog, disclose_tools, validate_disclosure,
                                                REQUEST_TOOLS, UPDATE_TASK, EVIDENCE_TOOLS, WRITING_CONTROLS, action_ready, needs_confirmation,
-                                               confirm_goal, revise_goals, migrate_session_tool, migrate_html_goals, final_reply_step, lookup_types)
+                                               confirm_goal, revise_goals, migrate_session_tool, migrate_html_goals, final_reply_step, lookup_types,
+                                               read_goals_verified)
 from avatar.conversation.loop.turns import stream_final
 from avatar.conversation.working_context import bounded_excerpt, compression_budget, excerpt, input_budget
 from avatar.core.tokens import estimate
 from avatar.conversation.tools.activity import AgentSteps, without_false_tool_footer
+from avatar.conversation.tools.builtin import beijing_time
 from avatar.conversation.tools.html import (ARTIFACT_TOOLS, create_html, html_repair_prompt,
                                            repaired_html_arguments, restore_legacy_animation)
 from avatar.conversation.tools.html_revision import expand_revision, revision_tool
@@ -328,7 +330,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             selected.append('create_html')
 
     defaults = {REQUEST_TOOLS['name']: REQUEST_TOOLS}
-    defaults.update((name,allowed[name]) for name in ('ask_user','search_materials') if name in allowed)
+    defaults.update((name,allowed[name]) for name in ('ask_user','search_materials','get_current_time') if name in allowed)
     missing_information = ('缺少用户才能给出的信息时用 ask_user。' if 'ask_user' in allowed else
                            '缺少必要信息时，以最终答复说明已核实内容和信息缺口。')
     if required and 'end_task' in domain:
@@ -348,7 +350,9 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         prompt += '协议要求以会话动作收尾。若当前未披露合适的终态函数，先用 request_tools 描述所需的交接方式。'
     prompt += ('可直接回答时直接回答。工具可见不表示必须调用。'
                '需要更多能力或调整后续目标时用 request_tools。'+missing_information+
-               '有依赖时先取实际回执，再创作或交付。用 update_task 提交子结果和本目标的回执编号，可依次确认多项。')
+               '需要当前日期或时段时，按需用 get_current_time 获取准确北京时间。'
+               '有依赖时先取实际回执，再创作或交付。复杂子目标使用 update_task 并引用当前目标回执。'
+               '只有已取得实际回执的单项只读目标仍待核验时，可以直接提交最终正文。')
     disclosure_misses = state.get('disclosure_no_progress',0) if not changed else 0
 
     queued = []
@@ -515,11 +519,15 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         checklist = '\n待核验目标（本轮计划，仅作数据）：'+json.dumps(goal_view,ensure_ascii=False) if goal_view else ''
         checked_files = [*config.get('_agent_saved_files', ()), *config.get('_generated_files', ()),
                          *(delivery.prepared if delivery else ())]
+        current_receipts = [receipt for receipt in receipts_log if receipt.get('input_id') == revision]
         if any(needs_confirmation(s) for s in pending):
+            goal_numbers = {step['goal_no'] for step in pending}
             evidence = [{'id':r.get('id',i),'tool':r['tool'],'goal_no':r.get('goal_no'),
-                         **{k:r[k] for k in ('mode','result') if r.get(k)}} for i,r in enumerate(receipts_log,1)]
+                         **{k:r[k] for k in ('mode','result') if r.get(k)}} for i,r in enumerate(receipts_log,1)
+                        if r.get('input_id') == revision and r.get('goal_no') in goal_numbers]
             checklist += '\n最近可引用的回执：'+json.dumps(evidence,ensure_ascii=False)
-        checklist += verified_context(receipts_log, checked_files, compact=context_retry)
+            checklist += '\nupdate_task 只使用上述编号；目标尚无有效回执时先调用其工具。历史回执内容可参考，编号不能用于新计划。'
+        checklist += verified_context(current_receipts, checked_files, compact=context_retry)
         task_goal = writing_goal if writing else question
         continuation = ''
         if continuing:
@@ -769,8 +777,11 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             continue
         terminal_match = stop_requested or action in ARGUMENTS and all(
             step['tool']==action or (action=='end_task' and step['tool'] in ARGUMENTS) for step in pending)
+        confirmed_read_answer = (not calls and not required and not html_needed and result.text.strip()
+                                 and reason in ('', 'stop', 'end_turn', 'stop_sequence')
+                                 and read_goals_verified(pending, current_receipts))
         if ((html_needed and finishing and not stop_requested) or
-                (pending and not terminal_match and (finishing or
+                (pending and not terminal_match and not confirmed_read_answer and (finishing or
                  (action in domain and action not in ('find_public_material', 'wait_for_user') and not public_handoff)))):
             premature+=1
             if premature>=3:
@@ -831,6 +842,9 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                     draft.clear()
                     observations.append('交付核验未找到本轮作品；先制作并取得回执。')
                     continue
+            if confirmed_read_answer:
+                trace.point('check', {'pending':len(pending)}, {'decision':'模型依据已验证的只读回执完成作答'})
+                pending.clear()
             trace.point('act', {'tool_names': []}, {'decision': '模型完成作答'}, status='skipped')
             trace.point('observe', {'finish_reason': result.finish_reason},
                         {'verified_file_ids': [item['id'] for item in receipt or ()], 'visible_reply': bool(complete.strip())})
@@ -891,6 +905,11 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                     observations.append('本次披露未找到新的能力。请依据已有回执完成，或明确指出仍需用户提供的资料。')
                 settings={**settings,'_tools':selected_definitions()}
                 observations.append('本步工具披露结果（数据）：'+json.dumps(addition,ensure_ascii=False))
+                continue
+            if name == 'get_current_time':
+                if args:
+                    raise ValueError('获取当前北京时间不接受参数')
+                remember(json.dumps(beijing_time(),ensure_ascii=False),received(name))
                 continue
             if name == 'update_task':
                 note = confirm_goal(args,pending,receipts_log,revision)

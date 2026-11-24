@@ -1,4 +1,20 @@
-"""所有个人分身共享的声明式绘图能力；渲染在浏览器隔离 iframe 完成，不执行图表中的任意脚本。"""
+"""分身共用的内置时钟及隔离渲染指引。"""
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+
+CURRENT_TIME = {
+    'name':'get_current_time',
+    'description':'获取当前北京时间，精确到秒，并返回星期。无需参数。',
+    'parameters':{'type':'object','properties':{},'additionalProperties':False},
+}
+
+
+def beijing_time():
+    current = datetime.now(ZoneInfo('Asia/Shanghai'))
+    return {'time':current.isoformat(timespec='seconds'), 'timezone':'Asia/Shanghai',
+            'iso_weekday':current.isoweekday()}
+
 
 
 
