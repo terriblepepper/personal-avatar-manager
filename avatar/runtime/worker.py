@@ -55,7 +55,7 @@ class ProvisionWorker:
             import json
             profile = json.loads(job["snapshot"])
             profile.pop("attachments",None)
-            # 外部创建可能耗时，先结束认领事务再 await，避免长期持有 SQLite 写锁。
+            # 外部创建可能耗时，先结束认领事务再 await，避免长期持有 数据库写锁。
             direct=getattr(self.provider,'mode','')=='acps-direct'
             cleanup_pending = job['registration_phase'] == 'identity_cleanup'
             if old and direct and old.get('identity_status') in ('active','unregistering'):
@@ -85,7 +85,7 @@ class ProvisionWorker:
                     phase = 'identity_verification'
                     from avatar.protocols.registration.direct import verify_existing
                     await verify_existing(self.provider.runner.settings,job['user_id'],old)
-            retired=bool(old and old.get("identity_status")=="retired" and getattr(self.provider,"mode","")=="acps-direct")
+            retired=bool(old and old.get("identity_status")=="retired" and direct)
             if cleanup_pending:
                 if not retired:
                     raise RegistrationFailure('待清理身份与账户当前状态不匹配，请核对')
@@ -97,7 +97,7 @@ class ProvisionWorker:
             if direct and old and not retired and old['identity_status'] not in ('active','unregistering'):
                 raise RegistrationFailure('原身份未激活，请先核对身份维护记录')
             if retired:phase = 'certificate_issuing'
-            identity = await self.provider.provision(job["user_id"], profile, None if retired else old, **({"acs_input":json.loads(job["acs_input"])} if getattr(self.provider,"mode","")=="acps-direct" else {}))
+            identity = await self.provider.provision(job["user_id"], profile, None if retired else old, **({"acs_input":json.loads(job["acs_input"])} if direct else {}))
             with self.database.connect(write=True) as db:
                 if direct and (not old or retired):
                     doc = identity.get('acs_document') or {}

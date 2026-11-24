@@ -244,7 +244,7 @@ def test_entity_admin_reads_use_configured_store(tmp_path, postgres_url):
             db.execute("INSERT INTO avatar_records(user_id,aic,certificate,profile,last_modified_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
                        (uid, 'fixture-aic', '{}', '{}', now(), now(), now()))
             db.execute('INSERT INTO avatar_entity_ports(user_id,port) VALUES(?,?)', (uid, settings.entity_aip_port))
-        overview = client.get('/api/admin/dashboard')
+        overview = client.get('/api/admin/agents/operations')
         agents = client.get('/api/records/agents', params={'scope': 'admin'})
         assert overview.status_code == agents.status_code == 200
         assert overview.json()['entity_port_pool']['allocated'] == 1
@@ -456,7 +456,7 @@ def test_explicit_settings_require_postgres_before_migrating_identities(tmp_path
     from avatar.core.config import Settings
     from avatar.protocols.identity import document
 
-    monkeypatch.setattr(document, 'migrate_identity_documents', lambda _: pytest.fail('identity write before validating DSN'))
+    monkeypatch.setattr(document, 'migrate_identity_document', lambda _: pytest.fail('identity write before validating DSN'))
     with pytest.raises(ValueError, match='PostgreSQL'):
         create_app(Settings(data_dir=tmp_path, database_url=''), run_worker=False)
 

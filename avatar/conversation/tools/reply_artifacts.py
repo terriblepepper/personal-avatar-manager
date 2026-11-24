@@ -36,9 +36,6 @@ def reply_with_artifacts(text, outputs, events, *, saved=()):
         info = match['info'].strip().lower().split()
         language = info[0] if info else ''
         code = match['code'].strip()
-        if language == 'avanim':
-            removed = True
-            return '\n'
         if language == 'mermaid':
             return match[0]
         if language in HTML_LANGUAGES or PAGE_START.search(code):
@@ -56,7 +53,7 @@ def reply_with_artifacts(text, outputs, events, *, saved=()):
         removed = True
         return '\n'
 
-    if '<' in text or sandbox or html_files or re.search(r'(?im)^ {0,3}(?:`{3,}|~{3,})\s*(?:html?|avanim)\b', text):
+    if '<' in text or sandbox or html_files or re.search(r'(?im)^ {0,3}(?:`{3,}|~{3,})\s*html?\b', text):
         text = FENCE.sub(drop_code, text)
         text = RAW_PAGE.sub(drop_raw_page, text)
         for script in scripts:

@@ -34,8 +34,7 @@ class SendMaterial(BaseModel):
 
 class SelectMaterials(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True, str_strip_whitespace=True)
-    numbers: list[int] = Field(default_factory=list, max_length=5, description='从本轮候选复制编号，按交付顺序填写。')
-    file_ids: list[str] = Field(default_factory=list, max_length=5, description='兼容本轮候选中的真实文件 ID。优先提交 numbers。')
+    numbers: list[int] = Field(min_length=1, max_length=5, description='从本轮候选复制编号，按交付顺序填写。')
     reply: str = Field(default='', max_length=12000)
 
 
@@ -96,8 +95,6 @@ async def review_file_receipt(model, config, key, request, draft, history, recei
 DELIVERY_TOOLS = [
     {'name':'find_material', 'description':'在本人资料库查询目录和原件。mode=directories 列出逻辑目录；mode=files 按文件名、路径、近似词和正文 RAG 主题查找。folder 限定目录；query 留空列出文件；offset 翻页。每项均有可交付的 file_id。', 'parameters':FindMaterial.model_json_schema()},
     {'name':'send_material', 'description':'本人明确索要已有资料原件时，使用真实 file_id 将文件作为附件发回本会话；可重复选取不同原件。正文可按需用独占一行的 [[attachment:file_id]] 展示已选文件，其余仅显示在底部胶囊。', 'parameters':SendMaterial.model_json_schema()},
-    {'name':'find_animation', 'description':'查找本人资料库中的历史 .avanim 和旧版标注的 HTML 动画。普通 HTML 原件请用 find_material 查找。', 'parameters':FindMaterial.model_json_schema()},
-    {'name':'send_animation', 'description':'仅当本轮用户明确索要查到的历史动画原件时，准备由当前用户拥有的精确 file_id，随本轮成功回答交付给本人。不要主动发送。发给另一个分身须走 contact_avatar 确认表单。', 'parameters':SendMaterial.model_json_schema()},
 ]
 
 
@@ -115,13 +112,13 @@ class MaterialDelivery:
         self.visible_ids = set()
         self.failure = ''
 
-    async def find(self, request, animation_only=False):
+    async def find(self, request):
         if self.discovery is None:
             if self.documents is None:
                 self.documents=await asyncio.to_thread(self.library.documents)
             excluded=self.config.get('_material_delivery',{}).get('exclude_ids',())
             self.discovery=MaterialDiscovery(self.documents,self.chat.rag.retrieve,excluded,refresh=self.library.documents)
-        return await self.discovery.page(request,animation_only=animation_only)
+        return await self.discovery.page(request)
 
     async def classify(self, account):
         # Only the incoming user message may authorize delivery. Exclude system evidence, files and history.
@@ -139,10 +136,9 @@ class MaterialDelivery:
         account(result.usage)
         return result.tool_calls == ({'name':'allow_delivery','arguments':{}},)
 
-    async def execute(self, name, request, account, validate):
-        animation_only = name in ('find_animation','send_animation')
+    async def execute(self, request, account, validate):
         if isinstance(request,FindMaterial):
-            page = await self.find(request,animation_only)
+            page = await self.find(request)
             self.visible_ids.update(item['file_id'] for item in page['items'])
             return page
         if self.requested is None:
@@ -160,7 +156,7 @@ class MaterialDelivery:
             self.failure='每轮附件最多五份。'
             return {'error':self.failure}
         try:
-            item = await asyncio.to_thread(self.library.prepare,request.file_id,animation_only=animation_only)
+            item = await asyncio.to_thread(self.library.prepare,request.file_id)
         except HTTPException as error:
             self.failure=str(error.detail)
             return {'error':self.failure}
@@ -234,7 +230,7 @@ class MaterialDelivery:
                         check_execution()
                         validate()
                         visited.add(self.lookup_key(lookup))
-                        page = await self.find(lookup, animation_only=selection.get('animation_only', False))
+                        page = await self.find(lookup)
                         result_numbers = []
                         for item in page['items'][:6]:
                             number = numbers.setdefault(item['file_id'],len(numbers)+1)
@@ -323,9 +319,7 @@ class MaterialDelivery:
                         args = dict(call['arguments'])
                         reply = args.pop('reply','')
                         chosen = SelectMaterials.model_validate(args)
-                        if bool(chosen.numbers) == bool(chosen.file_ids):
-                            raise ValueError('请提交一个非空候选列表')
-                        selected = chosen.numbers or [numbers.get(identifier) for identifier in chosen.file_ids]
+                        selected = chosen.numbers
                         if len(selected)>limit or len(set(selected))!=len(selected) or any(n not in visible for n in selected):
                             raise ValueError('选了重复、超限或当前候选之外的文件')
                         selection_rows = [visible[n] for n in selected]

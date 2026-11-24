@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, onMounted, onUnmounted, ref, watch } from 'vue'
 import type { ChatFile } from '../../types'
-import { MAX_ANIMATION_BYTES } from '../../utils/animation'
+import { MAX_HTML_BYTES } from '../../utils/htmlFile'
 import { decodePreviewText, readPreviewBytes, TEXT_PREVIEW_LIMIT } from '../../utils/previewFile'
 import MermaidDiagram from '../MermaidDiagram.vue'
 
@@ -31,7 +31,7 @@ onUnmounted(() => { observer?.disconnect(); clearTimeout(releaseTimer) })
 watch([visible,() => props.url,() => props.file.size,() => props.mode,running], async ([near,url,size,mode,activeHtml],_,cleanup) => {
   text.value = ''; note.value = ''
   if (!near || (mode === 'html' && !activeHtml)) return
-  const limit = mode === 'html' ? MAX_ANIMATION_BYTES : TEXT_PREVIEW_LIMIT
+  const limit = mode === 'html' ? MAX_HTML_BYTES : TEXT_PREVIEW_LIMIT
   if (size && size > limit) { note.value = '文件超过内嵌预览大小限制'; return }
   const active = new AbortController()
   cleanup(() => active.abort())

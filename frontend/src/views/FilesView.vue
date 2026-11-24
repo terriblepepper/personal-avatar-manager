@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { usePolling } from '../composables/usePolling'
 import { fileSizeMB, quotaSummary, type StorageQuota } from '../utils/format'
-import { animationUploadError } from '../utils/animation'
+import { htmlUploadError } from '../utils/htmlFile'
 import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElButton, ElMessage, ElMessageBox } from 'element-plus'
 import { useRoute, useRouter } from 'vue-router'
@@ -166,10 +166,10 @@ async function save() {
 }
 async function batch(actionName:'public'|'private'|'delete'){if(!selected.value.length)return;if(actionName==='delete'){try{await ElMessageBox.confirm('删除所选文件及文件夹？','确认删除')}catch{return}}await action('/me/attachments/batch','POST',{action:actionName,ids:selected.value.filter(x=>x.startsWith('f:')).map(x=>x.slice(2)),folders:selected.value.filter(x=>x.startsWith('d:')).map(x=>x.slice(2)),last_modified_at:modified.value})}
 interface UploadFile {file:File;path:string}
-const allowed=/\.(txt|md|mmd|avanim|html?|csv|tsv|xlsx|json|log|png|jpe?g|webp|gif|bmp|pdf|docx?|pptx?|wav|mp3|m4a|ogg|flac|mp4|mov|webm)$/i
+const allowed=/\.(txt|md|mmd|html?|csv|tsv|xlsx|json|log|png|jpe?g|webp|gif|bmp|pdf|docx?|pptx?|wav|mp3|m4a|ogg|flac|mp4|mov|webm)$/i
 async function uploadFiles(list:UploadFile[], directory:boolean, emptyFolders:string[]=[]){
   if(busy.value || (!list.length&&!emptyFolders.length))return
-  const sizeError = animationUploadError(list.map(item => item.file))
+  const sizeError = htmlUploadError(list.map(item => item.file))
   if (sizeError) { status.value = sizeError; return }
   const batchId=Array.from(crypto.getRandomValues(new Uint8Array(16)),x=>x.toString(16).padStart(2,'0')).join('');controller=new AbortController();busy.value=true;let count=0,skipped=0
   try{
@@ -191,7 +191,7 @@ async function drop(event: DragEvent) {
   const list: UploadFile[] = [], dirs: string[] = []
   try {
     // Capture entry handles and files before the browser releases the drop event.
-    const entries = Array.from(transfer.items || []).filter(item => item.kind === 'file')
+    const entries = Array.from(transfer.items).filter(item => item.kind === 'file')
       .map(item => ({ entry: item.webkitGetAsEntry?.(), file: item.getAsFile() }))
     const fallback = Array.from(transfer.files)
     for (const { entry, file } of entries) {

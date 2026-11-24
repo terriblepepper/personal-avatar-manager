@@ -181,41 +181,13 @@ def public_metadata(value):
 
 
 def configuration(path):
-    from wit.acps.atr import AtrConfig, AtrEndpoints, AtrLocalPaths, RegistryServerCredentials
-    source = path.resolve()
-    document = json.loads(source.read_text())
+    from avatar.protocols.identity.atr_config import read_atr_config
 
-    def local(value):
-        p = Path(value)
-        return p if p.is_absolute() else source.parent / p
-
-    # 仅兼容显式 use_saved_urls 的旧运维配置；新身份通常关闭此项，使用独立配置中的服务地址。
-    if document.get("use_saved_urls"):
-        from avatar.core.config import Settings
-        from avatar.core.db import Database
-        settings = Settings.from_env()
-        with Database.open_existing(settings.data_dir, settings.database_url) as database, database.connect() as db:
-            rows = db.execute("SELECT key,value FROM settings WHERE key IN ('registry_url','certificate_authority_url','registry_entity_mtls_url')")
-            for key, value in rows:
-                if saved := json.loads(value):
-                    document[key] = saved
-    username = os.environ.get("WIT_REGISTRY_USERNAME")
-    password = os.environ.get("WIT_REGISTRY_PASSWORD")
+    username = os.getenv('WIT_REGISTRY_USERNAME')
+    password = os.getenv('WIT_REGISTRY_PASSWORD')
     if not username or not password:
-        raise ValueError("请设置 WIT_REGISTRY_USERNAME 和 WIT_REGISTRY_PASSWORD")
-    ca_path = local(document["ca_cert_path"]) if document.get("ca_cert_path") else None
-    config = AtrConfig(
-        endpoints=AtrEndpoints(registry_url=document["registry_url"],
-                               certificate_authority_url=document["certificate_authority_url"],
-                               registry_entity_mtls_url=document.get("registry_entity_mtls_url") or None,
-                               ca_cert_path=ca_path),
-        registry_credentials=RegistryServerCredentials(username=username, password=password),
-        paths=AtrLocalPaths(acs_path=local(document["acs_path"]), state_dir=local(document["state_dir"]),
-                            parent_state_dir=local(document["parent_state_dir"]) if document.get("parent_state_dir") else None),
-        mode=document.get("mode", "integrated"))
-    from avatar.protocols.identity.document import migrate_identity_document
-    migrate_identity_document(config)
-    return config
+        raise ValueError('请设置 WIT_REGISTRY_USERNAME 和 WIT_REGISTRY_PASSWORD')
+    return read_atr_config(path, username, password)
 
 
 async def register_until_ready(registration, timeout, diagnostics=None):
@@ -308,7 +280,7 @@ async def execute(args, diagnostics=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Wit 3.0 注册与证书操作工具（真实远程操作）")
-    parser.add_argument("action", choices=["register", "status", "issue", "renew", "reconcile"])
+    parser.add_argument("action", choices=["register", "status", "issue", "renew", "reconcile", "migrate-acs"])
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=60)
     parser.add_argument("--usage", choices=["client", "server"], default="client")
@@ -318,6 +290,11 @@ def main():
     args = parser.parse_args()
     diagnostics = None
     try:
+        if args.action == 'migrate-acs':
+            from avatar.protocols.identity.atr_config import read_atr_config
+            from avatar.protocols.identity.document import migrate_identity_document
+            migrate_identity_document(read_atr_config(args.config))
+            return
         if args.debug:
 
             diagnostics = RegistryDiagnostics((os.getenv('WIT_REGISTRY_USERNAME'), os.getenv('WIT_REGISTRY_PASSWORD')),

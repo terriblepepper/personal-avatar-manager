@@ -1,18 +1,15 @@
 <script setup lang="ts">
-import { SKILLS_PAUSED } from '../../skillPolicy'
 import { computed, nextTick, ref, shallowRef, useId, watch } from 'vue'
 import { chatTextFits } from '../../chatTextBudget'
-import { ElMessage, ElTooltip } from 'element-plus'
+import { ElTooltip } from 'element-plus'
 import { request } from '../../api/client'
 
-interface Skill { id: string; name: string; description?: string; enabled: boolean | number }
 const props = defineProps<{
-  modelValue: string; catalog: Skill[]; session: string; label: string; placeholder: string;
+  modelValue: string; label: string; placeholder: string;
   disabled?: boolean; submitOnEnter?: boolean; usageUrl?: string; usageRevision?: string | number;
 }>()
 const emit = defineEmits<{ 'update:modelValue': [value: string]; submit: [] }>()
-const field = ref<HTMLTextAreaElement>(), token = ref<{start:number; query:string}>()
-const highlight = ref(0), hidden = ref<string[]>([])
+const field = ref<HTMLTextAreaElement>()
 const compact = computed(() => /^\/compact(?:\s|$)/.test(props.modelValue))
 const editable = computed(() => compact.value ? props.modelValue.slice(8).replace(/^ /,'') : props.modelValue)
 function removeCompact() {
@@ -55,56 +52,17 @@ function chooseCompact() {
   emit('update:modelValue','/compact')
   void nextTick(() => field.value?.focus())
 }
-function closePicker() { token.value=undefined; slashOpen.value=false }
+function closePicker() { slashOpen.value=false }
 const popup = useId()
-const storageKey = computed(() => 'avatar.hidden-skill-shortcuts.' + props.session)
-watch(storageKey, key => {
-  if (SKILLS_PAUSED) return
-  try {
-    const value: unknown = JSON.parse(localStorage.getItem(key) || '[]')
-    hidden.value = Array.isArray(value) ? value.filter((item): item is string => typeof item==='string') : []
-  } catch { hidden.value = [] }
-  closePicker()
-}, { immediate: true })
-const matches = computed(() => token.value ? props.catalog
-  .filter(skill => !hidden.value.includes(skill.id) && (skill.name+' '+(skill.description||'')).toLocaleLowerCase().includes(token.value!.query)) : [])
-const open = computed(() => !!token.value && !props.disabled)
-const command = (name: string) => '$' + JSON.stringify(name)
 function refresh() {
   const input = field.value
   if (!input || document.activeElement!==input) return
   slashOpen.value = !props.disabled && !compact.value && input.value.startsWith('/') && input.value !== '/compact' && '/compact'.startsWith(input.value)
-  if (SKILLS_PAUSED || compact.value || slashOpen.value) {token.value=undefined; return}
-  const prefix = input.value.slice(0,input.selectionStart ?? input.value.length)
-  const match = /(^|\s)\$("(?:\\.|[^"\\])*|[^\s$()]*)$/u.exec(prefix)
-  token.value = match ? {start:match.index+match[1].length,query:match[2].replace(/^"/,'').toLocaleLowerCase()} : undefined
-  highlight.value = matches.value.findIndex(skill => !!skill.enabled)
 }
 function update(event: Event) {
   if (!(event.target instanceof HTMLTextAreaElement) || ('isComposing' in event && event.isComposing)) return
   emit('update:modelValue',compact.value ? '/compact '+event.target.value : event.target.value)
   refresh()
-}
-async function choose(skill:Skill) {
-  const input = field.value, entry = token.value
-  if (!input || !entry || !skill.enabled) return
-  const rest = input.value.slice(entry.start)
-  const full = /^\$(?:"(?:\\.|[^"\\])*"?|[^\s$()]*)/u.exec(rest)?.[0] || '$'
-  const suffix = rest.slice(full.length)
-  const insert = command(skill.name) + (/^\s/.test(suffix) ? '' : ' ')
-  const value = input.value.slice(0,entry.start) + insert + suffix
-  if (!chatTextFits(value)) { ElMessage.warning('消息最多 64 KiB（UTF-8）'); return }
-  emit('update:modelValue', value)
-  token.value = undefined
-  await nextTick()
-  const caret = entry.start + insert.length
-  input.focus()
-  input.setSelectionRange(caret,caret)
-}
-function saveHidden(ids:string[]) {
-  hidden.value = ids
-  try { localStorage.setItem(storageKey.value,JSON.stringify(ids)) } catch { /* optional local preference */ }
-  highlight.value = matches.value.findIndex(skill => !!skill.enabled)
 }
 function keydown(event: KeyboardEvent) {
   if (event.isComposing || event.keyCode===229) return
@@ -118,25 +76,8 @@ function keydown(event: KeyboardEvent) {
   if (compact.value && event.key==='Backspace' && field.value?.selectionStart===0 && field.value.selectionEnd===0) {
     event.preventDefault(); removeCompact(); return
   }
-  if (open.value && event.key==='Escape') {
-    token.value = undefined; event.stopPropagation(); event.preventDefault(); return
-  }
-  if (open.value && (event.key==='ArrowDown' || event.key==='ArrowUp')) {
-    const enabled = matches.value.flatMap((skill,index) => skill.enabled?[index]:[])
-    if (!enabled.length) return
-    event.preventDefault()
-    const delta=event.key==='ArrowDown'?1:-1
-    highlight.value=enabled[(enabled.indexOf(highlight.value)+delta+enabled.length)%enabled.length]
-    return
-  }
-  if (open.value && (event.key==='Tab' || event.key==='Enter' && !event.shiftKey)) {
-    const active=matches.value[highlight.value]
-    if (active?.enabled) { event.preventDefault(); void choose(active); return }
-    if (event.key==='Enter') { event.preventDefault(); return }
-  }
   if ((props.submitOnEnter || compact.value) && event.key==='Enter' && !event.shiftKey) { event.preventDefault(); emit('submit') }
 }
-defineExpose({focus:()=>field.value?.focus()})
 </script>
 
 <template>
@@ -144,7 +85,7 @@ defineExpose({focus:()=>field.value?.focus()})
     <button v-if="compact" class="composer-command-pill" type="button" :disabled="disabled" aria-label="移除压缩会话记忆命令" :title="usageTitle+' · 点击移除命令'" :aria-description="usageTitle+' '+usageText" @click="removeCompact">/compact <small v-if="usageText" class="context-usage" :class="{'has-value': usageRing}" :style="usageRing">{{ usageText }}</small></button>
     <textarea class="form-control" ref="field" :value="editable" rows="2" :aria-label="label" :placeholder="compact ? '可选：希望摘要保留的重点' : placeholder" :disabled="disabled" :maxlength="compact ? 1991 : undefined"
       :aria-invalid="!chatTextFits(modelValue)"
-      aria-autocomplete="list" :aria-controls="open || slashOpen ? popup : undefined" :aria-activedescendant="slashOpen ? popup+'-compact' : open && highlight>=0 ? popup+'-'+highlight : undefined"
+      aria-autocomplete="list" :aria-controls="slashOpen ? popup : undefined" :aria-activedescendant="slashOpen ? popup+'-compact' : undefined"
       @input="update($event)" @focus="refresh" @click="refresh" @compositionend="update($event)" @blur="closePicker" @keydown="keydown"/>
     <small v-if="!chatTextFits(modelValue)" role="alert">消息超过 64 KiB（UTF-8），请缩短后发送。</small>
     <Transition name="menu-pop"><div v-if="slashOpen" class="skill-picker slash-picker">
@@ -157,19 +98,6 @@ defineExpose({focus:()=>field.value?.focus()})
           </ElTooltip>
         </button>
       </div>
-    </div></Transition>
-    <Transition name="menu-pop"><div v-if="open" class="skill-picker">
-      <div class="skill-picker-heading">选择技能 <span>↑ ↓ 选择 · Enter / Tab 填入</span></div>
-      <div :id="popup" role="listbox" aria-label="快捷选择技能">
-        <div v-for="(skill,index) in matches" :key="skill.id" class="skill-picker-choice">
-          <button :id="popup+'-'+index" type="button" role="option" tabindex="-1" class="skill-picker-option" :aria-selected="index===highlight" :disabled="!skill.enabled" @mousedown.prevent @click="choose(skill)">
-            <strong>{{ skill.name }}</strong><span v-if="skill.description">{{ skill.description }}</span>
-          </button>
-          <button type="button" class="button small" :aria-label="'从快捷选择移除 '+skill.name" title="仅从快捷选择移除" @mousedown.prevent @click="saveHidden([...hidden,skill.id])">×</button>
-        </div>
-      </div>
-      <p v-if="!matches.length" class="skill-picker-empty">没有匹配的技能。</p>
-      <button v-if="hidden.length" type="button" class="button small" @mousedown.prevent @click="saveHidden([])">恢复已隐藏的快捷选项</button>
     </div></Transition>
   </div>
 </template>

@@ -23,10 +23,7 @@ const actions: Record<string, string> = {
   read_material: '读取文件原文',
   find_public_material: '检索公开原件',
   send_public_material: '准备公开原件',
-  find_animation: '查找已保存动画',
-  send_animation: '准备动画原件',
   create_html: '生成 HTML',
-  create_animation: '生成 HTML',
   list_avatars: '查询公开分身目录',
   contact_avatar: '准备分身联络草稿',
   continue_answer: '确认由当前分身回答',
@@ -38,7 +35,6 @@ const actions: Record<string, string> = {
   send_message: '提交本轮任务发言',
 }
 function sessionFileLabel(name: unknown, args?: unknown) {
-  if (name === 'find_conversation_files') return '查找会话文件'
   if (name !== 'read_session_file') return undefined
   const { file_id, query, file_access } = record(args)
   if (file_access === 'content' || typeof file_id === 'string') return '读取会话原件'

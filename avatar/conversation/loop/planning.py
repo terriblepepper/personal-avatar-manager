@@ -63,48 +63,13 @@ def _selected(value, choices):
     return list(dict.fromkeys(value))
 
 
-def migrate_session_tool(state):
-    """Convert stored directory plans and receipts from before the tool was unified."""
-    old, current = 'find_conversation_files', 'read_session_file'
-    for key in ('plan','remaining'):
-        for step in state.get(key) or ():
-            if step.get('tool')==old:
-                step.update(tool=current,file_access='directory')
-            if old in step.get('tools',()):
-                step['tools']=list(dict.fromkeys(current if n==old else n for n in step['tools']))
-    for receipt in state.get('receipts',()):
-        if receipt.get('tool')==old:
-            receipt.update(tool=current,mode='directory')
-    if old in state.get('disclosed_tools',()):
-        state['disclosed_tools']=list(dict.fromkeys(current if n==old else n for n in state['disclosed_tools']))
-
-
-def migrate_html_goals(state):
-    from avatar.conversation.tools.html import LEGACY_ANIMATION_TOOL
-    old = LEGACY_ANIMATION_TOOL
-    for key in ('plan','remaining'):
-        for step in state.get(key) or ():
-            if step.get('tool')==old:
-                step['tool']='create_html'
-            if (dimension:=step.pop('html_mode',None)) in ('2d','3d'):
-                step['goal'] += f'（原目标：{dimension.upper()} 动画）'
-            for field in ('tools','support'):
-                if old in step.get(field,()):
-                    step[field]=list(dict.fromkeys('create_html' if n==old else n for n in step[field]))
-    for receipt in state.get('receipts',()):
-        if receipt.get('tool')==old:
-            receipt['tool']='create_html'
-    if old in state.get('disclosed_tools',()):
-        state['disclosed_tools']=list(dict.fromkeys('create_html' if n==old else n for n in state['disclosed_tools']))
-
-
 def final_reply_step(step):
     return step.get('tool')=='continue_answer' and all(name=='continue_answer' for name in step.get('tools',()))
 
 
 def lookup_types(config, allowed):
     from avatar.conversation.tools.material_delivery import FindMaterial
-    planned = {name:FindMaterial for name in ('find_material','find_animation','find_public_material') if name in allowed}
+    planned = {name:FindMaterial for name in ('find_material','find_public_material') if name in allowed}
     planned.update((name,schema) for name,schema in config.get('_entry_lookup_types',{}).items() if name in allowed)
     return planned
 
@@ -255,12 +220,12 @@ def needs_confirmation(step):
     names=step.get('tools',())
     return (not step['tool'] or len(names)>1 or
             bool(step.get('criterion') and step['tool'] not in ('create_html','deliver_material','list_avatars',
-                                                                  'send_material','send_animation','send_public_material','contact_avatar',
+                                                                  'send_material','send_public_material','contact_avatar',
                                                                   'end_task','send_message','wait_for_user','ask_user')))
 
 
 # These actions require a concrete file or a validated handoff before the goal can close.
-DELIVERABLES = {'create_html','deliver_material','send_material','send_animation',
+DELIVERABLES = {'create_html','deliver_material','send_material',
                 'send_public_material','contact_avatar'}
 
 
@@ -290,7 +255,7 @@ def revise_goals(plan, pending, selected, addition, replace_goals):
 
 
 # Alternative read methods can satisfy the evidence requirement of a composite delivery.
-EVIDENCE_TOOLS = {'search_materials','read_material','find_material','find_animation','find_public_material',
+EVIDENCE_TOOLS = {'search_materials','read_material','find_material','find_public_material',
                   'read_session_file','list_avatars'}
 READ_ONLY_GOALS = EVIDENCE_TOOLS | {'get_current_time'}
 WRITING_CONTROLS = READ_ONLY_GOALS | {'ask_user','request_tools','read_step_receipt'}

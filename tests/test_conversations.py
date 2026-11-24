@@ -1090,7 +1090,7 @@ def test_model_direct_first_fallback_never_replays_submitted_requests():
     asyncio.run(check())
 
 
-def test_unified_html_and_legacy_animation_setting(context):
+def test_unified_html_and_animation_setting(context):
     app,user,_=context
     created=user.post('/api/conversations',json={'channel':'assistant','title':'drawing-default'})
     assert created.status_code==201,created.text
@@ -1143,7 +1143,7 @@ def test_chat_accepted_job_finishes_without_any_browser_connection(context):
             await asyncio.sleep(.1)
             gate.set()
             for _ in range(30):
-                with app.state.database.connect() as db:row=db.execute('SELECT snapshot FROM chat_pending WHERE conversation_id=?',(cid,)).fetchone()
+                with app.state.database.connect() as db:row=db.execute('SELECT snapshot FROM chat_generation_jobs WHERE conversation_id=? AND request_id=?',(cid,'offline-job')).fetchone()
                 saved=json.loads(row['snapshot'])
                 if saved.get('done'):break
                 await asyncio.sleep(.05)

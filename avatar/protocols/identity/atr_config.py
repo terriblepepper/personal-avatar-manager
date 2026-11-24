@@ -6,7 +6,7 @@ from wit.acps.atr import AtrConfig, AtrEndpoints, AtrLocalPaths, RegistryServerC
 
 # 职责：从独占配置文件构造 wit 公开 ATR 配置对象。
 # 输入：path 是服务器控制的 registration.json；凭据由调用方显式注入，默认不加载。
-# 结果与约束：相对路径锚定配置目录；首次核验并迁移旧 ACS 缓存，拒绝隐式业务 URL，不创建身份或读取环境变量。
+# 结果与约束：相对路径锚定配置目录；拒绝隐式业务 URL，不创建身份或读取环境变量。
 def read_atr_config(path, username='', password=''):
     path = Path(path)
     if path.is_symlink():
@@ -32,6 +32,4 @@ def read_atr_config(path, username='', password=''):
                             parent_state_dir=local(source['parent_state_dir']) if source.get('parent_state_dir') else None),
         mode=source.get('mode', 'integrated'))
 
-    from avatar.protocols.identity.document import migrate_identity_document
-    migrate_identity_document(config)
     return config

@@ -4,7 +4,6 @@ import stat
 from fastapi import HTTPException
 
 from avatar.core.execution import authorization, current_generation
-from avatar.files.parsing.animation import ANIMATION_MIME, is_animation_file
 
 
 class SavedMaterials:
@@ -31,7 +30,7 @@ class SavedMaterials:
             return with_folder_captions(db,(row for row in rows if
                 self.attachments.directory.available(self.owner,row['id'],row['size'])),self.owner)
 
-    def owned(self, db, identifier, animation_only=False):
+    def owned(self, db, identifier):
         scope = authorization()
         if scope is None or identifier in scope.get('materials', []):
             condition = 'id=? AND user_id=?'
@@ -41,7 +40,7 @@ class SavedMaterials:
                 params.append(current_generation.get()['created_at'])
             row = db.execute('SELECT id,filename,relative_path,size,sha256,content_type,animation_digest,animation_metadata FROM attachments WHERE '+condition,
                              params).fetchone()
-            if row and (not animation_only or is_animation_file(row) and (row['content_type'] != ANIMATION_MIME or row['animation_digest'])):
+            if row:
                 return row
         raise HTTPException(404,'资料文件不存在')
 
@@ -56,9 +55,9 @@ class SavedMaterials:
             raise HTTPException(409,'资料原件校验失败')
         return row['sha256'], info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
 
-    def prepare(self, identifier, *, animation_only=False, expected_path=None):
+    def prepare(self, identifier, *, expected_path=None):
         with self.database.connect() as db:
-            source = self.owned(db,identifier,animation_only)
+            source = self.owned(db,identifier)
             path=source['relative_path'] or source['filename']
             if expected_path is not None and path!=expected_path:
                 raise HTTPException(409,'所选原件目录已改变，请重新查找')

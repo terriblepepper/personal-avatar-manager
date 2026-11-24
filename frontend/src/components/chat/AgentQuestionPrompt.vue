@@ -11,7 +11,7 @@ const opened = ref(false), answer = ref('')
 const trigger = ref<HTMLButtonElement>(), field = ref<HTMLTextAreaElement>()
 const descriptionId = useId()
 const fits = computed(() => chatTextFits(answer.value))
-const options = computed(() => [...new Set(props.question?.options || [])].slice(0, 3))
+const options = computed(() => [...new Set(props.question?.options || [])])
 let seen = '', currentDraft = '', previousReply: QuestionReply | undefined
 
 const key = () => props.scope + '/' + (props.question?.id || '')

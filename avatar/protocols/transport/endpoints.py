@@ -1,27 +1,8 @@
-"""个人分身使用服务器 IP 和稳定独占端口；用户名 DNS 映射保留供域名部署使用。"""
-import re
+"""个人分身使用服务器 IP 和稳定独占端口。"""
 from contextlib import closing, contextmanager
 from urllib.parse import urlsplit
 from avatar.core.db import Database
 from avatar.protocols.registration.base import RegistrationFailure
-
-LABEL = re.compile(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z')
-
-
-# 职责：以无碰撞的字符映射将用户名转换为 DNS 标签。
-# 合法小写标签直接使用；其余以 u- 开头，非小写字母/数字逐 UTF-8 字节映射为 -hh。
-# u- 前缀保留，原用户名中的连字符也转义，避免 a@b 与 a-40b 等用户名撞名；超长明确拒绝。
-def username_label(username):
-    if not isinstance(username, str) or not username or username != username.strip():
-        raise RegistrationFailure('请先绑定有效的 Keycloak 用户名')
-    if LABEL.fullmatch(username) and not username.startswith('u-'):
-        return username
-    label = 'u-' + ''.join(chr(b) if 97 <= b <= 122 or 48 <= b <= 57 else f'-{b:02x}'
-                           for b in username.encode('utf-8'))
-    if not LABEL.fullmatch(label):
-        raise RegistrationFailure('用户名映射后超过 DNS 标签的 63 字符限制，请缩短 Keycloak 用户名')
-    return label
-
 
 @contextmanager
 def entity_connection(settings, db=None, *, write=False):
@@ -69,8 +50,6 @@ def entity_port_pool(settings, *, db=None):
         allocated=db.execute('SELECT COUNT(*) FROM avatar_entity_ports').fetchone()[0]
         count=db.execute("SELECT COUNT(*) FROM avatar_records WHERE aic NOT LIKE 'DEMO-%' AND identity_status='active'").fetchone()[0]
     return {'mode':'ports','host':host,'start':start,'end':end,'allocated':allocated,'registered':count}
-
-
 
 def available_port(db, start, end):
     used = {row['port'] for row in db.execute('SELECT port FROM avatar_entity_ports WHERE port BETWEEN ? AND ?', (start, end))}

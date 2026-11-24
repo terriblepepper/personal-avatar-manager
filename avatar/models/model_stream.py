@@ -276,7 +276,7 @@ async def _stream_once(model, config, api_key, system, history, message, collect
     model.validate_endpoint(url)
     yield {'type': 'status', 'stage': 'connecting', 'message': '连接模型平台'}
     headers['Host'] = url.netloc.decode()
-    timeout = generation_http_timeout(config,streaming=True)
+    timeout = generation_http_timeout(config)
     receiving = False
     loop = asyncio.get_running_loop()
     idle_limit = generation_deadline(config)

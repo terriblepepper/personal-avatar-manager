@@ -10,40 +10,6 @@ from avatar.core.db import dump
 TEXT_SUFFIXES = {'.md', '.markdown', '.txt', '.json', '.csv', '.yaml', '.yml', '.toml', '.xml'}
 
 
-# 职责：从模型的纯 JSON 或 JSON 代码块中读取技能选择结果。
-# 输入：text 是选择调用的输出，catalog 是本次目标所有人的可用技能目录。
-# 结果与约束：最多选择三个清单内 ID，禁止通过输出指定其他账户或任意文件路径。
-def parse_selection(text, catalog):
-    if text is None or (isinstance(text,str) and not text.strip()):return [],{}
-    value = json.loads(re.sub(r'^```(?:json)?\s*|\s*```$', '', text.strip()))
-    if value is None:return [],{}
-    if not isinstance(value,dict):raise TypeError('技能选择必须为 JSON 对象')
-    selected=value.get('skills',[]);requested=value.get('resources',{})
-    if selected is None:selected=[]
-    if requested is None:requested={}
-    allowed={item['id']:set(item['files']) for item in catalog}
-    names={}
-    for item in catalog:names.setdefault(item['name'].casefold(),[]).append(item['id'])
-    # 职责：兼容模型返回目录中的唯一名称或对象，最终仍只允许当前用户目录 ID。
-    def identify(item):
-        if isinstance(item,dict):item=item.get('id') or item.get('name')
-        if not isinstance(item,str):raise ValueError('技能选择不在清单内')
-        if item in allowed:return item
-        candidates=names.get(item.removeprefix('$').casefold(),[])
-        if len(candidates)!=1:raise ValueError('技能选择不在清单内')
-        return candidates[0]
-    if not isinstance(selected,list) or len(selected)>10 or not isinstance(requested,dict):raise TypeError('技能选择格式无效')
-    identifiers=list(dict.fromkeys(identify(item) for item in selected))
-    if len(identifiers)>3:raise ValueError('技能选择超过三项')
-    resources={}
-    for key,paths in requested.items():
-        identifier=identify(key)
-        if identifier not in identifiers or not isinstance(paths,list) or len(paths)>20 or any(not isinstance(path,str) or path not in allowed[identifier] for path in paths):
-            raise ValueError('资源选择不在清单内')
-        resources[identifier]=list(dict.fromkeys(resources.get(identifier,[])+paths))
-    return identifiers, resources
-
-
 # 职责：在技能正文预算不足时保留开头及与问题最相关的段落，并明确标记省略。
 # 输入：text 是完整说明，question 是当前问题，limit 是剩余字符预算。
 # 结果与约束：原件不裁剪；只限制当前上下文，避免任意长说明撑爆请求。

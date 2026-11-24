@@ -396,20 +396,20 @@ def test_lexical_incomplete_write_does_not_publish(context,monkeypatch):
     with rag.database.connect() as db:assert db.execute('SELECT status FROM file_rag_documents WHERE file_id=?',(fid,)).fetchone()[0]=='failed'
 
 
-def test_legacy_publication_backfills_lexical_without_model_calls(context,monkeypatch):
-    from avatar.rag.stores.postgres import install_vector_schema
+def test_offline_publication_migration_preserves_lexical_search(context,monkeypatch):
+    from scripts.migrate_local_stores import migrate_postgres_publications
     from avatar.rag.stores.lexical import LexicalStore
-    rag,uid,fid,store=prepared_index(context,monkeypatch)
+    from avatar.rag.stores.postgres import PostgresFiles
+    rag,uid,fid,_=prepared_index(context,monkeypatch)
+    monkeypatch.setattr(rag,'store',PostgresFiles(rag.database))
     asyncio.run(rag.index('profile',fid,uid))
     with rag.database.connect(write=True) as db:
         db.execute("UPDATE file_rag_documents SET active_publication='' WHERE file_id=?",(fid,))
         db.execute('DELETE FROM rag_publications WHERE file_id=?',(fid,))
         db.execute('DELETE FROM rag_lexical_records WHERE user_id=?',(uid,))
-        install_vector_schema(db.raw);install_vector_schema(db.raw)
+        assert migrate_postgres_publications(db.raw)['publications']==1
+        assert migrate_postgres_publications(db.raw)['publications']==0
         assert db.execute('SELECT count(*) FROM rag_publications WHERE file_id=?',(fid,)).fetchone()[0]==1
-    async def forbidden(*args,**kwargs):raise AssertionError('Legacy lexical backfill must not call models')
-    monkeypatch.setattr(rag,'vectors',forbidden);monkeypatch.setattr(rag,'prepare',forbidden)
-    asyncio.run(rag.backfill_legacy('profile',fid,uid))
     with rag.database.connect() as db:
         doc=db.execute('SELECT collection,legacy_backfill FROM file_rag_documents WHERE file_id=?',(fid,)).fetchone()
         ids=[r[0] for r in db.execute('SELECT record_id FROM file_rag_nodes WHERE file_id=?',(fid,))]

@@ -51,7 +51,7 @@ export TEST_POSTGRES_URL=postgresql:///avatar_test
 
 - Python 3.12 / 3.13（推荐 3.13，暂不支持 3.14）。
 - 依赖变更必须同时更新 `pyproject.toml` 与 `uv.lock`，两者在同一个 PR 内提交。
-- `wit-framework` 与 `acps-sdk` 走根目录本地 wheel（`[tool.uv.sources]`），不要改成网络源。
+- `wit` 与 `acps-sdk` 走根目录本地 wheel（`[tool.uv.sources]`），不要改成网络源。
 - `everos` 由 `vendor/EverOS` 以 uv workspace 成员方式解析。
 
 ## PR 前自检（必须全部通过）

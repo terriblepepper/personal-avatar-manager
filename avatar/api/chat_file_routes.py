@@ -9,7 +9,6 @@ from starlette.formparsers import MultiPartParser, MultiPartException
 from avatar.files.uploads.buffer import upload_buffer
 from avatar.models.effort import Effort
 from avatar.accounts.auth import current_user
-from avatar.files.parsing.animation import ANIMATION_MIME
 
 router=APIRouter(prefix='/api/conversations',tags=['会话附件'])
 
@@ -139,17 +138,14 @@ def download(conversation_id: str, file_id: str, request: Request, user=Depends(
     with service.database.connect() as db:row=service.owned(db,user['id'],conversation_id,file_id)
     path=service.directory.path(row['user_id'],row['conversation_id'],file_id+'.blob')
     if not path.is_file():
-        from fastapi import HTTPException
         raise HTTPException(404,'会话原件不存在')
     if preview:
-        from fastapi import HTTPException
         # 内联只使用服务端重新编码的 JPEG，下载仍返回授权原件。
         image=service.directory.path(row['user_id'],row['conversation_id'],file_id+'.jpg')
         if not row['content_type'].startswith('image/') or not image.is_file():
             raise HTTPException(404,'图片预览不存在')
         return FileResponse(image,media_type='image/jpeg',headers={'Cache-Control':'private, no-store'})
-    mime = ANIMATION_MIME if row['content_type'] == ANIMATION_MIME else 'application/octet-stream'
-    return FileResponse(path,filename=row['filename'],media_type=mime)
+    return FileResponse(path,filename=row['filename'],media_type='application/octet-stream')
 
 
 # 职责：删除本人附件及其解析结果，失败时恢复文件。

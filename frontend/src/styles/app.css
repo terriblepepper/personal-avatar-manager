@@ -434,13 +434,9 @@ a.el-button { text-decoration:none; }
 .composer-toolbar .chat-file-menu > p.sub { margin: .45rem 0 0; color: var(--text-secondary); font: inherit; font-size: .75rem; line-height: 1.6; }
 .composer-toolbar .composer-popover .actions { margin-block: .35rem; }
 .composer-toolbar .chat-file label > .material-type-icon { width: 1.15rem; height: 1.3rem; margin-inline-end: .2rem; vertical-align: middle; }
-.composer-toolbar .composer-popover .session-skill { gap: .35rem; }
 .composer-input { position: relative; flex: 1 1 12rem; min-width: 0; }
 .composer-input > textarea { display: block; width: 100%; min-height: 2.25rem; max-height: 7rem; field-sizing: content; resize: vertical; }
 .composer-input .skill-picker { bottom: calc(100% + .35rem); width: min(28rem, 100%); z-index: 65; }
-.skill-picker-choice { display: flex; align-items: center; gap: .2rem; }
-.skill-picker-choice > .skill-picker-option { flex: 1; min-width: 0; }
-.skill-picker-choice > .button { flex: none; }
 .chat-header-commands, .chat-compose-actions { --chat-command-height: 2rem; }
 .chat-header-commands { flex: none; flex-wrap: nowrap; margin-inline-start: auto; }
 .chat-compose-actions { position: relative; display: flex; align-items: flex-end; justify-content: space-between; gap: .4rem; }
@@ -546,7 +542,7 @@ tr:has(td > input[type="checkbox"], td > .el-checkbox) > td { vertical-align: to
 td > .el-checkbox:only-child { height: auto; line-height: inherit; }
 td > input[data-material-pick] { vertical-align: top; margin-block-start: .55em; }
 .material-file-table td:has(> [data-material-pick]) > .material-entry { align-items: flex-start; }
-:is(.actions, .notification-batch, .skill-bulk) > label:has(> input[type="checkbox"]) { display: inline-flex; gap: .35rem; align-items: center; }
+:is(.actions, .notification-batch) > label:has(> input[type="checkbox"]) { display: inline-flex; gap: .35rem; align-items: center; }
 .skill-item > .actions { margin-block: .55rem 0; }
 .model-save-actions { margin-block-start: .9rem; }
 .model-save-actions .model-saved-at { font-size: .75rem; align-self: center; }

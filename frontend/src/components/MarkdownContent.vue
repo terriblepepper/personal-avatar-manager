@@ -2,18 +2,15 @@
 import { computed, defineAsyncComponent } from 'vue'
 import { marked, type Token, type Tokens } from 'marked'
 import DOMPurify from 'dompurify'
-import { prepareAnimation } from '../utils/animation'
 import type { ChatFile } from '../types'
 import { previewKind } from '../utils/previewFile'
 import { chatFileURL } from '../utils/chatFileURL'
 import MermaidDiagram from './MermaidDiagram.vue'
 import InlineTextFile from './chat/InlineTextFile.vue'
 
-const AnimationDiagram = defineAsyncComponent(() => import('./AnimationDiagram.vue'))
 const GeneratedImage = defineAsyncComponent(() => import('./chat/GeneratedImage.vue'))
-const AnimationAttachments = defineAsyncComponent(() => import('./chat/AnimationAttachments.vue'))
 
-const props = withDefaults(defineProps<{ source: string; documentMode?: boolean; manualPictures?: boolean; diagrams?: boolean; animations?: boolean; conversationId?: string; files?: ChatFile[]; artifactReply?: boolean; sandboxSources?: string[]; savedFileIds?: ReadonlySet<string> }>(), { diagrams: true, animations: undefined })
+const props = withDefaults(defineProps<{ source: string; documentMode?: boolean; manualPictures?: boolean; diagrams?: boolean; conversationId?: string; files?: ChatFile[]; artifactReply?: boolean; sandboxSources?: string[]; savedFileIds?: ReadonlySet<string> }>(), { diagrams: true })
 const emit = defineEmits<{ preview: [file: ChatFile]; promote: [file: ChatFile] }>()
 function fileLink(node: HTMLAnchorElement | HTMLImageElement, url: URL) {
   if (!props.files || url.origin !== location.origin) return false
@@ -111,13 +108,9 @@ function closedFence(raw: string) {
   return !!opening && !!closing && closing[0] === opening[0] && closing.length >= opening.length
 }
 
-// Streaming updates often change only the text after a completed animation.
-type AnimationBlock = {key:string; source:string}
-let previousBlocks = new Map<string, AnimationBlock>()
 const rendered = computed(() => {
-  const blocks: ({ kind: 'text' | 'diagram' | 'animation' | 'pending'; source: string } | FileBlock)[] = []
+  const blocks: ({ kind: 'text' | 'diagram'; source: string } | FileBlock)[] = []
   const embedded = new Set<string>()
-  const inlineKeys = new Set<string>(), nextBlocks = new Map<string, AnimationBlock>()
   let pending: Token[] = []
   const generatedHtml = props.artifactReply ? props.files?.filter(htmlFile) || [] : []
   function addFile(file: ChatFile) {
@@ -143,55 +136,36 @@ const rendered = computed(() => {
     if (props.artifactReply && token.type === 'html' && htmlPage.test(token.raw)) continue
     if (token.type !== 'code') { pending.push(token); continue }
     const language = token.lang?.trim().toLowerCase().split(/\s+/)[0] || ''
-    if (props.artifactReply && language !== 'avanim' && language !== 'mermaid') {
+    if (props.artifactReply && language !== 'mermaid') {
       const code = token.text.trim()
       if (language === 'html' || language === 'htm' || htmlPage.test(code)
           || generatedHtml.length && htmlSourceLanguages.has(language)
           || props.sandboxSources && (pythonLanguages.has(language)
             || code && props.sandboxSources.some(source => source.includes(code) || code.includes(source)))) continue
     }
-    if ((props.animations ?? props.diagrams) && language === 'avanim') {
-      flush()
-      if (!closedFence(token.raw)) { blocks.push({ kind: 'pending', source: '' }); continue }
-      let block = previousBlocks.get(token.text)
-      if (!block) {
-        try {
-          const prepared = prepareAnimation(token.text)
-          block = {key:JSON.stringify(prepared.scene), source:prepared.source}
-        } catch { block = {key:'', source:token.text} }
-      }
-      nextBlocks.set(token.text, block)
-      if (block.key && inlineKeys.has(block.key)) continue
-      if (block.key) inlineKeys.add(block.key)
-      blocks.push({ kind: 'animation', source: block.source })
-    } else if (props.diagrams && language === 'mermaid' && closedFence(token.raw)) {
+    if (props.diagrams && language === 'mermaid' && closedFence(token.raw)) {
       flush()
       blocks.push({ kind: 'diagram', source: token.text })
     } else pending.push(token)
   }
   for (const file of generatedHtml) addFile(file)
   flush()
-  previousBlocks = nextBlocks
-  return { blocks, inlineKeys }
+  return blocks
 })
 </script>
 
 <template>
   <div class="markdown-content" :class="{ 'manual-pictures': manualPictures }" @click="preview">
-    <template v-for="(block, index) in rendered.blocks" :key="block.kind === 'file' ? block.file.id : index">
+    <template v-for="(block, index) in rendered" :key="block.kind === 'file' ? block.file.id : index">
       <MermaidDiagram v-if="block.kind === 'diagram'" :source="block.source" :conversation-id="conversationId" />
-      <AnimationDiagram v-else-if="block.kind === 'animation'" :source="block.source" :conversation-id="conversationId" />
       <template v-else-if="block.kind === 'file'">
         <p v-if="block.file.expired" class="expired-file sub" role="status">{{ block.file.filename }} · 文件已过期</p>
-        <AnimationAttachments v-else-if="block.mode === 'animation'" :files="[block.file]" :inline-keys="rendered.inlineKeys"
-          :conversation-id="conversationId" @preview="emit('preview',$event)" />
         <GeneratedImage v-else-if="block.mode === 'image'" :file="block.file" :url="block.url" @preview="emit('preview',$event)" />
         <InlineTextFile v-else-if="block.mode === 'text' || block.mode === 'mermaid' || block.mode === 'html'" :file="block.file" :url="block.url" :mode="block.mode" :saved="savedFileIds?.has(block.file.id)" @preview="emit('preview',$event)" @promote="emit('promote',$event)"/>
         <audio v-else-if="block.mode === 'audio'" :src="block.url" :aria-label="block.file.filename" controls preload="none"/>
         <video v-else-if="block.mode === 'video'" :src="block.url" :aria-label="block.file.filename" controls playsinline preload="none"/>
         <button v-else type="button" class="button small file-link" @click="emit('preview',block.file)">{{ block.file.filename }}</button>
       </template>
-      <span v-else-if="block.kind === 'pending'" class="sub">正在接收动画包…</span>
       <div v-else class="markdown-prose" v-html="block.source" />
     </template>
   </div>

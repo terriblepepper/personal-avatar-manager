@@ -7,9 +7,9 @@ const image = computed(() => /^(png|jpe?g|gif|webp|bmp)$/.test(extension.value))
 const colors: Record<string, string> = {
   pdf: '#b95f55', doc: '#487ab0', docx: '#487ab0',
   xls: '#418570', xlsx: '#418570', csv: '#418570', tsv: '#418570',
-  ppt: '#bd8651', pptx: '#bd8651', avanim: '#496b98',
+  ppt: '#bd8651', pptx: '#bd8651',
 }
-const abbreviations: Record<string, string> = { docx: 'DOC', xlsx: 'XLS', pptx: 'PPT', avanim: 'ANIM' }
+const abbreviations: Record<string, string> = { docx: 'DOC', xlsx: 'XLS', pptx: 'PPT' }
 const color = computed(() => image.value ? '#8b76ac' : (colors[extension.value] ?? '#68867c'))
 const label = computed(() => image.value ? 'IMG' : ((abbreviations[extension.value] ?? extension.value.toUpperCase()).slice(0, 4) || 'FILE'))
 </script>
@@ -28,7 +28,6 @@ const label = computed(() => image.value ? 'IMG' : ((abbreviations[extension.val
       <circle cx="12" cy="17" r="2.5" :fill="color"/>
       <path d="m8 26 6-6 4 4 4-6 5 8" fill="none" :stroke="color" stroke-width="2" stroke-linejoin="round"/>
     </template>
-    <path v-else-if="extension === 'avanim'" d="M13 12v12l10-6Z" :fill="color"/>
     <path v-else d="M10 17h10m-10 5h13" :stroke="color" stroke-opacity=".45" stroke-width="2" stroke-linecap="round"/>
     <rect x="2" y="27" width="28" height="11" rx="3" :fill="color"/>
     <text x="16" y="35" text-anchor="middle" fill="white" font-family="system-ui,sans-serif" font-size="7.5" font-weight="700">{{ label }}</text>

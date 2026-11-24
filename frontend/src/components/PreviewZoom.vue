@@ -7,7 +7,7 @@ const input = ref<HTMLInputElement>()
 function restore() { if (input.value) input.value.value = String(props.percent) }
 function commit() {
   const field = input.value
-  if (field && field.reportValidity() && Number.isFinite(field.valueAsNumber)) emit('scale', field.valueAsNumber / 100)
+  if (field && field.reportValidity()) emit('scale', field.valueAsNumber / 100)
 }
 watch(() => props.percent, restore)
 </script>

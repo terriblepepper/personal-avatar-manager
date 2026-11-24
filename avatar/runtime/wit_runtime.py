@@ -31,8 +31,8 @@ class AvatarEntryComponent(BaseAgentEntryComponent):
         self.chat = ctx.get(AVATAR_CHAT)
 
     # 职责：实现一次受管理调用的具体执行流。
-    # 输入：invocation 提供业务输入、response_mode 及取消状态，身份不从 metadata 读取。
-    # 结果与约束：complete 调用领域完整接口，stream 转发可见事件；error 作为 HTTPException 传播，done 转为唯一 terminal。
+    # 输入：invocation 提供业务输入 及取消状态，身份不从 metadata 读取。
+    # 结果与约束：转发可见事件；error 作为 HTTPException 传播，done 转为唯一 terminal。
     async def _stream(self, invocation):
         invocation.ensure_active()
         call = invocation.request.input
@@ -40,13 +40,6 @@ class AvatarEntryComponent(BaseAgentEntryComponent):
             raise HTTPException(422, '智能体入口需要已认证的问答请求')
         if call.user.get('access_scope', 'full') != 'full':
             raise HTTPException(403, '临时入口仅允许个人资料管理')
-        mode = invocation.options.get('response_mode', 'complete')
-        if mode == 'complete':
-            result = await self.chat.reply(call.user, call.body)
-            yield InvocationEvent.final(InvocationResult(output=result))
-            return
-        if mode != 'stream':
-            raise HTTPException(422, '无效的智能体回答模式')
         # 显式关闭领域生成器，取消时继续释放模型连接与数据库会话租约。
         async with aclosing(self.chat.stream(call.user, call.body)) as source:
             async for event in source:
@@ -119,21 +112,13 @@ class AvatarRuntime:
                 yield agent
 
     # 职责：将已认证的 Web 请求转换成 wit 调用契约。
-    # 输入：user 为 current_user 返回值，body 为 ChatRequest，mode 为 complete 或 stream。
+    # 输入：user 为 current_user 返回值，body 为 ChatRequest。
     # 结果与约束：仅复制对话需要的账户字段，不携带 Cookie、CSRF、登录联系方式或 Key；metadata 仅用于观测，不作为认证依据。
     @staticmethod
-    def request(user, body, mode):
+    def request(user, body):
         identity = {key: user[key] for key in ('id', 'username', 'account_status', 'access_scope') if key in user}
-        return InvocationRequest(input=AvatarInvocation(identity, body), options={'response_mode': mode},
+        return InvocationRequest(input=AvatarInvocation(identity, body),
                                  metadata={'channel': body.channel})
-
-    # 职责：通过 WitAgent.invoke 执行完整回答。
-    # 输入：user 和 body 已在 Web HTTP 边界通过身份、CSRF 和格式校验；小镇管理协议不得复用本门面调用分身。
-    # 结果与约束：返回领域原有响应结构；框架执行同一 Entry 并消费其 terminal，错误继续交给 HTTP 错误处理。
-    async def reply(self, user, body):
-        async with self._execution_agent() as agent:
-            result = await agent.invoke(self.request(user, body, 'complete'))
-            return result.output
 
     # 职责：将 wit InvocationEvent 映射回现有 Web SSE 事件。
     # 输入：user、body 为已经认证的问答参数。
@@ -141,7 +126,7 @@ class AvatarRuntime:
     async def stream(self, user, body):
         try:
             async with self._execution_agent() as agent:
-                async with aclosing(agent.stream(self.request(user, body, 'stream'))) as source:
+                async with aclosing(agent.stream(self.request(user, body))) as source:
                     async for event in source:
                         if event.is_terminal:
                             yield event.result.output

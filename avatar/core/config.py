@@ -50,17 +50,11 @@ def runtime_environment(settings, provider):
     """Describe this startup from the active adapter, configuration and installed resources."""
     from importlib.metadata import PackageNotFoundError, version
     frameworks = {}
-    for package in ('wit-framework', 'acps-sdk'):
+    for package in ('wit', 'acps-sdk'):
         try:
             frameworks[package] = version(package)
         except PackageNotFoundError:
             frameworks[package] = None
-    # Keep the API label used by existing consoles after the distribution rename in WIT 3.2.
-    if frameworks['wit-framework'] is None:
-        try:
-            frameworks['wit-framework'] = version('wit')
-        except PackageNotFoundError:
-            pass
     manual = ROOT / 'docs' / '操作手册.md'
     return {
         'registration_adapter': type(provider).__name__,

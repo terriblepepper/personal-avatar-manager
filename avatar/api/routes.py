@@ -9,13 +9,13 @@ from pydantic import BaseModel, ConfigDict, Field
 from wit import __version__ as wit_version
 from fastapi.responses import FileResponse
 from avatar.files.library.folders import MaterialFolders,FolderRequest,NameRequest,FolderRenameRequest,rename_folder,rename_file
-from avatar.files.parsing.animation import MAX_SOURCE_BYTES
+from avatar.files.artifact_limits import MAX_SOURCE_BYTES
 from avatar.files.uploads.batches import batch_id as upload_batch_id, UploadComplete
 from avatar.profiles.profile_dates import ModifiedAt
 from avatar.models.model_settings import ModelSettingsRequest
 from avatar.files.library.attachments import ARTIFACT_SUFFIXES, AttachmentDescriptionRequest
 import avatar.accounts.auth as auth
-from avatar.core.schemas import Credentials, LoginRequest, RecoveryRequest, PasswordChangeRequest, ContactChangeRequest, RegistrationRequest, DraftRequest, SubmitRequest, ReviewRequest, ChatRequest, PlatformSettings
+from avatar.core.schemas import LoginRequest, RecoveryRequest, PasswordChangeRequest, ContactChangeRequest, RegistrationRequest, DraftRequest, SubmitRequest, ReviewRequest, ChatRequest, PlatformSettings
 from avatar.models.model_config import catalog
 from avatar.core.schemas import ConversationRequest, ConversationTitleRequest, ModelConfigInput
 from avatar.core.schemas import AccountRoleRequest
@@ -220,7 +220,7 @@ def model_effort_levels(provider: str, api_format: Literal['openai','anthropic',
 
 
 # 职责：保存当前账户的个人资料草稿。
-# 输入：body 含 Profile、修改日期和旧客户端可选模型配置，user 经过会话与 CSRF 检查。
+# 输入：body 含 Profile和修改日期，user 经过会话与 CSRF 检查。
 # 结果与约束：委托服务校验身份、选填学号、状态和修改日期后保存；独立文件及模型设置沿用各自入口。
 @router.put("/me/profile")
 def profile(body: DraftRequest, request: Request, user=Depends(auth.current_user)):
@@ -332,14 +332,6 @@ def clear_conversation(conversation_id: str, request: Request, channel: str = 'a
     return {'message':'历史记录和压缩记忆已清空'}
 
 
-# 职责：提供返回完整回答的非流式问答接口。
-# 输入：body 为消息请求，user 为认证账户，request 提供 AvatarChat。
-# 结果与约束：通过 wit Runtime.invoke 等待 Entry 完成后返回统一结果；目标权限、计费与保存继续由领域服务校验。
-@router.post("/chat")
-async def chat(body: ChatRequest, request: Request, user=Depends(auth.current_user)):
-    return await request.app.state.runtime.reply(user, body)
-
-
 @router.get("/admin/pending-count")
 def pending_review_count(request: Request, user=Depends(admin)):
     return {"pending": request.app.state.pending_reviews.get()}
@@ -373,26 +365,6 @@ def admin_agent_detail(user_id: str, request: Request, user=Depends(admin)):
         row = db.execute('SELECT a.*,u.username FROM avatar_records a JOIN users u ON u.id=a.user_id WHERE a.user_id=?',
                          (user_id,)).fetchone()
     return agent_detail(request.app.state, row)
-
-
-# 职责：提供管理员控制台汇总数据。
-# 输入：user 通过 admin 依赖，request 提供业务服务。
-# 结果与约束：返回统计、审核、任务、分身和事件，模型配置由服务脱敏。
-@router.get("/admin/dashboard")
-def dashboard(request: Request, user=Depends(admin)):
-    result = request.app.state.service.dashboard(user['id'])
-    result['environment'] = request.app.state.environment
-    from avatar.protocols.registration.entity import staged_entity_metadata
-    for agent in result['agents']:
-        agent['protocol'] = request.app.state.personal_aip.status(agent['user_id'])
-        agent['staged_identity'] = staged_entity_metadata(request.app.state.settings.data_dir, agent['user_id'])
-    result['entity_registration_enabled'] = request.app.state.settings.entity_aip_enabled
-    result['personal_registration_mode'] = request.app.state.settings.provider
-    from avatar.protocols.transport.endpoints import entity_port_pool
-    with request.app.state.database.connect() as db:
-        result['entity_port_pool'] = entity_port_pool(request.app.state.settings, db=db)
-    result['entity_port_pool']['online'] = sum(bool(agent['protocol']['serving']) for agent in result['agents'])
-    return result
 
 
 @router.post('/admin/agents/{user_id}/health')
@@ -600,7 +572,7 @@ async def upload_attachment(request: Request, filename: str | None = Query(defau
     remaining = max(0,quota['limit_bytes']-quota['used_bytes'])
     artifact_upload = filename.lower().endswith(ARTIFACT_SUFFIXES)
     limit = min(remaining,MAX_SOURCE_BYTES) if artifact_upload else remaining
-    reason = 'HTML 或动画文件不能超过 100 MiB' if artifact_upload and limit==MAX_SOURCE_BYTES else '资料文件剩余额度不足'
+    reason = 'HTML 文件不能超过 100 MiB' if artifact_upload and limit==MAX_SOURCE_BYTES else '资料文件剩余额度不足'
     if int(request.headers.get('content-length') or 0) > limit:
         raise HTTPException(413,reason)
     with TemporaryFile() as payload:

@@ -4,33 +4,6 @@ import json
 import uuid
 
 
-def migrate_chat_generations(db):
-    db.executescript('''
-    CREATE TABLE IF NOT EXISTS chat_generation_jobs (
-      task_id TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL REFERENCES users(id),
-      request_id TEXT NOT NULL,
-      conversation_id TEXT REFERENCES chat_conversations(id) ON DELETE SET NULL,
-      fingerprint TEXT NOT NULL,
-      payload TEXT NOT NULL,
-      authorization TEXT NOT NULL DEFAULT '{}',
-      state TEXT NOT NULL CHECK(state IN ('queued','running','succeeded','failed','cancelled','indeterminate')),
-      snapshot TEXT NOT NULL,
-      created_at REAL NOT NULL, updated_at REAL NOT NULL,
-      UNIQUE(user_id,request_id));
-    CREATE UNIQUE INDEX IF NOT EXISTS chat_generation_active
-      ON chat_generation_jobs(conversation_id) WHERE state IN ('queued','running');
-    CREATE INDEX IF NOT EXISTS chat_generation_queue ON chat_generation_jobs(state,created_at);
-    CREATE TRIGGER IF NOT EXISTS chat_generation_forget BEFORE DELETE ON chat_conversations
-    BEGIN
-      UPDATE chat_generation_jobs SET payload='{}',authorization='{}',
-        state='cancelled',snapshot='{"done":false,"error":"会话已删除","state":"cancelled"}'
-        WHERE conversation_id=OLD.id;
-    END;
-    ''')
-    restore_legacy_generations(db)
-
-
 def restore_legacy_generations(db):
     """只有旧快照的会话补录任务；已有任务的状态、授权和租约保持原样。"""
     rows = db.execute("""SELECT p.* FROM chat_pending p JOIN chat_conversations c

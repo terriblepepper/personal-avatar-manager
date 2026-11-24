@@ -16,7 +16,7 @@ const steps = [
   ['Soul','/knowledge','#knowledge-workspace h3','个人形象概览'],
   ['与分身对话','/chat','#personal-chat-compose',''],
   ['模型配置','/models','.avatar-panel h2','聊天模型配置'],
-  ['分身技能','/skills','.avatar-panel h2','安装技能包'],
+  ['分身技能','/skills','.avatar-panel h2','分身技能'],
   ['分身会话','/dialogues','.peer-session-list h2','分身间会话'],
   ['最近动态','/messages','main [role=tablist]','全部消息'],
   ['申请记录','/history','.pagehead h1','申请记录'],

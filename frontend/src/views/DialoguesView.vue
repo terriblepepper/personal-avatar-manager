@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import { SKILLS_PAUSED } from '../skillPolicy'
 import { defineAsyncComponent, computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElButton, ElMessage } from 'element-plus'
@@ -34,12 +33,10 @@ const IntentDialog = defineAsyncComponent(() => import('../components/collaborat
 interface Session { session_id:string; peer_name:string; messages?: Pick<Message, 'speaker_role' | 'content'>[] }
 interface Message { dialogue_id:string; turn:number; speaker_name:string; speaker_role:string; speaker_user_id?:string; content:string; state?:string; state_detail?:string; task_action?:string; tool_activity?:ToolEvent[]; is_own:boolean }
 interface TaskFile extends ChatFile {message_id:number|null;sender_user_id:string}
-interface Task { rejected?:boolean; sending_prepared?:boolean; expires_at?:string | null; workspace_expired?:boolean; user_question?:AgentQuestion; can_supplement?:boolean; revision?:number; files?:TaskFile[];id:string; objective:string; status:string; can_accept?:boolean; needs_confirmation?:boolean; delivery_mode:string; can_retry?:boolean; auto_retrying?:boolean; error?:string; rounds_done?:number; round_limit?:number;tool_activity?:ToolEvent[];skill_commands?:string;created_at?:string;ended_at?:string;returned_summary?:string;waiting_reason?:string;waiting_label?:string;waiting_for_other?:boolean; end_reason?:string; reason?:string; message_delivered?:boolean; active_speaker?:string; active_speaker_is_own?:boolean }
+interface Task { rejected?:boolean; sending_prepared?:boolean; expires_at?:string | null; workspace_expired?:boolean; user_question?:AgentQuestion; can_supplement?:boolean; revision?:number; files?:TaskFile[];id:string; objective:string; status:string; can_accept?:boolean; needs_confirmation?:boolean; delivery_mode:string; can_retry?:boolean; auto_retrying?:boolean; error?:string; rounds_done?:number; round_limit?:number;tool_activity?:ToolEvent[];created_at?:string;ended_at?:string;returned_summary?:string;waiting_reason?:string;waiting_label?:string;waiting_for_other?:boolean; end_reason?:string; reason?:string; message_delivered?:boolean; active_speaker?:string; active_speaker_is_own?:boolean }
 interface Intent {id:string;conversation_id:string;target_query:string;target_aic:string;objective:string;shared_content:string}
-interface Detail { auto_accept?:boolean; auto_accept_available?:boolean; settings_conversation_id?:string|null; legacy_file_conversation_id?:string|null; summary_through?:number; history_revision?:string; task_page?:Page<Task>; embedding_status?:{configured?:boolean;peerConfigured?:boolean}; resource_conversation_id:string | null; current_transport_mode?:string; chat?:Task; peer_name:string; messages:Message[]; message_tasks?:Task[]; tasks:Task[]; task?:Task; has_more:boolean }
-interface Skill {id:string;name:string;enabled:boolean}
+interface Detail { auto_accept?:boolean; auto_accept_available?:boolean; settings_conversation_id?:string|null; summary_through?:number; history_revision?:string; task_page?:Page<Task>; embedding_status?:{configured?:boolean;peerConfigured?:boolean}; resource_conversation_id:string | null; current_transport_mode?:string; chat?:Task; peer_name:string; messages:Message[]; message_tasks?:Task[]; tasks:Task[]; task?:Task; has_more:boolean }
 const copyMenu=ref<InstanceType<typeof MessageCopyMenu>>()
-const skills=ref<Skill[]>([])
 const route=useRoute(), router=useRouter()
 const sessions=ref<Session[]>([]), current=ref(''), taskId=ref(''), detail=ref<Detail|null>(null), message=ref(''), rounds=ref<number>(), search=ref(''), offset=ref(0), total=ref(0)
 const writeState = ref<'idle' | 'sending' | 'working'>('idle')
@@ -99,14 +96,6 @@ let sessionTrigger: HTMLElement | undefined
 const taskMap=ref<Record<string,Task>>({})
 const taskSearch=ref(''),taskOffset=ref(0),taskTotal=ref(0)
 const hasOlder=ref(false), allMessages=computed(()=>[...new Map([...older.value,...(detail.value?.messages||[])].map(item=>[item.turn,item])).values()].filter(item=>!(item.speaker_role==='user'&&item.speaker_name==='用户授权共享资料')).sort((a,b)=>a.turn-b.turn))
-const activeSkills = computed(() => {
-  const commands = detail.value?.task?.skill_commands || ''
-  const names = [...commands.matchAll(/\$("(?:\\.|[^"\\])*"|[^\s$]+)/g)].map(match => {
-    if (!match[1].startsWith('"')) return match[1]
-    try { return String(JSON.parse(match[1])) } catch { return match[1] }
-  })
-  return skills.value.filter(skill => names.some(name=>name.toLocaleLowerCase()===skill.name.toLocaleLowerCase()))
-})
 const resourceId = computed(() => detail.value?.resource_conversation_id || '')
 const sharedFilesRevision = computed(() => {
   const view=detail.value
@@ -313,12 +302,6 @@ function send(answer?: QuestionReply) {
     if (question && activeTask.value?.user_question?.id === question.id) delete activeTask.value.user_question
   }, 'sending')
 }
-function removeSkill(skill:Skill) {
-  if (!taskId.value || busy.value || switching.value) return
-  const token = pending ||= id()
-  return action('/agent-dialogues/'+encodeURIComponent(taskId.value)+'/resume','POST',
-    {message:'', request_id:token, remove_skills:[skill.id]}, () => { if (pending === token) pending='' })
-}
 function taskAction(name:string) {
   const target = name === 'cancel' ? runningTask.value?.id || taskId.value : taskId.value
   if (!target || busy.value || switching.value || resourceBusy.value) return
@@ -430,9 +413,6 @@ watch(()=>[route.query.session,route.query.task], ([session,task], previous)=>{
   else if (previous?.[0] && current.value) closeSession()
 }, {immediate:true})
 onMounted(async () => {
-  if (!SKILLS_PAUSED) {
-    try { skills.value = await request<Skill[]>('/me/skills') } catch(e) { if (!disposed) notifyError(e) }
-  }
   try { rounds.value = (await request<{max_rounds:number}>('/agent-dialogue-settings')).max_rounds } catch(e) { if (!disposed) notifyError(e) }
 })
 onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
@@ -535,22 +515,10 @@ onBeforeUnmount(() => { disposed=true; scope++; olderRequest?.abort() })
   </div><div class="peer-composer">
   <AgentQuestionPrompt v-if="!taskClosed" ref="questionPrompt" :key="current+'/'+shownTask" :scope="'peer:'+current+'/'+shownTask" :question="userQuestion"
     :disabled="commandsDisabled || toolsSaving" @answer="send"/>
-  <ComposerInput v-model="message" :catalog="detail?.embedding_status?.configured === false ? [] : skills" :session="taskId || current" :usage-url="current ? '/agent-sessions/'+encodeURIComponent(current)+'/compact'+(taskId?'?task_id='+encodeURIComponent(taskId):'') : ''" :usage-revision="(detail?.history_revision||'')+'/'+(detail?.summary_through||0)" :disabled="switching || taskClosed" label="分身会话消息" @submit="send()" :placeholder="taskClosed ? '任务已结束' : runningTask || pausedTask ? '补充任务所需信息…' : SKILLS_PAUSED ? '输入消息或任务目标…' : '输入消息或任务目标，$ 选择技能…'" @update:model-value="pending=''"/>
+  <ComposerInput v-model="message" :usage-url="current ? '/agent-sessions/'+encodeURIComponent(current)+'/compact'+(taskId?'?task_id='+encodeURIComponent(taskId):'') : ''" :usage-revision="(detail?.history_revision||'')+'/'+(detail?.summary_through||0)" :disabled="switching || taskClosed" label="分身会话消息" @submit="send()" :placeholder="taskClosed ? '任务已结束' : runningTask || pausedTask ? '补充任务所需信息…' : '输入消息或任务目标…'" @update:model-value="pending=''"/>
   <div class="chat-compose-actions">
   <ComposerToolbar class="peer-composer-toolbar" label="分身会话工具栏">
-    <details v-if="!SKILLS_PAUSED && detail?.embedding_status?.configured !== false" class="composer-menu composer-tool">
-      <summary class="chat-command" title="管理当前任务技能"><span aria-hidden="true">✧</span><span>技能</span><small>{{ activeSkills.length }}</small></summary>
-      <div class="composer-popover">
-        <h3>当前任务技能</h3>
-        <p class="sub">在输入框键入 $ 选择技能。移出仅影响当前任务。</p>
-        <p v-if="!activeSkills.length" class="sub">尚无已加载技能。</p>
-        <div v-for="skill in activeSkills" :key="skill.id" class="session-skill">
-          <span>{{ skill.name }}</span><button type="button" class="button small" :disabled="busy || switching || taskClosed" @click="removeSkill(skill)">移出本任务</button>
-        </div>
-      </div>
-    </details>
     <ChatFilesManager v-if="resourceId || taskClosed" :conversation-id="resourceId" label="共享文件" :shared-revision="sharedFilesRevision" :read-only="taskClosed" :busy="busy || switching || detail?.task?.status==='running'" @selected="fileIds=$event" @uploading="resourceBusy=$event"/>
-    <ChatFilesManager v-if="detail?.legacy_file_conversation_id" :conversation-id="detail.legacy_file_conversation_id" label="旧私有文件" read-only/>
     <ConversationTools :conversation-id="settingsId" @saving="toolPending=$event" :busy="taskClosed || busy || switching || resourceBusy || detail?.task?.status==='running'"/>
     <details class="composer-tool chat-command-menu">
       <summary class="chat-command chat-icon-command" aria-label="会话操作" title="会话操作"><AppIcon name="more" :size="18"/></summary>

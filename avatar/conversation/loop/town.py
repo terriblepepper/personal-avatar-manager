@@ -76,7 +76,7 @@ class TemporarySessionFiles(SessionFiles):
                 path = self.path / str(uuid.UUID(identifier))
                 if not path.exists():
                     path.write_bytes(data)
-            if extension in ('.pdf','.doc','.docx','.ppt','.pptx','.xlsx','.avanim'):
+            if extension in ('.pdf','.doc','.docx','.ppt','.pptx','.xlsx'):
                 from avatar.files.parsing.text_worker import read_original
                 try:
                     parsed = read_original(path,extension,start=page,end=page,offset=offset,limit=max(1,limit//4))

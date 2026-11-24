@@ -57,15 +57,3 @@ def public_profile(profile):
     return {key: profile[key] for key, _, _, audience, default in FIELDS
             if key in profile and audience in ("both", person_type)
             and (key in FIXED_PUBLIC_FIELDS or visibility.get(key, default) == "public")}
-
-
-# 职责：将参考学生 JSON 映射为本系统资料结构。
-# 输入：candidate 为参考对象，student_id 为明确提供的学生学号。
-# 结果与约束：返回映射结果而不写库或公开；示例信息不能自动灌入所有用户账户。
-def from_candidate(candidate, student_id):
-    """Reference mapping only; never automatically publish someone's sample data."""
-    identity = candidate.get("identity", {})
-    return {"person_type": "student", "student_id": student_id, "name": identity.get("name", ""),
-            "preferred_name": identity.get("preferred_name", ""), "location": identity.get("location", ""),
-            "bio": candidate.get("introduction", ""),
-            **{k: candidate[k] for k in ("current_advisor", "current_projects", "skills", "projects", "education", "certifications", "academic_highlights", "interests") if k in candidate}}

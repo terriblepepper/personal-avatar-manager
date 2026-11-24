@@ -15,14 +15,18 @@ class LexicalStore:
         self.database=database
 
     def stage(self,user_id,collection,records):
-        ids,metadata,texts=records
         with self.database.connect(write=True) as db:
-            for identifier,meta,text in zip(ids,metadata,texts,strict=True):
-                terms=' '.join(tokens(meta.get('filename','')+' '+meta.get('section','')+' '+text))
-                db.execute("""INSERT INTO rag_lexical_records(user_id,collection,record_id,file_id,source,text,metadata,tokens)
-                    VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(user_id,collection,record_id) DO UPDATE SET
-                    file_id=excluded.file_id,source=excluded.source,text=excluded.text,metadata=excluded.metadata,tokens=excluded.tokens""",
-                    (user_id,collection,identifier,meta['file_id'],meta['source'],text,json.dumps(meta,ensure_ascii=False),terms))
+            self.stage_in(db,user_id,collection,records)
+
+    @staticmethod
+    def stage_in(db,user_id,collection,records):
+        ids,metadata,texts=records
+        for identifier,meta,text in zip(ids,metadata,texts,strict=True):
+            terms=' '.join(tokens(meta.get('filename','')+' '+meta.get('section','')+' '+text))
+            db.execute("""INSERT INTO rag_lexical_records(user_id,collection,record_id,file_id,source,text,metadata,tokens)
+                VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(user_id,collection,record_id) DO UPDATE SET
+                file_id=excluded.file_id,source=excluded.source,text=excluded.text,metadata=excluded.metadata,tokens=excluded.tokens""",
+                (user_id,collection,identifier,meta['file_id'],meta['source'],text,json.dumps(meta,ensure_ascii=False),terms))
 
     def contains(self,user_id,collection,identifiers):
         if not identifiers:return False

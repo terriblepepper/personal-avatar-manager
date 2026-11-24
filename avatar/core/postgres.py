@@ -225,7 +225,6 @@ class PostgresDatabase:
         return users is not None and raw.execute('SELECT 1 FROM users WHERE is_root=1 LIMIT 1').fetchone() is not None
 
     def initialize(self, *, existing_data=False):
-        from avatar.core.migrations.chat_generations import restore_legacy_generations
         from avatar.core.postgres_schema import install_schema
         with self.pool.connection() as raw:
             lock_schema_transaction(raw, SCHEMA_LOCK)
@@ -234,7 +233,6 @@ class PostgresDatabase:
                 raise ValueError('数据目录已有账户或旧库，须先完成离线迁移并核对 DATABASE_URL')
             install_schema(raw)
             self._load_metadata(raw)
-            restore_legacy_generations(Connection(raw, self.metadata))
 
     def _load_metadata(self, raw):
         metadata = {}

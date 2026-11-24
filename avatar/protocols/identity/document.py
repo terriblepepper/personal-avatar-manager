@@ -64,24 +64,6 @@ def wit_candidate_config(config):
         yield replace(config, paths=replace(config.paths, acs_path=path))
 
 
-# 职责：对 wit 的只读身份目录提供单 ACS 文件兼容。
-# 输入：registrations 是服务器持有的 AIC/config 映射，factory 为 wit 原生目录或隔离测试替身。
-# 结果与约束：每次选择时临时提供原候选，由 wit 校验真实证书和 CA 状态；不缓存私钥，不保留临时文件。
-class SingleAcsEntityDirectory:
-    # 职责：保存只读身份映射及底层公开目录构造器。
-    # 输入：registrations 和 factory 由协议运行时装配。
-    # 结果与约束：构造不读文件或发起网络。
-    def __init__(self, registrations, factory):
-        self.registrations, self.factory = dict(registrations), factory
-
-    # 职责：在有界兼容上下文中选择一个真实本地实体。
-    # 输入：aic 必须已存在于服务器映射。
-    # 结果与约束：调用结束清理临时输入，错误原样交给上层关闭接入；不改变已分配 AIC。
-    async def select(self, aic):
-        with wit_candidate_config(self.registrations[aic]) as config:
-            return await self.factory({aic: config}).select(aic)
-
-
 class LocalEntityDirectory:
     """只装载已提交的 active 材料；日常通信不查询 Registry 或 CA。"""
     local_only=True
@@ -179,25 +161,6 @@ def migrate_identity_document(config):
     publish_identity_document(config.paths.acs_path, document, state['aic'], state['candidate']['entityUserId'])
     for path in legacy:
         path.unlink()
-
-
-# 职责：在启动应用时迁移现有身份目录，确保公开接口只读取 acs.json。
-# 输入：data_dir 是正式数据根或隔离测试根。
-# 结果与约束：只处理已有 registration.json 的系统、本体和个人身份；不扫描备份、不注册或申请证书。
-def migrate_identity_documents(data_dir):
-    from avatar.protocols.identity.atr_config import read_atr_config
-    roots = [Path(data_dir) / 'system_identity', Path(data_dir) / 'avatar_ontology']
-    personal = Path(data_dir) / 'users'
-    if personal.exists():
-        for p in personal.iterdir():
-            if p.is_symlink():raise ValueError('身份目录不能使用符号链接')
-            if p.is_dir():roots.append(p/'identity')
-    for root in roots:
-        if root.is_symlink():
-            raise ValueError('身份目录不能使用符号链接')
-        config_path = root / 'registration.json'
-        if config_path.exists():
-            read_atr_config(config_path)
 
 
 # 职责：把框架已经取得并核验的正式 ACS 写回唯一文件。

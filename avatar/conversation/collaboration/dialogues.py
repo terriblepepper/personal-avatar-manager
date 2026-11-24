@@ -441,10 +441,6 @@ class AgentDialogues:
                         settings_id=self.resources.settings_workspace(db,user['id'],identifier,task_id)
         with self.database.connect() as db:
             pair=self.member(db,user,identifier,hidden=separate)
-            legacy_files=bool(settings_id and db.execute("""SELECT 1 FROM chat_files f WHERE f.conversation_id=?
-                AND f.user_id=? AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now'))
-                AND NOT EXISTS(SELECT 1 FROM agent_task_files a WHERE a.file_id=f.id) LIMIT 1""",
-                (settings_id,user['id'])).fetchone())
             snapshot={}
             if task_paging is not None:
                 hidden = db.execute('''SELECT m.task_id FROM agent_task_members m JOIN agent_dialogues d ON d.id=m.task_id
@@ -497,7 +493,7 @@ class AgentDialogues:
         if after is None:messages.reverse()
         page=self.task_page(user,identifier,*(task_paging or (0,'')),from_task=separate)
         if task_paging is not None:snapshot['task_page']=page
-        return {'auto_accept':auto_accept,'auto_accept_available':auto_accept_available,'current_transport_mode':protocol,'embedding_status':embedding_status,'viewer_user_id':user['id'],'session_id':identifier,'id':identifier,'resource_conversation_id':workspace,'settings_conversation_id':settings_id,'legacy_file_conversation_id':settings_id if legacy_files else None,'accepted':bool(pair['accepted']),'can_accept':bool(task_id and any(t['id']==task_id and t['target_user_id']==user['id'] and t['status']=='awaiting_acceptance' for t in tasks)),
+        return {'auto_accept':auto_accept,'auto_accept_available':auto_accept_available,'current_transport_mode':protocol,'embedding_status':embedding_status,'viewer_user_id':user['id'],'session_id':identifier,'id':identifier,'resource_conversation_id':workspace,'settings_conversation_id':settings_id,'accepted':bool(pair['accepted']),'can_accept':bool(task_id and any(t['id']==task_id and t['target_user_id']==user['id'] and t['status']=='awaiting_acceptance' for t in tasks)),
                 'peer_name':json.loads(avatar['profile']).get('avatar_name','分身') if avatar else '分身','peer_aic':avatar['aic'] if avatar else '',
                 'messages':messages,'has_more':len(rows)==10,'chat':self.view(dict(chat),user) if chat else None,'message_tasks':[self.view(dict(r),user) for r in message_tasks],
                 'tasks':[self.view(dict(r),user) for r in tasks],'task_total':page['total'],**snapshot}

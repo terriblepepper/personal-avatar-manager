@@ -21,15 +21,14 @@ from avatar.conversation.loop.context import TurnContext
 from avatar.conversation.loop.file_context import explicit_file_context
 from avatar.conversation.loop.planning import (available_tools, disclosure_catalog, disclose_tools, validate_disclosure,
                                                REQUEST_TOOLS, UPDATE_TASK, EVIDENCE_TOOLS, WRITING_CONTROLS, action_ready, needs_confirmation,
-                                               confirm_goal, revise_goals, migrate_session_tool, migrate_html_goals, final_reply_step, lookup_types,
+                                               confirm_goal, revise_goals, final_reply_step, lookup_types,
                                                read_goals_verified)
 from avatar.conversation.loop.turns import stream_final
 from avatar.conversation.working_context import bounded_excerpt, compression_budget, excerpt, input_budget
 from avatar.core.tokens import estimate
 from avatar.conversation.tools.activity import AgentSteps, without_false_tool_footer
 from avatar.conversation.tools.builtin import beijing_time
-from avatar.conversation.tools.html import (ARTIFACT_TOOLS, create_html, html_repair_prompt,
-                                           repaired_html_arguments, restore_legacy_animation)
+from avatar.conversation.tools.html import ARTIFACT_TOOLS, create_html, html_repair_prompt, repaired_html_arguments
 from avatar.conversation.tools.html_revision import expand_revision, revision_tool
 from avatar.models.client import ModelResult, accumulate_usage
 from avatar.models.diagnostics import stop_reason
@@ -97,8 +96,6 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
     await check_execution_async(config.get('_validate_entry_results') or (lambda: rag.validate(context)))
     store = config.get('_run_store')
     state = await asyncio.to_thread(store.load) if store else {}
-    migrate_session_tool(state)
-    migrate_html_goals(state)
     journal = LoopState(store, state)
     if config.get('_validate_sandbox') and not config.get('_validate_entry_results'):
         await asyncio.to_thread(config['_validate_sandbox'])
@@ -107,8 +104,6 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
     if store:
         await restore_files(store, state, config)
     draft = SegmentedDraft(store or MemoryDraftStore(), state, max_tokens=config.get('max_tokens'))
-    if not state.get('final') and await draft.migrate_html_drafts():
-        await journal.save(draft=state.get('draft'),parked_drafts=state.get('parked_drafts',[]))
     if state.get('phase') == 'retry':
         await draft.prepare_retry()
         draft.reset_attempts()
@@ -475,7 +470,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             await draft.start(ModelResult('',None),tool=lookup_tool)
             await checkpoint('writing')
         planned_lookup = current.pop('lookup',None) if not draft.active and not queued_call and lookup_tool in {t['name'] for t in settings['_tools']} else None
-        structured = (planned_lookup is None and invalid == 1 and lookup_tool in ('find_material','find_animation','find_public_material')
+        structured = (planned_lookup is None and invalid == 1 and lookup_tool in ('find_material','find_public_material')
                       and any(t['name']==lookup_tool for t in settings['_tools']))
         ready = [t for t in settings['_tools'] if action_ready(t['name'],pending,receipts_log,revision)]
         step_settings = {**settings,'_tools':ready,'_call_purpose':'goal_decision','_batch_tools':True}
@@ -587,7 +582,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             progress({'type': 'status', 'stage': stage, 'message': detail})
         started = time.monotonic()
         receipts = [*config.get('_generated_files', ()), *config.get('_agent_saved_files', ())]
-        review_needed = (not domain and bool(set(selected) & {*ARTIFACT_TOOLS,'deliver_material','send_material','send_animation'})
+        review_needed = (not domain and bool(set(selected) & {*ARTIFACT_TOOLS,'deliver_material','send_material'})
                          and not any(item.get('html_mode') in ('html','2d','3d') for item in receipts)
                          and not (delivery and delivery.failure))
         try:
@@ -652,7 +647,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 elif artifact_ready and lookup_tool in ARTIFACT_TOOLS and getattr(error,'invalid_tool_call',False) and invalid < 1:
                     next_action = '修复 HTML 参数'
                 elif getattr(error,'invalid_tool_call',False) and invalid < 1 and settings['_tools']:
-                    next_action = '单项结构化检索' if lookup_tool in ('find_material','find_animation','find_public_material') else '修正工具调用'
+                    next_action = '单项结构化检索' if lookup_tool in ('find_material','find_public_material') else '修正工具调用'
                 elif pending and (structured or getattr(error,'invalid_tool_call',False)):
                     next_action = '保留目标并请求补充'
             log.warning('agent decision run=%s iteration=%d goal=%s tool=%s mode=%s status=%d issue=%s calls=%s pending=%d delivery_unknown=%s elapsed_ms=%d next=%s',
@@ -752,7 +747,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                     batch.append(call)
             # Handoffs return control to another workflow; decide them against the completed receipts.
             serial = [c for c in batch if c['name'] in EVIDENCE_TOOLS or
-                      c['name'] in ('update_task','send_material','send_animation',*ARTIFACT_TOOLS)]
+                      c['name'] in ('update_task','send_material',*ARTIFACT_TOOLS)]
             if any(c['name'] in EVIDENCE_TOOLS or c['name']=='update_task' for c in serial):
                 serial = [c for c in serial if c['name'] in EVIDENCE_TOOLS or c['name']=='update_task']
             if len(batch)==1:
@@ -1031,18 +1026,12 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                     continue
                 await check_execution_async(validate)
                 try:
-                    legacy = (state.get('draft') or {}).get('legacy_animation')
                     creation = args
                     if 'revision' in args:
-                        creation = await asyncio.to_thread(expand_revision,args,config.get('_load_session_source'),
-                                                           legacy_animation=bool(legacy))
-                    if legacy:
-                        item = await asyncio.to_thread(restore_legacy_animation,creation,candidates,
-                                                       expected_mode=state['draft'].get('mode'))
-                    else:
-                        item = await asyncio.to_thread(create_html,creation,candidates)
+                        creation = await asyncio.to_thread(expand_revision,args,config.get('_load_session_source'))
+                    item = await asyncio.to_thread(create_html,creation,candidates)
                     if saved:
-                        from avatar.files.parsing.animation import MAX_SOURCE_BYTES
+                        from avatar.files.artifact_limits import MAX_SOURCE_BYTES
                         sizes = {old['id']: old.get('size', 0) for old in saved}
                         sizes.update({old['id']:len(old.get('data', b'')) for old in candidates})
                         if sum(sizes.values()) > MAX_SOURCE_BYTES:
@@ -1126,9 +1115,9 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 return replace(result, usage=usage)
             if name == 'deliver_material':
                 selection = MaterialArguments.model_validate(args).model_dump()
-            elif name in ('find_animation','find_material'):
+            elif name == 'find_material':
                 material_request = FindMaterial.model_validate(args)
-            elif name in ('send_animation','send_material'):
+            elif name == 'send_material':
                 material_request = SendMaterial.model_validate(args)
             elif name == 'ask_user':
                 question_for_user = AskUser.model_validate(args).pending()
@@ -1190,7 +1179,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         if name == 'continue_answer':
             settings = {**settings, '_tools': selected_definitions(final=True)}
             continue
-        if name in ('send_animation','find_animation','send_material','find_material'):
+        if name in ('send_material','find_material'):
             identity = (name, *(delivery.lookup_key(material_request) if isinstance(material_request, FindMaterial)
                               else (material_request.file_id,)))
             if identity in seen:
@@ -1206,7 +1195,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             if progress:
                 progress({'type':'status','stage':'tool_action','message':'正在查找资料' if isinstance(material_request,FindMaterial) else '正在准备资料附件'})
             with trace.step('act', {'tool': name}) as output:
-                receipt = await delivery.execute(name, material_request, account, validate)
+                receipt = await delivery.execute(material_request, account, validate)
                 output.update({key: receipt[key] for key in ('prepared','error','next_offset') if key in receipt})
                 output['count'] = len(receipt.get('items', ()))
             trace.point('observe', {'tool': name}, {'candidate_count': len(receipt.get('items', ())),

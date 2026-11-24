@@ -141,7 +141,7 @@ async def bind_entry_tools(chat, context, owner, aic, session, files, *, include
         return json.dumps({'results':records}, ensure_ascii=False)
 
     # Recover files and recheck source grants even when the next model step only writes the final answer.
-    if state.get('sandbox') or config.get('_sandbox_receipts') or config.get('_agent_checkpoint',{}).get('sandbox_attempted'):
+    if state.get('sandbox') or config.get('_agent_checkpoint',{}).get('sandbox_attempted'):
         if not sandbox:
             raise HTTPException(409, '此前沙箱权限已撤回，未恢复其结果')
         await run_python('', restoring=True)

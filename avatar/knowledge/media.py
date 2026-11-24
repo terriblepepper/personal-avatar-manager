@@ -60,7 +60,7 @@ def validate(filename, data, *, max_size=MAX_ASSET):
         raise HTTPException(422,'文件名无效')
     if not data or len(data)>max_size:raise HTTPException(413,'素材不能为空，Soul 上传总大小最多 10 GiB')
     require_asset_format(filename)
-    AttachmentService.validate_file(filename,data,max_size=max_size)
+    AttachmentService.inspect_file(filename,data,max_size=max_size)
     return ext,TYPES[ext],'image' if TYPES[ext].startswith('image/') else 'document'
 
 

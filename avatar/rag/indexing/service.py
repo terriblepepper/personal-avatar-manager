@@ -19,7 +19,7 @@ from avatar.files.uploads.buffer import upload_work
 from avatar.files.parsing import text_worker
 from avatar.core.config import ROOT
 from avatar.core.performance import measure
-from avatar.rag.invalidation import invalidate, legacy_signature, signature
+from avatar.rag.invalidation import invalidate, signature
 from avatar.files.parsing.images import image_input
 from avatar.core.db import dump,now
 from avatar.models.embedding import EmbeddingSettings,embed,embedding_window,require_embedding
@@ -35,10 +35,6 @@ def revision(row):
 def native_text(path,extension):
     if text_worker.supports(extension):
         return {**text_worker.parse(path, extension, 'native'), 'format': extension}
-    if extension == '.avanim':
-        from avatar.files.parsing.extract import extract
-        text, status = extract(path, extension)
-        return {'text': text, 'status': status, 'format': extension}
     command=[sys.executable,'-m','avatar.files.parsing.word',str(path),extension] if extension in ('.doc','.docx') else [sys.executable,'-m','avatar.files.parsing.extract',str(path),extension,'--native-only']
     result=subprocess.run(command,cwd=ROOT,capture_output=True,timeout=90 if extension in ('.doc','.docx') else 45,check=True)
     parsed=json.loads(result.stdout)
@@ -136,7 +132,7 @@ class FileRag:
                 invalidate(db,user['id'],force=True)
             else:
                 model=self.chat.service.models.current(db,user['id'])
-                tokens={signature(embedding,model),legacy_signature(embedding,model)}
+                token=signature(embedding,model)
                 for document in db.execute('SELECT * FROM file_rag_documents WHERE user_id=?',(user['id'],)).fetchall():
                     if document['status'] in ('queued','running'):continue
                     try:row=self.file(db,document['source'],document['file_id'],user['id'])
@@ -145,7 +141,7 @@ class FileRag:
                         db.execute('DELETE FROM file_rag_documents WHERE source=? AND file_id=?',(document['source'],document['file_id']))
                         continue
                     if document['source']=='chat' and not row['referenced']:continue
-                    if document['status']=='ready' and not document['force_rebuild'] and document['revision']==revision(row) and document['signature'] in tokens:
+                    if document['status']=='ready' and not document['force_rebuild'] and document['revision']==revision(row) and document['signature']==token:
                         nodes=db.execute('SELECT ordinal,collection,record_id FROM file_rag_nodes WHERE source=? AND file_id=? AND user_id=? ORDER BY ordinal',(document['source'],document['file_id'],user['id'])).fetchall()
                         if nodes and all(node['ordinal']==index and node['collection']==document['collection'] for index,node in enumerate(nodes)) and self.store.contains(user['id'],document['collection'],[node['record_id'] for node in nodes],db):continue
                     db.execute("UPDATE file_rag_documents SET status='queued',error='',generation=generation+1 WHERE source=? AND file_id=?",(document['source'],document['file_id']))
@@ -355,7 +351,7 @@ class FileRag:
                         db.executemany('DELETE FROM file_rag_gc WHERE user_id=? AND collection=? AND record_id=?',[(user_id,collection,node) for node in staged])
                         db.execute('INSERT INTO rag_publications VALUES(?,?,?,?,?,?,?,?,?,?,1,0,?)',(publication,user_id,source,identifier,version,token,collection,coverage,dump(staged),dump(manifest),now()))
                         status='ready' if manifest.get('complete') is not False else 'partial'
-                        db.execute("UPDATE file_rag_documents SET status=?,force_rebuild=0,revision=?,signature=?,coverage=?,collection=?,error='',updated_at=?,active_publication=?,legacy_backfill=0,lease_until=0 WHERE source=? AND file_id=?",(status,version,token,coverage,collection,now(),publication,source,identifier))
+                        db.execute("UPDATE file_rag_documents SET status=?,force_rebuild=0,revision=?,signature=?,coverage=?,collection=?,error='',updated_at=?,active_publication=?,lease_until=0 WHERE source=? AND file_id=?",(status,version,token,coverage,collection,now(),publication,source,identifier))
             await self.work.execute(user_id,'parse',publish)
         except asyncio.CancelledError:
             if claimed is not None:await upload_work(interrupted,claimed[-1])
@@ -376,28 +372,9 @@ class FileRag:
     def discard_staged(self,user_id,collection,identifiers):
         with self.database.connect(write=True) as db:db.executemany('UPDATE file_rag_gc SET delete_after=0 WHERE user_id=? AND collection=? AND record_id=?',[(user_id,collection,node) for node in identifiers])
 
-    async def backfill_legacy(self,source,identifier,user_id):
-        """Derive FTS from existing vectors; never parse originals or call a model."""
-        def backfill():
-            with self.publication_lock(user_id):
-                with self.database.connect() as db:
-                    doc=db.execute('SELECT d.generation,p.* FROM file_rag_documents d JOIN rag_publications p ON p.id=d.active_publication WHERE d.source=? AND d.file_id=? AND d.user_id=? AND d.legacy_backfill=1',(source,identifier,user_id)).fetchone()
-                if not doc:return False
-                ids=json.loads(doc['record_ids']);collection=doc['collection']
-                if not self.store.contains(user_id,collection,ids):raise HTTPException(422,'旧向量索引缺少片段，请手动同步索引')
-                rows=self.store.records(user_id,collection,ids);by_id={item['id']:item for item in rows}
-                if set(by_id)!=set(ids):raise HTTPException(422,'旧向量正文缺少片段，请手动同步索引')
-                self.lexical.stage(user_id,collection,(ids,[by_id[node]['metadata'] for node in ids],[by_id[node]['text'] for node in ids]))
-                if not self.lexical.contains(user_id,collection,ids):raise HTTPException(502,'旧索引词法回填不完整，请重试')
-                with self.database.connect(write=True) as db:
-                    if db.execute("UPDATE file_rag_documents SET legacy_backfill=0,error='' WHERE source=? AND file_id=? AND active_publication=? AND generation=?",(source,identifier,doc['id'],doc['generation'])).rowcount:
-                        db.execute('UPDATE rag_publications SET lexical_ready=1 WHERE id=?',(doc['id'],))
-                return True
-        async with self.work.slot(user_id):return await self.work.execute(user_id,'parse',backfill)
-
     async def once(self):
         await asyncio.to_thread(self.prune)
-        with self.database.connect() as db:row=db.execute("SELECT source,file_id,user_id FROM file_rag_documents WHERE status='queued' OR (legacy_backfill=1 AND status IN ('ready','partial')) ORDER BY updated_at,file_id LIMIT 1").fetchone()
+        with self.database.connect() as db:row=db.execute("SELECT source,file_id,user_id FROM file_rag_documents WHERE status='queued' ORDER BY updated_at,file_id LIMIT 1").fetchone()
         if not row:return False
         return await self.queued_index(tuple(row))
 
@@ -450,7 +427,7 @@ class FileRag:
                 SELECT d.source,d.file_id,d.user_id,d.updated_at,coalesce(s.last_served,0) AS served,
                 row_number() OVER(PARTITION BY d.user_id ORDER BY d.updated_at,d.file_id) AS rank
                 FROM file_rag_documents d LEFT JOIN rag_schedule_users s ON s.user_id=d.user_id
-                WHERE (d.status='queued' OR (d.legacy_backfill=1 AND d.status IN ('ready','partial'))) AND d.next_attempt_at<=?
+                WHERE d.status='queued' AND d.next_attempt_at<=?
                   AND d.user_id NOT IN (SELECT value FROM json_each(?))) WHERE rank<=?
                 ORDER BY rank,served,updated_at,file_id LIMIT ?""",
                 (time.time(),json.dumps(blocked),INDEX_WORKERS,capacity*INDEX_WORKERS)).fetchall()
@@ -469,13 +446,12 @@ class FileRag:
 
     async def queued_index(self,row,lease=None):
         with self.database.connect() as db:
-            document=db.execute('SELECT generation,status,legacy_backfill FROM file_rag_documents WHERE source=? AND file_id=?',(row[0],row[1])).fetchone()
+            document=db.execute('SELECT generation,status FROM file_rag_documents WHERE source=? AND file_id=?',(row[0],row[1])).fetchone()
         if not document:return False
         try:
-            operation=self.backfill_legacy if document['legacy_backfill'] and document['status']!='queued' else self.index
             if lease:
-                async with lease:return await operation(*row)
-            return await operation(*row)
+                async with lease:return await self.index(*row)
+            return await self.index(*row)
         except asyncio.CancelledError:raise
         except Exception as error:
             with self.database.connect(write=True) as db:

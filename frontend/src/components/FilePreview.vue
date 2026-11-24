@@ -8,14 +8,12 @@ import { markText, normalize, pdfMatches } from '../utils/previewMatches'
 import RecordPagination from './RecordPagination.vue'
 import MarkdownContent from './MarkdownContent.vue'
 import DocumentFields from './DocumentFields.vue'
-import { readAnimation } from '../utils/readAnimation'
-import { MAX_ANIMATION_BYTES } from '../utils/animation'
+import { MAX_HTML_BYTES } from '../utils/htmlFile'
 import { decodePreviewText, previewKind, readPreviewBytes, TEXT_PREVIEW_LIMIT } from '../utils/previewFile'
 import MermaidDiagram from './MermaidDiagram.vue'
 
 const HtmlFrame = defineAsyncComponent(() => import('./HtmlFrame.vue'))
-const AnimationDiagram = defineAsyncComponent(() => import('./AnimationDiagram.vue'))
-const props = defineProps<{ file: { id: string; filename: string; content_type?: string }; url: string; imageData?: string; animationSource?: string; conversationId?: string; initialFullscreen?: boolean }>()
+const props = defineProps<{ file: { id: string; filename: string; content_type?: string }; url: string; imageData?: string; initialFullscreen?: boolean }>()
 const emit = defineEmits<{ close: [] }>()
 interface PDFPage {
   getViewport(options: { scale: number }): { width: number; height: number; convertToViewportPoint(x: number, y: number): number[] }
@@ -161,12 +159,6 @@ async function load() {
   cleanup(); const active = new AbortController(); controller.value = active
   loading.value = true; error.value = ''; text.value = ''; page.value = 1; pages.value = 1; source.value = false; resetZoom()
   try {
-    if (extension.value === 'avanim') {
-      kind.value = 'animation'
-      const value = props.animationSource ?? await readAnimation(props.url, active.signal)
-      if (!active.signal.aborted) text.value = value
-      return
-    }
     if (diagramImage.value) { kind.value = 'image'; return }
     if (!safeURL.value) throw Error('只能预览本平台有权访问的文件')
     const ext = extension.value
@@ -179,7 +171,7 @@ async function load() {
     }
     kind.value = previewKind(ext)
     if (!kind.value) return
-    const limit = kind.value === 'html' ? MAX_ANIMATION_BYTES : ['audio','video'].includes(kind.value) ? 64 * 1024 * 1024 : ['text','mermaid'].includes(kind.value) ? TEXT_PREVIEW_LIMIT : 10 * 1024 * 1024
+    const limit = kind.value === 'html' ? MAX_HTML_BYTES : ['audio','video'].includes(kind.value) ? 64 * 1024 * 1024 : ['text','mermaid'].includes(kind.value) ? TEXT_PREVIEW_LIMIT : 10 * 1024 * 1024
     const bytes = await readPreviewBytes(safeURL.value,limit,active.signal)
     if (active.signal.aborted) return
     if (['text','mermaid','html'].includes(kind.value)) {
@@ -272,14 +264,14 @@ watch([pdf, page], async ([document, number], _, cleanup) => {
   } catch (e) { if (current) error.value = e instanceof Error ? e.message : '无法读取 PDF 页面' }
 })
 watch([activePage, scale, canvas], renderPDF, { flush: 'post' })
-watch([() => props.url, () => props.animationSource, extension, diagramImage], load, { immediate: true })
+watch([() => props.url, extension, diagramImage], load, { immediate: true })
 onUnmounted(cleanup)
 </script>
 <template>
   <AppDialog align-center v-model="open" :title="file.filename" :subtitle="manual ? '帮助文档' : '文件预览'" close-label="关闭预览"
-    width="min(1100px, calc(100vw - 1rem))" class="vue-file-preview" :class="{ 'preview-media-window': ['image','pdf','animation','video','mermaid','html'].includes(kind) && !error }"
+    width="min(1100px, calc(100vw - 1rem))" class="vue-file-preview" :class="{ 'preview-media-window': ['image','pdf','video','mermaid','html'].includes(kind) && !error }"
     :initial-fullscreen="initialFullscreen" @closed="emit('close')">
-    <div v-if="kind !== 'animation' || downloadURL" class="preview-toolbar">
+    <div class="preview-toolbar">
       <button v-if="hasSourceView" type="button" class="button small" :aria-pressed="source" @click="source = !source">{{ source ? '返回阅读' : '查看源码' }}</button>
       <a v-if="downloadURL" :href="downloadURL" :download="file.filename" class="button small">{{ diagramImage ? '下载图片' : manual ? '下载手册' : extension === 'mmd' ? '下载源码' : '下载原件' }}</a>
       <span v-if="chapters.length && !loading && !error" aria-label="当前章节">{{ chapters[page - 1]?.title }}</span>
@@ -305,7 +297,6 @@ onUnmounted(cleanup)
         <pre v-if="source" class="html-source">{{ text }}</pre>
         <HtmlFrame v-else :source="text" :filename="file.filename"/>
       </template>
-      <AnimationDiagram v-else-if="kind === 'animation' && !loading && !error" :source="text" :filename="file.filename" :conversation-id="conversationId" preview-mode/>
       <MermaidDiagram v-else-if="kind === 'mermaid' && !loading && !error" :source="text" :filename="file.filename" preview-mode/>
       <audio v-else-if="kind === 'audio' && objectURL" :src="objectURL" :aria-label="file.filename" controls preload="metadata" />
       <video v-else-if="kind === 'video' && objectURL" :src="objectURL" :aria-label="file.filename" controls preload="metadata" />

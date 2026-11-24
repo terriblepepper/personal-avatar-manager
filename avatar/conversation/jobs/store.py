@@ -104,8 +104,6 @@ class GenerationStore:
                                     status='服务器已接收，等待生成',stage='queued',done=False,error='',recovered=True))
             db.execute('INSERT INTO chat_generation_jobs(task_id,user_id,request_id,conversation_id,fingerprint,payload,authorization,state,snapshot,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
                        (task_id,user['id'],body.request_id,body.conversation_id,fingerprint,raw,canonical(scope),'queued',snapshot,timestamp,timestamp))
-            db.execute('INSERT OR REPLACE INTO chat_pending VALUES(?,?,?,?)',
-                       (body.conversation_id,user['id'],snapshot,timestamp))
         return {'accepted':True,'request_id':body.request_id,'task_id':task_id}
 
     def claim(self,limit=1,*,leased=False,busy=()):
@@ -147,13 +145,12 @@ class GenerationStore:
         with self.database.connect(write=True, account_scope=user_id) as db:
             row=db.execute("""UPDATE chat_generation_jobs SET snapshot=?,updated_at=?
                 WHERE user_id=? AND request_id=? AND state='running'
-                AND (authorization::jsonb->>'claim_token') IS NOT DISTINCT FROM ? RETURNING conversation_id""",
-                (canonical(snapshot),time.time(),user_id,request_id,claim)).fetchone()
+                AND (authorization::jsonb->>'claim_token') IS NOT DISTINCT FROM ?""",
+                (canonical(snapshot),time.time(),user_id,request_id,claim)).rowcount
             if not row:return False
             if job and job.get('_source_guard'):
                 from avatar.conversation.jobs.pipeline import validate_authorization
                 validate_authorization(db,job)
-            db.execute('INSERT OR REPLACE INTO chat_pending VALUES(?,?,?,?)',(row[0],user_id,canonical({**snapshot,'request_id':request_id}),time.time()))
         if changes := getattr(self.database, 'changes', None):
             changes.generation_committed(user_id, request_id)
         return True
@@ -192,7 +189,6 @@ class GenerationStore:
                     WHERE conversation_id=? AND COALESCE(document::jsonb->>'run_id',
                     document::jsonb #>> '{snapshot,task_id}',pause_id)=?""",(row['conversation_id'],key[-1])).fetchone()
                 if not retained:RunStore.clear_in(db,*key)
-            db.execute('INSERT OR REPLACE INTO chat_pending VALUES(?,?,?,?)',(row['conversation_id'],user_id,canonical({**snapshot,'request_id':request_id}),time.time()))
             if row['state']=='running' or state=='succeeded':
                 db.execute('UPDATE chat_conversations SET lease_until=0 WHERE id=? OR parent_id=?',(row['conversation_id'],row['conversation_id']))
         return True

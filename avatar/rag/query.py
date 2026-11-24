@@ -18,7 +18,7 @@ class FileQuery(BaseModel):
     file_ids:list[str]=Field(default_factory=list,max_length=5)
     filename:str=Field(default='',max_length=200)
     folder:str=Field(default='',max_length=1024,description='目录中的完整逻辑文件夹路径，限定该目录及全部子目录；留空表示不限定')
-    file_type:Literal['','pdf','doc','docx','txt','md','csv','tsv','json','log','pptx','xlsx','image','avanim']=''
+    file_type:Literal['','pdf','doc','docx','txt','md','csv','tsv','json','log','pptx','xlsx','image']=''
     section:str=Field(default='',max_length=200)
     page_start:int|None=Field(default=None,ge=1,le=100000)
     page_end:int|None=Field(default=None,ge=1,le=100000)

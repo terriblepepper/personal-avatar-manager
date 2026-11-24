@@ -1,14 +1,16 @@
 """个人 ACS 独立注册：本平台批准后提交 Registry，审核通过再签证上线。"""
 import asyncio
 import json
-from pathlib import Path
+import re
+
+import httpx
 from avatar.protocols.transport.certificates import registration_component
 from wit import WitAgent
 from wit.acps.atr import TRUSTED_REGISTRATION, RegistryClient
 from avatar.protocols.transport.ready import RegistryReadyTransport
 from wit.acps.identity.acs import REGISTRATION_CANDIDATE_LAST_MODIFIED_TIME,validate_registration_candidate_acs
 from avatar.protocols.identity.acs import resolve_input,build_acs,public_base_url,default_input
-from avatar.protocols.registration.entity import EntityRegistrationRunner,DerivedRegistrationProvider,entity_identity_paths,certificate_projection
+from avatar.protocols.registration.entity import EntityRegistrationRunner,entity_identity_paths,certificate_projection
 from avatar.protocols.registration.base import RegistrationPending,RegistrationFailure
 from avatar.protocols.identity.atr_config import read_atr_config
 from avatar.protocols.identity.system import private_directory,create_identity_json,system_identity_paths
@@ -190,6 +192,44 @@ class DirectRegistrationRunner(EntityRegistrationRunner):
             return {'aic':material.aic,'certificate':certificate,'acs_document':document}
 
 
-class DirectRegistrationProvider(DerivedRegistrationProvider):
+class DirectRegistrationProvider:
     mode='acps-direct'
     def __init__(self,settings):self.runner=DirectRegistrationRunner(settings)
+
+    # 职责：为首次审核通过的用户注册身份，已有用户只更新业务资料。
+    # 输入：user_id 稳定不变，profile 为已审核公开/私密资料快照，previous 为原分身。
+    # 结果与约束：不向 Registry 发送私密资料；正式声明的修改必须按平台规范单独处理；遇到协议不兼容保留远端 AIC 等待对账。
+    async def provision(self, user_id, profile, previous, *, acs_input=None):
+        if previous:
+            if not previous['aic'].startswith('DEMO-') and any(
+                    str(item.get('id', '')).startswith('avatar.manager.') for item in previous.get('acs_document', {}).get('skills', [])):
+                raise RegistrationFailure('已有正式分身继承了管理技能，请保留原 AIC 并按平台规范迁移；不会自动替换身份')
+            return {'aic': previous['aic'], 'certificate': previous['certificate'], 'acs_document': previous.get('acs_document', {})}
+        try:
+            return await self.runner.advance(user_id, profile, stored=acs_input)
+        except (RegistrationFailure, RegistrationPending):
+            raise
+        except (OSError, httpx.HTTPError) as exc:
+            if isinstance(exc,httpx.HTTPStatusError) and exc.response.status_code==429:
+                raise RegistrationPending('注册或证书服务限流（HTTP 429），保留原 AIC 和状态，稍后自动重试', max(60,self.runner.settings.system_atr_poll_interval)) from None
+            raise RegistrationPending('注册网络暂不可用或响应超时；保留状态并恢复，结果不确定时需对账', self.runner.settings.system_atr_poll_interval) from None
+        except RuntimeError as exc:
+            # ATR 将 ACME HTTP 状态包装为 RuntimeError；仅明确的临时响应继续原申请。
+            transient = re.match(r'^ACME HTTP (429|502|503|504)\b', str(exc))
+            if transient:
+                code = transient.group(1)
+                message = '证书服务限流' if code == '429' else '证书服务暂不可用'
+                raise RegistrationPending(message+'（HTTP '+code+'），保留原 AIC 和签证状态，稍后自动重试', max(60,self.runner.settings.system_atr_poll_interval)) from None
+            raise RegistrationFailure('Registry 正式 ACS 与 wit 严格契约不一致或状态受阻；请保留 AIC 和状态，核对服务端正式字段后再对账') from None
+        except (ValueError, LookupError):
+            raise RegistrationFailure('Registry 正式 ACS 与 wit 严格契约不一致或状态受阻；请保留 AIC 和状态，核对服务端正式字段后再对账') from None
+
+    # 职责：拒绝用同步演示接口覆盖正式证书。
+    # 输入：certificate 是当前证书公开元数据。
+    # 结果与约束：正式续期需使用该账户 registration.json 的 wit 工具，不在 数据库写事务内进行远端签发。
+    def renew(self, certificate):
+        if certificate.get('mode') == 'demo':
+            from avatar.protocols.registration.base import DemoRegistrationProvider
+            return DemoRegistrationProvider().renew(certificate)
+        from fastapi import HTTPException
+        raise HTTPException(409, '请使用该实体 registration.json 运行 wit 证书续期工具')

@@ -44,7 +44,7 @@ it('renders task boundaries, message attachments and public tool details',async(
   expect(wrapper.get('.peer-user-note.peer-own small').text()).toBe('我补充要求')
   expect(wrapper.get('.peer-user-note.peer-other small').text()).toBe('Bob补充要求')
   expect(wrapper.text()).toContain('Python');expect(wrapper.text()).toContain('42')
-  expect(wrapper.get('.source-trigger').text()).toContain('1 份资料')
+  expect(wrapper.get('.source-trigger').text()).toContain('1 份文件')
   expect(wrapper.get('.source-chip').text()).toContain('result.txt')
   wrapper.unmount()
 })

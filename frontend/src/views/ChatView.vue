@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import { SKILLS_PAUSED } from '../skillPolicy'
 import { defineAsyncComponent, computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElButton, ElOption, ElSelect, ElMessage, ElMessageBox } from 'element-plus'
@@ -64,8 +63,7 @@ async function stop() {
   finally { if (stopping.value === rid) stopping.value = '' }
 }
 const copyMenu=ref<InstanceType<typeof MessageCopyMenu>>()
-const log=ref<HTMLElement>(),input=ref<{focus:()=>void}>(),preview=ref<{file:{id:string;filename:string};url:string}|null>(null)
-const skillCatalog=ref<{id:string;name:string;description?:string;enabled:boolean|number}[]>([])
+const log=ref<HTMLElement>(),preview=ref<{file:{id:string;filename:string};url:string}|null>(null)
 const current=computed(()=>conversations.value.find(row=>row.id===conversationId.value))
 let controller=new AbortController(),generation:AbortController|undefined,sequence=0,destroyed=false
 let olderRequest: AbortController | undefined
@@ -264,7 +262,6 @@ async function older() {
     if (olderRequest===active) { olderRequest=undefined; loadingOlder.value=false }
   }
 }
-function invoke(name:string){draft.value='$'+JSON.stringify(name)+' '+draft.value;void nextTick(()=>input.value?.focus())}
 const quickPrompts=['介绍一下你自己','有哪些分身','查询我的申请状态']
 async function ask(text:string){draft.value=text;await send()}
 function openSession(session:string,task?:string){void router.push({path:'/dialogues',query:{session,task}})}
@@ -274,7 +271,6 @@ watch(conversationId,id=>{
   if(id)void loadConversation(id)
 })
 watch(()=>route.query.conversation,value=>{if(typeof value==='string'&&value!==conversationId.value&&conversations.value.some(row=>row.id===value))conversationId.value=value})
-watch(()=>route.query.skill,value=>{if(!SKILLS_PAUSED&&typeof value==='string'&&value)invoke(value)},{immediate:true})
 onMounted(()=>{void load();window.addEventListener('online',resume);window.addEventListener('pageshow',resume);document.addEventListener('visibilitychange',resume)})
 onUnmounted(()=>{destroyed=true;olderRequest?.abort();controller.abort();generation?.abort();window.removeEventListener('online',resume);window.removeEventListener('pageshow',resume);document.removeEventListener('visibilitychange',resume)})
 </script>
@@ -324,7 +320,7 @@ onUnmounted(()=>{destroyed=true;olderRequest?.abort();controller.abort();generat
     <AgentQuestionPrompt ref="questionPrompt" :key="conversationId" :scope="'chat:'+conversationId" :question="userQuestion"
       :disabled="busy || uploading || toolsSaving || loading" @answer="answer => send('continue', answer)"/>
     <form id="personal-chat-compose" data-guide-target="chat" class="personal-compose" @submit.prevent="send()">
-      <ComposerInput ref="input" v-model="draft" :catalog="embedding === false ? [] : skillCatalog" :session="conversationId" :usage-url="conversationId ? selectedURL(conversationId)+'/compact' : ''" :usage-revision="(messages.at(-1)?.id || 0)+'/'+compressionThrough" label="聊天消息" :placeholder="pauseId ? (pending?.stream_retryable ? '可直接重试，也可补充要求后继续…' : '补充任务所需信息…') : '向自己的分身提问…'" :disabled="busy||loading||!conversationId" submit-on-enter @submit="send()"/>
+      <ComposerInput v-model="draft" :usage-url="conversationId ? selectedURL(conversationId)+'/compact' : ''" :usage-revision="(messages.at(-1)?.id || 0)+'/'+compressionThrough" label="聊天消息" :placeholder="pauseId ? (pending?.stream_retryable ? '可直接重试，也可补充要求后继续…' : '补充任务所需信息…') : '向自己的分身提问…'" :disabled="busy||loading||!conversationId" submit-on-enter @submit="send()"/>
     </form>
     <div class="chat-compose-actions">
       <ComposerToolbar class="personal-chat-toolbar">
@@ -333,7 +329,7 @@ onUnmounted(()=>{destroyed=true;olderRequest?.abort();controller.abort();generat
             <summary title="常用提问" aria-label="常用提问">常用提问</summary>
             <div class="composer-popover quick chat-command-panel"><button v-for="text in quickPrompts" :key="text" type="button" class="chat-menu-item" :disabled="busy||uploading" @click="ask(text)">{{ text }}</button></div>
           </details>
-          <ChatSettings v-if="embedding !== false" :conversation-id="conversationId" :busy="busy||uploading" :revision="messages.length" @catalog="skillCatalog=$event"/>
+          <ChatSettings v-if="embedding !== false" :conversation-id="conversationId" :busy="busy||uploading" :revision="messages.length"/>
           <ChatFilesManager :conversation-id="conversationId" :busy="busy" @selected="value=>selectedFiles=value" @uploading="value=>uploading=value"/>
           <ConversationTools :conversation-id="conversationId" :busy="busy||uploading" @saving="toolPending=$event"/>
         </template>

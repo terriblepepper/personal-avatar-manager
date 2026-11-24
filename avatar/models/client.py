@@ -4,7 +4,6 @@ import asyncio
 from contextlib import aclosing
 from contextvars import ContextVar
 import ipaddress
-import json
 import socket
 from dataclasses import dataclass, field, replace
 import httpx
@@ -55,7 +54,7 @@ def accumulate_usage(total, usage):
 async def resolve_public_all(host, port):
     try:
         addresses = await asyncio.wait_for(asyncio.to_thread(socket.getaddrinfo, host, port, type=socket.SOCK_STREAM), 15)
-    except (OSError, asyncio.TimeoutError):
+    except OSError:
         raise transport_error(502, "无法解析模型平台地址，请检查 API 地址及服务器网络")
     ips = list(dict.fromkeys(row[4][0] for row in addresses))
     if not ips or any(not ipaddress.ip_address(ip).is_global for ip in ips):
@@ -190,42 +189,30 @@ def parse_response(fmt, data, *, config=None, request_id=None, api_key=''):
         else:
             candidate=(data.get('candidates') or [{}])[0];reason=candidate.get('finishReason') or (data.get('promptFeedback') or {}).get('blockReason')
             thinking=any(p.get('thought') for p in (candidate.get('content') or {}).get('parts',[]));refusal=bool((data.get('promptFeedback') or {}).get('blockReason'))
-        if (config or {}).get('_call_purpose')=='skill_selection' and reason in ('stop','end_turn','STOP') and not thinking and not refusal and (text is None or isinstance(text,str)):
-            text='null'
+        if fmt=='openai':
+            action=message.get('tool_calls') or message.get('function_call')
+        elif fmt=='anthropic':
+            action=any(p.get('type')=='tool_use' for p in data.get('content',[]))
         else:
-            if fmt=='openai':
-                action=message.get('tool_calls') or message.get('function_call')
-            elif fmt=='anthropic':
-                action=any(p.get('type')=='tool_use' for p in data.get('content',[]))
-            else:
-                action=any('functionCall' in p for p in (candidate.get('content') or {}).get('parts',[]))
-            if (config and config.get('_tools') and not config.get('_optional_tools') and
-                    not thinking and not refusal and not action and str(reason or '').lower() in ('','stop','end_turn','stop_sequence')):
-                try:
-                    parse_tools(fmt,data,config['_tools'],required=True)
-                except HTTPException as error:
-                    error.model_usage=model_usage
-                    raise
-            raise empty_response(fmt,reason=reason,thinking=thinking and not action,refusal=refusal,usage=usage,request_id=request_id,config=config)
+            action=any('functionCall' in p for p in (candidate.get('content') or {}).get('parts',[]))
+        if (config and config.get('_tools') and not config.get('_optional_tools') and
+                not thinking and not refusal and not action and str(reason or '').lower() in ('','stop','end_turn','stop_sequence')):
+            try:
+                parse_tools(fmt,data,config['_tools'],required=True)
+            except HTTPException as error:
+                error.model_usage=model_usage
+                raise
+        raise empty_response(fmt,reason=reason,thinking=thinking and not action,refusal=refusal,usage=usage,request_id=request_id,config=config)
     # 分身可能在下一次完整响应续写，保留两段交界处的空格、换行与代码缩进。
     visible = (text or '') if retain or config.get('_avatar_agent') else (text or '').strip()
     return ModelResult(visible, model_usage, calls, reason)
-
-
-# 职责：将上游 HTTP 状态转换为可展示的模型错误。
-# 输入：status 为平台响应状态码。
-# 结果与约束：成功无返回；区分 Key 权限、额度限流、参数不兼容与平台故障，不透传上游响应体或自动重试计费请求。
-def check_status(status):
-    if not 200<=status<300:
-        from avatar.models.diagnostics import provider_error
-        raise provider_error(status,{})
 
 
 # 按 token 预算分别限制有效内容和 SSE 传输；每个 token 可能单独携带完整的 JSON 事件头。
 def response_limit(config,streaming=False):
     wire_allowance = min(64*1024*1024,max(8*1024*1024,config['max_tokens']*2048))
     if config.get('_call_purpose') == 'html_generation' or any(tool.get('name') == 'create_html' for tool in config.get('_tools') or ()):
-        from avatar.files.parsing.animation import MAX_ENVELOPE_BYTES
+        from avatar.files.artifact_limits import MAX_ENVELOPE_BYTES
         # HTML is nested inside JSON tool arguments. Escapes and streaming headers do not count toward file size.
         return MAX_ENVELOPE_BYTES + (wire_allowance if streaming else 0)
     if streaming:
@@ -234,15 +221,11 @@ def response_limit(config,streaming=False):
 
 
 def generation_deadline(config):
-    return 600 if config.get('_call_purpose') in ('html_generation','animation') else 180
+    return 600 if config.get('_call_purpose') == 'html_generation' else 180
 
 
-def generation_http_timeout(config, *, streaming=False):
-    purpose = config.get('_call_purpose')
-    read = 120
-    if purpose in ('html_generation','animation'):
-        # A non-streaming provider may generate the entire document before sending its first byte.
-        read = 240 if streaming and purpose == 'animation' else generation_deadline(config)
+def generation_http_timeout(config):
+    read = generation_deadline(config) if config.get('_call_purpose') == 'html_generation' else 120
     return httpx.Timeout(120, connect=10, read=read)
 
 
@@ -293,7 +276,7 @@ class ModelClient:
             except ValueError:
                 try:
                     addresses=await asyncio.wait_for(asyncio.to_thread(socket.getaddrinfo,url.host,url.port or 80,type=socket.SOCK_STREAM),15)
-                except (OSError,TimeoutError):
+                except OSError:
                     raise transport_error(502,'无法解析模型 HTTP 服务地址') from None
                 ips=list(dict.fromkeys(item[4][0] for item in addresses))
             if not ips:raise transport_error(502,'模型 HTTP 服务地址没有可用节点')

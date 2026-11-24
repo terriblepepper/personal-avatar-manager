@@ -132,7 +132,7 @@ def test_root_promotes_and_promoted_admin_delegates(context):
     assert role(user, tid, 'admin').status_code == 403
     assert role(root, uid, 'admin').status_code == 200
     assert identity(user)['role'] == 'admin' and (not identity(user)['is_root'])
-    assert user.get('/api/admin/dashboard').status_code == 200
+    assert user.get('/api/admin/overview').status_code == 200
     assert role(user, tid, 'admin').status_code == 200
     assert identity(third)['role'] == 'admin'
     accounts = root.get('/api/admin/accounts').json()['items']
@@ -159,7 +159,10 @@ def test_demotion_immediate_for_all_sessions_preserves_avatar(context):
     app, user, root = context
     approve(root, submit(user))
     asyncio.run(app.state.worker.once())
-    assert user.post('/api/chat', json={'channel': 'avatar', 'message': '你好'}).status_code == 200
+    session = user.post('/api/conversations', json={'channel': 'avatar'}).json()
+    body = {'channel': 'avatar', 'conversation_id': session['id'], 'request_id': 'before-demotion', 'message': '你好'}
+    with user.stream('POST', '/api/chat/stream', json=body) as stream:
+        assert stream.status_code == 200
     before = user.get('/api/me').json()
     uid = identity(user)['id']
     second = TestClient(app)
@@ -167,7 +170,7 @@ def test_demotion_immediate_for_all_sessions_preserves_avatar(context):
     role(root, uid, 'admin')
     stale_actor = identity(second)
     assert role(user, uid, 'user').status_code == 200
-    assert second.get('/api/admin/dashboard').status_code == 403
+    assert second.get('/api/admin/overview').status_code == 403
     assert identity(second)['role'] == 'user' and second.get('/api/me').status_code == 200
     after = user.get('/api/me').json()
     assert before['agent'] == after['agent'] and before['profile'] == after['profile']
@@ -179,15 +182,13 @@ def test_demotion_immediate_for_all_sessions_preserves_avatar(context):
         actions = [r[0] for r in db.execute('SELECT action FROM audit_events WHERE user_id=?', (uid,))]
     assert '授予管理员权限' in actions and '管理员自主降级' in actions
 
-def test_pending_teacher_cannot_gain_admin_without_review(context):
+def test_teacher_can_gain_admin_without_review(context):
     app, _, root = context
     teacher = register(app, 'teacher_role', teacher=True)
     uid = identity(teacher)['id']
-    assert role(root, uid, 'admin').status_code == 409
-    assert root.post('/api/admin/accounts/' + uid + '/review', json={'approve': True}).status_code == 200
     assert role(root, uid, 'admin').status_code == 200
     assert identity(teacher)['person_type'] == 'teacher'
-    assert any((u['id'] == uid for u in root.get('/api/admin/dashboard').json()['registrations']))
+    assert any((u['id'] == uid for u in root.get('/api/admin/accounts').json()['items']))
 
 def test_role_changes_csrf_schema_and_account_search(context):
     _, user, root = context
@@ -205,7 +206,8 @@ def test_role_changes_csrf_schema_and_account_search(context):
 
 def test_root_and_cli_admin_can_manage_personal_profiles(context):
     app, _, root = context
-    body = {'profile': {**PROFILE, 'student_id': 'ROOT-PERSONAL'}, 'last_modified_at': modified_at(root), 'model_config_input': MODEL}
+    assert root.put('/api/me/model-settings', json={'model_config_input': MODEL}).status_code == 200
+    body = {'profile': {**PROFILE, 'student_id': 'ROOT-PERSONAL'}, 'last_modified_at': modified_at(root)}
     assert root.put('/api/me/profile', json=body).status_code == 200
     with app.state.database.connect() as db:
         original_root = db.execute('SELECT id FROM users WHERE is_root=1').fetchone()[0]

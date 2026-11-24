@@ -78,11 +78,11 @@
 - `POST /api/conversations/{conversation_id}/clear`
 - `POST /api/conversations/{conversation_id}/self`
 - `GET /api/conversations/{conversation_id}/skills`、`PATCH /api/conversations/{conversation_id}/skills/{skill_id}`
-- `GET /api/chat`、`POST /api/chat`（兼容入口）
+- `GET /api/chat` 读取会话历史。
 - `POST /api/chat/stream` — SSE 流式
 - `POST /api/chat/generations` — 提交持久生成任务，返回 202
 - `GET /api/chat/generations/{request_id}` — 按请求查询状态与结果
-- `GET /api/chat/pending?conversation_id=…` — 待办输入兼容查询
+- `GET /api/chat/pending?conversation_id=…` — 查询会话最近的生成或待补充状态
 
 生成快照的 `state=awaiting_input` 表示该轮已停下，原任务等待用户。SSE 发出 `awaiting_input` 事件并关闭。客户端使用快照的 `conversation_id`、`agent_pause_id` 和新的 `request_id` 提交 `agent_control=continue` 或 `end`。继续时填写 `message`；同一次提交遇到网络中断时复用原请求号。其他客户端已处理的暂停标识会返回 409。
 
@@ -109,7 +109,6 @@
 - `GET /api/admin/overview` 返回账户、分身、待审和失败创建任务的计数。
 - `GET /api/admin/settings` 返回平台 URL、注册模式及环境信息。
 - `GET /api/admin/agents/operations?search=&offset=0` 每页返回最多 10 个分身及其最新适用身份任务，并附端口池状态。`GET /api/admin/agents/{user_id}/detail` 返回单个分身的完整管理视图。
-- `GET /api/admin/dashboard` 保留完整管理概览，供已有客户端使用。
 - `GET /api/admin/pending-count` 返回 `{"pending": 整数}`，合计资料和 Soul 待审记录，完整管理员会话可用。
   - `environment` 为本次启动的环境快照：实际注册适配器与模式、配置的通信地址/端口、已安装框架版本和真实手册路径；缺失元数据或手册返回空值。仅管理员可读取，通信配置不表示实时监听状态。
 - `GET /api/admin/accounts`、`GET /api/admin/accounts/{user_id}/profile`、`PUT /api/admin/accounts/{user_id}/role`
@@ -203,35 +202,11 @@
 - `POST /api/conversations/{conversation_id}/animations/promote` 接收 `source` 及可选的 `caption`、`visibility`、`folder`、`new_name`。成功时返回资料 ID 与是否复用了已有资料。超时后可用相同源码查询或重试。
 - `create_html` 接收 `filename` 和 `html`，用于生成网页、2D 动画和 3D 动画。预览隔离运行，禁止联网，提供内置 Three.js。会话设置 `{"tools":{"animation":true}}` 将制作动画传达为本轮目标。
 - `GET /api/me/attachments/{id}/preview-text` 在本人权限内从 DOCX 原件提取纯文本供小窗阅读。原始排版和图片保留在可下载的原件中。
-- 本人会话通过 `find_material` 查询本人已上传的全部类型原件。`mode=directories` 分页列出逻辑目录，`mode=files` 可按 `folder` 限定子树，再按名称、模糊词或已发布的正文索引返回可发送的 file_id。无索引仍能列出原件。saved_at 为空表示尚未显式保存资料设置；本人发送、历史和任务回放统一按所有权及本次授权快照核验。同实例接收方通过 `find_public_material` 浏览可转交的已公开、已保存资料。模型可继续按关键词查询或翻页，以 `select_materials({file_ids,reply})` 选择本轮目录中一至五份原件并撰写正文，或通过 `clarify_material` 请求澄清。普通工具循环也可调用 `send_material`。新生成的 HTML 作品使用通用文件检索。历史动画仍可用 `find_animation` 和 `send_animation`。成功提交的资料附件带有 `origin: "material"` 与授权的 `download_url`，读取原件仍需本人身份。底部资料胶囊列出已提交的文件；正文可选用独占一行的 `[[attachment:ID]]` 在指定位置展示同一份附件。历史和重放重新核对有效原件。
+- 本人会话通过 `find_material` 查询本人已上传的全部类型原件。`mode=directories` 分页列出逻辑目录，`mode=files` 可按 `folder` 限定子树，再按名称、模糊词或已发布的正文索引返回可发送的 file_id。无索引仍能列出原件。saved_at 为空表示尚未显式保存资料设置；本人发送、历史和任务回放统一按所有权及本次授权快照核验。同实例接收方通过 `find_public_material` 浏览可转交的已公开、已保存资料。模型可继续按关键词查询或翻页，以 `select_materials({numbers,reply})` 选择本轮目录中一至五份原件并撰写正文，或通过 `clarify_material` 请求澄清。普通工具循环也可调用 `send_material`。新生成的 HTML 作品使用通用文件检索。成功提交的资料附件带有 `origin: "material"` 与授权的 `download_url`，读取原件仍需本人身份。底部资料胶囊列出已提交的文件；正文可选用独占一行的 `[[attachment:ID]]` 在指定位置展示同一份附件。历史和重放重新核对有效原件。
 
 - `GET /api/me/file-index` 可用 `source=profile` 或 `source=chat` 限定本人索引范围。默认包含两类，汇总区分部分索引（`partial`）和阻塞（`blocked`）。索引查询、重建与同步均要求完整会话。
 - `POST /api/me/file-index/rebuild`、`POST /api/me/file-index/sync`（`rag_routes.py`）
 - `GET|PUT /api/me/embedding-settings`、`POST /api/me/embedding-settings/options`（`embedding_routes.py`）
-
-### 历史动画包 v1 示例
-
-旧消息的动画围栏及已保存的 `.avanim` 原件使用以下格式，可继续预览、下载及转存。新动画通过 HTML 工具生成独立文件。
-
-```json
-{
-  "format": "acps.animation", "version": 1,
-  "title": "客户端发送请求", "summary": "请求从客户端到达服务端。", "tags": ["网络"],
-  "canvas": {"width": 640, "height": 320, "background": "paper"},
-  "durationMs": 1800, "loop": false,
-  "accessibility": {"alt": "客户端沿网络连接向服务端发送请求。", "reducedMotion": "final-frame"},
-  "nodes": [
-    {"id": "client", "label": "客户端", "kind": "device", "x": 100, "y": 160},
-    {"id": "server", "label": "服务端", "kind": "server", "x": 540, "y": 160}
-  ],
-  "edges": [{"id": "link", "from": "client", "to": "server", "kind": "network"}],
-  "steps": [{
-    "id": "request", "title": "发送请求", "detail": "客户端将请求沿连接发出。",
-    "at": 0, "duration": 1800, "focus": ["client", "link", "server"],
-    "packets": [{"from": "client", "to": "server", "edge": "link", "label": "请求"}]
-  }]
-}
-```
 
 ## RAG 资源预算（`resource_routes.py`）
 

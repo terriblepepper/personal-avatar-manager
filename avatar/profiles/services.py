@@ -33,8 +33,6 @@ class AvatarService:
     # 结果与约束：正式派生注册器或既有正式 AIC 均启用继承；不依据浏览器声明改变正式技能。
     def inherited_acs(self, user_id=None):
         if getattr(self.provider,'mode','demo')=='acps-direct':return False
-        if getattr(self.provider, 'mode', 'demo') == 'acps-entity':
-            return True
         if user_id:
             with self.database.connect() as db:
                 row = db.execute('SELECT aic FROM avatar_records WHERE user_id=?', (user_id,)).fetchone()
@@ -192,8 +190,8 @@ class AvatarService:
         return {**data, "snapshot": json.loads(row["snapshot"]),
                 "acs_input": json.loads(row["acs_input"]), "acs_document": json.loads(row["acs_document"])}
 
-    # 职责：保存本人资料草稿，兼容旧客户端同时独立保存模型设置。
-    # 输入：user 为当前账户，request 含资料日期、Profile 和旧客户端可选模型配置。
+    # 职责：保存本人资料草稿。
+    # 输入：user 为当前账户，request 含资料日期及 Profile。
     # 结果与约束：检查状态及修改日期，允许本人选择资料身份；姓名和分身名称固定公开且文字可编辑，既有学号不自动合并；加密 Key 后更新草稿，返回最新概览。
     def save_draft(self, user, request):
         with self.database.connect(write=True) as db:
@@ -210,9 +208,6 @@ class AvatarService:
             # 即使请求省略 visibility，保存的姓名和分身名称也明确标为公开；不限制文字编辑。
             profile.visibility.update({key: 'public' for key in FIXED_PUBLIC_FIELDS})
             save_identity(db, user, profile)
-            # 兼容旧客户端的输入也立即保存到账户设置，不进入个人资料或审核快照。
-            if request.model_config_input is not None:
-                self.models.save_in_transaction(db,user,request.model_config_input)
             saved = json.loads(p['draft'])
             previous = self.personal_acs(json.loads(p['acs_input']), saved)
             fields = request.acs_input.model_dump() if request.acs_input else previous.model_dump()
@@ -349,28 +344,6 @@ class AvatarService:
             db.execute("UPDATE avatar_records SET certificate=?,updated_at=? WHERE user_id=?", (dump(certificate), now(), user_id))
             event(db, user_id, user["username"], "更新演示证书", f"证书代次 {certificate['generation']}", actor_id=user['id'])
         return certificate
-
-    # 职责：汇总管理后台统计、申请、任务、历史注册记录和事件。
-    # 输入：当前管理员账户 ID，仅由已验证管理员的路由调用；登录审计始终限定本人。
-    # 结果与约束：返回有数量上限的后台记录及配置，解码快照并脱敏 Key；mode 反映注册器配置，逐个证书仍保留其真实类型。
-    def dashboard(self,user_id):
-        from avatar.profiles.admin_reads import counts as admin_counts
-        with self.database.connect() as db:
-            counts = admin_counts(db)
-            submissions = db.execute("SELECT s.*,u.username,r.username AS reviewer_name FROM profile_submissions s JOIN users u ON u.id=s.user_id LEFT JOIN users r ON r.id=s.reviewer ORDER BY s.submitted_at DESC LIMIT 500").fetchall()
-            agents = db.execute("SELECT a.*,u.username FROM avatar_records a JOIN users u ON u.id=a.user_id ORDER BY a.updated_at DESC").fetchall()
-            jobs = db.execute("SELECT j.*,COALESCE(NULLIF(trim(i.username),''),u.username) AS username FROM provision_jobs j JOIN profile_submissions s ON s.id=j.submission_id JOIN users u ON u.id=s.user_id LEFT JOIN oidc_identities i ON i.user_id=u.id ORDER BY j.updated_at DESC LIMIT 200").fetchall()
-            identity_jobs = db.execute('SELECT j.*,u.username FROM avatar_identity_jobs j JOIN users u ON u.id=j.user_id ORDER BY j.created_at DESC LIMIT 200').fetchall()
-            scope,values=event_scope(user_id,True)
-            events = db.execute("SELECT e.*,u.username FROM audit_events e LEFT JOIN users u ON u.id=e.user_id WHERE "+scope+" ORDER BY e.id DESC LIMIT 200",values).fetchall()
-            registrations = db.execute("SELECT u.id,u.username,u.teacher_id,u.account_status,u.account_reason,u.created_at,p.draft FROM users u LEFT JOIN profile_records p ON p.user_id=u.id WHERE u.person_type='teacher' ORDER BY u.created_at DESC").fetchall()
-            account_reviews = db.execute("SELECT r.*,u.username AS applicant,a.username AS reviewer_name FROM account_reviews r JOIN users u ON u.id=r.user_id JOIN users a ON a.id=r.reviewer ORDER BY r.id DESC LIMIT 200").fetchall()
-            settings = {r["key"]: json.loads(r["value"]) for r in db.execute("SELECT * FROM settings")}
-        return {"counts": counts, "submissions": [self._submission(s, admin=True) for s in submissions],
-                "agents": [self._agent(a, admin=True) for a in agents], "jobs": [dict(j) for j in jobs],
-                "events": [dict(e) for e in events], "settings": settings, "mode": getattr(self.provider, 'mode', 'demo'),
-                "registrations": [{**dict(r), "draft": json.loads(r["draft"] or "{}")} for r in registrations],
-                "account_reviews": [dict(r) for r in account_reviews], 'identity_jobs': [dict(r) for r in identity_jobs]}
 
     # 职责：持久化管理员填写的平台服务 URL 设置。
     # 输入：user 为管理员，settings 为经过格式校验的 PlatformSettings。

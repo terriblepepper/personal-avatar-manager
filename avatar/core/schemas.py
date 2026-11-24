@@ -304,13 +304,12 @@ class ModelConfigInput(BaseModel):
 
 
 # 职责：定义保存个人资料草稿的请求。
-# 输入：profile 为资料对象，last_modified_at 为此前读取的修改日期，model_config_input 仅兼容旧客户端的可选独立模型更新。
-# 结果与约束：日期须含时区；不提交模型配置时保留原配置，事务以日期精确比较防止覆盖他人编辑，不接受数字资料版本。
+# 输入：profile 为资料对象，last_modified_at 为此前读取的修改日期。
+# 结果与约束：日期须含时区；事务以日期精确比较防止覆盖他人编辑，不接受数字资料版本。
 class DraftRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
     profile: Profile
     last_modified_at: ModifiedAt
-    model_config_input: ModelConfigInput | None = Field(default=None, json_schema_extra={'deprecated':True}, description='仅兼容旧客户端，会立即保存到账户，不参与审核')
     acs_input: AcsInput | None = None
     acs_edit: bool = False
 

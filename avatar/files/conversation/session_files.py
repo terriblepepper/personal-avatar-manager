@@ -11,7 +11,7 @@ from fastapi import HTTPException
 
 from avatar.core.execution import authorization
 from avatar.files.parsing import PLAIN_TEXT_EXTENSIONS
-from avatar.files.parsing.animation import MAX_SOURCE_BYTES
+from avatar.files.artifact_limits import MAX_SOURCE_BYTES
 
 
 _CONTROL = re.compile(r'[\x00-\x08\x0e-\x1f\x7f-\x9f]')
@@ -194,7 +194,7 @@ class SessionFiles:
                 stream.seek(offset)
                 chunk = stream.read(limit if limit is not None else 8192)
             result.update(self._text_page(chunk,offset,row['size']))
-        elif extension in ('.pdf','.doc','.docx','.ppt','.pptx','.xlsx','.avanim'):
+        elif extension in ('.pdf','.doc','.docx','.ppt','.pptx','.xlsx'):
             from avatar.files.parsing.text_worker import read_original
             try:
                 parsed = read_original(path,extension,start=page,end=None if explicit else page,offset=offset,

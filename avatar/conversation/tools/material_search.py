@@ -7,7 +7,6 @@ import unicodedata
 
 from avatar.rag.query import directory_catalog, file_catalog
 from avatar.rag.stores.tokenization import tokens
-from avatar.files.parsing.animation import is_animation_file
 
 
 def folded(text):
@@ -56,14 +55,13 @@ class MaterialDiscovery:
         self.directories=directory_catalog(live)
         self.last_rows=[item for item in self.last_rows if item['file_id'] in self.catalog]
 
-    async def page(self, request, *, animation_only=False):
+    async def page(self, request):
         query=folded(request.query.strip())
         folder=folded(request.folder.strip('/'))
         prefix=folder+'/' if folder else ''
-        key=(query,folder,animation_only,request.sort)
+        key=(query,folder,request.sort)
         if request.mode!='directories' and key!=self.last_key:
-            scoped=[row for row in self.documents if folded(row.get('relative_path') or row['filename']).startswith(prefix)
-                    and (not animation_only or is_animation_file(row))]
+            scoped=[row for row in self.documents if folded(row.get('relative_path') or row['filename']).startswith(prefix)]
             self.last_rows=await self.rank(scoped,request.query.strip(),latest=request.sort=='latest')
             self.last_key=key
         await self.validate_candidates()

@@ -12,7 +12,6 @@ from itertools import chain, groupby
 from math import log
 
 import numpy as np
-from psycopg.rows import tuple_row
 from psycopg.types.json import Jsonb
 from avatar.rag.stores.tokenization import tokens
 
@@ -33,27 +32,6 @@ def install_vector_schema(connection):
             PRIMARY KEY(user_id,collection,record_id)
         )
     """)
-
-    # Older ledgers can have published chunks with no manifest or lexical index.
-    with connection.cursor(row_factory=tuple_row) as cursor:
-        documents = cursor.execute("""SELECT user_id,source,file_id,collection,revision,signature,coverage,updated_at
-            FROM file_rag_documents WHERE active_publication='' AND collection<>'' FOR UPDATE""").fetchall()
-        for owner, source, file_id, collection, revision, signature, coverage, updated in documents:
-            ids = [row[0] for row in cursor.execute("""SELECT record_id FROM file_rag_nodes
-                WHERE user_id=%s AND source=%s AND file_id=%s AND collection=%s ORDER BY ordinal""",
-                (owner, source, file_id, collection))]
-            if not ids:
-                continue
-            key = 'legacy-' + hashlib.sha256(json.dumps([owner, source, file_id, collection, ids]).encode()).hexdigest()
-            manifest = dict(expected_chunks=len(ids), processed_chunks=len(ids), expected_pages=None,
-                            processed_pages=None, expected_images=None, processed_images=None, complete=None, legacy=True)
-            cursor.execute("""INSERT INTO rag_publications
-                (id,user_id,source,file_id,revision,signature,collection,coverage,record_ids,manifest,lexical_ready,legacy,created_at)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,1,%s) ON CONFLICT(id) DO NOTHING""",
-                (key, owner, source, file_id, revision, signature, collection, coverage, json.dumps(ids), json.dumps(manifest), updated))
-            cursor.execute("""UPDATE file_rag_documents SET active_publication=%s,legacy_backfill=1
-                WHERE user_id=%s AND source=%s AND file_id=%s""", (key, owner, source, file_id))
-
 
 def _cache_bytes(value):
     """Conservative size for cached tuples, JSON, BM25 state and owning NumPy arrays."""

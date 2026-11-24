@@ -40,7 +40,7 @@ def https_versions(names):
 
 
 class SandboxEffects:
-    def __init__(self, store, scope, checkpoint, legacy_receipts):
+    def __init__(self, store, scope, checkpoint):
         self.store = store
         self.scope = scope
         self.state = store.load().get('sandbox')
@@ -52,16 +52,7 @@ class SandboxEffects:
         if self.state and self.state.get('in_flight'):
             raise AgentNeedsInput('上次沙箱操作结果未确认，已暂停等待核对', checkpoint=checkpoint)
         if self.state is None and checkpoint['sandbox_attempted']:
-            signatures = checkpoint.get('sandbox_actions', [])
-            confirmed = []
-            for record in legacy_receipts:
-                token = record.get('_sandbox_action')
-                if token in signatures and record.get('status') == 'success':
-                    confirmed.append({'token':token, 'sources':{'skill':None, 'files':{}, 'https':{}},
-                                      'record':{k:record[k] for k in ('name','status','stdout') if k in record}, 'sizes':[]})
-            migrated = {'scope':scope, 'in_flight':None, 'receipts':confirmed, 'legacy_actions':signatures}
-            self.store.merge({'sandbox':migrated}, expected={'sandbox':None})
-            self.state = migrated
+            raise AgentNeedsInput('此前沙箱操作缺少可核验的回执，请结束任务后重新提交', checkpoint=checkpoint)
 
     @property
     def receipts(self):

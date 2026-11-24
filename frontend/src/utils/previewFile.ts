@@ -1,6 +1,5 @@
 export const TEXT_PREVIEW_LIMIT = 1024 * 1024
 export function previewKind(ext: string) {
-  if (ext === 'avanim') return 'animation'
   if (ext === 'mmd') return 'mermaid'
   if (ext === 'html' || ext === 'htm') return 'html'
   if (ext === 'pdf') return 'pdf'

@@ -107,7 +107,7 @@ function preview(file: ChatFile) {
 </script>
 
 <template>
-  <MarkdownContent v-if="content.body || attachments?.length" animations :source="content.body" :conversation-id="conversationId" :diagrams="diagrams" :artifact-reply="artifactReply" :sandbox-sources="sandboxSources" :files="attachments || []" :saved-file-ids="saved" @preview="emit('preview',$event)" @promote="promoting = $event"/>
+  <MarkdownContent v-if="content.body || attachments?.length" :source="content.body" :conversation-id="conversationId" :diagrams="diagrams" :artifact-reply="artifactReply" :sandbox-sources="sandboxSources" :files="attachments || []" :saved-file-ids="saved" @preview="emit('preview',$event)" @promote="promoting = $event"/>
   <div v-if="content.entries.length" class="answer-sources">
     <button ref="trigger" type="button" class="source-trigger" aria-haspopup="dialog" :aria-expanded="open" @click="toggle">
       <span class="source-avatar-stack" aria-hidden="true">

@@ -89,7 +89,7 @@ class ModelExchange:
         self.secret = secret
         self.attempt = attempt
         purpose = config.get('_call_purpose', 'answer')
-        self.kind = 'artifact' if purpose in ('segmented_writing','html_generation','animation') else 'text'
+        self.kind = 'artifact' if purpose in ('segmented_writing','html_generation') else 'text'
         self.name = PURPOSES.get(purpose, '模型调用')
         self.purpose = purpose if purpose in PURPOSES else 'answer'
         self.event = None

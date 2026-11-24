@@ -520,7 +520,6 @@ test('create task opens an editable form with an empty composer', async ({ page 
   await page.route('**/api/agent-intents/draft-1/cancel', route => { cancelled = true; return route.fulfill({ json: {} }) })
   await page.route('**/api/conversations/draft-workspace/files', route => route.fulfill({ json: [] }))
   await page.route('**/api/conversations/draft-workspace/tools', route => route.fulfill({ json: { items:[] } }))
-  await page.route('**/api/me/skills',route=>route.fulfill({json:[{id:'ready',name:'撰写技能',enabled:true},{id:'disabled',name:'待启用技能',enabled:false}]}))
   await login(page)
   await page.goto('/dialogues')
   await page.getByRole('button', { name:'与 任务分身 的对话' }).click()
@@ -534,10 +533,7 @@ test('create task opens an editable form with an empty composer', async ({ page 
   await expect(objective).toHaveValue('')
   expect(draftBody).toMatchObject({ message:'', request_id:expect.any(String) })
   const tools = form.getByRole('group',{name:'聊天工具栏'})
-  await expect(tools.locator('summary > span:not([aria-hidden]):not(.app-icon)')).toHaveText(['技能','文件','工具'])
-  await tools.locator('summary').filter({hasText:'技能'}).click()
-  await expect(tools.getByText('撰写技能',{exact:true})).toBeVisible()
-  await expect(tools.getByText('待启用技能')).toBeVisible()
+  await expect(tools.locator('summary > span:not([aria-hidden]):not(.app-icon)')).toHaveText(['文件','工具'])
   await tools.locator('summary').filter({hasText:'文件'}).click()
   await expect(tools.getByText('上传本地文件')).toBeVisible()
   await expect(tools.getByRole('button',{name:'从资料库添加'})).toBeVisible()
@@ -623,15 +619,9 @@ test('Mermaid renders a completed fenced diagram in a chat bubble', async ({page
   await expect(preview).toBeHidden()
 })
 
-test('personal composer keeps session settings separate and shortcuts only affect the picker', async ({page}) => {
-  const catalog=[{id:'active',name:'已加载技能',description:'当前会话使用中',enabled:true},{id:'other',name:'另一项技能',enabled:true}]
-  let toggled:unknown, skillMutation=false
+test('personal composer keeps session tools and style settings separate', async ({page}) => {
+  let toggled:unknown
   await page.route('**/api/conversations?**', route=>route.fulfill({json:{items:[{id:'ui-chat-1',title:'测试会话',message_count:1}],default_id:'ui-chat-1'}}))
-  await page.route('**/api/me/skills', route=>route.fulfill({json:catalog}))
-  await page.route('**/api/conversations/ui-chat-1/skills**', route=>{
-    if(route.request().method()==='PATCH')skillMutation=true
-    return route.fulfill({json:[{...catalog[0],installed_enabled:true}]})
-  })
   await page.route('**/api/conversations/ui-chat-1/style-learning', route=>route.fulfill({json:{enabled:false}}))
   await page.route('**/api/conversations/ui-chat-1/files', route=>route.fulfill({json:[]}))
   await page.route('**/api/conversations/ui-chat-1/tools', route=>{
@@ -642,7 +632,7 @@ test('personal composer keeps session settings separate and shortcuts only affec
   await login(page)
   await page.goto('/chat')
   const bar=page.getByRole('group',{name:'聊天工具栏'})
-  await expect(bar.locator('summary > span:not([aria-hidden]):not(.app-icon)')).toHaveText(['技能','文件','工具'])
+  await expect(bar.locator('summary > span:not([aria-hidden]):not(.app-icon)')).toHaveText(['文件','工具'])
   const card=page.locator('#personal-chat-card')
   const box=await card.boundingBox(), select=await card.locator('.chat-session-select').boundingBox()
   expect(select!.width).toBeLessThan(box!.width/2)
@@ -652,28 +642,9 @@ test('personal composer keeps session settings separate and shortcuts only affec
   await card.locator('summary').filter({hasText:'表达风格学习'}).click()
   await expect(card.getByRole('checkbox',{name:'自动学习本人表达'})).toBeVisible()
   await capture(page,'chat-style-learning')
-  const skills=bar.locator('summary').filter({hasText:'技能'})
-  await skills.click()
-  await expect(bar.getByText('已加载技能',{exact:true})).toBeVisible()
-  await expect(bar.getByText('另一项技能',{exact:true})).toHaveCount(0)
-  expect(await skills.evaluate(async element => {
-    const details = element.closest('details')!
-    const frame = () => new Promise<void>(done => requestAnimationFrame(() => done()))
-    const opacity = () => Number(getComputedStyle(details,'::details-content').opacity)
-    while (opacity() < 1) await frame()
-    async function toggle() {
-      (element as HTMLElement).click()
-      for (let n=0; n<30; n++) { await frame(); if (opacity()>0 && opacity()<1) return true }
-      return false
-    }
-    const closing = await toggle()
-    while (opacity() > 0) await frame()
-    return closing && await toggle()
-  })).toBe(true)
   await bar.locator('summary').filter({hasText:'文件'}).click()
   await expect(bar.getByText('上传本地文件')).toBeVisible()
   await expect(bar.getByRole('button',{name:'从资料库引用'})).toBeVisible()
-  await expect(bar.getByText('已加载技能',{exact:true})).toBeHidden()
   await capture(page,'chat-toolbar-files')
   await checkLibraryPicker(page,'ui-chat-1')
   await bar.locator('summary').filter({hasText:'工具'}).click()
@@ -681,14 +652,7 @@ test('personal composer keeps session settings separate and shortcuts only affec
   await expect.poll(()=>toggled).toEqual({tools:{sample_tool:true}})
   const input=page.getByRole('textbox',{name:'聊天消息'})
   await input.fill('$')
-  const picker=page.getByRole('listbox',{name:'快捷选择技能'})
-  await expect(picker.getByRole('option',{name:'另一项技能'})).toBeVisible()
-  await capture(page,'chat-skill-picker')
-  await picker.getByRole('button',{name:'从快捷选择移除 另一项技能'}).click()
-  await expect(picker.getByRole('option',{name:'另一项技能'})).toHaveCount(0)
-  expect(skillMutation).toBe(false)
-  await input.press('Enter')
-  await expect(input).toHaveValue('$"已加载技能" ')
+  await expect(page.getByRole('listbox',{name:'快捷选择技能'})).toHaveCount(0)
 })
 
 test('Soul materials and build history use tight tables and shared pagination', async ({page}) => {
@@ -1071,7 +1035,7 @@ test('sidebars animate both directions and honor reduced motion', async ({page})
   await expect(task).toBeHidden()
   await expect.poll(async()=>Math.round((await chat.boundingBox())!.x)).toBe(Math.round(closed!.x))
   await page.setViewportSize({width:390,height:844})
-  await page.goto('/overview')
+  await page.goto('/')
   const nav=page.locator('aside.sidebar'), toggle=page.getByRole('button',{name:/展开导航|收起导航/})
   await toggle.click()
   expect(await slides(nav)).toBe(true)
