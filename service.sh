@@ -4,13 +4,13 @@ set -euo pipefail
 cd -- "$(dirname -- "$(readlink -f -- "$0")")"
 umask 077
 action="${1:---help}"
-[[ $# -le 1 ]] || { echo '用法：./service.sh start|stop|install|check-sandbox'; exit 2; }
+[[ $# -le 1 ]] || { echo '用法：./service.sh start|restart|stop|install|check-sandbox'; exit 2; }
 case "$action" in
-  -h|--help) echo '用法：./service.sh start|stop|install|check-sandbox'; exit 0 ;;
-  start|stop|install|check-sandbox) ;;
-  *) echo '用法：./service.sh start|stop|install|check-sandbox' >&2; exit 2 ;;
+  -h|--help) echo '用法：./service.sh start|restart|stop|install|check-sandbox'; exit 0 ;;
+  start|restart|stop|install|check-sandbox) ;;
+  *) echo '用法：./service.sh start|restart|stop|install|check-sandbox' >&2; exit 2 ;;
 esac
-if [[ ( "$action" == start || "$action" == check-sandbox ) && -f .env ]]; then set -a; source .env; set +a; fi
+if [[ "$action" != install && -f .env ]]; then set -a; source .env; set +a; fi
 service=personal-avatar.service
 service_file="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$service"
 check_sandbox() {
@@ -33,7 +33,7 @@ PYTHON
 }
 if [[ "$action" == check-sandbox ]]; then check_sandbox; exit; fi
 [[ "$action" == stop || -x .venv/bin/python ]] || uv sync --locked
-if [[ "$action" == start && -n "${AVATAR_SANDBOX_RUNTIME:-}" ]]; then check_sandbox; fi
+if [[ ( "$action" == start || "$action" == restart ) && -n "${AVATAR_SANDBOX_RUNTIME:-}" ]]; then check_sandbox; fi
 
 owned_process() {
   [[ "$1" =~ ^[1-9][0-9]*$ ]] &&
@@ -83,9 +83,9 @@ PY
 fi
 
 if [[ -f "$service_file" ]]; then
-  [[ "$action" != start ]] || pg_start
+  [[ "$action" == stop ]] || pg_start
   systemctl --user "$action" "$service"
-  [[ "$action" == start ]] || { stop_dependencies; echo 'systemd 服务已停止。'; exit 0; }
+  [[ "$action" != stop ]] || { stop_dependencies; echo 'systemd 服务已停止。'; exit 0; }
 else
   mkdir -p data
   exec 9>data/process.lock
@@ -93,7 +93,7 @@ else
   [[ "$action" != stop || -f data/avatar.pid ]] || { echo '系统未运行。'; stop_dependencies; exit 0; }
   pid=''
   if [[ -f data/avatar.pid ]]; then read -r pid <data/avatar.pid || true; fi
-  if [[ "$action" == stop ]]; then
+  if [[ "$action" == stop || ( "$action" == restart && -f data/avatar.pid ) ]]; then
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || { echo 'PID 文件无效。' >&2; exit 1; }
     if kill -0 "$pid" 2>/dev/null; then
       owned_process "$pid" || { echo 'PID 与本项目进程不匹配，拒绝终止。' >&2; exit 1; }
@@ -105,8 +105,11 @@ else
       owned_process "$pid" && { echo '进程尚未退出，请检查日志。' >&2; exit 1; }
     fi
     rm -f data/avatar.pid
-    stop_dependencies
-    echo '系统已停止。'; exit 0
+    if [[ "$action" == stop ]]; then
+      stop_dependencies
+      echo '系统已停止。'; exit 0
+    fi
+    pid=''
   fi
   owned_process "$pid" && { echo "系统已运行，PID=$pid"; exit 0; }
   pg_start

@@ -10,6 +10,8 @@ export interface Traffic {
   sent_bytes: number
 }
 export interface Point extends Traffic { time: string; sample_minutes: number }
+export type Metric = 'requests' | 'client_errors' | 'server_errors' | 'received_bytes' | 'sent_bytes'
+export interface TrendPoint { time: string; value: number; sample_minutes: number }
 export interface RecentTraffic extends Traffic {
   span_seconds: number
   in_flight: number
@@ -53,6 +55,8 @@ const wallTime = new Intl.DateTimeFormat('zh-CN', {
   timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit',
   hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
 })
+const clock = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
+export const clockTime = (date: string) => clock.format(new Date(date))
 export const amount = (n?: number | null) => n == null ? '—' : decimal.format(n)
 export const latency = (n?: number | null) => n == null ? '—' : amount(n) + ' ms'
 export const timestamp = (date: string | number) => wallTime.format(new Date(date))

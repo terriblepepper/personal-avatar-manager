@@ -1,5 +1,5 @@
 import { onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
-import type { Dashboard, WindowName } from './metrics'
+import type { Dashboard, Point, WindowName } from './metrics'
 
 class ResponseError extends Error {
   constructor(message: string, readonly status: number) { super(message) }
@@ -13,6 +13,14 @@ async function call<T>(path: string, options: RequestInit = {}): Promise<T> {
   }
   if (body == null) throw new Error('无法读取监控响应')
   return body
+}
+
+export async function fetchMinutes(time: string, count: number, signal: AbortSignal) {
+  const start = Math.floor(Date.parse(time) / 60000)
+  const { series } = await call<{ series: Point[] }>('/api/ops/metrics/minutes?start=' + start + '&count=' + count, {
+    signal: AbortSignal.any([signal, AbortSignal.timeout(10000)]),
+  })
+  return series
 }
 
 export function useMonitor() {

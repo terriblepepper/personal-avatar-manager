@@ -1,7 +1,7 @@
 """Read-only operational metrics restricted to complete local admin sessions."""
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 
 from avatar.accounts import auth
@@ -31,3 +31,10 @@ async def metrics(request: Request, window: Literal['1h', '24h', '7d'] = '1h',
                   user=Depends(local_admin)):
     snapshot = await request.app.state.monitor.read(window)
     return JSONResponse({**snapshot, 'csrf': user['csrf']}, headers=PRIVATE)
+
+
+@router.get('/metrics/minutes')
+async def minutes(request: Request, start: int = Query(ge=0), count: int = Query(ge=1, le=60),
+                  user=Depends(local_admin)):
+    series = request.app.state.monitor.read_minutes(start, count)
+    return JSONResponse({'series': series}, headers=PRIVATE)

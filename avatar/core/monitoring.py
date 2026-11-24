@@ -158,10 +158,15 @@ class PlatformMonitor:
             if lower <= key < current:
                 group = groups.setdefault(key // step * step, Counter())
                 group.update({metric: metrics[metric] for metric in COUNTERS})
-            group['sample_minutes'] += 1
+                group['sample_minutes'] += 1
         return [{'time': iso_stamp(key * 60), 'sample_minutes': row['sample_minutes'],
                  **{metric: row[metric] for metric in COUNTERS}}
                 for key, row in sorted(groups.items())], step
+
+    def read_minutes(self, start, count):
+        lower = max(start, int(time() // 60) - HISTORY_MINUTES)
+        return [{'time': iso_stamp(minute * 60), 'sample_minutes': 1, **metrics}
+                for minute, metrics in self.history if lower <= minute < start + count]
 
     async def read(self, selection):
         current = int(time() // 60)
