@@ -1,4 +1,5 @@
 import { defineConfig, type Connect } from 'vite'
+import { fileURLToPath } from 'node:url'
 import { pages } from './src/router/pages'
 import vue from '@vitejs/plugin-vue'
 import tailwindcss from '@tailwindcss/vite'
@@ -13,7 +14,12 @@ const consoleHistory: Connect.NextHandleFunction = (request, _response, next) =>
   next()
 }
 
-export default defineConfig({
+export default defineConfig(({ mode }) => mode === 'ops' ? {
+  root: fileURLToPath(new URL('../admin-frontend/', import.meta.url)),
+  base: '/ops/',
+  plugins: [vue()],
+  resolve: { alias: { vue: fileURLToPath(new URL('./node_modules/vue/dist/vue.esm-bundler.js', import.meta.url)) } },
+} : {
   appType: 'mpa',
   plugins: [vue(), tailwindcss(), {
     name: 'console-history',

@@ -29,9 +29,10 @@ def measure(name):
         record_duration(name, perf_counter() - started)
 
 
-def snapshot():
+def snapshot(names=None):
     with _lock:
-        samples = [(name, count, tuple(window)) for name, (count, window) in _series.items()]
+        selected = _series if names is None else (name for name in names if name in _series)
+        samples = [(name, _series[name][0], tuple(_series[name][1])) for name in selected]
     result = {}
     for name, count, window in samples:
         values = sorted(window)

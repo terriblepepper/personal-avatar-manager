@@ -4,6 +4,7 @@
     "module": "ESNext",
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "moduleResolution": "Bundler",
+    "paths": { "vue": ["./node_modules/vue"] },
     "strict": true,
     "noEmit": true,
     "skipLibCheck": true,
@@ -12,5 +13,5 @@
     "esModuleInterop": true,
     "types": ["vite/client", "vitest/globals", "node"]
   },
-  "include": ["src/**/*.ts", "src/**/*.vue", "tests/**/*.ts", "*.ts"]
+  "include": ["src/**/*.ts", "src/**/*.vue", "tests/**/*.ts", "*.ts", "../admin-frontend/src/**/*.ts", "../admin-frontend/src/**/*.vue"]
 }

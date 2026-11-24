@@ -2,7 +2,7 @@
 from pathlib import Path
 import re
 from fastapi import HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 PAGES = {'', 'overview', 'avatar', 'profile', 'files', 'knowledge', 'models', 'skills',
@@ -16,6 +16,28 @@ class BuildAssets(StaticFiles):
         if response.status_code == 200:
             response.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
         return response
+
+
+PAGE_HEADERS = {
+    'Cache-Control': 'no-cache', 'Referrer-Policy': 'no-referrer',
+    'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+}
+
+
+def mount_ops(app, dist: Path):
+    if (dist / 'assets').is_dir():
+        app.mount('/ops/assets', BuildAssets(directory=dist / 'assets'), name='ops-assets')
+
+    @app.get('/ops', include_in_schema=False)
+    def ops_redirect():
+        return RedirectResponse('/ops/')
+
+    @app.get('/ops/', include_in_schema=False)
+    def ops_page():
+        index = dist / 'index.html'
+        if not index.is_file():
+            raise HTTPException(503, '缺少运行监控构建产物，请在 frontend 执行 npm run build')
+        return FileResponse(index, headers=PAGE_HEADERS)
 
 
 def mount_frontend(app, dist: Path):
