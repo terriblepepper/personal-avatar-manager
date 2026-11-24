@@ -122,14 +122,6 @@ def spreadsheet_text(path):
 # 输入：path 为不可变附件路径，extension 决定解析器。
 # 结果与约束：返回文字及状态；PDF 最多解析 1000 页及 100 万字符，扫描页最多三页本地 OCR，加密或未识别内容可由用户补充说明。
 def extract(path, extension):
-    if extension == '.avanim':
-        from avatar.files.parsing.animation import parse_animation
-        from avatar.files.uploads.buffer import upload_buffer
-        with Path(path).open('rb') as original, upload_buffer(original) as data:
-            scene = parse_animation(data)
-        sections = [scene.title, scene.summary, ' '.join(scene.tags), scene.accessibility.alt]
-        sections.extend('\n'.join((step.title, step.detail, *step.notes)) for step in scene.steps)
-        return '\n\n'.join(filter(None, sections)), 'extracted'
     if extension in PLAIN_TEXT_EXTENSIONS:
         text=text_content(path,MAX_TEXT+1)
         if '\x00' in text:return '', 'needs_description'

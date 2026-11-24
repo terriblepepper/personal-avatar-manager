@@ -4,13 +4,11 @@ import asyncio
 import re
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 from avatar.core.text_budget import TEXT_BYTES
 from avatar.core.config import ROOT, Settings, application_version, require_database_url
 from avatar.runtime.wit_runtime import AvatarRuntime
 from avatar.files.library.attachments import MAX_STORED_SIZE
-from avatar.files.parsing.animation import MAX_ENVELOPE_BYTES
 from avatar.knowledge.media import MAX_ASSET
 from avatar.api.routes import router
 from avatar.profiles.pending_reviews import PendingReviews
@@ -40,9 +38,6 @@ from avatar.skills.packages import MAX_UPLOAD
 def create_app(settings=None, provider=None, run_worker=True, model_client=None):
     settings = settings or Settings.from_env()
     require_database_url(settings.database_url)
-    from avatar.protocols.identity.document import migrate_identity_documents
-
-    migrate_identity_documents(settings.data_dir)
     runtime = AvatarRuntime(settings, provider, run_worker, model_client)
     resources = runtime.services
     from avatar.conversation.jobs.runner import GenerationRunner
@@ -189,7 +184,6 @@ def create_app(settings=None, provider=None, run_worker=True, model_client=None)
         redoc_url=None,
         openapi_url="/api/openapi.json",
     )
-    app.state.animation_requests = asyncio.Semaphore(2)
     app.state.pending_reviews = pending_reviews
     app.state.changes = changes
     app.state.monitor = monitor
@@ -279,26 +273,15 @@ def create_app(settings=None, provider=None, run_worker=True, model_client=None)
                 limit = 8 * 1024 * 1024
             if request.url.path == "/api/me/knowledge/assets":
                 limit = MAX_ASSET + 65536
-            if request.url.path.startswith(
-                "/api/conversations/"
-            ) and request.url.path.endswith("/diagrams"):
-                limit = 10 * 1024 * 1024
-            elif request.url.path.startswith(
-                "/api/conversations/"
-            ) and request.url.path.endswith("/diagrams/lookup"):
-                limit = 400000
-            if request.url.path.startswith("/api/conversations/") and request.url.path.endswith(
-                ("/animations/lookup", "/animations/promote")
-            ):
-                # The JSON envelope may escape bytes in the animation source.
-                limit = MAX_ENVELOPE_BYTES
-            if re.fullmatch(r"/api/(?:chat(?:/stream|/generations)?|agent-dialogues(?:/[^/]+/(?:resume|confirm|accept))?|"
+            if re.fullmatch(r"/api/conversations/[^/]+/diagrams/promote", request.url.path):
+                limit = 7 * 1024 * 1024
+            if re.fullmatch(r"/api/(?:chat/(?:stream|generations)|agent-dialogues(?:/[^/]+/(?:resume|confirm|accept))?|"
                             r"agent-sessions/[^/]+/(?:messages|accept|task-draft)|agent-intents/[^/]+/confirm|"
                             r"town/avatars/[^/]+/tasks)", request.url.path):
                 # A JSON escape can take six wire bytes for one byte of decoded text.
                 limit = 7 * TEXT_BYTES
                 if request.url.path.startswith("/api/agent-intents/"):
-                    limit += 12 * 60000  # Optional legacy shared_content, up to 60k Unicode characters.
+                    limit += 12 * 60000  # Optional shared_content, up to 60k Unicode characters.
             if request.method == "POST" and re.fullmatch(r"/api/conversations/[^/]+/files", request.url.path):
                 # The multipart endpoint spools originals and validates each file type.
                 limit = None

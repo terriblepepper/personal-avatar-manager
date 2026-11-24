@@ -37,7 +37,6 @@ def test_workspace_cleanup_preserves_live_run_across_pid_namespaces(monkeypatch,
 @pytest.mark.parametrize(('mode', 'adapter'), [
     ('demo', 'DemoRegistrationProvider'),
     ('acps-direct', 'DirectRegistrationProvider'),
-    ('acps-entity', 'DerivedRegistrationProvider'),
 ])
 def test_environment_provider_controls_runtime_and_admin_mode(monkeypatch, tmp_path, mode, adapter, postgres_url):
     from fastapi.testclient import TestClient
@@ -51,17 +50,16 @@ def test_environment_provider_controls_runtime_and_admin_mode(monkeypatch, tmp_p
     try:
         assert type(app.state.service.provider).__name__ == adapter, 'Environment must select the active adapter'
         assert client.get('/api/health').json()['mode'] == mode, 'Health must report the configured mode'
-        assert app.state.service.dashboard('test-admin')['mode'] == mode, 'Admin mode must reflect the active adapter'
         password = (tmp_path / 'initial-admin.txt').read_text().split('password: ')[1].strip()
         from tests.support import login
         login(client, 'admin', password)
-        result = client.get('/api/admin/dashboard')
+        result = client.get('/api/admin/settings')
         assert result.status_code == 200, result.text
         environment = result.json()['environment']
         assert environment['registration_adapter'] == adapter
         assert environment['registration_mode'] == mode
         monkeypatch.setenv('AVATAR_PROVIDER', 'different-after-startup')
-        assert client.get('/api/admin/dashboard').json()['environment'] == environment, 'Startup information must stay consistent until the next start'
+        assert client.get('/api/admin/settings').json()['environment'] == environment, 'Startup information must stay consistent until the next start'
     finally:
         client.close()
         app.state.chat.rag.store.close()
@@ -76,7 +74,7 @@ def test_runtime_environment_reads_package_versions_and_manual_resources(monkeyp
     manual.parent.mkdir()
     manual.write_text('operator manual')
     monkeypatch.setattr(config, 'ROOT', tmp_path)
-    versions = {'wit-framework': '8.7.6', 'acps-sdk': '5.4.3'}
+    versions = {'wit': '8.7.6', 'acps-sdk': '5.4.3'}
     monkeypatch.setattr(metadata, 'version', lambda name: versions[name])
     settings = config.Settings(provider='acps-direct', oidc_public_url='https://platform.test',
                                system_aip_enabled=True, system_aip_public_url='https://system.test/aip/rpc',
@@ -95,7 +93,7 @@ def test_runtime_environment_reads_package_versions_and_manual_resources(monkeyp
     monkeypatch.setattr(metadata, 'version', missing)
     environment = config.runtime_environment(config.Settings(), SimpleNamespace())
     assert environment['manual_path'] is None, 'Absent resources must not produce an invented path'
-    assert environment['framework_versions'] == {'wit-framework': None, 'acps-sdk': None}
+    assert environment['framework_versions'] == {'wit': None, 'acps-sdk': None}
     assert [item['value'] for item in environment['communication'][1:]] == [None, None]
 
 
@@ -457,7 +455,7 @@ def test_spa_refresh_keeps_api_static_and_unknown_paths_distinct(tmp_path):
     assert 'Vue' in client.get('/admin/custom-section').text
     assert client.get('/api/me').json() == {'user': 'current'}
     for path in ('/api/missing', '/assets/missing.js', '/static/core/app.js', '/static/index.html',
-                 '/admin/missing.css', '/admin/nested/section', '/missing.css', '/unknown'):
+                 '/admin/missing.css', '/admin/nested/section', '/missing.css', '/overview', '/unknown'):
         assert client.get(path).status_code == 404, path
     assert client.get('/static/system-avatar.svg').headers['content-type'] == 'image/svg+xml'
     assert client.get('/assets/app-123.js').headers['content-type'].startswith('text/javascript')

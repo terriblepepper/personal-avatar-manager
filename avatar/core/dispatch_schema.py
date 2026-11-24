@@ -26,8 +26,8 @@ TRIGGERS = (
     ('controls', 'agent_protocol_controls', 'INSERT OR UPDATE OF status,next_attempt', """
         IF NEW.status='queued' THEN PERFORM avatar_emit('work', 'controls'); END IF;
     """),
-    ('index', 'file_rag_documents', 'INSERT OR UPDATE OF status,next_attempt_at,generation,legacy_backfill', """
-        IF NEW.status='queued' OR (NEW.legacy_backfill=1 AND NEW.status IN ('ready','partial')) THEN
+    ('index', 'file_rag_documents', 'INSERT OR UPDATE OF status,next_attempt_at,generation', """
+        IF NEW.status='queued' THEN
             PERFORM avatar_emit('work', 'index');
         END IF;
     """),

@@ -33,7 +33,6 @@ class MaterialArguments(BaseModel):
     queries: list[Annotated[AgentText, StringConstraints(strip_whitespace=True, min_length=1)]] = Field(default_factory=list, max_length=5, description='多目标时逐项给出可独立检索的主题，保留目录、日期和类型。')
     sort: Literal['relevance','latest'] = Field(default='relevance',description='按发布时间选取原件时选 latest，查询词只填主题。')
     exclude_ids: list[Annotated[str, StringConstraints(min_length=1, max_length=80)]] = Field(default_factory=list, max_length=20, description='只在索要其他资料时列出已交付且需排除的 ID。')
-    animation_only: StrictBool = Field(False, description='仅查找历史 .avanim 或本平台转存的 HTML 动画时开启。')
 
     @model_validator(mode='after')
     def has_target(self):

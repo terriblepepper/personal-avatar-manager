@@ -2,10 +2,7 @@ from avatar.core.user_storage import ConversationBlobs, UserBlobs
 from avatar.files.uploads.buffer import upload_work, write_original
 # 模块说明：独立资料文件存储、归属、说明和隐私；用户保存立即生效，原件不进入公开静态目录。
 import asyncio
-import hashlib
 import json
-import subprocess
-import sys
 import uuid
 import zipfile
 from io import BytesIO
@@ -15,7 +12,7 @@ from typing import Literal
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 from avatar.core.db import now, dump, event
-from avatar.files.parsing.animation import ANIMATION_MIME, MAX_SOURCE_BYTES, parse_animation
+from avatar.files.artifact_limits import MAX_SOURCE_BYTES
 from avatar.files.parsing.media_types import MEDIA,validate_media
 from avatar.profiles.profile_dates import next_modified_at
 from avatar.profiles.profile_dates import ModifiedAt
@@ -23,7 +20,7 @@ from avatar.profiles.profile_dates import ModifiedAt
 # Model and sandbox outputs retain a separate per-file processing bound.
 MAX_FILE = 10 * 1024 * 1024
 MAX_STORED_SIZE = 10 * 1024 ** 3
-TYPES = {'.avanim': ANIMATION_MIME, '.txt': 'text/plain', '.md': 'text/markdown', '.mmd': 'text/x-mermaid', '.html': 'text/html', '.htm': 'text/html', '.csv': 'text/csv', '.json': 'application/json',
+TYPES = {'.txt': 'text/plain', '.md': 'text/markdown', '.mmd': 'text/x-mermaid', '.html': 'text/html', '.htm': 'text/html', '.csv': 'text/csv', '.json': 'application/json',
          '.log': 'text/plain', '.tsv': 'text/tab-separated-values',
          '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
          '.webp': 'image/webp', '.gif': 'image/gif', '.bmp': 'image/bmp', '.pdf': 'application/pdf',
@@ -32,7 +29,7 @@ TYPES = {'.avanim': ANIMATION_MIME, '.txt': 'text/plain', '.md': 'text/markdown'
          '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',**MEDIA}
 
 
-ARTIFACT_SUFFIXES = ('.html', '.htm', '.avanim')
+ARTIFACT_SUFFIXES = ('.html', '.htm')
 
 
 def chat_file_limit(filename):
@@ -93,11 +90,6 @@ class AttachmentService:
     # 输入：filename 为客户端文件名，data 为已经限长的原件字节。
     # 结果与约束：名称不参与存储路径；拒绝空文件、不支持类型、扩展名伪装及宏文件/超限压缩包。
     @staticmethod
-    def validate_file(filename, data, *, max_size=None, generated=False):
-        extension, _ = AttachmentService.inspect_file(filename, data, max_size=max_size, generated=generated)
-        return extension
-
-    @staticmethod
     def inspect_file(filename, data, *, max_size=None, generated=False):
         if not filename or len(filename) > 200 or any(ord(c) < 32 for c in filename) or '/' in filename or '\\' in filename:
             raise HTTPException(422, '文件名无效')
@@ -107,7 +99,7 @@ class AttachmentService:
         if not data:
             raise HTTPException(422, '不能上传空文件')
         if extension in ARTIFACT_SUFFIXES and len(data) > MAX_SOURCE_BYTES:
-            raise HTTPException(413, 'HTML 或动画文件不能超过 100 MiB')
+            raise HTTPException(413, 'HTML 文件不能超过 100 MiB')
         if max_size is not None and len(data) > max_size:
             raise HTTPException(413, '文件超过上传大小限制')
         if extension in ('.zip','.docx','.pptx','.xlsx'):
@@ -137,7 +129,7 @@ class AttachmentService:
             raise HTTPException(415, 'WebP 文件格式无效')
         if extension in ('.txt', '.md', '.mmd', '.csv', '.tsv', '.json', '.log', '.html', '.htm') and data.find(b'\x00') >= 0 and not data[:4].startswith((b'\xff\xfe',b'\xfe\xff',b'\x00\x00\xfe\xff')):
             raise HTTPException(415, '文本文件包含二进制内容')
-        return extension, parse_animation(data) if extension == '.avanim' else None
+        return extension
 
     # 职责：读取账户文件集合的独立修改日期。
     # 输入：user_id 为已授权文件所有人。
@@ -168,15 +160,6 @@ class AttachmentService:
             raise HTTPException(409,'资料文件已变更，请刷新后再操作')
         return row
 
-    def animation_match(self, db, user_id, digest, *, include_staged=False):
-        condition = '' if include_staged else ' AND saved_at IS NOT NULL'
-        row = db.execute("""SELECT id,saved_at FROM attachments WHERE user_id=? AND animation_digest<>''
-            AND animation_digest=?""" + condition + ' ORDER BY (saved_at IS NULL),id LIMIT 1',
-            (user_id, digest)).fetchone()
-        if row and not self.directory.new(user_id, row['id']+'.blob').is_file():
-            raise HTTPException(410,'动画原件缺失，请联系管理员恢复')
-        return row
-
     @staticmethod
     def quota(db,user_id):
         total = db.execute('SELECT coalesce(sum(size),0) FROM attachments WHERE user_id=?',(user_id,)).fetchone()[0]
@@ -185,7 +168,7 @@ class AttachmentService:
     # 职责：接收有界原件并在隔离线程中解析入库。
     # 输入：user 为已认证账户，last_modified_at 可选核对文件集合日期，filename 与 data 为限长文件，caption 可留空后续填写。
     # 结果与约束：上传说明最多 2000 字符但允许空；说明选填，不影响索引或引用，每进程最多两个解析任务，未保存文件可立即删除。
-    async def upload(self, user, last_modified_at, filename, data, caption='', *, relative_path='', deduplicate=False, batch_id='', generated=False, visibility=None, check_name=False, authorize_animation=None):
+    async def upload(self, user, last_modified_at, filename, data, caption='', *, relative_path='', deduplicate=False, batch_id='', generated=False, visibility=None, check_name=False):
         caption = caption.strip()
         if len(caption) > 2000:
             raise HTTPException(422, '资料说明最多 2000 字')
@@ -197,18 +180,17 @@ class AttachmentService:
                     or parts[-1]!=filename):
                 raise HTTPException(422,'文件夹路径无效，请使用相对目录且保留原文件名')
         async with self.parsing:
-            extension, animation = await upload_work(self.inspect_file, filename, data, max_size=MAX_STORED_SIZE, generated=generated)
-            return await upload_work(self._store, user, last_modified_at, filename, data, extension, caption, relative_path, deduplicate, batch_id, visibility, check_name, animation, authorize_animation)
+            extension = await upload_work(self.inspect_file, filename, data, max_size=MAX_STORED_SIZE, generated=generated)
+            return await upload_work(self._store, user, last_modified_at, filename, data, extension, caption, relative_path, deduplicate, batch_id, visibility, check_name)
 
     # 职责：保存不可变原件并提交元数据，派生索引由后台更新。
     # 输入：校验后的用户、修改日期、名称、字节、扩展名及可为空的暂存说明。
     # 结果与约束：写入 0600 UUID 文件，最终事务重新检查日期与配额；失败删除未登记原件，解析失败仍保留文件供补充说明。
-    def _store(self, user, last_modified_at, filename, data, extension, caption, relative_path='', deduplicate=False, batch_id='', visibility=None, check_name=False, animation=None, authorize_animation=None):
+    def _store(self, user, last_modified_at, filename, data, extension, caption, relative_path='', deduplicate=False, batch_id='', visibility=None, check_name=False):
         with self.database.connect() as db:
             self.editable(db, user['id'], last_modified_at)
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.directory.chmod(0o700)
-        animation_digest = hashlib.sha256(animation.canonical()).hexdigest() if animation else ''
         identifier = str(uuid.uuid4())
         path = self.directory.new(user['id'],identifier + '.blob')
         checksum = write_original(path,data)
@@ -216,23 +198,6 @@ class AttachmentService:
             extracted,status='','rag_pending'
             with self.database.connect(write=True) as db:
                 self.editable(db,user['id'],last_modified_at)
-                if authorize_animation is not None:
-                    authorize_animation(db)
-                    existing = self.animation_match(db, user['id'], animation_digest, include_staged=True)
-                    if existing:
-                        saved = existing['saved_at'] is not None
-                        if not saved:
-                            from avatar.files.library.folders import ensure_folders, ensure_filename_available
-                            if check_name:
-                                ensure_filename_available(db,user['id'],relative_path or filename,existing['id'])
-                            ensure_folders(db,user['id'],relative_path.rpartition('/')[0])
-                            modified = self.touch(db,user['id'])
-                            db.execute("""UPDATE attachments SET saved_at=?,updated_at=?,caption=?,visibility=?,
-                                visibility_override=1,filename=?,relative_path=? WHERE id=? AND user_id=?""",
-                                (modified,modified,caption,visibility,filename,relative_path,existing['id'],user['id']))
-                            event(db,user['id'],user['username'],'转存动画资料',existing['id'],actor_id=user['id'])
-                        path.unlink()
-                        return {'id': existing['id'], 'already_exists': saved}
                 if deduplicate and db.execute('SELECT 1 FROM attachments WHERE user_id=? AND sha256=?',(user['id'],checksum)).fetchone():raise HTTPException(409,'相同内容已在资料库中，不能重复转存')
                 quota = self.quota(db,user['id'])
                 if quota['used_bytes']+len(data)>quota['limit_bytes']:
@@ -247,17 +212,11 @@ class AttachmentService:
                            (identifier,user['id'],filename,'application/zip' if extension=='.zip' else TYPES[extension],len(data),checksum,extracted,status,now(),caption,modified))
                 db.execute('UPDATE attachments SET extraction_version=1,relative_path=?,visibility=?,visibility_override=?,saved_at=? WHERE id=?',
                            (relative_path,effective_visibility,int(visibility is not None),modified if visibility is not None else None,identifier))
-                if animation:
-                    summary = animation.metadata()
-                    db.execute('UPDATE attachments SET animation_metadata=?,animation_digest=? WHERE id=?',
-                               (dump(summary), animation_digest, identifier))
                 from avatar.files.uploads.batches import audit_detail
                 event(db, user['id'], user['username'], '上传资料附件', audit_detail(identifier,batch_id), actor_id=user['id'])
         except BaseException:
             path.unlink(missing_ok=True)
             raise
-        if authorize_animation is not None:
-            return {'id': identifier, 'already_exists': False}
         ref = {'id': identifier, 'visibility': effective_visibility, 'caption': caption}
         return {**self.metadata(user['id'], [ref])[0], 'last_modified_at': modified}
 

@@ -13,9 +13,9 @@ exec 8>redis.lock
 warn() { echo "Redis：$*；应用可回源数据库。" >&2; }
 flock -w 3 8 || { warn "等待服务锁超时"; exit 0; }
 
-key="$(printf '%s' "$PWD" | sha256sum)"
-unit="personal-avatar-redis-${key:0:16}.service"
 if command -v systemd-run >/dev/null && systemctl --user show-environment >/dev/null 2>&1; then
+  key="$(printf '%s' "$PWD" | sha256sum)"
+  unit="personal-avatar-redis-${key:0:16}.service"
   if systemctl --user is-active --quiet "$unit"; then
     if [[ "$action" == stop ]]; then systemctl --user stop "$unit"; fi
     exit 0

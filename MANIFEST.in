@@ -4,7 +4,6 @@ include redis/redis.conf redis/service.sh redis/redis-*.whl
 include kafka/broker.env kafka/service.sh
 include *.whl
 recursive-include avatar *.py *.ts
-include avatar/conversation/tools/animation_clock.js
 recursive-include frontend/public *
 recursive-include frontend/static *.js
 include frontend/package.json frontend/package-lock.json frontend/index.html frontend/tsconfig.json frontend/vite.config.ts

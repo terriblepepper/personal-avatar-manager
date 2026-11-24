@@ -91,7 +91,7 @@ async function health(agent:Agent) {
   } finally {busy.value=false;processing.value=''}
 }
 function latestHealth(agent:Agent){return checks.value[agent.user_id] || agent.protocol?.health}
-const modes:Record<string,string>={'acps-direct':'ACPS 独立实体','acps-entity':'ACPS 派生实体',demo:'演示身份'}
+const modes:Record<string,string>={'acps-direct':'ACPS 独立实体',demo:'演示身份'}
 function statusLabel(agent:Agent) { return retired(agent)?'已注销':isDemo(agent)?'演示身份':deployed(agent)?'已部署':'未部署' }
 function operationLabel(agent:Agent,key:string) {
   const job=agent.identity_job, text=key==='unregister'&&isDemo(agent)?'注销正式申请':identityActions[key]
@@ -101,7 +101,7 @@ onMounted(()=>{if(props.page==='agents')void load()})
 onBeforeUnmount(()=>{disposed=true;listSequence++;detailSequence++})
 </script>
 <template><template v-if="page==='agents'">
-  <p v-if="data" class="notice">{{ data.mode==='acps-direct'?'新分身按独立实体申请，经平台与 Registry 审核、证书核验后上线。':data.mode==='acps-entity'?'新分身按个人模板派生注册；已有 Demo 分身可在此迁移。':'当前使用本地演示注册器，Demo 身份和证书仅用于流程演示。' }}</p>
+  <p v-if="data" class="notice">{{ data.mode==='acps-direct'?'新分身按独立实体申请，经平台与 Registry 审核、证书核验后上线。':'当前使用本地演示注册器，Demo 身份和证书仅用于流程演示。' }}</p>
   <section v-if="data?.entity_registration_enabled && data.entity_port_pool" class="card info-card">
     <h2>个人分身固定端口</h2>
     <p v-if="data.entity_port_pool.error" role="alert">{{ data.entity_port_pool.error }}</p>

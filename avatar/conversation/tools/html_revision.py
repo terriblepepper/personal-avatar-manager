@@ -1,15 +1,14 @@
 """Apply anchored edits to a previously read original, then use the normal creation validator."""
-import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from avatar.files.parsing.animation import MAX_SOURCE_BYTES
+from avatar.files.artifact_limits import MAX_SOURCE_BYTES
 
 
 class SourceEdit(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
-    field: Literal['html', 'render_frame'] = 'html'
+    field: Literal['html'] = 'html'
     old: str = Field(min_length=1, description='从原件复制的准确文本。未提供 offset 时须唯一匹配。')
     offset: int | None = Field(default=None, ge=0, description='可选的绝对 UTF-8 字节偏移，用于定位重复文本。')
     new: str
@@ -23,8 +22,6 @@ class Revision(BaseModel):
 
 
 REVISION_SCHEMA = Revision.model_json_schema()
-_FRAME_CALL = re.compile(r'\ninstallAnimationClock\(host, ([0-9.eE+-]+), function\(time, duration, state\) \{\n')
-_PLAYER = re.compile(r'<script type="module">\n(?:[^\n]*\n)?function installAnimationClock\(host, duration, renderFrame\) \{')
 
 
 def revision_tool(tool):
@@ -34,23 +31,6 @@ def revision_tool(tool):
     properties = {**form['properties'], 'revision':{k:v for k,v in REVISION_SCHEMA.items() if k!='$defs'}}
     return {**tool, 'description':tool['description']+' 局部修改使用已读取原件的 file_id、sha256 和准确片段，另存新文件。',
             'parameters':{**form,'properties':properties,'$defs':{**form.get('$defs',{}),**REVISION_SCHEMA['$defs']},'required':['filename']}}
-
-
-def author_fields(source, mode):
-    if mode not in ('2d','3d'):
-        return {'html':source}
-    start = _PLAYER.search(source)
-    if not start or _PLAYER.search(source,start.end()):
-        raise ValueError('旧动画播放器边界不明确，请读取源码后提交完整作品')
-    end = source.find('</script>', start.end())
-    call = _FRAME_CALL.search(source,start.end(),max(end,0))
-    if not call or source[end-5:end] != '\n});\n':
-        raise ValueError('旧动画帧函数边界不明确，请读取源码后提交完整作品')
-    after = end+len('</script>')
-    if source[after:after+1]=='\n':
-        after+=1
-    return {'html':source[:start.start()]+source[after:], 'render_frame':source[call.end():end-5],
-            'mode':mode, 'duration_seconds':float(call[1])}
 
 
 def apply_edits(text, edits):
@@ -86,21 +66,10 @@ def apply_edits(text, edits):
     return b''.join(parts).decode('utf-8')
 
 
-def expand_revision(args, load_source, *, legacy_animation=False):
+def expand_revision(args, load_source):
     from avatar.conversation.tools.html import checked_args
-    allowed = {'revision','filename'} | ({'mode','duration_seconds'} if legacy_animation else set())
-    if not load_source or set(args)-allowed:
+    if not load_source or set(args) - {'revision', 'filename'}:
         raise ValueError('修订需使用已读取的当前会话原件，完整源码与局部修改不可混用')
-    change=checked_args(Revision,args['revision'])
-    _,source,mode=load_source(change.file_id,change.sha256)
-    original=author_fields(source,mode) if legacy_animation else {'html':source}
-    result=dict(original)
-    for field in dict.fromkeys(edit.field for edit in change.edits):
-        if field not in result:
-            raise ValueError('此原件没有要修改的字段')
-        result[field]=apply_edits(result[field],[edit for edit in change.edits if edit.field==field])
-    result.update((k,v) for k,v in args.items() if k not in ('revision','filename'))
-    if result==original:
-        raise ValueError('修改结果与原件相同，请核对要修改的位置')
-    result['filename']=args.get('filename')
-    return result
+    change = checked_args(Revision, args['revision'])
+    _, source, _ = load_source(change.file_id, change.sha256)
+    return {'filename': args.get('filename'), 'html': apply_edits(source, change.edits)}

@@ -34,33 +34,27 @@ def require_database_url(value):
 
 
 def application_version():
-    """部署环境优先；未配置时使用发行包版本，未安装的源码使用项目元数据。"""
+    """部署环境优先；源码读取项目元数据，安装包读取发行元数据。"""
     configured = os.getenv('AVATAR_VERSION', '').strip()
     if configured:
         return configured
-    from importlib.metadata import PackageNotFoundError, version
-    try:
-        return version('personal-avatar-manager')
-    except PackageNotFoundError:
+    project = SOURCE_ROOT / 'pyproject.toml'
+    if project.is_file():
         import tomllib
-        return tomllib.loads((SOURCE_ROOT / 'pyproject.toml').read_text())['project']['version']
+        return tomllib.loads(project.read_text())['project']['version']
+    from importlib.metadata import version
+    return version('personal-avatar-manager')
 
 
 def runtime_environment(settings, provider):
     """Describe this startup from the active adapter, configuration and installed resources."""
     from importlib.metadata import PackageNotFoundError, version
     frameworks = {}
-    for package in ('wit-framework', 'acps-sdk'):
+    for package in ('wit', 'acps-sdk'):
         try:
             frameworks[package] = version(package)
         except PackageNotFoundError:
             frameworks[package] = None
-    # Keep the API label used by existing consoles after the distribution rename in WIT 3.2.
-    if frameworks['wit-framework'] is None:
-        try:
-            frameworks['wit-framework'] = version('wit')
-        except PackageNotFoundError:
-            pass
     manual = ROOT / 'docs' / '操作手册.md'
     return {
         'registration_adapter': type(provider).__name__,

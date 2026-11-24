@@ -8,11 +8,9 @@ from typing import Literal
 from urllib.parse import urlsplit
 import httpx
 from PIL import Image, UnidentifiedImageError
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, Field
 from fastapi import APIRouter, Depends, HTTPException, Request
 from avatar.accounts.auth import current_user
-from avatar.files.parsing.animation import MAX_SOURCE_BYTES, MAX_ENVELOPE_BYTES, JSON_TOKEN
-from avatar.files.uploads.buffer import upload_work
 from avatar.models.client import resolve_public
 
 router = APIRouter(prefix='/api')
@@ -101,114 +99,14 @@ async def diagram_icons(body: DiagramIconsRequest,user=Depends(current_user)):
         raise HTTPException(502,'图标服务暂不可用') from None
 
 
-# 源码是缓存键的数据，不执行；体积限制与入口中间件双重控制。
-class DiagramLookupRequest(BaseModel):
-    source: str = Field(min_length=1,max_length=100000)
-
-
-class DiagramSaveRequest(DiagramLookupRequest):
-    svg: str = Field(min_length=1,max_length=4*1024*1024)
-    png: str = Field(min_length=1,max_length=5600000)
-    blocked: int = Field(default=0,ge=0,le=10000)
-    height: int = Field(default=160,ge=100,le=600)
-
-
-# 复用个人资料说明与可见性要求，默认私密；此接口不能转存其他账户的绘图。
-class DiagramPromoteRequest(BaseModel):
-    caption: str = Field(default='',max_length=2000)
+class DiagramSourcePromoteRequest(BaseModel):
+    source: str = Field(min_length=1, max_length=100000)
+    caption: str = Field(default='', max_length=2000)
     visibility: Literal['public','private'] = 'private'
-    new_name: str | None = Field(default=None,min_length=1,max_length=200)
-
-
-class DiagramSourcePromoteRequest(DiagramLookupRequest, DiagramPromoteRequest):
-    pass
-
-
-@router.post('/conversations/{conversation_id}/diagrams/lookup')
-def lookup_diagram(conversation_id: str,body: DiagramLookupRequest,request: Request,user=Depends(current_user)):
-    from avatar.files.conversation.diagrams import DiagramCache
-    return DiagramCache(request.app.state.chat.chat_files).lookup(user['id'],conversation_id,body.source)
-
-
-@router.post('/conversations/{conversation_id}/diagrams')
-def save_diagram(conversation_id: str,body: DiagramSaveRequest,request: Request,user=Depends(current_user)):
-    from avatar.files.conversation.diagrams import DiagramCache
-    return DiagramCache(request.app.state.chat.chat_files).save(user['id'],conversation_id,body)
-
-
-@router.post('/conversations/{conversation_id}/diagrams/{diagram_id}/promote')
-async def promote_diagram(conversation_id: str,diagram_id: str,body: DiagramPromoteRequest,request: Request,user=Depends(current_user)):
-    from avatar.files.conversation.diagrams import DiagramCache
-    caption=body.caption.strip()
-    return await DiagramCache(request.app.state.chat.chat_files).promote(user,conversation_id,diagram_id,caption,body.visibility,body.new_name)
+    new_name: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 @router.post('/conversations/{conversation_id}/diagrams/promote')
 async def promote_diagram_source(conversation_id: str,body: DiagramSourcePromoteRequest,request: Request,user=Depends(current_user)):
-    from avatar.files.conversation.diagrams import DiagramCache
-    return await DiagramCache(request.app.state.chat.chat_files).promote_source(user,conversation_id,body.source,body.caption,body.visibility,body.new_name)
-
-
-class AnimationLookupRequest(BaseModel):
-    model_config = ConfigDict(extra='forbid', strict=True)
-    source: str = Field(min_length=1, max_length=MAX_SOURCE_BYTES)
-
-
-class AnimationPromoteRequest(AnimationLookupRequest):
-    caption: str = Field(default='', max_length=2000)
-    visibility: Literal['public', 'private'] = 'private'
-    folder: str = Field(default='', max_length=1024)
-    new_name: str | None = Field(default=None, min_length=1, max_length=200)
-
-
-def animation_body_schema(model):
-    return {'requestBody':{'required':True,'content':{'application/json':{'schema':model.model_json_schema()}}}}
-
-
-def check_animation_session(files,user_id,conversation_id):
-    with files.database.connect() as db:files.session(db,user_id,conversation_id)
-
-
-async def animation_body(request, model):
-    body = bytearray()
-    async for chunk in request.stream():
-        if len(body) + len(chunk) > MAX_ENVELOPE_BYTES:
-            raise HTTPException(413,'动画请求超过大小限制')
-        body.extend(chunk)
-
-    def decode():
-        # Only scalar fields are allowed in this envelope; reject container floods before JSON allocation.
-        if len(body)>1024*1024:
-            position = 0
-            for match in JSON_TOKEN.finditer(body):
-                first = body[match.start()]
-                if first in b' \t\r\n':
-                    continue
-                position += 1
-                if position > 22 or first in b'[]' or (position > 1 and first == ord('{')):
-                    raise HTTPException(422,'动画请求仅接受源码和转存设置')
-        try:
-            return model.model_validate_json(body)
-        except ValidationError:
-            raise HTTPException(422,'动画请求的 JSON 或字段无效') from None
-    return await upload_work(decode)
-
-
-@router.post('/conversations/{conversation_id}/animations/lookup', openapi_extra=animation_body_schema(AnimationLookupRequest))
-async def animation_status(conversation_id: str, request: Request, user=Depends(current_user)):
-    from avatar.files.conversation.animations import lookup_animation
-    files = request.app.state.chat.chat_files
-    async with request.app.state.animation_requests:
-        await asyncio.to_thread(check_animation_session,files,user['id'],conversation_id)
-        body = await animation_body(request, AnimationLookupRequest)
-        return await upload_work(lookup_animation,files,user['id'],conversation_id,body.source)
-
-
-@router.post('/conversations/{conversation_id}/animations/promote', openapi_extra=animation_body_schema(AnimationPromoteRequest))
-async def save_animation(conversation_id: str, request: Request, user=Depends(current_user)):
-    from avatar.files.conversation.animations import promote_animation
-    files = request.app.state.chat.chat_files
-    async with request.app.state.animation_requests:
-        await asyncio.to_thread(check_animation_session,files,user['id'],conversation_id)
-        body = await animation_body(request, AnimationPromoteRequest)
-        return await promote_animation(files,user,conversation_id,**body.model_dump())
+    from avatar.files.conversation.diagrams import save_mermaid
+    return await save_mermaid(request.app.state.chat.chat_files,user,conversation_id,body.source,body.caption,body.visibility,body.new_name)

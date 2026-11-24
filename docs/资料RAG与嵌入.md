@@ -145,7 +145,7 @@ hits, notices = await rag.retrieve(documents, question, plan)
 
 ### 动画资料
 
-`.avanim` 是 UTF-8 JSON，MIME 为 `application/vnd.acps.animation+json`。服务端校验 v1 的节点、边、时间和引用后，将标题、摘要、标签、步骤标题、步骤说明、备注和等价文本送入现有词法与向量索引。坐标、连线 ID 及序列化的 JSON 不参与正文匹配。模型读取到的动画文本沿用资料权限和引用校验，按资料内容处理。
+动画以 HTML 保存。RAG 提取静态文字及资料说明，检索和原件交付沿用通用资料工具。
 
 ## 流程图
 

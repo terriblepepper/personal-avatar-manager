@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ElTooltip } from 'element-plus'
-import { SKILLS_PAUSED, SKILL_PAUSE_NOTICE } from '../skillPolicy'
+import { SKILL_PAUSE_NOTICE } from '../skillPolicy'
 import { computed, defineAsyncComponent, nextTick, onMounted, onUnmounted, provide, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
@@ -72,10 +72,11 @@ const moduleHelp: Record<string,string> = {
 const tabHelp: Record<string,string> = {
   avatar: '查看分身身份、在线状态以及尚未就绪的原因。',
   files: '上传文件，按目录整理资料，检查索引进度，并选择哪些资料可以公开。',
+  skills: SKILL_PAUSE_NOTICE,
   knowledge: '用自己的写作样本和问答构建 Soul，让分身保留你的措辞与表达习惯。',
   chat: '直接向自己的分身提问。需要它参考指定文件时，从资料库引用到本次对话。',
   models: '配置对话模型生成回答，配置嵌入模型用于资料检索。调用费用归对应配置的所有者。',
-  skills: SKILLS_PAUSED ? SKILL_PAUSE_NOTICE : '管理分身可以使用的技能。在对话中引入所需技能后，可以用 $技能名称 调用。',
+
   dialogues: '查看与其他分身的消息，跟进需要确认、补充或结束的独立任务。',
 }
 const guideSteps = computed(() => [
@@ -95,7 +96,7 @@ const guideSteps = computed(() => [
     target: 'help', path: profileScope.value ? '/profile' : '/',
   },
 ])
-const runtimePill = computed(() => (({ demo: 'DEMO · 本地演示', 'acps-direct': 'ACPS · 独立实体模式', 'acps-entity': 'ACPS · 派生实体模式' }) as Record<string, string>)[session.authConfig?.runtime_mode || ''] || '服务已启动')
+const runtimePill = computed(() => (({ demo: 'DEMO · 本地演示', 'acps-direct': 'ACPS · 独立实体模式' }) as Record<string, string>)[session.authConfig?.runtime_mode || ''] || '服务已启动')
 function closeMore(restoreFocus = false) {
   more.value = false
   if (restoreFocus) menuTrigger.value?.focus()
@@ -237,12 +238,12 @@ async function logout() { try { await session.logout() } catch (e) { notifyError
       <main :data-guide-page="route.path" ref="mainContent" class="content" tabindex="-1">
         <div v-if="inHub" class="heading"><div><h1 data-guide-target="hub">我的分身</h1><p class="sub">集中管理分身、资料文件、知识库、模型、技能和任务。</p></div></div>
         <nav v-if="inHub" class="avatar-tabs" aria-label="我的分身功能">
-          <ElTooltip v-for="[key, label] in hubTabs" :key="key" :disabled="!SKILLS_PAUSED || key !== 'skills'"
+          <ElTooltip v-for="[key, label] in hubTabs" :key="key" :disabled="key !== 'skills'"
             :content="SKILL_PAUSE_NOTICE" :trigger="['hover', 'focus']" placement="bottom">
             <button :data-hub="key" type="button"
-              :class="{ active: route.path === '/' + key, 'paused-skill-tab': SKILLS_PAUSED && key === 'skills' }"
+              :class="{ active: route.path === '/' + key, 'paused-skill-tab': key === 'skills' }"
               :aria-current="route.path === '/' + key ? 'page' : undefined"
-              :aria-description="SKILLS_PAUSED && key === 'skills' ? SKILL_PAUSE_NOTICE : undefined"
+              :aria-description="key === 'skills' ? SKILL_PAUSE_NOTICE : undefined"
               @click="go('/' + key)">{{ label }}</button>
           </ElTooltip>
         </nav>

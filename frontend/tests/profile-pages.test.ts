@@ -32,13 +32,14 @@ describe('migrated settings contracts', () => {
     const call=request.mock.calls.find(c=>c[0]==='/me/model-settings' && c[1]==='PUT')
     expect(call?.[2]).toMatchObject({updated_at:'version-1',model_config_input:{api_key:null}})
   })
-  it('toggles only the selected skill using the existing endpoint', async () => {
-    const item={id:'id-1',name:'test',description:'desc',enabled:true,updated_at:'now',manifest:[]}
-    request.mockResolvedValueOnce([item]).mockResolvedValueOnce({items:[{...item,enabled:false}]})
-    const wrapper=mount(SkillsView,{global:{mocks:{$router:{push:vi.fn()}}}});await flushPromises()
-    const button=wrapper.findAll('button').find(b=>b.text()==='停用');expect(button).toBeTruthy()
-    await button!.trigger('click');await flushPromises()
-    expect(request).toHaveBeenCalledWith('/me/skills/id-1','PATCH',{enabled:false})
+
+  it('shows installed skills in read-only mode', async () => {
+    request.mockResolvedValueOnce([{id:'id-1',name:'test',description:'desc',updated_at:'now',manifest:[]}])
+    const wrapper=mount(SkillsView); await flushPromises()
+    expect(wrapper.text()).toContain('暂停使用')
+    expect(wrapper.get('.skill-item').text()).toContain('test')
+    expect(wrapper.find('.skill-item button').exists()).toBe(false)
+    expect(request).toHaveBeenCalledExactlyOnceWith('/me/skills')
   })
 })
 

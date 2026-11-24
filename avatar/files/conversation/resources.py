@@ -8,11 +8,10 @@ import uuid
 from fastapi import HTTPException
 from avatar.core.db import now
 from avatar.files.library.attachments import TYPES, chat_file_limit
-from avatar.files.parsing.animation import MAX_SOURCE_BYTES
+from avatar.files.artifact_limits import MAX_SOURCE_BYTES
 from avatar.files.uploads.buffer import upload_buffer, upload_work
 
-OUTPUT_TYPES={suffix: mime for suffix, mime in TYPES.items() if suffix != '.avanim'}
-OUTPUT_TYPES['.zip'] = 'application/zip'
+OUTPUT_TYPES = {**TYPES, '.zip': 'application/zip'}
 
 
 def original_hashes(path, size, destination=None):
@@ -102,8 +101,7 @@ class ConversationResources:
                 raise HTTPException(409,'源文件校验失败，请重新保存资料文件')
             return await self.upload(user,conversation_id,row['filename'],data,origin='reference',
                 description=row['caption'][:2000],source_label='个人资料文件',temporary=temporary,
-                html_mode=json.loads(row['animation_metadata']).get('html_mode'),
-                source_animation_id=row['id'] if row['animation_digest'] and not temporary else None)
+                html_mode=json.loads(row['animation_metadata']).get('html_mode'))
 
     # 职责：与成功回答共用事务保存生成文件；提交失败或取消时删除本次原件和预览。
     # 结果与约束：生成文件保留单轮处理边界，原上传文件不被覆盖。

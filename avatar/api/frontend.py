@@ -5,7 +5,7 @@ from fastapi import HTTPException
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-PAGES = {'', 'overview', 'avatar', 'profile', 'files', 'knowledge', 'models', 'skills',
+PAGES = {'', 'avatar', 'profile', 'files', 'knowledge', 'models', 'skills',
          'dialogues', 'chat', 'messages', 'history', 'account', 'platform-entry',
          'admin'}
 

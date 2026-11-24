@@ -1,10 +1,8 @@
 /** Unique request identifier; falls back when crypto.randomUUID is unavailable (plain HTTP). */
 export function requestId(): string {
   const source = globalThis.crypto
-  if (typeof source?.randomUUID === 'function') return source.randomUUID()
-  const bytes = new Uint8Array(16)
-  if (typeof source?.getRandomValues === 'function') source.getRandomValues(bytes)
-  else for (let index = 0; index < bytes.length; index += 1) bytes[index] = Math.floor(Math.random() * 256)
+  if (typeof source.randomUUID === 'function') return source.randomUUID()
+  const bytes = source.getRandomValues(new Uint8Array(16))
   bytes[6] = (bytes[6] & 0x0f) | 0x40
   bytes[8] = (bytes[8] & 0x3f) | 0x80
   const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')

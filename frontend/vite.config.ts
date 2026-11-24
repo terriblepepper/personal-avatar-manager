@@ -4,7 +4,7 @@ import { pages } from './src/router/pages'
 import vue from '@vitejs/plugin-vue'
 import tailwindcss from '@tailwindcss/vite'
 
-const consolePaths = new Set(['/', '/overview', '/avatar', '/platform-entry', '/admin', ...pages.map(page => '/' + page)])
+const consolePaths = new Set(['/', '/avatar', '/platform-entry', '/admin', ...pages.map(page => '/' + page)])
 const consoleHistory: Connect.NextHandleFunction = (request, _response, next) => {
   const url = new URL(request.url || '/', 'http://localhost')
   const path = url.pathname.replace(/\/+$/, '') || '/'

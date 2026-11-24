@@ -162,6 +162,7 @@ def test_legacy_snapshot_migration_is_idempotent_and_unlocks(legacy_sqlite,postg
     import sqlite3
     from avatar.conversation.jobs.store import GenerationStore
     from avatar.core.db import Database
+    from avatar.core.migrations.chat_generations import restore_legacy_generations
     from scripts.migrate_sqlite_to_postgres import migrate
 
     snapshot='invalid JSON' if corrupt else json.dumps({'request_id':'legacy','done':False,'stage':'accepted','error':''})
@@ -186,6 +187,9 @@ def test_legacy_snapshot_migration_is_idempotent_and_unlocks(legacy_sqlite,postg
             db.execute("UPDATE chat_conversations SET lease_until=1000 WHERE id='chat'")
         database.initialize()
         store = GenerationStore(database)
+        assert store.latest('old','chat') is None
+        with database.connect(write=True) as db:
+            restore_legacy_generations(db)
         assert store.latest('old','chat')['state'] == expected
         with database.connect(write=True) as db:
             assert db.execute("SELECT lease_until FROM chat_conversations WHERE id='chat'").fetchone()[0] == 0
@@ -1055,6 +1059,10 @@ def test_chat_generation_survives_refresh_and_bounded_queue(context,disconnect):
             assert 'queued' in await anext(iterator)
             if disconnect:await iterator.aclose()
             resume.set()
+            if not disconnect:
+                async with asyncio.timeout(5):
+                    tail = [chunk async for chunk in iterator]
+                assert any(chunk.startswith('event: done') for chunk in tail)
             for _ in range(100):
                 saved=runner.store.get(actor['id'],'refresh')
                 if saved['done']:break
@@ -1090,7 +1098,7 @@ def test_model_direct_first_fallback_never_replays_submitted_requests():
     asyncio.run(check())
 
 
-def test_unified_html_and_legacy_animation_setting(context):
+def test_unified_html_and_animation_setting(context):
     app,user,_=context
     created=user.post('/api/conversations',json={'channel':'assistant','title':'drawing-default'})
     assert created.status_code==201,created.text
@@ -1143,7 +1151,7 @@ def test_chat_accepted_job_finishes_without_any_browser_connection(context):
             await asyncio.sleep(.1)
             gate.set()
             for _ in range(30):
-                with app.state.database.connect() as db:row=db.execute('SELECT snapshot FROM chat_pending WHERE conversation_id=?',(cid,)).fetchone()
+                with app.state.database.connect() as db:row=db.execute('SELECT snapshot FROM chat_generation_jobs WHERE conversation_id=? AND request_id=?',(cid,'offline-job')).fetchone()
                 saved=json.loads(row['snapshot'])
                 if saved.get('done'):break
                 await asyncio.sleep(.05)

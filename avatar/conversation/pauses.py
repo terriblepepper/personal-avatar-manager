@@ -1,6 +1,4 @@
 """Durable browser-agent checkpoints scoped to the authenticated parent conversation."""
-import hashlib
-import re
 import json
 import time
 import uuid
@@ -44,8 +42,8 @@ def merged_work(request, task):
 
 
 _PUBLIC_ACTIONS = frozenset("""deliver_material find_material select_materials send_material search_materials
-    read_material find_public_material send_public_material find_animation send_animation create_html
-    create_animation list_avatars contact_avatar find_conversation_files read_session_file continue_answer require_conversation_tool
+    read_material find_public_material send_public_material create_html
+    list_avatars contact_avatar read_session_file continue_answer require_conversation_tool
     python ask_user get_current_time wait_for_user end_task send_message""".split())
 
 
@@ -79,59 +77,16 @@ def public_event(event):
     return public
 
 
-def numeric_receipts(db,user_id,parent_id,task):
-    # Older pauses kept successful stdout in the job snapshot, but only action hashes in the checkpoint.
-    signatures=set(task['checkpoint'].get('sandbox_actions',[]))
-    if not signatures:return []
-    receipts={}
-    rows=db.execute("""SELECT snapshot FROM chat_generation_jobs WHERE user_id=? AND conversation_id=?
-        AND state='awaiting_input' AND json_extract(snapshot,'$.agent_pause_id')=? ORDER BY created_at""",
-        (user_id,parent_id,task['snapshot']['agent_pause_id']))
-    for row in rows:
-        for event in json.loads(row['snapshot']).get('tool_events',[]):
-            args=event.get('input') or {};output=event.get('output') or {}
-            if not isinstance(args,dict) or not isinstance(output,dict):continue
-            if not args.get('code') or args.get('input_ids') or args.get('https_inputs') or output.get('outputs'):continue
-            value=output.get('stdout','')
-            if isinstance(value,str):value=value.strip()
-            if output.get('status')!='success' or not isinstance(value,str) or not re.fullmatch(r'[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?',value[:2049]) or len(value)>2048:continue
-            action=[['python',args['code']],args.get('args',[]),[]]
-            token=hashlib.sha256(json.dumps(action,sort_keys=True,separators=(',',':')).encode()).hexdigest()
-            if token in signatures:receipts[token]={'_sandbox_action':token,'name':'Python 沙箱','status':'success','stdout':value}
-    return list(receipts.values())
-
-
-def legacy_work(db,user_id,parent_id,task):
-    rows=db.execute("""SELECT payload FROM chat_generation_jobs WHERE user_id=? AND conversation_id=?
-        AND state='awaiting_input' AND json_extract(snapshot,'$.agent_pause_id')=?
-        ORDER BY created_at,rowid""",(user_id,parent_id,task['snapshot']['agent_pause_id']))
-    requests=[json.loads(row['payload']) for row in rows]
-    if requests and not requests[0].get('agent_control') and requests[0].get('message')==task.get('goal',task['objective']):
-        objective=requests[0]['message']
-        for item in requests[1:]:
-            if item.get('agent_control')=='continue' and item.get('message','').strip():
-                objective+='\n\n用户补充：'+item['message'].strip()
-        task={**task,'objective':objective}
-    selected=dict.fromkeys([*task.get('attachment_ids',()),*(i for item in requests for i in item.get('attachment_ids',()))])
-    allowed={row['id'] for row in db.execute("""SELECT id FROM chat_files WHERE user_id=? AND conversation_id=?
-        AND referenced=1 AND origin!='attachment' AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))""",
-        (user_id,parent_id))}
-    # v1 never recorded source versions; only independently verified numeric receipts are reusable.
-    return {**task,'outputs':[],'activity':[],'answer_route':None,'attachment_ids':[i for i in selected if i in allowed]}
-
-
 def continue_task(chat, user, request, parent, task):
     with chat.service.database.connect() as db:
         target = db.execute("""SELECT a.* FROM avatar_records a JOIN users u ON u.id=a.user_id
             WHERE a.aic=? AND a.user_id=? AND u.account_status='active'""",(task['aic'],task['owner'])).fetchone()
         session = db.execute("""SELECT * FROM chat_conversations WHERE id=? AND user_id=?
             AND (id=? OR parent_id=?)""",(task['session_id'],user['id'],parent['id'],parent['id'])).fetchone()
-        if task.get('sources'):
-            from avatar.conversation.loop.personal import validate_sources_in
-            validate_sources_in(db,user['id'],parent['id'],task,task['sources'])
-        else:
-            task=legacy_work(db,user['id'],parent['id'],task)
-        receipts=numeric_receipts(db,user['id'],parent['id'],task)
+        if not task.get('sources'):
+            raise HTTPException(409,'原任务缺少可核验的来源，请结束任务后重新提交')
+        from avatar.conversation.loop.personal import validate_sources_in
+        validate_sources_in(db,user['id'],parent['id'],task,task['sources'])
         artifacts = available_outputs(chat,db,user['id'],parent['id'],task['outputs'])
     if not target or not session:raise HTTPException(409,'原分身或会话已变更，无法继续此任务')
     if {item['id'] for item in artifacts} != set(task['outputs']):
@@ -146,7 +101,7 @@ def continue_task(chat, user, request, parent, task):
         cfg={**cfg,'_answered_question':{**question,'answer':request.message.strip()}}
     if (request.agent_control=='retry' or not request.message.strip()) and task.get('answer_route'):
         cfg={**cfg,'_answer_route':task['answer_route']}
-    if task.get('sources') and task['snapshot'].get('reply'):
+    if task['snapshot'].get('reply'):
         prefix,raw=system.split('\n',1)
         background=json.loads(raw)
         background['last_clarification']=task['snapshot']['reply']
@@ -155,8 +110,7 @@ def continue_task(chat, user, request, parent, task):
     evidence = memory_evidence(task.get('activity', []))
     if evidence:
         history = [*history, {'role':'assistant','content':evidence}]
-    context=({**cfg,'_resume_history':history,'_agent_checkpoint':task['checkpoint'],'_agent_saved_files':artifacts,'_agent_persisted_file_ids':task['outputs'],'_sandbox_receipts':receipts,
-              '_resume_results_only':bool(receipts) and (request.agent_control=='retry' or not request.message.strip())},key,system,history)
+    context=({**cfg,'_resume_history':history,'_agent_checkpoint':task['checkpoint'],'_agent_saved_files':artifacts,'_agent_persisted_file_ids':task['outputs']},key,system,history)
     return overview,context,dict(session),work
 
 

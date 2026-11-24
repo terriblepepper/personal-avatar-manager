@@ -9,7 +9,7 @@ interface Overview { agent: Agent | null }
 const router = useRouter(), data = ref<Overview | null>(null)
 const agent = computed(() => data.value?.agent || null)
 const personType = computed(() => (({ student: '学生分身', teacher: '教师分身' }) as Record<string, string>)[agent.value?.profile?.person_type || 'student'] || '未设置')
-const registrationMode = computed(() => (({ 'acps-direct': 'ACPS 独立实体', 'acps-entity': 'ACPS 本体派生实体', demo: '本地 demo（模拟 AIC 与证书）' }) as Record<string, string>)[agent.value?.certificate?.mode || ''] || '注册方式待确认')
+const registrationMode = computed(() => (({ 'acps-direct': 'ACPS 独立实体', demo: '本地 demo（模拟 AIC 与证书）' }) as Record<string, string>)[agent.value?.certificate?.mode || ''] || '注册方式待确认')
 async function load() { try { data.value = await request<Overview>('/me') } catch (e) { notifyError(e) } }
 async function downloadACS() { try { const value = await request<{ document: unknown }>('/me/acs?source=approved'); const url = URL.createObjectURL(new Blob([JSON.stringify(value.document, null, 2)], { type: 'application/json' })); const link = document.createElement('a'); link.href = url; link.download = 'avatar-acs.json'; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000) } catch (e) { notifyError(e) } }
 onMounted(load)

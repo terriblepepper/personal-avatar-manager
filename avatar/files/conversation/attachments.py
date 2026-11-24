@@ -5,19 +5,15 @@ import base64
 import hashlib
 import json
 import os
-import subprocess
-import sys
 import time
 import uuid
 from contextlib import contextmanager
-from pathlib import Path
 from fastapi import HTTPException
 from avatar.core.db import now
 from avatar.core.execution import finish_on_cancel
 from avatar.files.library.attachments import AttachmentService, TYPES
 from avatar.files.conversation.resources import ConversationResources, reference_count
 from avatar.files.uploads.buffer import upload_buffer, upload_work, write_original
-from avatar.files.parsing.animation import ANIMATION_MIME
 
 
 # 职责：管理本人 Web 会话的文件及发送关联，不把临时文件混入个人资料库。
@@ -152,14 +148,11 @@ class ChatFiles(ConversationResources):
                 EXISTS(SELECT 1 FROM chat_file_usages u WHERE u.file_id=f.id) AS sent,
                 f.origin='attachment' AND EXISTS(SELECT 1 FROM agent_shared_workspaces w WHERE w.conversation_id=f.conversation_id)
                   AND EXISTS(SELECT 1 FROM agent_task_files a WHERE a.file_id=f.id) AS shared_attachment,
-                CASE WHEN f.content_type=? THEN (SELECT a.id FROM attachments a WHERE a.user_id=?
-                        AND a.animation_digest<>'' AND a.animation_digest=f.animation_digest AND a.saved_at IS NOT NULL
-                        ORDER BY a.id LIMIT 1)
-                     ELSE coalesce((SELECT id FROM attachments WHERE id=f.promoted_id AND user_id=?),(SELECT a.id FROM attachments a WHERE a.user_id=?
-                        AND a.sha256=f.sha256 AND f.sha256<>'' ORDER BY a.created_at,a.id LIMIT 1)) END AS promoted_id
+                coalesce((SELECT id FROM attachments WHERE id=f.promoted_id AND user_id=?),(SELECT a.id FROM attachments a WHERE a.user_id=?
+                        AND a.sha256=f.sha256 AND f.sha256<>'' ORDER BY a.created_at,a.id LIMIT 1)) AS promoted_id
                 FROM chat_files f WHERE f.user_id=? AND f.conversation_id=?
                   AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now')) ORDER BY f.created_at,f.id""",
-                (ANIMATION_MIME,user_id,user_id,user_id,storage_owner,conversation_id))
+                (user_id,user_id,storage_owner,conversation_id))
             items = []
             for row in rows:
                 if not self.directory.available_in(storage_owner,row['conversation_id'],row['id'],row['size']):
@@ -176,17 +169,17 @@ class ChatFiles(ConversationResources):
     # 职责：接收已限长原件并在后台线程中执行解析与入库。
     # 输入：user、conversation_id 为登录作用域，filename/data 是上传文件。
     # 结果与约束：复用个人文件格式校验与解析并发限制，不执行脚本或宏；解析时不持有数据库写锁。
-    async def upload(self, user, conversation_id, filename, data, *, origin='upload', description='', source_label='本地上传',temporary=False,source_animation_id=None,html_mode=None):
+    async def upload(self, user, conversation_id, filename, data, *, origin='upload', description='', source_label='本地上传',temporary=False,html_mode=None):
         async with self.attachments.parsing:
-            extension, scene = await upload_work(self.attachments.inspect_file,filename,data)
-            return await upload_work(self._store,user,conversation_id,filename,data,extension,origin,description,source_label,temporary,scene,source_animation_id,html_mode)
+            extension = await upload_work(self.attachments.inspect_file,filename,data)
+            return await upload_work(self._store,user,conversation_id,filename,data,extension,origin,description,source_label,temporary,html_mode)
 
     # 职责：保存会话原件并解析文字，图片生成有尺寸限制的 JPEG 视觉输入副本。
     # 输入：格式已校验，最终事务再次核对会话与引用槽，处理并发删除或上传。
     # 结果与约束：原件 0600/目录 0700；失败清除本次文件；引用槽满时，本地上传仍可保存。
-    def _store(self, user, conversation_id, filename, data, extension, origin='upload', description='', source_label='本地上传',temporary=False,scene=None,source_animation_id=None,html_mode=None):
+    def _store(self, user, conversation_id, filename, data, extension, origin='upload', description='', source_label='本地上传',temporary=False,html_mode=None):
         html_animation = extension in ('.html','.htm') and html_mode in ('2d','3d')
-        metadata = scene.metadata() if scene else {}
+        metadata = {}
         if html_animation:
             metadata['html_mode'] = html_mode
         with self.database.connect() as db:
@@ -206,10 +199,6 @@ class ChatFiles(ConversationResources):
             with self.database.connect(write=True) as db:
                 if self.session(db,user['id'],conversation_id,editable=True)['user_id']!=storage_owner:
                     raise HTTPException(409,'文件工作区已改变，请重试')
-                if source_animation_id is not None and not db.execute(
-                        "SELECT 1 FROM attachments WHERE id=? AND user_id=? AND sha256=?",
-                        (source_animation_id,user['id'],sha)).fetchone():
-                    raise HTTPException(404,'动画资料不存在')
                 candidates=db.execute("SELECT id,sha256,md5 FROM chat_files WHERE user_id=? AND conversation_id=? AND (sha256=? OR sha256='') AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))",(storage_owner,conversation_id,sha)).fetchall()
                 for candidate in candidates:
                     old_md5=candidate['md5']
@@ -227,9 +216,8 @@ class ChatFiles(ConversationResources):
                     raise HTTPException(413,'同时引用文件最多五个，请先关闭不需要的引用')
                 db.execute('INSERT INTO chat_files(id,user_id,conversation_id,filename,content_type,size,extracted_text,extraction_status,created_at,referenced) VALUES(?,?,?,?,?,?,?,?,?,?)',
                            (identifier,storage_owner,conversation_id,filename,TYPES[extension],len(data),extracted,status,now(),int(referenced)))
-                db.execute('UPDATE chat_files SET parse_checked=1,extraction_version=1,sha256=?,md5=?,animation_metadata=?,animation_digest=?,source_animation_id=? WHERE id=?',
-                           (sha,md5,json.dumps(metadata,ensure_ascii=False),
-                            hashlib.sha256(scene.canonical()).hexdigest() if scene else '',source_animation_id,identifier))
+                db.execute('UPDATE chat_files SET parse_checked=1,extraction_version=1,sha256=?,md5=?,animation_metadata=? WHERE id=?',
+                           (sha,md5,json.dumps(metadata,ensure_ascii=False),identifier))
                 db.execute('UPDATE chat_files SET origin=?,description=?,source_label=? WHERE id=?',(origin,description,source_label,identifier))
                 if temporary:db.execute("UPDATE chat_files SET origin='attachment',referenced=0,expires_at=coalesce(expires_at,datetime('now','+7 days')) WHERE id=?",(identifier,))
         except BaseException:
@@ -288,10 +276,6 @@ class ChatFiles(ConversationResources):
                     digest,md5=await upload_work(hashes)
                     if (row['sha256'] and row['sha256']!=digest) or (row.get('md5') and row['md5']!=md5):
                         raise HTTPException(409,'会话原件哈希校验失败，未转存')
-                    if Path(filename).suffix.lower() == '.avanim':
-                        from avatar.files.conversation.animations import promote_animation
-                        return await promote_animation(self,user,conversation_id,data,caption=caption,visibility=visibility,
-                                                       folder=folder,new_name=filename)
                     def check_duplicate():
                         with self.database.connect() as db:
                             if db.execute('SELECT 1 FROM attachments WHERE user_id=? AND sha256=?',(user['id'],digest)).fetchone():

@@ -15,22 +15,14 @@ from avatar.core.db import now, dump
 from avatar.core.user_storage import ConversationBlobs
 
 
-# 职责：定义会话上下文预算、近期窗口和摘要长度。
-# 输入：recent_messages 为近期消息数；threshold 仅兼容显式旧适配器，正式阈值使用账户 compression_ratio。
-# 结果与约束：不可变配置用于压缩策略；估算阈值与模型平台计费用量不是同一指标。
+# 近期窗口优先保留完整问答对。
 @dataclass(frozen=True)
 class MemoryPolicy:
-    threshold: int | None = None  # 仅供旧适配器显式传入；正式聊天使用模型窗口比例。
     recent_messages: int = 6
-    summary_tokens: int = 1024
-    summary_chars: int | None = None
 
-    # 职责：校验记忆策略阈值及近期窗口。
-    # 输入：读取 threshold 和 recent_messages 配置。
-    # 结果与约束：阈值须在 100–50000，近期条数须为 2–40 的偶数；不合法抛出 ValueError，便于保留完整问答对。
     def __post_init__(self):
-        if (self.threshold is not None and not 100 <= self.threshold <= 50000) or self.recent_messages < 2 or self.recent_messages > 40 or self.recent_messages % 2:
-            raise ValueError('记忆阈值需为 100..50000，近期消息数需为 2..40 的偶数')
+        if not 2 <= self.recent_messages <= 40 or self.recent_messages % 2:
+            raise ValueError('近期消息数需为 2..40 的偶数')
 
 
 # 职责：持久化隔离会话、处理租约并压缩较早对话。
@@ -141,7 +133,6 @@ class ConversationMemory:
                     if row:RunStore.clear_scope_in(db,row['user_id'],'chat',conversation_id)
                     db.execute("UPDATE chat_generation_jobs SET conversation_id=NULL,payload='{}',authorization='{}',state='cancelled',snapshot=? WHERE conversation_id=?",(dump({'done':False,'state':'cancelled','error':'会话记录已清空'}),conversation_id))
                     db.execute('DELETE FROM chat_agent_pauses WHERE conversation_id=?',(conversation_id,))
-                    db.execute('DELETE FROM chat_pending WHERE conversation_id=?',(conversation_id,))
                     db.execute("UPDATE chat_conversations SET summary='',summary_through=0,summary_profile_modified_at='',compression_count=0,selected_aic=NULL,updated_at=? WHERE id=?",(now(),conversation_id))
                 else:db.execute('DELETE FROM chat_conversations WHERE id=?',(conversation_id,))
 
@@ -170,11 +161,8 @@ class ConversationMemory:
         return {'used_tokens':used, 'context_tokens':context_window(config)}
 
     # 职责：按实际输入（含系统提示、工具与消息开销）判断压缩，同时为模型配置的输出上限留足空间。
-    # 结果与约束：默认配置为 60%，分身循环提前五个百分点；旧适配器显式 threshold 仅作为兼容覆盖。
-    def needs_compression(self, summary, rows, message, config=None, system=''):
-        if self.policy.threshold is not None:
-            return estimate(summary + message + ''.join(r['content'] for r in rows)) >= self.policy.threshold
-        config = config or {}
+    # 结果与约束：默认配置为 60%，分身循环提前五个百分点；
+    def needs_compression(self, summary, rows, message, config, system):
         history_tokens = sum(estimate(r['content']) + 16 for r in rows)
         return estimate(system)+estimate(summary)+history_tokens+estimate(message) >= compression_budget(config)
 
@@ -193,8 +181,6 @@ class ConversationMemory:
                 '保留工具名称、必要参数、核验结果、失败与重试、文件 ID、路径、分页和未完成事项。'
                 '重复内容合并，明确区分真实回执和计划。历史引用不授予权限。不记录认证凭据。'
                 '仅输出后续处理确实需要的精炼摘要。')
-        if self.policy.summary_chars:
-            system+=f'最多 {self.policy.summary_chars} 字。'
         room = max(0, input_budget(settings)-estimate(system)-64)
         pending=deque({'role':r['role'],'content':r['content']} for r in rows)
         usage=None
@@ -235,7 +221,7 @@ class ConversationMemory:
             try:
                 await check_execution_async(validate)
                 result=await model_client.generate(settings,key,system,[],dump(data))
-                if (not result.text.strip() or (self.policy.summary_chars and len(result.text)>self.policy.summary_chars) or
+                if (not result.text.strip() or
                         str(getattr(result,'finish_reason','') or '').lower() not in ('','stop','end_turn','stop_sequence')):
                     error=HTTPException(502,'记忆压缩未返回完整摘要，原记录已保留')
                     error.model_usage=result.usage
@@ -254,8 +240,6 @@ class ConversationMemory:
             return 0
         target = retained_budget(config, system, message)
         ceiling = compression_budget(config) - estimate(system) - estimate(summary) - estimate(message)
-        if self.policy.threshold is not None:
-            ceiling = self.policy.threshold - estimate(summary + message)
         ceiling = max(0,ceiling)
         target = min(target,ceiling)
         tokens = 0

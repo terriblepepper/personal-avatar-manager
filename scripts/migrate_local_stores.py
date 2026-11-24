@@ -26,10 +26,13 @@ if __package__ in ('', None):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from avatar.core.config import require_database_url
-from avatar.core.postgres import Connection, SCHEMA_LOCK, lock_schema_transaction
+from avatar.core.db import dump
+from avatar.core.postgres import Connection, SCHEMA_LOCK, WRITE_LOCK, lock_schema_transaction
 from avatar.knowledge import everos_storage as storage
 from avatar.protocols.tasks.store import import_system_tasks, initialize_system_tasks
 from avatar.rag.stores.postgres import install_vector_schema
+from avatar.rag.stores.lexical import LexicalStore
+from avatar.rag.invalidation import signature
 
 
 def _manifest(root):
@@ -372,6 +375,70 @@ def sources(root, owners):
     return [(kind,uid,path) for (kind,uid),path in found.items()]
 
 
+def legacy_signature(embedding,model):
+    fields=('provider','base_url','model','dimensions','context_tokens','context_enabled','multimodal_enabled')
+    # The historical parser signature keeps previously published embeddings valid.
+    return hashlib.sha256(dump(['unstructured-chroma-document-images-v2',{key:embedding.get(key) for key in fields},
+        {key:model.get(key) for key in ('provider','base_url','model','vision_enabled','audio_enabled')}]).encode()).hexdigest()
+
+
+def migrate_postgres_publications(connection):
+    """Convert stored manifests and signatures in the caller's offline transaction."""
+    lock_schema_transaction(connection, SCHEMA_LOCK)
+    lock_schema_transaction(connection, WRITE_LOCK)
+    from avatar.models.embedding import EmbeddingSettings
+    from avatar.models.model_settings import ModelSettingsService
+
+    db = Connection(connection, {})
+    documents = db.execute("""SELECT * FROM file_rag_documents
+        WHERE legacy_backfill=1 OR (active_publication='' AND collection<>'') FOR UPDATE""").fetchall()
+    count = lexical_count = 0
+    for doc in documents:
+        owner, source, file_id, collection = (doc[k] for k in ('user_id','source','file_id','collection'))
+        ids = [row[0] for row in db.execute("""SELECT record_id FROM file_rag_nodes WHERE user_id=?
+            AND source=? AND file_id=? AND collection=? ORDER BY ordinal""", (owner,source,file_id,collection))]
+        if not ids:
+            raise ValueError('Legacy publication has no vector references')
+        rows = {row['record_id']:row for row in db.execute("""SELECT record_id,document,metadata
+            FROM rag_vector_records WHERE user_id=? AND collection=? AND record_id=ANY(?::text[])""", (owner,collection,ids))}
+        if set(rows) != set(ids):
+            raise ValueError('Legacy publication has missing vectors')
+        publication = doc['active_publication']
+        if publication:
+            current = db.execute("""SELECT record_ids,manifest FROM rag_publications WHERE id=?
+                AND user_id=? AND source=? AND file_id=? AND collection=?""",
+                (publication,owner,source,file_id,collection)).fetchone()
+            if not current or json.loads(current['record_ids']) != ids:
+                raise ValueError('Legacy publication ownership or vector references differ')
+            manifest = json.loads(current['manifest'])
+            manifest.pop('legacy',None)
+            db.execute('UPDATE rag_publications SET lexical_ready=1,legacy=0,manifest=? WHERE id=?',
+                       (dump(manifest),publication))
+        else:
+            publication = uuid.uuid4().hex
+            manifest = dict(expected_chunks=len(ids), processed_chunks=len(ids), expected_pages=None,
+                            processed_pages=None, expected_images=None, processed_images=None, complete=None)
+            db.execute("""INSERT INTO rag_publications
+                (id,user_id,source,file_id,revision,signature,collection,coverage,record_ids,manifest,lexical_ready,legacy,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,1,0,?)""",
+                (publication,owner,source,file_id,doc['revision'],doc['signature'],collection,doc['coverage'],
+                 dump(ids),dump(manifest),doc['updated_at']))
+        LexicalStore.stage_in(db,owner,collection,(ids,[rows[key]['metadata'] for key in ids],[rows[key]['document'] for key in ids]))
+        db.execute('UPDATE file_rag_documents SET active_publication=?,legacy_backfill=0 WHERE source=? AND file_id=? AND user_id=?',
+                   (publication,source,file_id,owner))
+        count += 1
+        lexical_count += len(ids)
+    signatures = 0
+    for (owner,) in connection.execute("SELECT DISTINCT user_id FROM file_rag_documents WHERE signature<>''"):
+        embedding = EmbeddingSettings.current(db,owner)
+        model = ModelSettingsService.current(db,owner)
+        old, new = legacy_signature(embedding,model), signature(embedding,model)
+        signatures += db.execute("UPDATE file_rag_documents SET signature=? WHERE user_id=? AND signature=?",
+                                 (new,owner,old)).rowcount
+        db.execute('UPDATE rag_publications SET signature=? WHERE user_id=? AND signature=?',(new,owner,old))
+    return {'publications':count,'lexical_records':lexical_count,'signatures':signatures}
+
+
 def verify_publications(conn):
     rows = conn.execute("""SELECT d.user_id,d.collection,d.source,d.file_id,p.user_id,p.collection,
                p.source,p.file_id,p.record_ids FROM file_rag_documents d
@@ -420,15 +487,34 @@ def migrate(root, url):
                 for key,value in import_everos_snapshot(db,uid,path).items():
                     if isinstance(value,int):
                         report['everos'][key] = report['everos'].get(key,0)+value
+        report['publications'] = migrate_postgres_publications(db)
         report['active_publication_references'] = verify_publications(db)
     return report
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--snapshot',type=Path,required=True,help='冻结数据目录的私有副本')
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--snapshot',type=Path,help='冻结数据目录的私有副本')
+    mode.add_argument('--postgres-only',action='store_true',help='离线转换已导入 PostgreSQL 的资料索引')
+    mode.add_argument('--storage-layout',action='store_true',help='离线迁移原件及身份目录')
     args = parser.parse_args()
     live = Path(os.getenv('AVATAR_DATA_DIR',Path(__file__).resolve().parents[1]/'data')).resolve()
+    if args.storage_layout:
+        from avatar.core.db import Database
+        from avatar.core.user_storage import migrate_user_storage
+        with Database.open_existing(live, os.getenv('DATABASE_URL','')) as database:
+            migrate_user_storage(database)
+        print('文件目录迁移已完成')
+        return
+    if args.postgres_only:
+        from avatar.core.migrations.chat_generations import restore_legacy_generations
+        with psycopg.connect(require_database_url(os.getenv('DATABASE_URL',''))) as db:
+            report = migrate_postgres_publications(db)
+            restore_legacy_generations(Connection(db, {}))
+            report['active_publication_references'] = verify_publications(db)
+        print(json.dumps(report))
+        return
     if args.snapshot.resolve() == live:
         parser.error('请先制作离线快照，将 --snapshot 指向副本')
     print(json.dumps(migrate(args.snapshot,os.getenv('DATABASE_URL','')),ensure_ascii=False))

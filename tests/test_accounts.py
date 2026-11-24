@@ -132,7 +132,7 @@ def test_root_promotes_and_promoted_admin_delegates(context):
     assert role(user, tid, 'admin').status_code == 403
     assert role(root, uid, 'admin').status_code == 200
     assert identity(user)['role'] == 'admin' and (not identity(user)['is_root'])
-    assert user.get('/api/admin/dashboard').status_code == 200
+    assert user.get('/api/admin/overview').status_code == 200
     assert role(user, tid, 'admin').status_code == 200
     assert identity(third)['role'] == 'admin'
     accounts = root.get('/api/admin/accounts').json()['items']
@@ -159,19 +159,34 @@ def test_demotion_immediate_for_all_sessions_preserves_avatar(context):
     app, user, root = context
     approve(root, submit(user))
     asyncio.run(app.state.worker.once())
-    assert user.post('/api/chat', json={'channel': 'avatar', 'message': '你好'}).status_code == 200
-    before = user.get('/api/me').json()
+    session = user.post('/api/conversations', json={'channel': 'avatar'}).json()
+    body = {'channel': 'avatar', 'conversation_id': session['id'], 'request_id': 'before-demotion', 'message': '你好'}
     uid = identity(user)['id']
+    with app.state.database.connect(write=True) as db:
+        db.execute('DELETE FROM embedding_settings WHERE user_id=?', (uid,))
+    assert user.post('/api/chat/generations', json=body).status_code == 202
+
+    async def answer():
+        runner = app.state.generations
+        jobs = await runner.claim(1)
+        assert len(jobs) == 1
+        await runner.execute(jobs[0])
+
+    asyncio.run(answer())
+    assert user.get('/api/chat/generations/before-demotion').json()['state'] == 'succeeded'
+    before = user.get('/api/me').json()
     second = TestClient(app)
     login(second, 'tester', 'testpassword123')
     role(root, uid, 'admin')
     stale_actor = identity(second)
     assert role(user, uid, 'user').status_code == 200
-    assert second.get('/api/admin/dashboard').status_code == 403
+    assert second.get('/api/admin/overview').status_code == 403
     assert identity(second)['role'] == 'user' and second.get('/api/me').status_code == 200
     after = user.get('/api/me').json()
     assert before['agent'] == after['agent'] and before['profile'] == after['profile']
-    assert len(user.get('/api/chat?channel=avatar').json()) == 2
+    history = user.get('/api/chat', params={'channel':'avatar','conversation_id':session['id']})
+    assert history.status_code == 200
+    assert len(history.json()) == 2
     with pytest.raises(HTTPException) as exc:
         AccountManagement(app.state.database).set_role(stale_actor, identity(root)['id'], 'admin')
     assert exc.value.status_code == 403
@@ -179,15 +194,13 @@ def test_demotion_immediate_for_all_sessions_preserves_avatar(context):
         actions = [r[0] for r in db.execute('SELECT action FROM audit_events WHERE user_id=?', (uid,))]
     assert '授予管理员权限' in actions and '管理员自主降级' in actions
 
-def test_pending_teacher_cannot_gain_admin_without_review(context):
+def test_teacher_can_gain_admin_without_review(context):
     app, _, root = context
     teacher = register(app, 'teacher_role', teacher=True)
     uid = identity(teacher)['id']
-    assert role(root, uid, 'admin').status_code == 409
-    assert root.post('/api/admin/accounts/' + uid + '/review', json={'approve': True}).status_code == 200
     assert role(root, uid, 'admin').status_code == 200
     assert identity(teacher)['person_type'] == 'teacher'
-    assert any((u['id'] == uid for u in root.get('/api/admin/dashboard').json()['registrations']))
+    assert any((u['id'] == uid for u in root.get('/api/admin/accounts').json()['items']))
 
 def test_role_changes_csrf_schema_and_account_search(context):
     _, user, root = context
@@ -205,7 +218,8 @@ def test_role_changes_csrf_schema_and_account_search(context):
 
 def test_root_and_cli_admin_can_manage_personal_profiles(context):
     app, _, root = context
-    body = {'profile': {**PROFILE, 'student_id': 'ROOT-PERSONAL'}, 'last_modified_at': modified_at(root), 'model_config_input': MODEL}
+    assert root.put('/api/me/model-settings', json={'model_config_input': MODEL}).status_code == 200
+    body = {'profile': {**PROFILE, 'student_id': 'ROOT-PERSONAL'}, 'last_modified_at': modified_at(root)}
     assert root.put('/api/me/profile', json=body).status_code == 200
     with app.state.database.connect() as db:
         original_root = db.execute('SELECT id FROM users WHERE is_root=1').fetchone()[0]
@@ -482,9 +496,9 @@ def test_admin_page_budgets_and_detail(context, monkeypatch):
         assert response.status_code == 200, response.text
         return response, [s for s in sql if s.lstrip().upper().startswith(('SELECT','WITH'))]
 
-    legacy, baseline = read('dashboard')
+    assert admin.get('/api/admin/dashboard').status_code == 404
     overview, stats = read('overview')
-    assert overview.json() == {'counts': legacy.json()['counts']}
+    assert overview.json()['counts']['agents'] == 12
     settings, config = read('settings')
     assert set(settings.json()) == {'settings','environment','mode'}
     assert 'unrelated' not in settings.json()['settings']
@@ -496,15 +510,15 @@ def test_admin_page_budgets_and_detail(context, monkeypatch):
     assert [item['user_id'] for item in first.json()['items']+page['items']] == [f'owner-{i:02}' for i in range(12)]
     item = page['items'][1]
     assert item['identity_job']['id'] == 'relevant'
-    assert page['entity_port_pool'] == legacy.json()['entity_port_pool']
+    assert page['entity_port_pool'] == first.json()['entity_port_pool']
     assert 'fixture-only-' not in first.text and 'fixture-only-' not in second.text
     assert len(stats) <= 5 and len(queries) <= 9 and len(first.content) < 16000
-    assert len(baseline) > len(queries) and len(legacy.content) > 4*len(first.content)
     detail, _ = read('agents/owner-11/detail')
-    assert detail.json() == next(a for a in legacy.json()['agents'] if a['user_id']=='owner-11')
+    assert detail.json()['user_id'] == item['user_id']
+    assert {key:detail.json()['protocol'][key] for key in item['protocol']} == item['protocol']
     assert admin.get('/api/admin/agents/missing/detail').status_code == 404
     assert read('agents/operations?search=owner-11')[0].json()['total'] == 1
-    print(f'fixture 12 agents/213 jobs: dashboard {len(baseline)} SQL/{len(legacy.content)} B, '
+    print('fixture 12 agents/213 jobs: '
           f'overview {len(stats)} SQL/{len(overview.content)} B, settings {len(config)} SQL/{len(settings.content)} B, '
           f'operations page {len(queries)} SQL/{len(first.content)} B')
     from dataclasses import replace

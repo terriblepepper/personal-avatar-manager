@@ -1,10 +1,8 @@
 # 模块说明：对话协调：目标路由、公开资料与本人技能上下文、记忆压缩、模型调用及成功回答保存。
-from pathlib import Path
 import asyncio
 from contextlib import aclosing, ExitStack
 import json
 import logging
-import re
 from fastapi import HTTPException
 from avatar.conversation.tools.registry import ConversationTools
 from avatar.models.effort import with_chat_effort
@@ -131,25 +129,6 @@ class AvatarChat:
         for row in result:
             row['intent']=by_intent.get(row['id'])
             row['task_event']=json.loads(row.get('task_event') or '{}')
-        legacy_receipts={'已确认发起任务，请求已进入通信队列。实际送达与失败原因请查看分身会话；尚不能视为已送达。':'negotiation','已确认发送消息，请求已进入通信队列。实际送达与失败原因请查看分身会话；尚不能视为已送达。':'message'}
-        with self.service.database.connect() as db:
-            for row in result:
-                mode=legacy_receipts.get(row['content'])
-                if mode and row['role']=='assistant' and not row['task_event']:
-                    task=db.execute('SELECT id,objective FROM agent_dialogues WHERE user_id=? AND source_conversation_id=? AND delivery_mode=? AND created_at<=? ORDER BY created_at DESC LIMIT 1',(user_id,row['conversation_id'],mode,row['created_at'])).fetchone()
-                    if task:row['task_event']={'kind':'start','task_id':task['id'],'title':task['objective'],'mode':mode,'state':'submitted','reason':'请求已提交，请查看对应会话。'}
-        # 旧完成通知按本方记忆关联投影，不改写历史原文或重新调用模型。
-        if result:
-            with self.service.database.connect() as db:
-                legacy=db.execute('SELECT m.source_message_id,m.task_id,m.content,d.objective,d.end_reason FROM agent_task_memories m JOIN agent_dialogues d ON d.id=m.task_id WHERE m.user_id=? AND m.source_message_id IN ('+','.join('?' for _ in result)+')',(user_id,*[r['id'] for r in result])).fetchall()
-            linked={r['source_message_id']:r for r in legacy}
-            from avatar.conversation.collaboration.dialogues import reply_status
-            for row in result:
-                memory=linked.get(row['id'])
-                if memory and not row['task_event']:
-                    summary=memory['content'].split('本人分身的结论：\n',1)[-1].split('已接收的任务结果：\n',1)[-1]
-                    row['task_event']={'kind':'end','task_id':memory['task_id'],'title':memory['objective'],'state':'ended','reason':memory['end_reason'],'summary':reply_status(summary,0)[0]}
-
         # 提交卡片在原消息内显示当前状态；读取不触发模型或通信动作。
         with self.service.database.connect() as db:
             for row in result:
@@ -474,7 +453,7 @@ class AvatarChat:
             if materials:
                 generated += SavedMaterials(self.service.attachments,user['id']).attach(db,cursor.lastrowid,materials)
             generated += pauses.finish(self,db,user['id'],overview.get('_parent_id',request.conversation_id),request.agent_pause_id,cursor.lastrowid)
-            result={'reply':reply, 'profile_url':'/#profile', 'mode':'model' if model else 'demo', 'usage':usage,'conversation_id':overview.get('_parent_id',request.conversation_id),'target':target,'dialogue_id':overview.get('_dialogue_id'),'intent':overview.get('_intent'),'used_skills':overview.get('_used_skills',[]),'notices':overview.get('_workflow_notices',[]),'generated_files':generated}
+            result={'reply':reply, 'profile_url':'/profile', 'mode':'model' if model else 'demo', 'usage':usage,'conversation_id':overview.get('_parent_id',request.conversation_id),'target':target,'dialogue_id':overview.get('_dialogue_id'),'intent':overview.get('_intent'),'used_skills':overview.get('_used_skills',[]),'notices':overview.get('_workflow_notices',[]),'generated_files':generated}
             pauses.update_waiters(db,user['id'],result['conversation_id'],request.agent_pause_id,'succeeded',result)
             if store:
                 store.clear_in(db,user['id'],'chat',result['conversation_id'],store.run_id)
@@ -548,26 +527,8 @@ class AvatarChat:
         overview['_target']={'aic':own['aic'],'name':own['profile'].get('avatar_name','我的分身')}
         return overview,context,parent,None
 
-    # 职责：完成一次非流式回答并保存结果。
-    # 输入：user 为认证账户，request 含消息、频道及可选会话 ID。
-    # 结果与约束：使用进程锁与数据库租约，构建上下文后调用模型或本地引导；仅成功结果写入，finally 释放租约，返回统一响应。
-    async def reply(self, user, request):
-        result=None
-        async with aclosing(self.stream(user,request)) as source:
-            async for event in source:
-                if event['type'] in ('done','awaiting_input'):
-                    result={key:value for key,value in event.items() if key!='type'}
-                    break
-                if event['type']=='error':raise HTTPException(event.get('code',500),event['message'])
-        if result:
-            if request.personal and not request.agent_control and result.get('state')!='awaiting_input':
-                from avatar.conversation.jobs.titles import generate_title
-                await generate_title(self,user['id'],result['conversation_id'],request.message,result['reply'])
-            return result
-        raise HTTPException(502,'回答未返回最终结果')
-
     # 职责：以异步事件流生成回答、状态和最终保存结果。
-    # 输入：user、request 同完整回答接口；消费者须正确关闭异步生成器。
+    # 输入：user 和 request 为已认证账户与本轮请求；消费者须正确关闭异步生成器。
     # 结果与约束：依次 yield 状态、文本、用量和 done；失败转换为脱敏 error，未完成片段不保存，退出始终释放租约与上游资源。
     async def stream(self, user, request):
         lock = self.locks.setdefault(request.conversation_id or user['id'], asyncio.Lock())

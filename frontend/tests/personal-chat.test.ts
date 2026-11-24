@@ -95,12 +95,15 @@ describe('conversation file selection',()=>{
     expect(wrapper.emitted('selected')?.at(-1)).toEqual([['new']]);expect(wrapper.text()).not.toContain('old.txt')
     wrapper.unmount()
   })
-  it('rejects uploads that exceed five referenced files',async()=>{
-    request.mockResolvedValue(Array.from({length:5},(_,i)=>item(String(i))))
+  it('uploads another original without exceeding five references',async()=>{
+    const referenced=Array.from({length:5},(_,i)=>item(String(i)))
+    request.mockResolvedValueOnce(referenced).mockResolvedValueOnce({items:[...referenced,{...item('new'),referenced:false}],file_id:'new'})
     const wrapper=mount(ChatFilesManager,{props:{conversationId:'a',busy:false}});await flushPromises()
     const input=wrapper.get<HTMLInputElement>('input[type=file]');Object.defineProperty(input.element,'files',{configurable:true,value:[new File(['a'],'new.txt')]})
     await input.trigger('change');await flushPromises()
-    expect(request.mock.calls.filter(call=>call[1]==='POST')).toHaveLength(0);expect(wrapper.text()).toContain('最多同时引用五份')
+    expect(request.mock.calls.filter(call=>call[1]==='POST')).toHaveLength(1)
+    expect(wrapper.emitted('selected')?.at(-1)).toEqual([referenced.map(file=>file.id)])
+    expect(wrapper.text()).toContain('new.txt')
     wrapper.unmount()
   })
 })

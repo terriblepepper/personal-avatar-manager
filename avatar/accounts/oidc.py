@@ -116,7 +116,7 @@ class OidcService:
         await asyncio.to_thread(admit)
         configuration = await self.discovery()
         if platform_token:
-            return_to = '/#profile'
+            return_to = '/profile'
             from avatar.accounts.platform_binding import PlatformBindingService
             await asyncio.to_thread(PlatformBindingService(self.database).preview,platform_token)
         def save_state():

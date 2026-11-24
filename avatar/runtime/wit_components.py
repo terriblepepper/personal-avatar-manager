@@ -50,10 +50,8 @@ class ApplicationServices:
     def create(cls, settings: Settings, provider=None, model_client=None):
         database = Database(settings.data_dir, settings.database_url)
         database.dispatch_enabled = bool(settings.redis_socket or settings.kafka_bootstrap)
+        database.initialize()
         try:
-            database.initialize()
-            from avatar.core.user_storage import migrate_user_storage
-            migrate_user_storage(database)
             bootstrap(database, settings.data_dir)
             provider = provider or build_provider(settings.provider, settings)
             vault = SecretVault(settings.data_dir, database)

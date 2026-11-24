@@ -83,18 +83,14 @@ class SkillExecution:
         trace=AgentSteps(progress if agent else None)
         original=config.get('_agent_checkpoint')
         checkpoint=sandbox_checkpoint(original if agent else None)
-        legacy_receipts=config.get('_sandbox_receipts',[])
-        if any(record.get('skill_id') for record in legacy_receipts):
-            require_skills_enabled()
         journal=None
         if store is not None:
             scope=[user_id,caller_id or user_id,conversation_id,parent_id]
-            journal=await run_blocking(SandboxEffects,store,scope,checkpoint,legacy_receipts)
+            journal=await run_blocking(SandboxEffects,store,scope,checkpoint)
         previous=list(checkpoint.get('sandbox_actions',[]))
         if journal and journal.state:
-            previous=list(dict.fromkeys([*previous,*journal.state.get('legacy_actions',()),*(r['token'] for r in journal.receipts)]))
+            previous=list(dict.fromkeys([*previous,*(r['token'] for r in journal.receipts)]))
         resumed=bool(previous)
-        legacy=not previous and (checkpoint['sandbox_attempted'] or bool(journal and journal.state and 'legacy_actions' in journal.state))
         prefix,raw=system.split('\n',1);background,end=json.JSONDecoder().raw_decode(raw);suffix=raw[end:]
         if SKILLS_PAUSED:
             background.pop('installed_skills',None)
@@ -110,15 +106,12 @@ class SkillExecution:
                for item in config.get('_agent_saved_files',[]) if isinstance(item,dict)] if agent else []
         if saved:
             background['saved_sandbox_files']=saved
-        if resumed or legacy:
+        if resumed:
             background['tool_rules']+=' 此前已尝试的操作不会重放。以当前任务补充和授权文件为准，只可引用 saved_sandbox_files 中已保存的文件及本轮真实输出。'
-        if legacy:
-            background['conversation_tools'].update(python=False,libraries=[])
-            background['tool_rules']+=' 旧任务未记录动作签名，恢复后无法再次执行沙箱。'
         context=config,key,prefix+'\n'+json.dumps(background,ensure_ascii=False)+suffix,history
         if not enabled and journal and journal.receipts:
             raise HTTPException(409,'沙箱工具已关闭，未使用先前结果')
-        if not enabled or legacy:return context
+        if not enabled:return context
         loaded=[] if SKILLS_PAUSED else background.get('installed_skills',[])
         catalog=[]
         for item in loaded:
@@ -127,7 +120,7 @@ class SkillExecution:
             if paths:catalog.append({'skill_id':item['id'],'name':item['name'],'scripts':paths,'instructions':item['instructions']})
         if not catalog and not allow_code and not (journal and journal.receipts):return context
         revision=self.skills.collection_date(user_id)
-        results=[{k:v for k,v in item.items() if k!='_sandbox_action'} for item in legacy_receipts if not (journal and item.get('_sandbox_action'))]
+        results=[]
         outputs=[];notices=list(config.get('_workflow_notices',[]));seen=set()
         inputs=inputs or {}
 
@@ -171,7 +164,7 @@ class SkillExecution:
             if state.get('count',0)>=4:
                 background['sandbox_stop_reason']='已达到本轮操作上限，请依据真实回执回答并注明未完成部分。'
                 return {'stopped':True}
-            if config.get('_restore_only') or (results and config.get('_resume_results_only')):
+            if config.get('_restore_only'):
                 return {'stopped':True}
             prompt=(('你负责选择是否需要独立 Python 沙箱操作。上传技能暂停，不能选择包内脚本。'
                      '简单问答依据现有信息返回 {"action":"finish"}。' if SKILLS_PAUSED else

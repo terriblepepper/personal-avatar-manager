@@ -163,7 +163,9 @@ def login(client, username, password):
 
 def submit(user, profile=None):
     version = user.get("/api/me").json()["profile"]["last_modified_at"]
-    saved = user.put("/api/me/profile", json={"profile": profile or PROFILE, "last_modified_at": version, "model_config_input": MODEL})
+    model = user.put("/api/me/model-settings", json={"model_config_input": MODEL})
+    assert model.status_code == 200, model.text
+    saved = user.put("/api/me/profile", json={"profile": profile or PROFILE, "last_modified_at": version})
     assert saved.status_code == 200, saved.text
     r = user.post("/api/me/submit", json={"last_modified_at": saved.json()["profile"]["last_modified_at"]})
     assert r.status_code == 200, r.text

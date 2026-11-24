@@ -25,9 +25,7 @@ class EverOSMemory:
     def scope(self,user_id):
         owner=hashlib.sha256(user_id.encode()).hexdigest()
         from avatar.core.user_storage import user_root
-        database=self.knowledge.database
-        data_dir=database.data_dir if hasattr(database,'data_dir') else database.path.parent
-        root=user_root(data_dir,user_id)/'everos'
+        root=user_root(self.knowledge.database.data_dir,user_id)/'everos'
         if root.is_symlink():raise HTTPException(409,'记忆目录归属异常，已停止访问')
         return owner,root
 

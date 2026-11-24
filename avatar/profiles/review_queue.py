@@ -35,7 +35,7 @@ class ReviewQueue:
         for field,value in [('category',category),('status',status)]:
             if value!='all':where.append(field+'=?');values.append(value)
         if search:where.append("instr(lower(username||' '||name||' '||avatar_name||' '||reason),lower(?))>0");values.append(search)
-        clause=' WHERE '+' AND '.join(where) if where else ''
+        clause=' WHERE '+' AND '.join(where)
         with self.database.connect() as db:
             db.execute('BEGIN')
             total=db.execute('SELECT COUNT(*) FROM ('+SOURCE+')'+clause,values).fetchone()[0]

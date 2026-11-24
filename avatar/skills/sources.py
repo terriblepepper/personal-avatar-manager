@@ -41,11 +41,6 @@ def repository_source(url):
     return 'https://'+os.getenv('AVATAR_GITHUB_ARCHIVE_HOST','codeload.github.com')+'/'+('/'.join(parts[:2]))+'/zip/'+quote(ref,safe=''), directory
 
 
-# 职责：为调用方提供已校验的固定归档地址，兼容原仓库首页入口。
-def repository_archive(url):
-    return repository_source(url)[0]
-
-
 # 职责：从 GitHub 单一根目录归档中裁出指定子目录，防止误安装同仓库的其他技能。
 # 输入：content 为有大小上限的 ZIP，directory 为 URL 解析后校验过的目录元组。
 # 结果与约束：先复用全包路径、链接、重复及解压预算校验；只重打包目标目录，不落地或执行文件。
