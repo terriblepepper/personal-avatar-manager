@@ -5,7 +5,7 @@ import json
 from itertools import islice
 
 from avatar.conversation.loop.store import RunCapacity, draft_byte_limit
-from avatar.conversation.working_context import bounded_excerpt, compression_budget, excerpt, fit_working_set, input_budget, retained_budget
+from avatar.models.context_budget import bounded_excerpt, compression_budget, excerpt, fit_working_set, input_budget, retained_budget
 from avatar.core.execution import run_blocking
 from avatar.core.tokens import estimate
 

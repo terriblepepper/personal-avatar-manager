@@ -259,8 +259,11 @@ def test_admin_views_approved_profile_not_new_draft_or_model_credentials(context
     assert record.json()['profile']['bio'] == PROFILE['bio'] and record.json()['account']['id'] == uid
     assert 'UNREVIEWED_DRAFT_ONLY' not in record.text and MODEL['api_key'] not in record.text
     assert not any((name in record.json() for name in ('password', 'model_config', 'draft')))
-    teacher = register(app, 'profile_pending', teacher=True)
-    assert root.get('/api/admin/accounts/' + identity(teacher)['id'] + '/profile').status_code == 409
+    teacher = register(app, 'new_teacher', teacher=True)
+    teacher_record = root.get('/api/admin/accounts/' + identity(teacher)['id'] + '/profile')
+    assert teacher_record.status_code == 200
+    assert teacher_record.json()['account']['person_type'] == 'teacher'
+    assert teacher_record.json()['profile'] == {} and teacher_record.json()['approved_at'] is None
     role(root, uid, 'admin')
     stale = identity(user)
     assert role(user, uid, 'user').status_code == 200
@@ -269,32 +272,37 @@ def test_admin_views_approved_profile_not_new_draft_or_model_credentials(context
     assert error.value.status_code == 403
 
 
-def test_uploaded_skills_require_explicit_conversation_authorization(context):
+def test_previously_installed_skills_are_read_only_and_hidden_from_chat(context, previously_installed_skill):
     import json
-    app,user,_=context;uid=identity(user)['id'];skills=app.state.chat.skills
-    skill={'id':skills.install(uid,'SKILL.md',b'---\nname: explicit-test\ndescription: Test explicit skill authorization\n---\nOnly use after user selection.\n')}
-    cid=user.post('/api/conversations',json={'channel':'assistant','title':'skills-authorization'}).json()['id']
-    async def check(message,caller=uid,persistent=()):
-        with app.state.database.connect() as db:catalog,revision=skills.context(uid,message,db)
-        background={'available_skills':catalog,'_skills_revision':revision,'_session_skill_ids':list(persistent)}
-        async def forbidden(*args,**kwargs):raise AssertionError('No automatic skill selector should run')
-        from types import SimpleNamespace
-        return await skills.load_context(uid,({},'key','system\n'+json.dumps(background),[]),message,SimpleNamespace(generate=forbidden),caller)
-    result=asyncio.run(check('帮我阅读文件'))
-    assert result[0]['_used_skills']==[] and json.loads(result[2].split('\n',1)[1])['available_skills']==[]
-    result=asyncio.run(check('$explicit-test'))
-    assert result[0]['_used_skills'][0]['id']==skill['id']
-    assert asyncio.run(check('$explicit-test',caller='peer'))[0]['_used_skills']==[]
+    from types import SimpleNamespace
+
+    app, user, _ = context
+    uid = identity(user)['id']
+    skill = previously_installed_skill
+    cid = user.post('/api/conversations', json={'channel': 'assistant'}).json()['id']
     with app.state.database.connect(write=True) as db:
-        db.execute('INSERT INTO chat_session_skills(conversation_id,skill_id) VALUES(?,?)',(cid,skill['id']))
-        assert app.state.chat.session_skills.active(db,uid,cid)==[]
-    app.state.chat.session_skills.set_enabled(uid,cid,skill['id'],True)
-    with app.state.database.connect() as db:active=app.state.chat.session_skills.active(db,uid,cid)
-    assert asyncio.run(check('继续',persistent=active))[0]['_used_skills'][0]['id']==skill['id']
-    app.state.chat.session_skills.set_enabled(uid,cid,skill['id'],False)
-    with app.state.database.connect() as db:assert app.state.chat.session_skills.active(db,uid,cid)==[]
-    skills.install(uid,'second.md',b'Another installed skill, never auto selected.')
-    assert asyncio.run(check('帮我阅读文件'))[0]['_used_skills']==[]
+        db.execute('INSERT INTO chat_session_skills(conversation_id,skill_id,authorized) VALUES(?,?,1)', (cid, skill))
+
+    assert [row['id'] for row in user.get('/api/me/skills').json()] == [skill]
+    assert user.post('/api/me/skills', files={'file': ('SKILL.md', b'New skill')}).status_code == 403
+    assert user.patch(f'/api/me/skills/{skill}', json={'enabled': False}).status_code == 403
+    assert user.get(f'/api/conversations/{cid}/skills').json() == []
+    assert user.patch(f'/api/conversations/{cid}/skills/{skill}', json={'enabled': True}).status_code == 403
+
+    background = {'available_skills': [{'id': skill, 'name': 'archived-skill'}],
+                  'installed_skills': [{'id': skill, 'instructions': 'Old instructions.'}],
+                  '_session_skill_ids': [skill]}
+
+    async def forbidden(*args, **kwargs):
+        pytest.fail('Paused skills must not trigger a model request')
+
+    skills = app.state.chat.skills
+    result = asyncio.run(skills.load_context(
+        uid, ({}, 'key', 'system\n' + json.dumps(background), []),
+        '$archived-skill', SimpleNamespace(generate=forbidden), uid,
+    ))
+    assert result[0]['_used_skills'] == []
+    assert not background.keys() & json.loads(result[2].split('\n', 1)[1]).keys()
 
 
 def test_fixture_password_cache_keeps_real_hash_and_fresh_salts():
@@ -624,16 +632,16 @@ def test_redis_hit_and_concurrent_invalidation(context, monkeypatch, redis_socke
         cache.close()
 
 
-def test_same_socket_isolates_different_schemas(pg_database, postgres_schema, redis_socket):
+def test_same_socket_isolates_different_schemas(context, postgres_schema, redis_socket):
     from contextlib import closing
     from avatar.core.db import Database
     from avatar.profiles.pending_reviews import PendingReviews
-    with pg_database.connect(write=True) as db:
-        db.execute("""INSERT INTO users(id,username,password,role,created_at,person_type,account_status)
-                      VALUES('teacher','teacher','unused','user','1','teacher','pending')""")
-    with postgres_schema() as other_url, closing(Database(pg_database.data_dir, other_url)) as other_db:
+    app, user, _ = context
+    database = app.state.database
+    submit(user)
+    with postgres_schema() as other_url, closing(Database(database.data_dir / 'other-schema', other_url)) as other_db:
         other_db.initialize()
-        with closing(PendingReviews(pg_database, redis_socket)) as first, closing(PendingReviews(other_db, redis_socket)) as second:
+        with closing(PendingReviews(database, redis_socket)) as first, closing(PendingReviews(other_db, redis_socket)) as second:
             try:
                 assert first.get() == 1
                 assert second.get() == 0

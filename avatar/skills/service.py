@@ -10,7 +10,7 @@ from pathlib import Path
 from fastapi import HTTPException
 from avatar.core.db import now, dump
 from avatar.core.tokens import estimate
-from avatar.conversation.working_context import fit_turn, input_budget, json_text_view
+from avatar.models.context_budget import fit_turn, input_budget, json_text_view
 from avatar.skills.policy import PAUSE_NOTICE, SKILLS_PAUSED, require_skills_enabled
 from avatar.skills.packages import unpack_skills, MAX_SKILLS, MAX_STORAGE
 

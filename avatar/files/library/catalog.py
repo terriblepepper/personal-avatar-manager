@@ -34,7 +34,7 @@ def fit_catalog(rows, query, budget):
 
 def fit_text_rows(rows, budget, field):
     """Keep ranked rows and their source identifiers, clipping free text only when needed."""
-    from avatar.conversation.working_context import json_text_view
+    from avatar.models.context_budget import json_text_view
     remaining = budget - estimate('[]')
     kept = []
     for row in rows:

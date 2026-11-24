@@ -24,7 +24,7 @@ from avatar.conversation.loop.planning import (available_tools, disclosure_catal
                                                confirm_goal, revise_goals, final_reply_step, lookup_types,
                                                read_goals_verified)
 from avatar.conversation.loop.turns import stream_final
-from avatar.conversation.working_context import bounded_excerpt, compression_budget, excerpt, input_budget
+from avatar.models.context_budget import bounded_excerpt, compression_budget, excerpt, input_budget
 from avatar.core.tokens import estimate
 from avatar.conversation.tools.activity import AgentSteps, without_false_tool_footer
 from avatar.conversation.tools.builtin import beijing_time
@@ -59,7 +59,7 @@ async def run_agent(rag, context, question, *, progress=None, on_delta=None):
     trace.point('perceive', {'request_chars': len(question)},
                 {'history_turns': len(context[3]), 'retrieval_sources': len(context[0].get('_material_sources', ()))})
     try:
-        from avatar.conversation.working_context import input_budget
+        from avatar.models.context_budget import input_budget
         with model_text_budget(input_budget(context[0])):
             result = await _run_agent(rag, context, question, report if progress else None,
                                       emit if on_delta and progress else None, trace, discard)

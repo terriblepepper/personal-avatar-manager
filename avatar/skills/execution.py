@@ -12,7 +12,7 @@ from avatar.core.execution import AgentSteps
 from avatar.core.execution import AgentNeedsInput, check_execution, run_blocking, sandbox_checkpoint
 from avatar.conversation.loop.effects import SandboxEffects, file_versions, https_versions
 from avatar.models.limits import check_context
-from avatar.conversation.working_context import json_text_view, fit_turn, fit_working_set
+from avatar.models.context_budget import json_text_view, fit_turn, fit_working_set
 from avatar.core.tokens import estimate
 from avatar.skills.policy import SKILLS_PAUSED, require_skills_enabled
 from avatar.skills.sandbox import LocalPythonSandbox, SandboxUnavailable

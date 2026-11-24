@@ -266,7 +266,7 @@ class AvatarChat:
             return await self._prepare(user,request,overview,context,session,emit)
 
     async def prepare_direct(self, context, session, message):
-        from avatar.conversation.working_context import fit_turn
+        from avatar.models.context_budget import fit_turn
 
         def recent_questions():
             with self.service.database.connect() as db:
@@ -304,7 +304,7 @@ class AvatarChat:
             prefix,raw=system.split('\n',1);background=json.loads(raw)
             references=[{'file_id':file['id'],'filename':file['filename'],'description':file['description']} for file in files]
             background['conversation_file_reference_rules']='这里列出本会话已启用的文件引用。用户消息另附当前授权原件的文字、分页或图像；metadata_only 仅有元信息，其余部分可凭文件 ID 按需读取。历史检索结果不授予文件访问权限。'
-            from avatar.conversation.working_context import compression_budget
+            from avatar.models.context_budget import compression_budget
             from avatar.core.tokens import estimate
             from avatar.files.library.catalog import fit_catalog
             room = compression_budget(config)-estimate(prefix+'\n'+dump(background))-estimate(request.message)-16
@@ -348,7 +348,7 @@ class AvatarChat:
                 return await self.skill_execution.enrich(overview['agent']['user_id'],context,objective,self.model_client,caller_id=user['id'],conversation_id=session['id'],parent_id=parent_id,inputs=inputs,progress=progress,enabled=enabled,allow_code=enabled)
             overview['_generated_files'] = context[0].setdefault('_generated_files', [])
             # Enrichment can add evidence after memory.prepare. Fit this working copy without reloading the old turns.
-            from avatar.conversation.working_context import fit_turn
+            from avatar.models.context_budget import fit_turn
             history=[*context[3], *context[0].get('_resume_history', ())]
             working_history,_=fit_turn(context[0],context[2],history,request.message,[])
             if progress and working_history!=context[3]:

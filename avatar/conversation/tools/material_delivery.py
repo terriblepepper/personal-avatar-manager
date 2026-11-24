@@ -13,7 +13,7 @@ from avatar.core.execution import call_with_retry, check_execution
 from avatar.files.library.delivery import SavedMaterials
 from avatar.conversation.tools.material_search import MaterialDiscovery
 from avatar.core.tokens import estimate
-from avatar.conversation.working_context import bounded_excerpt, compression_budget, fit_turn, input_budget, json_text_view
+from avatar.models.context_budget import bounded_excerpt, compression_budget, fit_turn, input_budget, json_text_view
 from avatar.models.limits import check_context
 from avatar.models.client import ModelResult, accumulate_usage
 

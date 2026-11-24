@@ -161,7 +161,7 @@ async def bind_entry_tools(chat, context, owner, aic, session, files, *, include
             if request.query is not None:
                 result = await run_blocking(session_files.discover, request.query, request.offset)
             else:
-                from avatar.conversation.working_context import input_budget
+                from avatar.models.context_budget import input_budget
                 room = config.get('_session_page_bytes')
                 if room is None:
                     room = max(4,(input_budget(config)*3-512)//2)
