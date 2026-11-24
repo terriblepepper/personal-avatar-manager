@@ -119,10 +119,18 @@ def platform_binding(request: Request, user=Depends(auth.current_user)):
 # 职责：验证登录标识和密码并设置完整会话 Cookie。
 # 输入：body 为 LoginRequest，request.client.host 用于限流，response 写 Cookie。
 # 结果与约束：成功返回账户和 CSRF，Cookie 有效 12 小时且 HttpOnly；失败与限流由认证服务处理。
+def password_session(body, request, response, *, admin_only=False):
+    settings = request.app.state.settings
+    token, csrf, user = auth.login(request.app.state.database, body, request.client.host,
+                                  root_only=settings.oidc_enabled, admin_only=admin_only)
+    response.set_cookie("avatar_session", token, httponly=True, samesite="strict",
+                        secure=settings.secure_cookie, max_age=43200)
+    return user, csrf
+
+
 @router.post("/auth/login")
 def login(body: LoginRequest, request: Request, response: Response):
-    token, csrf, user = auth.login(request.app.state.database, body, request.client.host, root_only=request.app.state.settings.oidc_enabled)
-    response.set_cookie("avatar_session", token, httponly=True, samesite="strict", secure=request.app.state.settings.secure_cookie, max_age=43200)
+    user, csrf = password_session(body, request, response)
     return {"user": user, "csrf": csrf}
 
 

@@ -93,7 +93,7 @@ def issue_session(db,user_id,duration=43200,access_scope='full',auth_method='loc
 # 职责：按用户名、邮箱或手机号验证密码并签发完整会话。
 # 输入：credentials 为登录请求，ip 用于限流，root_only 表示仅根账户可用本地密码；登录标识按联系方式规范化。
 # 结果与约束：成功返回会话三元组；失败计入 15 分钟限流，用户名优先匹配，错误统一返回 401，未知账户仍计算虚拟密码哈希；统一认证启用后仅根账号可使用本地密码；关闭时预关联的旧账号仍可本地登录。
-def login(database, credentials, ip, root_only=False):
+def login(database, credentials, ip, root_only=False, *, admin_only=False):
     identifier = credentials.username.strip()
     try:
         identifier = normalize_email(identifier) if '@' in identifier else normalize_phone(identifier)
@@ -115,7 +115,8 @@ def login(database, credentials, ip, root_only=False):
             raise HTTPException(429, "登录尝试过多，请 15 分钟后重试")
         managed = bool(user and not user['is_root'] and db.execute('SELECT 1 FROM oidc_identities WHERE user_id=?', (user['id'],)).fetchone())
         valid = verify_password(credentials.password, user["password"] if user else hash_password("dummy-password", "00"*16))
-        if not user or not valid or (managed and root_only) or (root_only and not user['is_root']):
+        if (not user or not valid or (managed and root_only) or (root_only and not user['is_root'])
+                or (admin_only and user['role'] != 'admin')):
             attempts = limit["attempts"] + 1 if limit and limit["reset_at"] > current else 1
             reset = limit["reset_at"] if limit and limit["reset_at"] > current else current + 900
             db.execute("INSERT OR REPLACE INTO login_limits VALUES(?,?,?)", (key, attempts, reset))

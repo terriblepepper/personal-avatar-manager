@@ -60,6 +60,7 @@ node_modules/
 /kafka/data/
 /kafka/logs/
 /kafka/kafka.lock
+/admin-frontend/dist/
 *.sqlite3
 *.sqlite
 *.db

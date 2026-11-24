@@ -12,6 +12,9 @@ include frontend/vitest.config.ts frontend/playwright.config.ts
 recursive-include frontend/src *.vue *.ts *.css
 recursive-include frontend/tests *.ts
 recursive-include frontend/dist *
+include admin-frontend/index.html
+recursive-include admin-frontend/src *.vue *.ts *.css
+recursive-include admin-frontend/dist *
 prune frontend/node_modules
 prune frontend/test-results
 prune frontend/playwright-report

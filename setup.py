@@ -11,12 +11,15 @@ class BuildPlatform(build_py):
         root = Path(__file__).resolve().parent
         resources = Path(self.build_lib) / 'avatar' / '_resources'
         frontend = root / 'frontend' / 'dist'
-        if not (frontend / 'index.html').is_file() and not self.editable_mode:
+        ops = root / 'admin-frontend' / 'dist'
+        if not self.editable_mode and any(not (site / 'index.html').is_file() for site in (frontend, ops)):
             raise RuntimeError('缺少 Vue 构建产物；请先 cd frontend && npm ci && npm run build')
         if resources.exists():
             rmtree(resources)  # Drop generated files from earlier builds before assembling the wheel.
         if frontend.is_dir():
             copytree(frontend, resources / 'frontend' / 'dist')
+        if ops.is_dir():
+            copytree(ops, resources / 'admin-frontend' / 'dist')
         for document in ('用户操作手册-purge.md', '操作手册.md', '知识库与soul.md', '资料RAG与嵌入.md'):
             target = resources / 'docs' / document
             target.parent.mkdir(parents=True, exist_ok=True)

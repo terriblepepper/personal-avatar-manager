@@ -1491,3 +1491,5 @@ def install_schema(connection):
 
     from avatar.core.dispatch_schema import install_dispatch
     install_dispatch(connection)
+    connection.execute('''CREATE TABLE IF NOT EXISTS ops_metric_minutes (
+        minute BIGINT PRIMARY KEY, metrics JSONB NOT NULL)''')

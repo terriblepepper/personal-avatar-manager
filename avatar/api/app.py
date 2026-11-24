@@ -51,6 +51,8 @@ def create_app(settings=None, provider=None, run_worker=True, model_client=None)
     from avatar.core.dispatch import Changes
     changes = Changes(resources.database, settings.redis_socket, settings.kafka_bootstrap, pending_reviews.invalidate)
     resources.database.changes = changes
+    from avatar.core.monitoring import PlatformMonitor
+    monitor = PlatformMonitor(resources.database, changes, pending_reviews.client)
     rag_resources=resources.chat.rag.resources
     from avatar.knowledge.service import KnowledgeService
 
@@ -89,7 +91,8 @@ def create_app(settings=None, provider=None, run_worker=True, model_client=None)
         except BaseException:
             resources.database.close()
             raise
-        tasks = [asyncio.create_task(sample_loop_lag(),name="avatar-event-loop-lag")]
+        tasks = [asyncio.create_task(sample_loop_lag(),name="avatar-event-loop-lag"),
+                 asyncio.create_task(monitor.run(), name='avatar-platform-monitor')]
         if settings.redis_socket or settings.kafka_bootstrap:
             tasks.append(asyncio.create_task(changes.run(), name='avatar-commit-dispatch'))
         try:
@@ -189,6 +192,9 @@ def create_app(settings=None, provider=None, run_worker=True, model_client=None)
     app.state.animation_requests = asyncio.Semaphore(2)
     app.state.pending_reviews = pending_reviews
     app.state.changes = changes
+    app.state.monitor = monitor
+    from avatar.api.ops_routes import router as ops_router
+    app.include_router(ops_router)
     from avatar.api.update_routes import router as update_router
     app.include_router(update_router)
     app.state.settings, app.state.database = settings, resources.database
@@ -365,9 +371,12 @@ def create_app(settings=None, provider=None, run_worker=True, model_client=None)
     from avatar.api.chat_file_routes import router as chat_files_router
 
     app.include_router(chat_files_router)
-    from avatar.api.frontend import mount_frontend
+    from avatar.api.frontend import mount_frontend, mount_ops
+    mount_ops(app, ROOT / 'admin-frontend' / 'dist')
     mount_frontend(app, ROOT / 'frontend' / 'dist')
 
     from avatar.core.performance import RouteTimings
     app.add_middleware(RouteTimings)
+    from avatar.core.http_metrics import ObserveHTTP
+    app.add_middleware(ObserveHTTP, metrics=monitor.http)
     return app
