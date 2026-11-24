@@ -85,7 +85,7 @@ export TEST_POSTGRES_URL=postgresql:///avatar_test
 ```
 
 - 发行版本在 `pyproject.toml`（`[project] version`）维护，并用 `uv lock` 同步本项目锁文件元数据；发布时从合并后的 `main` 打 `v<MAJOR>.<MINOR>.<PATCH>` 标签。
-- 平台 API 与管理 ACS 通过 `avatar/core/config.py:application_version()` 优先读取 `AVATAR_VERSION`；空值读取安装包版本，未安装源码回退项目元数据。个人分身 ACS 保留用户填写的版本；能力本体模板版本独立维护。
+- 平台 API 与管理 ACS 通过 `avatar/core/config.py:application_version()` 优先读取 `AVATAR_VERSION`；源码读取项目元数据，安装包读取发行元数据。个人分身 ACS 保留用户填写的版本；能力本体模板版本独立维护。
 - 发布 PR 同步 README、`.env.example` 和打包示例，API 或平台管理 ACS 不再写死版本；Release 说明直接填写在 GitHub 发布页，不在 docs 内维护副本。
 - 代码里的 ACS 版本只影响**新生成**的身份材料：`create_identity_json` 遇到已存在的 `data/system_identity/acs.json` 不覆盖。线上要更新 ACS 版本必须重写材料并重新注册（注销旧身份、撤旧证书、同端口重申，AIC 会变）。
 - 交付物为 `dist/` 下的 wheel、sdist 与交付 ZIP（含依赖 wheel 与 SHA256 清单）。

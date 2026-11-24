@@ -34,16 +34,16 @@ def require_database_url(value):
 
 
 def application_version():
-    """部署环境优先；未配置时使用发行包版本，未安装的源码使用项目元数据。"""
+    """部署环境优先；源码读取项目元数据，安装包读取发行元数据。"""
     configured = os.getenv('AVATAR_VERSION', '').strip()
     if configured:
         return configured
-    from importlib.metadata import PackageNotFoundError, version
-    try:
-        return version('personal-avatar-manager')
-    except PackageNotFoundError:
+    project = SOURCE_ROOT / 'pyproject.toml'
+    if project.is_file():
         import tomllib
-        return tomllib.loads((SOURCE_ROOT / 'pyproject.toml').read_text())['project']['version']
+        return tomllib.loads(project.read_text())['project']['version']
+    from importlib.metadata import version
+    return version('personal-avatar-manager')
 
 
 def runtime_environment(settings, provider):

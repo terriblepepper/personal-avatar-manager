@@ -162,6 +162,7 @@ def test_legacy_snapshot_migration_is_idempotent_and_unlocks(legacy_sqlite,postg
     import sqlite3
     from avatar.conversation.jobs.store import GenerationStore
     from avatar.core.db import Database
+    from avatar.core.migrations.chat_generations import restore_legacy_generations
     from scripts.migrate_sqlite_to_postgres import migrate
 
     snapshot='invalid JSON' if corrupt else json.dumps({'request_id':'legacy','done':False,'stage':'accepted','error':''})
@@ -186,6 +187,9 @@ def test_legacy_snapshot_migration_is_idempotent_and_unlocks(legacy_sqlite,postg
             db.execute("UPDATE chat_conversations SET lease_until=1000 WHERE id='chat'")
         database.initialize()
         store = GenerationStore(database)
+        assert store.latest('old','chat') is None
+        with database.connect(write=True) as db:
+            restore_legacy_generations(db)
         assert store.latest('old','chat')['state'] == expected
         with database.connect(write=True) as db:
             assert db.execute("SELECT lease_until FROM chat_conversations WHERE id='chat'").fetchone()[0] == 0
@@ -1055,6 +1059,10 @@ def test_chat_generation_survives_refresh_and_bounded_queue(context,disconnect):
             assert 'queued' in await anext(iterator)
             if disconnect:await iterator.aclose()
             resume.set()
+            if not disconnect:
+                async with asyncio.timeout(5):
+                    tail = [chunk async for chunk in iterator]
+                assert any(chunk.startswith('event: done') for chunk in tail)
             for _ in range(100):
                 saved=runner.store.get(actor['id'],'refresh')
                 if saved['done']:break

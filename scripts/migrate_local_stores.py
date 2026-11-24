@@ -508,8 +508,10 @@ def main():
         print('文件目录迁移已完成')
         return
     if args.postgres_only:
+        from avatar.core.migrations.chat_generations import restore_legacy_generations
         with psycopg.connect(require_database_url(os.getenv('DATABASE_URL',''))) as db:
             report = migrate_postgres_publications(db)
+            restore_legacy_generations(Connection(db, {}))
             report['active_publication_references'] = verify_publications(db)
         print(json.dumps(report))
         return

@@ -20,12 +20,12 @@ def chat_response(chat, user, body, database):
 
     changes = getattr(database, 'changes', None)
 
-    async def stream(event):
+    async def stream(wakeup):
         previous = None
         delivered = ''
         while True:
-            if event is not None:
-                event.take()
+            if wakeup is not None:
+                wakeup.take()
             snapshot = await asyncio.to_thread(store.get,user['id'],body.request_id)
             if snapshot != previous:
                 event = {'type': 'snapshot', 'snapshot': snapshot}
@@ -47,10 +47,10 @@ def chat_response(chat, user, body, database):
                 yield 'event: ' + event['type'] + '\ndata: ' + json.dumps(event, ensure_ascii=False) + '\n\n'
                 return
             yield ': keep-alive\n\n'
-            if event is None:
+            if wakeup is None:
                 await asyncio.sleep(.5)
             else:
-                await wait_change(event, 5. if changes.can_push else .5)
+                await wait_change(wakeup, 5. if changes.can_push else .5)
 
     async def events():
         subscription = changes.watch(('generation', user['id'], body.request_id)) if changes else nullcontext()
