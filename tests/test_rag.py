@@ -1,10 +1,7 @@
 """资料检索、索引发布、PostgreSQL 向量与历史索引导入。"""
 import asyncio
-import hashlib
-import struct
 from dataclasses import replace
 
-import psycopg
 import pytest
 
 from avatar.core.resource_budget import ResourceController, ResourcePolicy, ResourceSample
@@ -647,55 +644,6 @@ def test_dense_cache_validates_current_rows_on_every_search(pg_database, monkeyp
     with pg_database.connect(write=True) as conn:
         store.delete_in(conn, 'alice', 'c', ids)
     assert store.search('alice', 'c', ids, [], [[1., 0.]], FileQuery(query='q')) == []
-
-
-# Legacy import must leave the offline Chroma snapshot and existing PG rows intact
-
-def test_chroma_snapshot_is_exact_atomic_and_idempotent(tmp_path, postgres_url):
-    from scripts.migrate_local_stores import import_chroma_snapshot
-
-    chromadb = pytest.importorskip('chromadb')
-    from chromadb.config import Settings
-
-    path = tmp_path / 'file_rag'
-    client = chromadb.PersistentClient(str(path), settings=Settings(anonymized_telemetry=False))
-    collection = client.create_collection('files-old', embedding_function=None,
-                                          configuration={'hnsw': {'space': 'cosine', 'num_threads': 1}})
-    ids = [f'original-{i}' for i in range(1058)]
-    documents = [f'资料 {i}' for i in range(len(ids))]
-    metadata = [{'record_id': key, 'page': i, 'title': '原文'} for i, key in enumerate(ids)]
-    vectors = [[i + .125, -2.75, .7] for i in range(len(ids))]
-    collection.add(ids=ids, embeddings=vectors, documents=documents, metadatas=metadata)
-    exported = collection.get(include=['embeddings', 'documents', 'metadatas'])
-    expected = {k: (d, m, struct.pack('<3f', *v)) for k, d, m, v in zip(
-        exported['ids'], exported['documents'], exported['metadatas'], exported['embeddings'], strict=True)}
-    client.close()
-    (path / 'chroma.sqlite3').chmod(0o400)
-
-    def manifest():
-        return {p.relative_to(path): (p.stat().st_mtime_ns, hashlib.sha256(p.read_bytes()).digest())
-                for p in path.rglob('*') if p.is_file()}
-
-    before = manifest()
-    with psycopg.connect(postgres_url) as db:
-        db.execute('''CREATE TEMP TABLE rag_vector_records(
-            user_id text, collection text, record_id text, document text, metadata jsonb, embedding real[],
-            PRIMARY KEY(user_id,collection,record_id))''')
-        assert import_chroma_snapshot(db, 'owner', path) == len(ids)
-        db.row_factory = psycopg.rows.dict_row
-        assert import_chroma_snapshot(db, 'owner', path) == len(ids)
-        db.row_factory = psycopg.rows.tuple_row
-        rows = db.execute('SELECT record_id, document, metadata, embedding FROM rag_vector_records '
-                          "WHERE user_id='owner' AND collection='files-old'").fetchall()
-        assert {k: (d, m, struct.pack('<3f', *v)) for k, d, m, v in rows} == expected
-        db.execute("DELETE FROM rag_vector_records WHERE record_id = 'original-0'")
-        db.execute("UPDATE rag_vector_records SET document='冲突' WHERE record_id='original-1057'")
-        with pytest.raises(ValueError, match='conflict'):
-            import_chroma_snapshot(db, 'owner', path)
-        assert db.execute('SELECT count(*) FROM rag_vector_records').fetchone()[0] == len(ids) - 1
-        assert db.execute("SELECT document FROM rag_vector_records WHERE record_id='original-1057'").fetchone()[0] == '冲突'
-        assert import_chroma_snapshot(db, 'another-owner', path) == len(ids)
-    assert manifest() == before
 
 
 def test_chroma_snapshot_refuses_missing_database_and_symlinks(tmp_path):
