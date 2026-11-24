@@ -16,7 +16,7 @@ CREATE DATABASE avatar OWNER avatar_app;
 export DATABASE_URL='postgresql:///avatar?user=avatar_app'
 ```
 
-源码部署的 `./service.sh start` 先启动自管 PostgreSQL 16（`data/pgsql`），再启动应用。`./service.sh stop` 同时停止自管数据库。外部 PostgreSQL 由其管理员维护。可选读缓存使用服务器项目根目录的 `redis/`，套接字示例为 `AVATAR_REDIS_SOCKET=redis/redis.sock`。Redis 不可用时管理员待审计数回源 PostgreSQL。
+源码部署的 `./service.sh start` 先启动自管 PostgreSQL 16（`data/pgsql`），再启动应用。`./service.sh restart` 保留数据库和项目独立运行的消息依赖。`./service.sh stop` 同时停止自管数据库。外部 PostgreSQL 由其管理员维护。可选读缓存使用服务器项目根目录的 `redis/`，套接字示例为 `AVATAR_REDIS_SOCKET=redis/redis.sock`。Redis 不可用时管理员待审计数回源 PostgreSQL。
 
 任务和通知继续在 PostgreSQL 提交后生效。应用启动时在当前 schema 安装事务内事件表和变更触发器。回滚同时撤销事件。转发器分批读取和清理事件，避免 PostgreSQL NOTIFY 给并发提交增加全局锁。Kafka 的任务唤醒和 Redis 的客户端刷新可通过数据库账本与快照恢复，队列或缓存数据可重新生成。认证的会话和 OIDC 查询复用一次连接池借用。事务和写锁保持原有一致性边界。
 

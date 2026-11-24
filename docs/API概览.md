@@ -18,7 +18,7 @@
 
 `GET /api/updates` 为站内实时更新流，要求完整登录态。`ready` 表示可刷新当前快照，`change` 返回有变化的类型（`inbox`、`dialogue`、管理员的 `reviews`）。客户端沿用各自 API 获取数据。实时服务未就绪返回 503，客户端暂用原有轮询。
 
-运行监控在 `/ops/`。`POST /api/ops/login` 复用本地管理员登录与限流，`GET /api/ops/metrics?window=1h` 返回聚合运行指标。时间范围为 `1h`、`24h`、`7d`，数据接口要求本地密码签发的完整管理员会话。
+运行监控在 `/ops/`。`POST /api/ops/login` 复用本地管理员登录与限流，`GET /api/ops/metrics?window=1h` 返回聚合运行指标。时间范围为 `1h`、`24h`、`7d`。`GET /api/ops/metrics/minutes` 按 `start`（Unix 分钟）及 `count`（1–60）查看完整分钟数据。指标接口要求本地密码签发的完整管理员会话。
 
 ## 路由模块一览
 

@@ -57,6 +57,8 @@ node_modules/
 /redis/redis.sock
 /redis/redis.pid
 /redis/redis.lock
+/redis/bin/
+/redis/lib/
 /kafka/data/
 /kafka/logs/
 /kafka/kafka.lock

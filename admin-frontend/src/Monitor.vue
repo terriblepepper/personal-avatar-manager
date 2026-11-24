@@ -108,9 +108,9 @@ function submit() {
       </div>
       <p v-if="!snapshot.history_ready" class="muted">历史采样仍在加载。</p>
       <div class="trends">
-        <TrendChart title="请求量" unit="次" :rows="requests" :bucket-minutes="snapshot.bucket_minutes" :format="amount"/>
-        <TrendChart :title="direction === 'sent_bytes' ? '下行流量' : '上行流量'" unit="HTTP 正文" :rows="traffic" :bucket-minutes="snapshot.bucket_minutes" :format="bytes"/>
-        <TrendChart title="服务错误" unit="次" :rows="errors" :bucket-minutes="snapshot.bucket_minutes" :format="amount"/>
+        <TrendChart title="请求量" unit="次" metric="requests" :rows="requests" :bucket-minutes="snapshot.bucket_minutes" :format="amount"/>
+        <TrendChart :title="direction === 'sent_bytes' ? '下行流量' : '上行流量'" unit="HTTP 正文字节" :metric="direction" :rows="traffic" :bucket-minutes="snapshot.bucket_minutes" :format="bytes"/>
+        <TrendChart title="服务错误" unit="次" metric="server_errors" :rows="errors" :bucket-minutes="snapshot.bucket_minutes" :format="amount"/>
       </div>
       <div class="section-head"><h2>服务与任务</h2><span v-if="services" class="muted">{{ delayed ? '采样已延迟 · ' : '' }}{{ timestamp(services.sampled_at) }}</span></div>
       <template v-if="services">

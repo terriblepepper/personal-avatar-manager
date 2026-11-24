@@ -1,30 +1,56 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
-import { timestamp } from './metrics'
+import { computed, ref, watch } from 'vue'
+import { timestamp, type Metric, type TrendPoint } from './metrics'
+import { fetchMinutes } from './useMonitor'
+import TrendPlot from './TrendPlot.vue'
 
 const props = defineProps<{
   title: string
   unit: string
-  rows: { time: string; value: number; sample_minutes: number }[]
+  metric: Metric
+  rows: TrendPoint[]
   bucketMinutes: number
   format: (value: number) => string
 }>()
-const choice = ref<number | null>(null)
-const times = computed(() => props.rows.map(row => Date.parse(row.time)))
-const last = computed(() => props.rows.at(-1))
-const peak = computed(() => Math.max(1, ...props.rows.map(row => row.value)))
-const active = computed(() => props.rows[choice.value ?? props.rows.length - 1] || last.value)
-const lines = computed(() => {
-  if (!times.value.length) return []
-  const first = times.value[0], span = Math.max(1, times.value.at(-1)! - first)
-  const paths: string[][] = [[]]
-  props.rows.forEach((row, i) => {
-    if (i && times.value[i] - times.value[i - 1] > props.bucketMinutes * 60000) paths.push([])
-    const x = 4 + 392 * (times.value[i] - first) / span
-    const y = 116 - 108 * row.value / peak.value
-    paths.at(-1)!.push(x.toFixed(2) + ',' + y.toFixed(2))
-  })
-  return paths
+const dialog = ref<HTMLDialogElement>()
+const open = ref(false)
+const selection = ref('')
+const selectedPeriod = ref('')
+const detailSelection = ref('')
+const minutes = ref<TrendPoint[]>([])
+const loading = ref(false)
+const failed = ref(false)
+const group = computed(() => props.rows.find(row => row.time === selectedPeriod.value) ?? props.rows.at(-1))
+const plotted = computed(() => props.bucketMinutes === 1 ? props.rows : minutes.value)
+const titleId = computed(() => 'expanded-' + props.metric)
+
+function expand() {
+  selectedPeriod.value = selection.value
+  detailSelection.value = props.bucketMinutes === 1 ? selection.value : ''
+  dialog.value!.showModal()
+  open.value = true
+}
+
+watch([open, () => group.value?.time, () => group.value?.sample_minutes, () => props.metric, () => props.bucketMinutes],
+      async ([opened, period, , metric, count], previous, onCleanup) => {
+  if (!opened || !period || count === 1) return
+  const controller = new AbortController()
+  onCleanup(() => controller.abort())
+  const changed = !previous[0] || period !== previous[1] || metric !== previous[3]
+  if (changed) {
+    minutes.value = []
+    detailSelection.value = ''
+    loading.value = true
+  }
+  failed.value = false
+  try {
+    const points = await fetchMinutes(period, count, controller.signal)
+    if (!controller.signal.aborted) minutes.value = points.map(point => ({ ...point, value: point[metric] }))
+  } catch {
+    if (!controller.signal.aborted) failed.value = true
+  } finally {
+    if (!controller.signal.aborted) loading.value = false
+  }
 })
 </script>
 
@@ -32,29 +58,30 @@ const lines = computed(() => {
   <section class="panel trend">
     <div class="section-title">
       <h2>{{ title }}</h2>
-      <span>{{ unit }} · 每 {{ bucketMinutes }} 分钟</span>
+      <div class="chart-actions">
+        <span>{{ unit }} · 每 {{ bucketMinutes }} 分钟</span>
+        <button v-if="rows.length" class="chart-zoom" type="button" :aria-label="'放大' + title" @click="expand">放大</button>
+      </div>
     </div>
-    <template v-if="last">
-      <div class="chart">
-        <svg viewBox="0 0 400 120" preserveAspectRatio="none" role="img"
-             :aria-label="title + '，最新值 ' + format(last.value)">
-          <path class="grid" d="M0 116h400 M0 80h400 M0 44h400 M0 8h400"/>
-          <template v-for="(line, i) in lines" :key="i">
-            <polyline v-if="line.length > 1" :points="line.join(' ')" class="trace"/>
-            <circle v-else :cx="line[0].split(',')[0]" :cy="line[0].split(',')[1]" r="2.4" class="dot"/>
-          </template>
-        </svg>
-        <div class="chart-axis"><span>{{ timestamp(rows[0].time) }}</span><span>{{ timestamp(last.time) }}</span></div>
+    <TrendPlot v-model:selected="selection" v-bind="{ title, unit, rows, bucketMinutes, format }"/>
+    <dialog ref="dialog" class="chart-dialog" :aria-labelledby="titleId" @close="open = false"
+            @click.self="dialog?.close()">
+      <div class="chart-dialog-content">
+        <div class="section-title">
+          <h2 :id="titleId">{{ title }} · 每分钟</h2>
+          <button class="button" type="button" autofocus @click="dialog?.close()">关闭</button>
+        </div>
+        <label v-if="bucketMinutes > 1 && group" class="chart-period">
+          汇总时段
+          <select :value="group.time" @change="selectedPeriod = ($event.target as HTMLSelectElement).value">
+            <option v-for="row in rows" :key="row.time" :value="row.time">{{ timestamp(row.time) }}</option>
+          </select>
+        </label>
+        <p v-if="bucketMinutes > 1 && loading" class="chart-empty" role="status">正在读取分钟数据…</p>
+        <p v-else-if="bucketMinutes > 1 && failed" class="chart-empty" role="alert">暂时无法读取分钟数据。</p>
+        <TrendPlot v-else v-model:selected="detailSelection" :title="title" :unit="unit"
+                   :rows="plotted" :bucket-minutes="1" :format="format" expanded/>
       </div>
-      <div v-if="active" class="chart-value">
-        <span>{{ timestamp(active.time) }}</span>
-        <strong>{{ format(active.value) }}</strong>
-        <span v-if="active.sample_minutes < bucketMinutes">已采样 {{ active.sample_minutes }} 分钟</span>
-        <input v-if="rows.length > 1" type="range" min="0" :max="rows.length - 1"
-               :value="choice ?? rows.length - 1" :aria-label="title + '的时间点'"
-               @input="choice = Number(($event.target as HTMLInputElement).value)">
-      </div>
-    </template>
-    <p v-else class="chart-empty">等待完整采样周期</p>
+    </dialog>
   </section>
 </template>
