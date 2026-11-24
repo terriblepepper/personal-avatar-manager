@@ -2,6 +2,8 @@ from avatar.core.user_storage import UserBlobs
 from avatar.files.uploads.buffer import upload_work, write_original
 """独立知识库：私有原料 → 可恢复后台构建 → 管理员审核 → 生效 soul。"""
 import asyncio
+
+from avatar.core.dispatch import begin_work, wait_work
 from contextvars import ContextVar
 import logging
 import hashlib
@@ -702,6 +704,7 @@ class KnowledgeService:
         pending={}
         try:
             while True:
+                latch = begin_work(self.database, 'soul')
                 for task in list(pending):
                     if not task.done():continue
                     identifier,_=pending.pop(task)
@@ -725,7 +728,7 @@ class KnowledgeService:
                         for row in rows:pending[asyncio.create_task(self.once(row['id']))]=(row['id'],row['user_id'])
                 except Exception as error:logging.getLogger(__name__).warning('Soul queue temporarily unavailable (%s)',type(error).__name__)
                 if pending:await asyncio.wait(pending,timeout=1,return_when=asyncio.FIRST_COMPLETED)
-                else:await asyncio.sleep(1)
+                else:await wait_work(latch, 1.)
         finally:
             tasks=tuple(pending)
             for task in tasks:task.cancel()

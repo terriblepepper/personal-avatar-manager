@@ -58,6 +58,7 @@ pg_start() {
 }
 
 stop_dependencies() {
+  ./kafka/service.sh stop || echo "Kafka 未正常停止，请检查项目的 kafka/ 目录。" >&2
   ./redis/service.sh stop || echo "Redis 未正常停止，请检查项目的 redis/ 目录。" >&2
   [[ -x "$pg_bin/pg_ctl" && -d "$pg_data" ]] || return 0
   export LD_LIBRARY_PATH="$pg_home/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

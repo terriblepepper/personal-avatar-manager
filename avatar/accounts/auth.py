@@ -134,15 +134,14 @@ def current_user(request: Request):
     with request.app.state.database.connect() as db:
         row = db.execute("SELECT u.id,u.username,u.role,u.is_root,u.person_type,u.student_id,u.teacher_id,u.account_status,u.account_reason,u.email,u.phone,u.onboarding_stage,s.csrf,s.access_scope,s.auth_method FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires>?",
                          (hashlib.sha256(token.encode()).hexdigest(), time.time())).fetchone()
-    if not row:
-        raise HTTPException(401, "请先登录")
-    if request.method not in ("GET", "HEAD", "OPTIONS"):
-        if not hmac.compare_digest(request.headers.get("x-csrf-token", ""), row["csrf"]):
-            raise HTTPException(403, "会话校验失败，请刷新页面")
-    user=dict(row)
-    if user['role'] == 'admin':
-        user['onboarding_stage'] = 'done'
-    with request.app.state.database.connect() as db:
+        if not row:
+            raise HTTPException(401, "请先登录")
+        if request.method not in ("GET", "HEAD", "OPTIONS"):
+            if not hmac.compare_digest(request.headers.get("x-csrf-token", ""), row["csrf"]):
+                raise HTTPException(403, "会话校验失败，请刷新页面")
+        user=dict(row)
+        if user['role'] == 'admin':
+            user['onboarding_stage'] = 'done'
         identity=db.execute('SELECT subject,username,verified_at FROM oidc_identity_links WHERE user_id=? AND issuer=?',
                             (user['id'], request.app.state.settings.oidc_issuer.rstrip('/'))).fetchone()
         if not identity:

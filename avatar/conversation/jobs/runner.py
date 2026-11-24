@@ -1,5 +1,7 @@
 """Application-owned generation; browsers only observe persisted snapshots."""
 import asyncio
+
+from avatar.core.dispatch import begin_work, wait_work
 import json
 import logging
 import time
@@ -201,6 +203,7 @@ class GenerationRunner:
         next_heartbeat=0
         try:
             while True:
+                latch = begin_work(self.database, 'chat')
                 try:
                     active = {task.get_name().removeprefix('chat-') for task in self.tasks}
                     if self.active_jobs and time.monotonic()>=next_heartbeat:
@@ -220,7 +223,7 @@ class GenerationRunner:
                         task.add_done_callback(self.completed)
                 except Exception:
                     log.exception('Generation queue temporarily unavailable')
-                await asyncio.sleep(.25)
+                await wait_work(latch, .25, reconcile=1. if self.active_jobs else 5.)
         finally:
             active = tuple(self.tasks)
             for task in active: task.cancel()
@@ -229,5 +232,7 @@ class GenerationRunner:
     def completed(self, task):
         self.tasks.discard(task)
         self.active_jobs.pop(task.get_name().removeprefix('chat-'), None)
+        if changes := getattr(self.database, 'changes', None):
+            changes.wake('chat')
         if not task.cancelled() and task.exception():
             log.error('Generation cleanup failed', exc_info=task.exception())

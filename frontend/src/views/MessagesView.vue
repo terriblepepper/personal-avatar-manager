@@ -7,7 +7,7 @@ import ContextMenu from '../components/ContextMenu.vue'
 import RecordPagination from '../components/RecordPagination.vue'
 import { request, notifyError } from '../api/client'
 import { useNotificationInbox } from '../composables/useNotificationInbox'
-import { usePolling } from '../composables/usePolling'
+import { useLivePolling } from '../composables/usePlatformUpdates'
 import { date } from '../utils/format'
 interface Notice { id:number; title:string; content:string; kind:string; read_at:string|null; created_at:string; session_id?:string; task_id?:string; task_request_state?:'pending'|'accepted'|'rejected'; target_page?:string; admin_only?:boolean }
 const props = withDefaults(defineProps<{ management?: boolean }>(), { management: true })
@@ -15,7 +15,7 @@ const emit = defineEmits<{ opened: [] }>()
 const router = useRouter(), items = ref<Notice[]>([]), total = ref(0), offset = ref(0), status = ref('all'), category = ref('all'), search = ref(''), selected = ref<number[]>([]), detail = ref<Notice | null>(null), busy = ref(false), failure = ref('')
 const inbox = useNotificationInbox()
 const controller = new AbortController()
-const poll = usePolling(async signal => {
+const poll = useLivePolling('inbox', async signal => {
   const update = inbox.readUnread()
   try {
     const query = new URLSearchParams({offset:String(offset.value), status:status.value, category:category.value, search:search.value})

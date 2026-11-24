@@ -1,5 +1,7 @@
 """Subagent 风格双分身委派：配对长期会话、独立任务、ACPS 传输及双方独立持久记忆。"""
 import asyncio
+
+from avatar.core.dispatch import begin_work, wait_work
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -1627,11 +1629,17 @@ class AgentDialogues:
 
     async def control_loop(self):
         while True:
-            await self.flush_controls();await asyncio.sleep(1)
+            latch = begin_work(self.database, 'controls')
+            if await self.flush_controls():
+                await asyncio.sleep(1.)
+            else:
+                await wait_work(latch, 1., reconcile=2.)
 
     async def worker(self):
         while True:
-            if not await self.once():await asyncio.sleep(.4)
+            latch = begin_work(self.database, 'peer')
+            if not await self.once():
+                await wait_work(latch, .4)
 
     async def cleanup_loop(self):
         while True:

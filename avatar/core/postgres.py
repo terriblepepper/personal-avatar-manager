@@ -16,9 +16,11 @@ SCHEMA_LOCK = 1096172627
 ACCOUNT_WRITE_LOCK = 1096172628
 
 
-def lock_schema_transaction(raw, domain, *, account_scope=None):
+def lock_schema_transaction(raw, domain, *, account_scope=None, dispatch=False):
     # 旧版进程仍取全库排他锁；共享同一旧锁后，再按当前 schema 互斥。
-    raw.execute('SELECT pg_advisory_xact_lock_shared(%s::bigint)', (domain,))
+    raw.execute(
+        "SELECT pg_advisory_xact_lock_shared(%s::bigint), set_config('avatar.dispatch_enabled','on',true)"
+        if dispatch else 'SELECT pg_advisory_xact_lock_shared(%s::bigint)', (domain,))
     if account_scope is None:
         raw.execute('SELECT pg_advisory_xact_lock(%s::integer, hashtext(current_schema()))', (domain,))
         return
@@ -214,6 +216,7 @@ class PostgresDatabase:
     def __init__(self, url):
         self.pool = ConnectionPool(url, min_size=1, max_size=10, open=True)
         self.metadata = {}
+        self.dispatch_enabled = False
         self.compile_static = lru_cache(maxsize=512)(partial(_compile_sql, self.metadata))
 
     @staticmethod
@@ -259,7 +262,8 @@ class PostgresDatabase:
             record_duration('db_pool_acquire', perf_counter() - started)
             if write:
                 with measure('db_write_lock'):
-                    lock_schema_transaction(raw, WRITE_LOCK, account_scope=account_scope)
+                    lock_schema_transaction(raw, WRITE_LOCK, account_scope=account_scope,
+                                            dispatch=self.dispatch_enabled)
             yield Connection(raw, self.metadata, self.compile_static)
 
     def close(self):

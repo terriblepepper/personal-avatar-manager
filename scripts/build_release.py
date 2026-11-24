@@ -8,6 +8,7 @@ import sys
 import tempfile
 import tomllib
 import zipfile
+from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -49,8 +50,22 @@ def main():
         wheels = staging / 'dependencies'
         wheels.mkdir()
         copy_redis(staging)
+        kafka = staging / 'kafka'
+        kafka.mkdir()
+        for name in ('service.sh', 'broker.env'):
+            shutil.copy2(ROOT / 'kafka' / name, kafka / name)
         build(ROOT / 'vendor' / 'EverOS', wheels, '--wheel')
         lock = tomllib.loads((ROOT / 'uv.lock').read_text())
+        kafka_client = next(package for package in lock['package'] if package['name'] == 'confluent-kafka')
+        for abi in ('cp312-cp312', 'cp313-cp313'):
+            wheel, = [item for item in kafka_client['wheels']
+                      if item['url'].endswith(f'{abi}-manylinux_2_28_x86_64.whl')]
+            name = wheel['url'].rsplit('/', 1)[1]
+            with urlopen(wheel['url'], timeout=60) as response:
+                data = response.read()
+            if 'sha256:' + hashlib.sha256(data).hexdigest() != wheel['hash']:
+                raise ValueError(f'{name} 与 uv.lock 不符')
+            (wheels / name).write_bytes(data)
         for package in lock['package']:
             if package['name'] in {'wit', 'acps-sdk'}:
                 source = ROOT / package['source']['path']

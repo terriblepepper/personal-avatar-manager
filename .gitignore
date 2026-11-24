@@ -57,6 +57,9 @@ node_modules/
 /redis/redis.sock
 /redis/redis.pid
 /redis/redis.lock
+/kafka/data/
+/kafka/logs/
+/kafka/kafka.lock
 *.sqlite3
 *.sqlite
 *.db

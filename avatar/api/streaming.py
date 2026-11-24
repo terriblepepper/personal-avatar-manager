@@ -2,9 +2,11 @@
 import asyncio
 import json
 import uuid
+from contextlib import nullcontext
 from fastapi.responses import StreamingResponse
 from avatar.conversation.jobs.store import GenerationStore, TERMINAL
 from avatar.conversation.jobs.runner import GenerationRunner
+from avatar.core.dispatch import wait_change
 
 
 def submit_generation(database, user, body):
@@ -16,10 +18,14 @@ def chat_response(chat, user, body, database):
     submit_generation(database, user, body)
     store = GenerationStore(database)
 
-    async def events():
+    changes = getattr(database, 'changes', None)
+
+    async def stream(event):
         previous = None
         delivered = ''
         while True:
+            if event is not None:
+                event.take()
             snapshot = await asyncio.to_thread(store.get,user['id'],body.request_id)
             if snapshot != previous:
                 event = {'type': 'snapshot', 'snapshot': snapshot}
@@ -41,7 +47,16 @@ def chat_response(chat, user, body, database):
                 yield 'event: ' + event['type'] + '\ndata: ' + json.dumps(event, ensure_ascii=False) + '\n\n'
                 return
             yield ': keep-alive\n\n'
-            await asyncio.sleep(.5)
+            if event is None:
+                await asyncio.sleep(.5)
+            else:
+                await wait_change(event, 5. if changes.can_push else .5)
+
+    async def events():
+        subscription = changes.watch(('generation', user['id'], body.request_id)) if changes else nullcontext()
+        with subscription as event:
+            async for item in stream(event):
+                yield item
 
     return StreamingResponse(events(), media_type='text/event-stream',
                              headers={'X-Accel-Buffering': 'no', 'Cache-Control': 'no-store'})
