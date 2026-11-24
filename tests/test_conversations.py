@@ -124,19 +124,24 @@ def test_clear_forgets_job_content_and_does_not_resurrect_it(context,jobs):
     assert 'private' not in str(store.get(user['id'],'forgotten'))
 
 
-@pytest.mark.parametrize('command',['$first','$FIRST'])
-def test_queued_skill_scope_cannot_expand_and_revocations_apply(context,jobs,command):
+@pytest.mark.parametrize('activation', ['explicit', 'session'])
+def test_queued_generation_ignores_paused_skills(context, jobs, previously_installed_skill, activation):
     from avatar.conversation.jobs.pipeline import generation_scope
-    app,client,_=context;store,user,_,cid=jobs;skills=app.state.chat.skills
-    first=skills.install(user['id'],'SKILL.md',b'---\nname: first\ndescription: First\n---\nTest instruction.')
-    store.submit(user,request(cid,'scoped',command));job=store.claim()[0]
-    second=skills.install(user['id'],'SKILL.md',b'---\nname: second\ndescription: Second\n---\nTest instruction.')
-    with generation_scope(job),store.database.connect() as db:
-        catalog,_=skills.context(user['id'],'hello',db)
-        assert [item['id'] for item in catalog]==[first]
-    with store.database.connect(write=True) as db:db.execute('UPDATE agent_skills SET enabled=0 WHERE id=?',(first,))
-    with generation_scope(job),store.database.connect() as db:
-        assert skills.context(user['id'],'hello',db)[0]==[]
+
+    app, _, _ = context
+    store, user, _, cid = jobs
+    skills = app.state.chat.skills
+    message = '$archived-skill'
+    if activation == 'session':
+        with store.database.connect(write=True) as db:
+            db.execute('INSERT INTO chat_session_skills(conversation_id,skill_id,authorized) VALUES(?,?,1)',
+                       (cid, previously_installed_skill))
+        message = '继续'
+    store.submit(user, request(cid, 'scoped', message))
+    job = store.claim()[0]
+    assert json.loads(job['authorization'])['skills'] == {}
+    with generation_scope(job), store.database.connect() as db:
+        assert skills.context(user['id'], message, db)[0] == []
 
 
 def test_changed_configuration_fails_without_calling_model(context,jobs):
@@ -317,20 +322,36 @@ def test_bad_job_does_not_stop_generation_runner(context,cleanup_failure,corrupt
     assert calls==['good']
 
 
-@pytest.mark.parametrize('revocation',['account','skill','session'])
-def test_revoked_generation_cannot_commit_history(context,jobs,revocation):
+@pytest.mark.parametrize(('revocation', 'status', 'reason'), [
+    ('account', 403, '账户已停用'),
+    ('cancelled', 409, '原请求已结束'),
+    ('paused_skill', 403, '因安全问题暂时停止分身技能的使用'),
+])
+def test_revoked_generation_cannot_commit_history(context, jobs, revocation, status, reason):
     from avatar.conversation.jobs.pipeline import generation_scope
-    app,_,_=context;store,user,_,cid=jobs;chat=app.state.chat
-    skill=chat.skills.install(user['id'],'SKILL.md',b'---\nname: revoke\ndescription: Test\n---\nInstructions.')
-    chat.session_skills.set_enabled(user['id'],cid,skill,True)
-    body=request(cid,'revoke');store.submit(user,body);job=store.claim()[0]
-    with store.database.connect(write=True) as db:
-        if revocation=='account':db.execute("UPDATE users SET account_status='disabled' WHERE id=?",(user['id'],))
-        elif revocation=='skill':db.execute('UPDATE agent_skills SET enabled=0 WHERE id=?',(skill,))
-        else:db.execute('UPDATE chat_session_skills SET enabled=0 WHERE conversation_id=?',(cid,))
-    with pytest.raises(HTTPException),generation_scope(job):chat.save(user,body,{'agent':None},'late')
+
+    app, _, _ = context
+    store, user, _, cid = jobs
+    body = request(cid, 'revoke')
+    store.submit(user, body)
+    job = store.claim(leased=True)[0]
+    if revocation == 'cancelled':
+        assert store.finish(user['id'], 'revoke', 'cancelled')
+    else:
+        with store.database.connect(write=True) as db:
+            if revocation == 'account':
+                db.execute("UPDATE users SET account_status='disabled' WHERE id=?", (user['id'],))
+            else:
+                scope = json.loads(job['authorization'])
+                scope['skills'] = {'archived-skill-id': 'previous-revision'}
+                job['authorization'] = json.dumps(scope)
+                db.execute('UPDATE chat_generation_jobs SET authorization=? WHERE task_id=?',
+                           (job['authorization'], job['task_id']))
+    with pytest.raises(HTTPException) as error, generation_scope(job):
+        app.state.chat.save(user, body, {'agent': None}, 'late')
+    assert error.value.status_code == status and reason in error.value.detail
     with store.database.connect() as db:
-        assert db.execute('SELECT count(*) FROM chat_messages WHERE conversation_id=?',(cid,)).fetchone()[0]==0
+        assert db.execute('SELECT count(*) FROM chat_messages WHERE conversation_id=?', (cid,)).fetchone()[0] == 0
 
 
 def test_revoked_account_cannot_start_model_request(jobs,monkeypatch):

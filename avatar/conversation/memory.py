@@ -6,7 +6,7 @@ from contextlib import ExitStack
 from avatar.core.tokens import estimate
 from avatar.models.limits import check_context, context_window, tool_budget
 from avatar.conversation.tools.activity import memory_evidence
-from avatar.conversation.working_context import compression_budget, fit_turn, input_budget, json_text_view, retained_budget
+from avatar.models.context_budget import compression_budget, fit_turn, input_budget, json_text_view, retained_budget
 import time
 import uuid
 from dataclasses import dataclass

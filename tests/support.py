@@ -155,6 +155,17 @@ def context(tmp_path,monkeypatch,request,postgres_url):
     return app, user, admin
 
 
+@pytest.fixture
+def previously_installed_skill(context, monkeypatch):
+    app, user, _ = context
+    uid = user.get('/api/auth/me').json()['user']['id']
+    with monkeypatch.context() as before_pause:
+        before_pause.setattr('avatar.skills.policy.SKILLS_PAUSED', False)
+        return app.state.chat.skills.install(
+            uid, 'SKILL.md', b'---\nname: archived-skill\ndescription: Archived skill\n---\nOld instructions.\n'
+        )
+
+
 def login(client, username, password):
     r = client.post("/api/auth/login", json={"username": username, "password": password})
     assert r.status_code == 200, r.text

@@ -1,7 +1,7 @@
 """受限自查询：模型只构造语义查询和元数据条件，权限范围始终由业务库决定。"""
 from avatar.core.text_budget import AgentText, fits_text_budget, budget_error
 from avatar.files.library.catalog import fit_catalog, model_animation_metadata
-from avatar.conversation.working_context import fit_turn
+from avatar.models.context_budget import fit_turn
 from avatar.core.tokens import estimate
 from pathlib import Path
 from typing import Literal

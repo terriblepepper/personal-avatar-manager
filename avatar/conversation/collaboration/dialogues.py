@@ -1218,7 +1218,7 @@ class AgentDialogues:
         config['_run_store'] = store
         config['_omit_source_citations'] = True
         if config.get('_direct_chat'):
-            from avatar.conversation.working_context import fit_turn
+            from avatar.models.context_budget import fit_turn
 
             system += '\n以分身身份回应最新来信或用户补充，仅返回本轮文字。'
             history = [{'role':'user','content':row['speaker_name']+'：'+row['content']}

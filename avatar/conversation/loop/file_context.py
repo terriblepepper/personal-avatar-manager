@@ -3,7 +3,7 @@ import json
 
 from fastapi import HTTPException
 
-from avatar.conversation.working_context import compression_budget, input_budget
+from avatar.models.context_budget import compression_budget, input_budget
 from avatar.core.tokens import estimate
 
 

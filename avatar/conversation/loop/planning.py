@@ -5,7 +5,7 @@ from fastapi import HTTPException
 
 from avatar.core.text_budget import TEXT_LIMIT, fits_text_budget, budget_error
 from avatar.conversation.loop.file_context import explicit_file_context
-from avatar.conversation.working_context import bounded_excerpt, fit_turn, input_budget
+from avatar.models.context_budget import bounded_excerpt, fit_turn, input_budget
 from avatar.core.tokens import estimate
 from avatar.core.execution import AskUser, call_with_retry, check_execution_async
 from avatar.models.client import accumulate_usage

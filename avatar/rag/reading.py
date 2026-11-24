@@ -14,7 +14,7 @@ from avatar.core.db import dump,now
 from avatar.core.tokens import estimate
 from avatar.core.text_budget import AgentText
 from avatar.models.limits import check_context
-from avatar.conversation.working_context import fit_turn, json_text_view
+from avatar.models.context_budget import fit_turn, json_text_view
 from avatar.files.library.catalog import fit_text_rows
 
 
