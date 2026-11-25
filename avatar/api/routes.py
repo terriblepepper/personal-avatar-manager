@@ -119,10 +119,10 @@ def platform_binding(request: Request, user=Depends(auth.current_user)):
 # 职责：验证登录标识和密码并设置完整会话 Cookie。
 # 输入：body 为 LoginRequest，request.client.host 用于限流，response 写 Cookie。
 # 结果与约束：成功返回账户和 CSRF，Cookie 有效 12 小时且 HttpOnly；失败与限流由认证服务处理。
-def password_session(body, request, response, *, admin_only=False):
+def password_session(body, request, response, *, ops_only=False):
     settings = request.app.state.settings
     token, csrf, user = auth.login(request.app.state.database, body, request.client.host,
-                                  root_only=settings.oidc_enabled, admin_only=admin_only)
+                                  root_only=settings.oidc_enabled, ops_only=ops_only)
     response.set_cookie("avatar_session", token, httponly=True, samesite="strict",
                         secure=settings.secure_cookie, max_age=43200)
     return user, csrf
@@ -376,7 +376,7 @@ async def agent_health(user_id:str,request:Request,user=Depends(admin)):
 # 输入：search 最多 100 字符，role 限 all/user/admin，offset 非负，user 必须管理员。
 # 结果与约束：委托账户管理服务分页检索，返回 items 与 total，不返回密码哈希。
 @router.get('/admin/accounts')
-def account_list(request: Request, search: str = Query(default='',max_length=100), role: Literal['all','user','admin'] = 'all', offset: int = Query(default=0,ge=0), user=Depends(admin)):
+def account_list(request: Request, search: str = Query(default='',max_length=100), role: Literal['all','user','admin','super_admin'] = 'all', offset: int = Query(default=0,ge=0), user=Depends(admin)):
     return request.app.state.runtime.services.accounts.list(user,search,role,offset)
 
 

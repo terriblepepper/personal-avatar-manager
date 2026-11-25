@@ -12,6 +12,7 @@ import NotificationBell from '../components/NotificationBell.vue'
 import { request, notifyError } from '../api/client'
 import { createPlatformUpdates, platformUpdatesKey } from '../composables/usePlatformUpdates'
 import { useSessionStore } from '../stores/session'
+import { accountRoleLabels, canViewOps, isAdministrator } from '../utils/accountRole'
 
 const FilePreview = defineAsyncComponent(() => import('../components/FilePreview.vue'))
 
@@ -120,7 +121,7 @@ function go(path: string) {
   void router.push(path).then(() => { if (fromDrawer) mainContent.value?.focus() })
 }
 function menuItems() {
-  return [...(menuPanel.value?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)') || [])]
+  return [...(menuPanel.value?.querySelectorAll<HTMLElement>('button:not(:disabled), a[role="menuitem"]') || [])]
     .filter(button => button.getClientRects().length > 0)
 }
 function menuKeys(event: KeyboardEvent) {
@@ -160,9 +161,9 @@ async function pollSidebar(fetchPending = true) {
   try {
     await session.refresh()
     const user = session.user
-    if (!fetchPending || !admin.value || user?.role !== 'admin' || user.access_scope === 'profile') return
+    if (!fetchPending || !admin.value || !user || !isAdministrator(user) || user.access_scope === 'profile') return
     const { pending } = await request<{ pending: number }>('/admin/pending-count', 'GET', undefined, controller.signal)
-    if (!controller.signal.aborted && admin.value && session.user?.id === user.id && session.user.role === 'admin') session.pending = pending
+    if (!controller.signal.aborted && admin.value && session.user?.id === user.id && isAdministrator(session.user)) session.pending = pending
   } catch { /* 短暂断连时保留最后一次成功结果。 */ }
   finally {
     polling = false
@@ -198,7 +199,7 @@ async function logout() { try { await session.logout() } catch (e) { notifyError
     <aside ref="sidebar" id="console-sidebar" class="sidebar" :inert="narrowNav && !drawerOpen" :class="{ 'mobile-open': drawerOpen, 'guide-drawer': phase === 'tour' }">
       <div class="brand"><span class="mark"><AppIcon name="agent"/></span><div>镜像<small>个人分身工作台</small></div></div>
       <div class="sidebar-navigation">
-        <div class="sidebar-account"><AppIcon name="person"/><div><strong>{{ session.user?.profile_name || session.user?.identity_username || session.user?.username }}</strong><small>{{ session.user?.is_root ? '根管理员' : session.user?.role === 'admin' ? '管理员' : '个人账户' }}</small></div></div>
+        <div class="sidebar-account"><AppIcon name="person"/><div><strong>{{ session.user?.profile_name || session.user?.identity_username || session.user?.username }}</strong><small>{{ session.user?.is_root ? '根管理员' : session.user && isAdministrator(session.user) ? accountRoleLabels[session.user.role] : '个人账户' }}</small></div></div>
         <p class="navgroup">{{ admin ? '管理' : '工作空间' }}</p>
         <nav class="nav" aria-label="主导航">
           <button v-for="item in nav" :key="item.key" type="button" :data-nav="item.key" :class="{ active: activeKey === item.key }" :aria-current="activeKey === item.key ? 'page' : undefined" @click="go(item.path)">
@@ -224,7 +225,8 @@ async function logout() { try { await session.logout() } catch (e) { notifyError
                 <button type="button" role="menuitem" class="sidebar-action" @click="closeMore(true); replay('tour')"><AppIcon name="panel"/><span>重播模块导览</span></button>
               </template>
             </template>
-            <button v-if="session.user?.role === 'admin' && !profileScope" type="button" role="menuitem" class="sidebar-action" @click="go(admin ? '/' : '/admin')"><AppIcon name="panel"/><span>{{ admin ? '个人中心' : '管理控制台' }}</span></button>
+            <a v-if="canViewOps(session.user)" href="/ops/" role="menuitem" class="sidebar-action" @click="closeMore()"><AppIcon name="panel"/><span>运行监控</span></a>
+            <button v-if="isAdministrator(session.user) && !profileScope" type="button" role="menuitem" class="sidebar-action" @click="go(admin ? '/' : '/admin')"><AppIcon name="panel"/><span>{{ admin ? '个人中心' : '管理控制台' }}</span></button>
           </div></Transition>
         </div>
       </div>

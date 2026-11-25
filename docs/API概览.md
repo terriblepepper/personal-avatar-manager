@@ -18,7 +18,7 @@
 
 `GET /api/updates` 为站内实时更新流，要求完整登录态。`ready` 表示可刷新当前快照，`change` 返回有变化的类型（`inbox`、`dialogue`、管理员的 `reviews`）。客户端沿用各自 API 获取数据。实时服务未就绪返回 503，客户端暂用原有轮询。
 
-运行监控在 `/ops/`。`POST /api/ops/login` 复用本地管理员登录与限流，`GET /api/ops/metrics?window=1h` 返回聚合运行指标。时间范围为 `1h`、`24h`、`7d`。`GET /api/ops/metrics/minutes` 按 `start`（Unix 分钟）及 `count`（1–60）查看完整分钟数据。指标接口要求本地密码签发的完整管理员会话。
+运行监控在 `/ops/`。`POST /api/ops/login` 复用本地密码登录与限流，并校验运维角色，`GET /api/ops/metrics?window=1h` 返回聚合运行指标。时间范围为 `1h`、`24h`、`7d`。`GET /api/ops/metrics/minutes` 按 `start`（Unix 分钟）及 `count`（1–60）查看完整分钟数据。指标接口要求根管理员或超级管理员的完整会话。通过统一认证登录的超级管理员沿用平台会话。
 
 ## 路由模块一览
 
@@ -111,7 +111,7 @@
 - `GET /api/admin/agents/operations?search=&offset=0` 每页返回最多 10 个分身及其最新适用身份任务，并附端口池状态。`GET /api/admin/agents/{user_id}/detail` 返回单个分身的完整管理视图。
 - `GET /api/admin/pending-count` 返回 `{"pending": 整数}`，合计资料和 Soul 待审记录，完整管理员会话可用。
   - `environment` 为本次启动的环境快照：实际注册适配器与模式、配置的通信地址/端口、已安装框架版本和真实手册路径；缺失元数据或手册返回空值。仅管理员可读取，通信配置不表示实时监听状态。
-- `GET /api/admin/accounts`、`GET /api/admin/accounts/{user_id}/profile`、`PUT /api/admin/accounts/{user_id}/role`
+- `GET /api/admin/accounts`、`GET /api/admin/accounts/{user_id}/profile`、`PUT /api/admin/accounts/{user_id}/role`。角色为 `user`、`admin` 或 `super_admin`。任命 `super_admin` 需要本地根管理员完整会话。非根管理账户仅可由本人降为 `user`。
 - `POST /api/admin/reviews/{submission_id}`
 - `POST /api/admin/jobs/{job_id}/retry`
 - `POST /api/admin/agents/{user_id}/health`、`POST /api/admin/agents/{user_id}/renew`

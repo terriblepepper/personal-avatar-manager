@@ -53,7 +53,7 @@ class AccountManagement:
         profile.pop('attachments',None)
         return {'account':dict(account),'profile':profile,'approved_at':approved_at}
 
-    # 职责：在写事务中授予管理员身份或执行管理员自主降级。
+    # 职责：在写事务中任命管理角色或执行本人降级。
     # 输入：actor 为操作者，target_id 为目标账户 ID，role 为接口已校验的目标角色。
     # 结果与约束：事务内重新检查操作者权限；禁止降级他人或根管理员，未完成注册审核者不能升权；返回变更结果并记录事件。
     def set_role(self, actor, target_id, role):
@@ -70,12 +70,21 @@ class AccountManagement:
                     raise HTTPException(403,'管理员只能将自己降级为普通用户')
                 if target['is_root']:
                     raise HTTPException(403,'根管理员 admin 保留管理权限，不能降级')
-            elif target['account_status'] != 'active':
+            elif role == 'super_admin':
+                if (not current['is_root'] or current['account_status'] != 'active'
+                        or actor.get('access_scope') != 'full' or actor.get('auth_method') != 'local'):
+                    raise HTTPException(403, '只有本地根管理员可以任命超级管理员')
+                if target['is_root']:
+                    raise HTTPException(403, '根管理员权限保留')
+            elif target['role'] == 'super_admin':
+                raise HTTPException(403, '超级管理员只能由本人降级为普通用户')
+            if role != 'user' and target['account_status'] != 'active':
                 raise HTTPException(409,'只有已激活账户可以成为管理员')
             if target['role'] == role:
                 return {'id':target_id,'role':role,'changed':False}
             db.execute('UPDATE users SET role=? WHERE id=?',(role,target_id))
-            event(db,target_id,current['username'],'授予管理员权限' if role=='admin' else '管理员自主降级',
+            action = {'admin':'授予管理员权限','super_admin':'授予超级管理员权限','user':'管理员自主降级'}[role]
+            event(db,target_id,current['username'],action,
                   dump({'username':target['username'],'from':target['role'],'to':role}), actor_id=current['id'])
         # 现有会话每次读取 users 当前角色，不使用缓存权限的 JWT，角色变化立即参与后续校验。
         return {'id':target_id,'role':role,'changed':True}

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Literal
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
+from avatar.accounts.roles import ADMIN_ROLES
 from avatar.core.db import now, dump, event
 from avatar.files.artifact_limits import MAX_SOURCE_BYTES
 from avatar.files.parsing.media_types import MEDIA,validate_media
@@ -282,7 +283,7 @@ class AttachmentService:
     def file_for(self, user, identifier, admin=False):
         with self.database.connect() as db:
             row = db.execute('SELECT * FROM attachments WHERE id=?', (identifier,)).fetchone()
-        if not row or (row['user_id'] != user['id'] and not (admin and user['role'] == 'admin')):
+        if not row or (row['user_id'] != user['id'] and not (admin and user['role'] in ADMIN_ROLES)):
             raise HTTPException(404, '附件不存在')
         path = self.directory / (row['id'] + '.blob')
         if not path.is_file():

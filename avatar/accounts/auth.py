@@ -6,6 +6,7 @@ from psycopg import IntegrityError
 import time
 import uuid
 from fastapi import HTTPException, Request
+from avatar.accounts.roles import ADMIN_ROLES, can_view_ops
 from avatar.core.db import event, now, dump
 from avatar.core.schemas import normalize_email, normalize_phone
 
@@ -93,7 +94,7 @@ def issue_session(db,user_id,duration=43200,access_scope='full',auth_method='loc
 # 职责：按用户名、邮箱或手机号验证密码并签发完整会话。
 # 输入：credentials 为登录请求，ip 用于限流，root_only 表示仅根账户可用本地密码；登录标识按联系方式规范化。
 # 结果与约束：成功返回会话三元组；失败计入 15 分钟限流，用户名优先匹配，错误统一返回 401，未知账户仍计算虚拟密码哈希；统一认证启用后仅根账号可使用本地密码；关闭时预关联的旧账号仍可本地登录。
-def login(database, credentials, ip, root_only=False, *, admin_only=False):
+def login(database, credentials, ip, root_only=False, *, ops_only=False):
     identifier = credentials.username.strip()
     try:
         identifier = normalize_email(identifier) if '@' in identifier else normalize_phone(identifier)
@@ -116,7 +117,7 @@ def login(database, credentials, ip, root_only=False, *, admin_only=False):
         managed = bool(user and not user['is_root'] and db.execute('SELECT 1 FROM oidc_identities WHERE user_id=?', (user['id'],)).fetchone())
         valid = verify_password(credentials.password, user["password"] if user else hash_password("dummy-password", "00"*16))
         if (not user or not valid or (managed and root_only) or (root_only and not user['is_root'])
-                or (admin_only and user['role'] != 'admin')):
+                or (ops_only and not can_view_ops(user))):
             attempts = limit["attempts"] + 1 if limit and limit["reset_at"] > current else 1
             reset = limit["reset_at"] if limit and limit["reset_at"] > current else current + 900
             db.execute("INSERT OR REPLACE INTO login_limits VALUES(?,?,?)", (key, attempts, reset))
@@ -141,7 +142,7 @@ def current_user(request: Request):
             if not hmac.compare_digest(request.headers.get("x-csrf-token", ""), row["csrf"]):
                 raise HTTPException(403, "会话校验失败，请刷新页面")
         user=dict(row)
-        if user['role'] == 'admin':
+        if user['role'] in ADMIN_ROLES:
             user['onboarding_stage'] = 'done'
         identity=db.execute('SELECT subject,username,verified_at FROM oidc_identity_links WHERE user_id=? AND issuer=?',
                             (user['id'], request.app.state.settings.oidc_issuer.rstrip('/'))).fetchone()
@@ -164,10 +165,10 @@ def current_user(request: Request):
 
 
 # 职责：检查当前账户是否具有管理员角色。
-# 输入：user 为已认证账户字典，要求 role 为 admin。
+# 输入：user 为已认证账户字典，要求具有管理角色。
 # 结果与约束：通过时无返回值，否则返回 403；根身份之外的业务限制由具体操作另行检查。
 def require_admin(user):
-    if user["role"] != "admin":
+    if user["role"] not in ADMIN_ROLES:
         raise HTTPException(403, "需要管理员权限")
 
 

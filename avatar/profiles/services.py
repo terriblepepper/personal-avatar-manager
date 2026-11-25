@@ -3,6 +3,7 @@ import json
 import uuid
 from contextlib import nullcontext
 from fastapi import HTTPException
+from avatar.accounts.roles import ADMIN_ROLES
 from avatar.core.db import dump, event, now
 from avatar.core.activity_visibility import event_scope
 from avatar.core.schemas import Profile
@@ -79,7 +80,7 @@ class AvatarService:
             p = db.execute("SELECT * FROM profile_records WHERE user_id=?", (user_id,)).fetchone()
             agent = db.execute("SELECT * FROM avatar_records WHERE user_id=?", (user_id,)).fetchone()
             history = db.execute("SELECT s.*,u.username AS reviewer_name FROM profile_submissions s LEFT JOIN users u ON u.id=s.reviewer WHERE s.user_id=? ORDER BY submitted_at DESC", (user_id,)).fetchall()
-            admin = access_scope == 'full' and bool(db.execute("SELECT role='admin' FROM users WHERE id=?", (user_id,)).fetchone()[0])
+            admin = access_scope == 'full' and bool(db.execute("SELECT role IN (?,?) FROM users WHERE id=?", (*ADMIN_ROLES, user_id)).fetchone()[0])
             scope,values=event_scope(user_id,admin)
             events = db.execute("SELECT e.* FROM audit_events e WHERE "+scope+" ORDER BY e.id DESC LIMIT 50",values).fetchall()
             calls = db.execute("SELECT provider,model,usage,created_at,purpose FROM model_calls WHERE user_id=? ORDER BY id DESC LIMIT 20", (user_id,)).fetchall()

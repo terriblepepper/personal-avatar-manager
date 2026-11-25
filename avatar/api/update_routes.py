@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from avatar.accounts.auth import current_user
+from avatar.accounts.roles import ADMIN_ROLES
 from avatar.core.dispatch import wait_change
 
 router = APIRouter(prefix='/api', tags=['平台更新'])
@@ -18,7 +19,7 @@ async def updates(request: Request, user=Depends(current_user)):
         raise HTTPException(503, '实时更新暂不可用')
     uid = user['id']
     keys = [('inbox', uid), ('dialogue', uid)]
-    if user['role'] == 'admin':
+    if user['role'] in ADMIN_ROLES:
         keys.append(('reviews',))
 
     async def events():

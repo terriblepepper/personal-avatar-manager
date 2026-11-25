@@ -13,7 +13,7 @@ import { decodePreviewText, previewKind, readPreviewBytes, TEXT_PREVIEW_LIMIT } 
 import MermaidDiagram from './MermaidDiagram.vue'
 
 const HtmlFrame = defineAsyncComponent(() => import('./HtmlFrame.vue'))
-const props = defineProps<{ file: { id: string; filename: string; content_type?: string }; url: string; imageData?: string; initialFullscreen?: boolean }>()
+const props = defineProps<{ file: { id: string; filename: string; content_type?: string }; url: string; diagramSvg?: string; initialFullscreen?: boolean }>()
 const emit = defineEmits<{ close: [] }>()
 interface PDFPage {
   getViewport(options: { scale: number }): { width: number; height: number; convertToViewportPoint(x: number, y: number): number[] }
@@ -43,8 +43,7 @@ const extension = computed(() => props.file.filename.split('.').pop()?.toLowerCa
 const safeURL = computed(() => {
   try { const url = new URL(props.url, location.href); return url.origin === location.origin && url.pathname.startsWith('/api/') && !url.username && !url.password ? url.href : '' } catch { return '' }
 })
-const diagramImage = computed(() => props.imageData?.startsWith('data:image/png;base64,') ? props.imageData : '')
-const downloadURL = computed(() => diagramImage.value || safeURL.value)
+const downloadURL = computed(() => props.diagramSvg ? objectURL.value : safeURL.value)
 const manual = computed(() => !!safeURL.value && new URL(safeURL.value).pathname.startsWith('/api/help/')
   && ['md', 'markdown'].includes(extension.value))
 const manualPictures = computed(() => manual.value && props.file.filename === '用户操作手册.md'
@@ -159,7 +158,11 @@ async function load() {
   cleanup(); const active = new AbortController(); controller.value = active
   loading.value = true; error.value = ''; text.value = ''; page.value = 1; pages.value = 1; source.value = false; resetZoom()
   try {
-    if (diagramImage.value) { kind.value = 'image'; return }
+    if (props.diagramSvg) {
+      kind.value = 'image'
+      objectURL.value = URL.createObjectURL(new Blob([props.diagramSvg], { type: 'image/svg+xml' }))
+      return
+    }
     if (!safeURL.value) throw Error('只能预览本平台有权访问的文件')
     const ext = extension.value
     const url = new URL(safeURL.value)
@@ -264,7 +267,7 @@ watch([pdf, page], async ([document, number], _, cleanup) => {
   } catch (e) { if (current) error.value = e instanceof Error ? e.message : '无法读取 PDF 页面' }
 })
 watch([activePage, scale, canvas], renderPDF, { flush: 'post' })
-watch([() => props.url, extension, diagramImage], load, { immediate: true })
+watch([() => props.url, extension, () => props.diagramSvg], load, { immediate: true })
 onUnmounted(cleanup)
 </script>
 <template>
@@ -273,7 +276,7 @@ onUnmounted(cleanup)
     :initial-fullscreen="initialFullscreen" @closed="emit('close')">
     <div class="preview-toolbar">
       <button v-if="hasSourceView" type="button" class="button small" :aria-pressed="source" @click="source = !source">{{ source ? '返回阅读' : '查看源码' }}</button>
-      <a v-if="downloadURL" :href="downloadURL" :download="file.filename" class="button small">{{ diagramImage ? '下载图片' : manual ? '下载手册' : extension === 'mmd' ? '下载源码' : '下载原件' }}</a>
+      <a v-if="downloadURL" :href="downloadURL" :download="file.filename" class="button small">{{ diagramSvg ? '下载 SVG' : manual ? '下载手册' : extension === 'mmd' ? '下载源码' : '下载原件' }}</a>
       <span v-if="chapters.length && !loading && !error" aria-label="当前章节">{{ chapters[page - 1]?.title }}</span>
       <PreviewZoom v-if="zoomable && !loading && !error" :percent="percent" :fit="fit" :fit-label="kind === 'image' ? '适应窗口' : '适应宽度'" @scale="setScale"/>
     </div>
@@ -283,7 +286,7 @@ onUnmounted(cleanup)
       <div v-if="zoomable" class="preview-stage"><div ref="sheet" class="preview-sheet" :style="{ width: sheetWidth ? sheetWidth + 'px' : undefined }">
       <canvas v-if="kind === 'pdf'" ref="canvas" :aria-label="'PDF 第 ' + page + ' 页'"
         :style="paper ? { aspectRatio: paper.width + '/' + paper.height } : {}"/>
-      <img v-else-if="kind === 'image' && (diagramImage || objectURL)" :src="diagramImage || objectURL" :alt="file.filename"
+      <img v-else-if="kind === 'image' && objectURL" :src="objectURL" :alt="file.filename"
         @load="imageLoaded">
       <div v-else-if="kind === 'text'" :style="{ zoom: scale }"><DocumentFields v-if="!source && structured" :value="structured.value"/>
         <table v-else-if="!source && tabular.length" class="preview-data-table">

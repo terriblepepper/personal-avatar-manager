@@ -51,24 +51,26 @@ function download(kind: 'mmd' | 'svg' | 'png') {
     else notifyError(Error('无法导出 PNG'))
   }, 'image/png')).catch(notifyError)
 }
-async function pngCanvas() {
+function sizedSvg(width: number, height: number) {
   const root = new DOMParser().parseFromString(svg.value, 'image/svg+xml').documentElement
-  const box = root.getAttribute('viewBox')?.trim().split(/[ ,]+/).map(Number)
-  const width = box?.[2] || 1000, h = box?.[3] || height.value, scale = Math.min(1, 4096 / Math.max(width, h))
-  root.setAttribute('width', String(Math.ceil(width * scale))); root.setAttribute('height', String(Math.ceil(h * scale)))
-  const image = new Image(); image.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(new XMLSerializer().serializeToString(root))
+  root.setAttribute('width', String(width))
+  root.setAttribute('height', String(height))
+  return new XMLSerializer().serializeToString(root)
+}
+async function pngCanvas() {
+  const width = naturalWidth.value, h = height.value
+  const scale = Math.min(1, 4096 / Math.max(width, h))
+  const canvas = document.createElement('canvas')
+  canvas.width = Math.ceil(width * scale)
+  canvas.height = Math.ceil(h * scale)
+  const image = new Image()
+  image.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(sizedSvg(canvas.width, canvas.height))
   await image.decode()
-  const canvas = document.createElement('canvas'); canvas.width = Math.ceil(width * scale); canvas.height = Math.ceil(h * scale)
   const context = canvas.getContext('2d'); if (!context) throw Error('无法导出图形'); context.drawImage(image, 0, 0)
   return canvas
 }
-async function openPreview() {
-  if (!svg.value) return
-  const current = svg.value
-  try {
-    const image = (await pngCanvas()).toDataURL('image/png')
-    if (!controller.signal.aborted && current === svg.value) preview.value = image
-  } catch (error) { notifyError(error) }
+function openPreview() {
+  if (svg.value) preview.value = sizedSvg(naturalWidth.value, height.value)
 }
 async function external() {
   try {
@@ -126,7 +128,7 @@ onUnmounted(() => { controller.abort(); clearTimeout(timer); window.removeEventL
     <p v-if="link"><a class="button small" :href="link" target="_blank" rel="noopener noreferrer">打开图表链接</a></p>
   </figure>
   <MaterialFileDialog v-if="promoting" filename="Mermaid绘图.mmd" :save="promote" @close="promoting=false"/>
-  <FilePreview v-if="preview" :file="{ id: 'diagram', filename: 'Mermaid 图表.png' }" url="" :image-data="preview" @close="preview=''"/>
+  <FilePreview v-if="preview" :file="{ id: 'diagram', filename: 'Mermaid 图表.svg' }" url="" :diagram-svg="preview" @close="preview=''"/>
 </template>
 <style scoped>
 .diagram-viewport { max-height: 65dvh; overflow: auto; overflow-anchor: none; }

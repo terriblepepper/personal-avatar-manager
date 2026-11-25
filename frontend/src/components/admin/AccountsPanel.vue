@@ -7,6 +7,7 @@ import { notifyError, request } from '../../api/client'
 import { useSessionStore } from '../../stores/session'
 import type { Page, User } from '../../types'
 import { date, statusLabel } from '../../utils/format'
+import { accountRoleLabels, isAdministrator } from '../../utils/accountRole'
 
 interface Account extends User { name?: string; employee_id?: string }
 interface Profile extends Record<string, unknown> { name?: string; person_type?: string; employee_id?: string; visibility?: Record<string, string> }
@@ -14,6 +15,7 @@ interface Detail { account: Account; profile: Profile; approved_at: string | nul
 interface Field { key: string; label: string; audience: string; visibility: string; fixed_public?: boolean }
 
 const session = useSessionStore()
+const canAppointSuper = computed(() => session.user?.is_root && session.user.auth_source === 'local' && session.user.access_scope === 'full')
 const rows = ref<Account[]>([]), search = ref(''), role = ref('all'), offset = ref(0), total = ref(0)
 const detail = ref<Detail | null>(null), fields = ref<Field[]>([]), loadingProfile = ref('')
 const visibleFields = computed(() => fields.value.filter(field =>
@@ -43,9 +45,10 @@ async function profile(item: Account) {
   finally { if (ticket === profileRequest) loadingProfile.value = '' }
 }
 function hasEntries(value: unknown) { return value !== null && typeof value === 'object' && !!Object.keys(value).length }
-async function setRole(item: Account, value: 'user' | 'admin') {
+async function setRole(item: Account, value: User['role']) {
   const message = value === 'user' ? '确认将自己降级为普通用户？管理权限会立即撤销。' :
-    '确认将账户 ' + (item.identity_username || item.username) + ' 设为管理员？该账户将能审核申请、管理平台并授权其他用户。'
+    '确认将账户 ' + (item.identity_username || item.username) + ' 设为' + accountRoleLabels[value] + '？'
+      + (value === 'super_admin' ? '该账户可以管理平台和查看运行监控。' : '该账户可以审核申请、管理平台并授权其他用户。')
   if (!confirm(message)) return
   try {
     await request('/admin/accounts/' + encodeURIComponent(item.id) + '/role', 'PUT', { role: value })
@@ -62,10 +65,10 @@ onBeforeUnmount(() => { listRequest++; profileRequest++ })
     <h2>账户管理</h2>
     <div class="toolbar">
       <select v-model="role" aria-label="账户角色" class="form-control compact-record-filter" @change="load()">
-        <option value="all">全部角色</option><option value="user">普通用户</option><option value="admin">管理员</option>
+        <option value="all">全部角色</option><option value="user">普通用户</option><option value="admin">管理员</option><option value="super_admin">超级管理员</option>
       </select>
     </div>
-    <p class="sub">共 {{ total }} 个账户。管理员可为已激活账户授予管理权限。</p>
+    <p class="sub">共 {{ total }} 个账户。管理员可任命管理员。超级管理员由本地根管理员任命。</p>
     <div v-if="rows.length" class="tablewrap compact-record-table">
       <table>
         <thead><tr><th>姓名 / 用户名</th><th>身份 / 学号或工号</th><th>登记联系方式</th><th>角色 / 注册状态</th><th>操作</th></tr></thead>
@@ -73,13 +76,13 @@ onBeforeUnmount(() => { listRequest++; profileRequest++ })
           <td><strong>{{ item.name || '未填写姓名' }}</strong><small>{{ item.identity_username || item.username }}</small></td>
           <td>{{ item.person_type === 'teacher' ? '教师' : '学生' }}<small>{{ (item.person_type === 'teacher' ? item.employee_id : item.student_id) || '未填写学号或工号' }}</small></td>
           <td>{{ item.email || '未绑定邮箱' }}<small>{{ item.phone || '未绑定手机号' }}</small></td>
-          <td><span class="tag" :class="{ active: item.role === 'admin' }">{{ item.is_root ? '根管理员' : item.role === 'admin' ? '管理员' : '普通用户' }}</span>
+          <td><span class="tag" :class="{ active: isAdministrator(item) }">{{ item.is_root ? '根管理员' : accountRoleLabels[item.role] }}</span>
             <small>{{ item.account_status === 'active' ? '已激活' : statusLabel(item.account_status) }}</small></td>
           <td><div class="admin-row-actions">
             <button v-if="item.account_status === 'active'" type="button" class="button small" :disabled="loadingProfile === item.id" @click="profile(item)">查看资料</button>
             <button v-if="item.role === 'user' && item.account_status === 'active'" type="button" class="button small" @click="setRole(item, 'admin')">设为管理员</button>
-            <button v-else-if="item.role === 'admin' && !item.is_root && item.id === session.user?.id" type="button" class="button small danger" @click="setRole(item, 'user')">自己降级</button>
-            <span v-else>{{ item.is_root ? '根管理员权限保留' : item.role === 'admin' ? '仅本人可降级' : '等待注册审核' }}</span>
+            <button v-if="canAppointSuper && item.account_status === 'active' && !item.is_root && item.role !== 'super_admin'" type="button" class="button small" @click="setRole(item, 'super_admin')">设为超级管理员</button>
+            <button v-if="isAdministrator(item) && !item.is_root && item.id === session.user?.id" type="button" class="button small danger" @click="setRole(item, 'user')">自己降级</button>
           </div></td>
         </tr></tbody>
       </table>
