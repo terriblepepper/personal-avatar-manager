@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from xml.etree import ElementTree
 from fastapi import HTTPException
 
 DOCUMENTS = ('.pdf', '.doc', '.docx')
@@ -22,12 +23,13 @@ def pdf_image(path,page):
 
 
 def office_runtime():
-    local = Path(sys.prefix) / 'share/avatar-office/usr/lib/libreoffice/program'
+    root = Path(os.environ.get('AVATAR_OFFICE_RUNTIME') or Path(sys.prefix) / 'share/avatar-office').resolve()
+    local = root / 'usr/lib/libreoffice/program'
     binary = shutil.which('libreoffice') or shutil.which('soffice')
     env = {**os.environ, 'SAL_USE_VCLPLUGIN': 'svp', 'OMP_THREAD_LIMIT': '1'}
     if not binary and (local / 'soffice').is_file():
         binary = str(local / 'soffice')
-        libs = (Path(sys.prefix) / 'share/avatar-office/usr/lib').glob('*-linux-gnu')
+        libs = (root / 'usr/lib').glob('*-linux-gnu')
         env['LD_LIBRARY_PATH'] = os.pathsep.join([str(local), *map(str, libs)])
     if not binary:
         raise ValueError('Word 转换需要 LibreOffice；请安装 libreoffice-writer 或执行 scripts/install_runtime.py office')
@@ -107,6 +109,24 @@ def pdf_images(path, pages=None):
             pass  # The full page remains the fallback for unsupported image codecs.
 
 
+def needs_word_render(xml):
+    picture = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}pict'
+    drawing = '{http://schemas.microsoft.com/office/word/2010/wordprocessingShape}wsp'
+    rect = '{urn:schemas-microsoft-com:vml}rect'
+    horizontal_rule = '{urn:schemas-microsoft-com:office:office}hr'
+    for element in ElementTree.fromstring(xml).iter():
+        if element.tag in (drawing, '{urn:schemas-microsoft-com:vml}shape'):
+            return True
+        if element.tag == picture:
+            # Word stores paragraph separators as VML rectangles, without image or drawing content.
+            if len(element) == 1:
+                child = element[0]
+                if child.tag == rect and not len(child) and child.get(horizontal_rule) in ('t', 'true', '1'):
+                    continue
+            return True
+    return False
+
+
 def images(path, extension, pages=None):
     """Yield every raster asset and a page fallback for drawings; never sample the first N."""
     if extension == '.pdf':
@@ -132,10 +152,8 @@ def images(path, extension, pages=None):
                     yield {'id':name, 'page':1, 'label':'Word 内嵌图片 '+Path(name).name+'（资源序号，不代表物理页码）', 'data':data}
                 elif name.startswith(('word/charts/', 'word/diagrams/')):
                     fallback = True
-                elif name.startswith('word/') and name.endswith('.xml'):
-                    value = archive.read(name)
-                    if b'<w:pict' in value or b'<wps:wsp' in value or b'<v:shape' in value:
-                        fallback = True
+                elif not fallback and name.startswith('word/') and name.endswith('.xml'):
+                    fallback = needs_word_render(archive.read(name))
         if fallback:
             rendered=False
             with converted(source, '.docx', 'pdf') as pdf:

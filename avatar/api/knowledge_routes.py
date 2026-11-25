@@ -1,6 +1,7 @@
 """本人知识库与 soul 生命周期；管理员审核统一进入审核与审计。"""
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
+from avatar.api.file_previews import word_pdf
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.formparsers import MultiPartParser, MultiPartException
 from avatar.accounts.auth import current_user
@@ -98,8 +99,11 @@ async def upload(request:Request,user=Depends(owner)):
 
 
 @router.get('/assets/{identifier}')
-def download(identifier:str,request:Request,user=Depends(owner)):
-    path,item=request.app.state.knowledge.file(user['id'],identifier)
+def download(identifier:str,request:Request,user=Depends(owner),preview_pdf:bool=False):
+    knowledge = request.app.state.knowledge
+    if preview_pdf:
+        return word_pdf(lambda: knowledge.file(user['id'], identifier))
+    path,item=knowledge.file(user['id'],identifier)
     return FileResponse(path,media_type=item['mime'],filename=item['filename'])
 
 

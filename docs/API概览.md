@@ -201,7 +201,7 @@
 - `POST /api/conversations/{conversation_id}/animations/lookup` 接收 `source`，按当前账户和规范化内容查找真实资料。返回 `attachment_id` 与 `already_exists`。未转存时 ID 为空。
 - `POST /api/conversations/{conversation_id}/animations/promote` 接收 `source` 及可选的 `caption`、`visibility`、`folder`、`new_name`。成功时返回资料 ID 与是否复用了已有资料。超时后可用相同源码查询或重试。
 - `create_html` 接收 `filename` 和 `html`，用于生成网页、2D 动画和 3D 动画。预览隔离运行，禁止联网，提供内置 Three.js。会话设置 `{"tools":{"animation":true}}` 将制作动画传达为本轮目标。
-- `GET /api/me/attachments/{id}/preview-text` 在本人权限内从 DOCX 原件提取纯文本供小窗阅读。原始排版和图片保留在可下载的原件中。
+- 本人资料、会话及共享文件、Soul 素材和审核附件的下载接口支持 `?preview_pdf=true`，按原文件访问权限返回 DOC/DOCX 的 PDF 版式预览（最大 10 MiB）。`GET /api/me/attachments/{id}/preview-text` 提供 DOCX 纯文本。
 - 本人会话通过 `find_material` 查询本人已上传的全部类型原件。`mode=directories` 分页列出逻辑目录，`mode=files` 可按 `folder` 限定子树，再按名称、模糊词或已发布的正文索引返回可发送的 file_id。无索引仍能列出原件。saved_at 为空表示尚未显式保存资料设置；本人发送、历史和任务回放统一按所有权及本次授权快照核验。同实例接收方通过 `find_public_material` 浏览可转交的已公开、已保存资料。模型可继续按关键词查询或翻页，以 `select_materials({numbers,reply})` 选择本轮目录中一至五份原件并撰写正文，或通过 `clarify_material` 请求澄清。普通工具循环也可调用 `send_material`。新生成的 HTML 作品使用通用文件检索。成功提交的资料附件带有 `origin: "material"` 与授权的 `download_url`，读取原件仍需本人身份。底部资料胶囊列出已提交的文件；正文可选用独占一行的 `[[attachment:ID]]` 在指定位置展示同一份附件。历史和重放重新核对有效原件。
 
 - `GET /api/me/file-index` 可用 `source=profile` 或 `source=chat` 限定本人索引范围。默认包含两类，汇总区分部分索引（`partial`）和阻塞（`blocked`）。索引查询、重建与同步均要求完整会话。

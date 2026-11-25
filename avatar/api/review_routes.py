@@ -2,6 +2,7 @@
 from typing import Literal
 from fastapi import APIRouter,Depends,Query,Request,HTTPException
 from fastapi.responses import FileResponse
+from avatar.api.file_previews import word_pdf
 import json
 from pydantic import BaseModel,ConfigDict,Field,StrictBool
 from avatar.api.routes import admin
@@ -61,10 +62,15 @@ def detail(kind:Literal['profile','teacher_history','soul'],identifier:str,reque
 
 
 @router.get('/soul/{identifier}/assets/{asset_id}')
-def soul_source(identifier:str,asset_id:str,request:Request,user=Depends(admin)):
-    with request.app.state.database.connect() as db:
-        row=db.execute('SELECT user_id,asset_ids,status FROM soul_builds WHERE id=?',(identifier,)).fetchone()
-    if not row or row['status'] not in ('pending','approved','rejected') or asset_id not in json.loads(row['asset_ids']):
-        raise HTTPException(404,'审核素材不存在')
-    path,item=request.app.state.knowledge.file(row['user_id'],asset_id)
+def soul_source(identifier:str,asset_id:str,request:Request,user=Depends(admin),preview_pdf:bool=False):
+    def resolve():
+        with request.app.state.database.connect() as db:
+            row=db.execute('SELECT user_id,asset_ids,status FROM soul_builds WHERE id=?',(identifier,)).fetchone()
+        if not row or row['status'] not in ('pending','approved','rejected') or asset_id not in json.loads(row['asset_ids']):
+            raise HTTPException(404,'审核素材不存在')
+        return request.app.state.knowledge.file(row['user_id'],asset_id)
+
+    if preview_pdf:
+        return word_pdf(resolve)
+    path,item=resolve()
     return FileResponse(path,media_type=item['mime'],filename=item['filename'])

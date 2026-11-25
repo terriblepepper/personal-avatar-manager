@@ -30,7 +30,7 @@ def install_office():
         subprocess.run([existing,'--headless','--version'],check=True,timeout=30)
         print('使用已安装的系统 LibreOffice。')
         return
-    target=Path(sys.prefix)/'share/avatar-office'
+    target=Path(os.environ.get('AVATAR_OFFICE_RUNTIME') or Path(sys.prefix)/'share/avatar-office').resolve()
     program=target/'usr/lib/libreoffice/program'
     env={**os.environ,'LD_LIBRARY_PATH':os.pathsep.join([str(program),*map(str,(target/'usr/lib').glob('*-linux-gnu'))])}
     if (program/'soffice').is_file():

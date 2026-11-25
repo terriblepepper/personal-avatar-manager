@@ -2,7 +2,7 @@ export const TEXT_PREVIEW_LIMIT = 1024 * 1024
 export function previewKind(ext: string) {
   if (ext === 'mmd') return 'mermaid'
   if (ext === 'html' || ext === 'htm') return 'html'
-  if (ext === 'pdf') return 'pdf'
+  if (ext === 'pdf' || ext === 'doc' || ext === 'docx') return 'pdf'
   if (['png','jpg','jpeg','webp','gif','bmp'].includes(ext)) return 'image'
   if (['mp3','wav','m4a','ogg','flac'].includes(ext)) return 'audio'
   if (['mp4','mov','webm'].includes(ext)) return 'video'
