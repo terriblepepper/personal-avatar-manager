@@ -37,8 +37,15 @@ TRIGGERS = (
             PERFORM avatar_emit('reviews');
         END IF;
     """),
-    ('provision', 'provision_jobs', 'INSERT OR UPDATE OF status,next_attempt_at', """
+    ('provision', 'provision_jobs', 'INSERT OR UPDATE OF status,next_attempt_at,registration_phase', """
         IF NEW.status IN ('queued','waiting') THEN PERFORM avatar_emit('work', 'provision'); END IF;
+        PERFORM avatar_emit('overview', (SELECT user_id FROM profile_submissions WHERE id=NEW.submission_id));
+    """),
+    ('overview_profile', 'profile_records', 'INSERT OR UPDATE OF status,reason,draft', """
+        PERFORM avatar_emit('overview', NEW.user_id);
+    """),
+    ('overview_avatar', 'avatar_records', 'INSERT OR UPDATE OF aic,profile,identity_status OR DELETE', """
+        PERFORM avatar_emit('overview', CASE WHEN TG_OP='DELETE' THEN OLD.user_id ELSE NEW.user_id END);
     """),
     ('identity', 'avatar_identity_jobs', 'INSERT OR UPDATE OF status,next_attempt_at', """
         IF NEW.status IN ('queued','waiting') THEN

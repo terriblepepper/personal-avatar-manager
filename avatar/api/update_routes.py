@@ -18,7 +18,7 @@ async def updates(request: Request, user=Depends(current_user)):
     if not changes.can_push:
         raise HTTPException(503, '实时更新暂不可用')
     uid = user['id']
-    keys = [('inbox', uid), ('dialogue', uid)]
+    keys = [('inbox', uid), ('dialogue', uid), ('overview', uid)]
     if user['role'] in ADMIN_ROLES:
         keys.append(('reviews',))
 

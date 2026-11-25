@@ -125,7 +125,6 @@ def test_os_enforcement_refuses_to_change_an_unrelated_service(monkeypatch):
 
 
 def test_index_dispatch_is_globally_bounded_and_fair(pg_database):
-    from types import SimpleNamespace
     from avatar.rag.indexing.service import FileRag
 
     users = [f"owner-{index:03}" for index in range(100)]
@@ -143,10 +142,11 @@ def test_index_dispatch_is_globally_bounded_and_fair(pg_database):
     async def check():
         controller=ResourceController(ResourcePolicy(max_jobs=8,query_reserved=2),sampler=lambda:quiet())
         async def wait(row,lease=None):await asyncio.Event().wait()
-        rag=SimpleNamespace(database=pg_database,running=set(),resources=controller,queued_index=wait)
+        rag=FileRag.__new__(FileRag)
+        rag.database, rag.running, rag.resources, rag.queued_index = pg_database, {}, controller, wait
         pending={}
         try:
-            FileRag.dispatch(rag,pending)
+            await rag.dispatch(pending)
             assert 1<len(pending)<=controller.status()['limits']['index']
             assert len({row[2] for row in pending.values()})==len(pending)
         finally:

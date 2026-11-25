@@ -1,21 +1,23 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { request } from '../api/client'
 import { useSessionStore } from '../stores/session'
 import { statusLabel } from '../utils/format'
+import { useLivePolling } from '../composables/usePlatformUpdates'
 import MessageRecent from '../components/MessageRecent.vue'
 interface Overview { profile: { status: string; reason?: string; draft: { name?: string; avatar_name?: string }; registration?: { registration_phase?: string } | null }; agent: { aic: string; identity_status: string; profile: { name?: string; avatar_name?: string } } | null }
 const session = useSessionStore(), router = useRouter(), data = ref<Overview | null>(null), error = ref('')
-const controller = new AbortController()
 const ready = computed(() => data.value?.agent?.identity_status === 'active' ? data.value.agent : null)
 const status = computed(() => { const profile = data.value?.profile; if (!profile) return ''; return profile.status === 'creating' && profile.registration ? profile.registration.registration_phase || profile.status : profile.status })
 const step = computed(() => ['draft', 'rejected'].includes(status.value) ? 1 : ['pending', 'updating'].includes(status.value) ? 2 : status.value === 'active' ? 4 : 3)
 const name = computed(() => ready.value?.profile.name || data.value?.profile.draft.name || session.user?.identity_username || session.user?.username || '')
-async function load() { try { data.value = await request<Overview>('/me', 'GET', undefined, controller.signal); error.value = '' } catch (e) { if (!controller.signal.aborted) error.value = e instanceof Error ? e.message : '读取失败' } }
-let timer: ReturnType<typeof setInterval>
-onMounted(() => { void load(); timer = setInterval(() => { if (!document.hidden) void load() }, 8000) })
-onUnmounted(() => { controller.abort(); clearInterval(timer) })
+useLivePolling('overview', async signal => {
+  try {
+    const result = await request<Overview>('/me', 'GET', undefined, signal)
+    if (!signal.aborted) { data.value = result; error.value = '' }
+  } catch (e) { if (!signal.aborted) error.value = e instanceof Error ? e.message : '读取失败' }
+}, () => 8000)
 </script>
 <template>
   <div class="heading"><div><h1>你好，{{ name }}</h1><p class="sub">你的数字分身旅程，从一份个人资料开始。</p></div></div>

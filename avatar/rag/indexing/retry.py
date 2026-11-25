@@ -1,6 +1,7 @@
 """Only index work retries transient model transport failures; chat sends stay single-shot."""
 import asyncio
 from fastapi import HTTPException
+from avatar.core.execution import run_blocking
 
 
 class IndexRetry:
@@ -22,5 +23,5 @@ class IndexRetry:
                     raise
                 self.used+=1
                 delay=(2,5,10)[self.used-1]
-                self.notify(self.used,delay)
+                await run_blocking(self.notify,self.used,delay)
                 await asyncio.sleep(delay)

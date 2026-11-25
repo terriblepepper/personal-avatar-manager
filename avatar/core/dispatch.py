@@ -106,7 +106,7 @@ class Changes:
                     deliveries.append(self.kafka.publish(keys[0]))
                 else:
                     self.wake(keys[0])
-            elif topic in ('inbox', 'dialogue', 'generation', 'reviews') and all(keys):
+            elif topic in ('inbox', 'dialogue', 'generation', 'reviews', 'overview') and all(keys):
                 updates.append(payload)
         if updates and self.redis is not None:
             try:

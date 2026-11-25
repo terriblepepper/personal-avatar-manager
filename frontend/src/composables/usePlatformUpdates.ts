@@ -1,8 +1,8 @@
 import { inject, onMounted, onUnmounted, shallowRef, watch, type InjectionKey } from 'vue'
 import { usePolling } from './usePolling'
 
-type Topic = 'inbox' | 'dialogue' | 'reviews'
-const topics: Topic[] = ['inbox', 'dialogue', 'reviews']
+type Topic = 'inbox' | 'dialogue' | 'reviews' | 'overview'
+const topics: Topic[] = ['inbox', 'dialogue', 'reviews', 'overview']
 
 export function createPlatformUpdates(account: () => string | undefined) {
   const connected = shallowRef(false)
