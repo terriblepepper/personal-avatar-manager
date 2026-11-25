@@ -110,13 +110,13 @@ def extract(path, filename, kind, config):
                  'images':[{'mime_type':'image/jpeg','data':image}]}], '图片原件经有界缩放后分析'
     if kind=='document':
         extension=Path(filename).suffix.lower()
-        from avatar.files.parsing.document_images import WORD_SUFFIXES, word_pdf
+        from avatar.files.word_pdfs import WORD_SUFFIXES, read_word_pdf
         if extension in WORD_SUFFIXES:
             try:
-                with word_pdf(path, extension) as (pdf, vector):
-                    return document_parts(pdf, '.pdf', config, vector=vector)
-            except (ValueError, OSError, subprocess.SubprocessError):
-                raise HTTPException(422, 'Word 转 PDF 失败，请检查原件及 LibreOffice 运行环境') from None
+                pdf, vector = read_word_pdf(path)
+            except ValueError as error:
+                raise HTTPException(422, str(error)) from None
+            return document_parts(pdf, '.pdf', config, vector=vector)
         return document_parts(path, extension, config)
     duration,types=probe(path)
     require_media_model(config,types)

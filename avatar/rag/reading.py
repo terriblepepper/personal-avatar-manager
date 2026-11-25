@@ -1,6 +1,6 @@
 """模型原生资料读取工具；检索找来源，读取工具按需读取原件或遍历全文。"""
 import asyncio
-from contextlib import ExitStack, aclosing
+from contextlib import aclosing
 import json
 from pathlib import Path
 import subprocess
@@ -110,12 +110,10 @@ class MaterialReading:
             result=await read_media(self,context,row,path,request,limit)
             self.validate(context)
             return {'file_id':row['id'],'filename':row['filename'],'relative_path':row.get('relative_path') or row['filename'],**result}
-        from avatar.files.parsing.document_images import WORD_SUFFIXES, word_pdf
+        from avatar.files.word_pdfs import WORD_SUFFIXES, read_word_pdf
         if extension in WORD_SUFFIXES:
-            from avatar.files.uploads.buffer import upload_work
-            with ExitStack() as stack:
-                pdf, vector = await upload_work(stack.enter_context, word_pdf(path, extension))
-                return await self._read_document(context, row, request, pdf, '.pdf', limit, vector=vector)
+            pdf, vector = await asyncio.to_thread(read_word_pdf, path)
+            return await self._read_document(context, row, request, pdf, '.pdf', limit, vector=vector)
         return await self._read_document(context, row, request, path, extension, limit)
 
     async def _read_document(self, context, row, request, path, extension, limit, *, vector=True):

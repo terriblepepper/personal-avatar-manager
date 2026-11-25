@@ -10,6 +10,7 @@ from avatar.core.db import now
 from avatar.files.library.attachments import TYPES, chat_file_limit
 from avatar.files.artifact_limits import MAX_SOURCE_BYTES
 from avatar.files.uploads.buffer import upload_buffer, upload_work
+from avatar.files.word_pdfs import WORD_SUFFIXES, link_word_pdf, prepare_word_pdf
 
 OUTPUT_TYPES = {**TYPES, '.zip': 'application/zip'}
 
@@ -148,6 +149,14 @@ class ConversationResources:
                     else:
                         stream.write(item['data'])
                         sha=hashlib.sha256(item['data']).hexdigest()
+                extension = Path(item['filename']).suffix.lower()
+                if extension in WORD_SUFFIXES:
+                    if source:
+                        pdf = link_word_pdf(original, path)
+                    else:
+                        pdf, _ = prepare_word_pdf(path, extension)
+                    if pdf is not None:
+                        paths.append(pdf)
                 if mime.startswith('image/'):
                     from avatar.files.parsing.images import jpeg_bytes
                     encoded=jpeg_bytes(path);preview=path.with_suffix('.jpg')

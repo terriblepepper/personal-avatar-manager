@@ -187,7 +187,7 @@ class ChatFiles(ConversationResources):
         identifier=str(uuid.uuid4())
         path=self.directory.path(storage_owner,conversation_id,identifier+'.blob',create=True)
         preview=path.with_suffix('.jpg')
-        sha = write_original(path,data)
+        sha = write_original(path,data,extension=extension)
         try:
             extracted,status='','rag_pending'
             if TYPES[extension].startswith('image/'):
@@ -221,7 +221,10 @@ class ChatFiles(ConversationResources):
                 db.execute('UPDATE chat_files SET origin=?,description=?,source_label=? WHERE id=?',(origin,description,source_label,identifier))
                 if temporary:db.execute("UPDATE chat_files SET origin='attachment',referenced=0,expires_at=coalesce(expires_at,datetime('now','+7 days')) WHERE id=?",(identifier,))
         except BaseException:
-            path.unlink(missing_ok=True);preview.unlink(missing_ok=True);raise
+            from avatar.files.word_pdfs import discard_original
+            discard_original(path)
+            preview.unlink(missing_ok=True)
+            raise
         return {'items':self.list(user['id'],conversation_id),'file_id':identifier}
 
     # 职责：取得本人当前会话原件，供下载、删除与转存共同使用。

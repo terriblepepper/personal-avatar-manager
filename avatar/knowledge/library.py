@@ -74,7 +74,9 @@ def folder(k,user,body,operation):
         stamp=changed(db,user['id'],analyse=operation=='edit' and bool(rows))
         event(db,user['id'],user['username'],'管理 Soul 知识库目录',path,actor_id=user['id'])
     if operation=='delete':
-        for row in rows:(k.directory/(row['id']+'.blob')).unlink(missing_ok=True)
+        from avatar.files.word_pdfs import discard_original
+        for row in rows:
+            discard_original(k.directory/(row['id']+'.blob'))
     return {**result(k,user['id']),'path':path,'last_modified_at':stamp}
 
 

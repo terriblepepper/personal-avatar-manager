@@ -123,7 +123,7 @@ class KnowledgeService:
         self.directory.mkdir(parents=True,exist_ok=True,mode=0o700)
         self.directory.chmod(0o700)
         identifier=str(uuid.uuid4());path=self.directory.new(user['id'],identifier+'.blob')
-        checksum=write_original(path,data)
+        checksum=write_original(path,data,extension=Path(filename).suffix.lower())
         try:
             with self.database.connect(write=True) as db:
                 previous=db.execute('SELECT * FROM knowledge_assets WHERE user_id=? AND sha256=?',(user['id'],checksum)).fetchone()
@@ -135,7 +135,8 @@ class KnowledgeService:
                     if batch_id:
                         from avatar.files.uploads.batches import audit_detail
                         event(db,user['id'],user['username'],'上传知识库素材',audit_detail(previous['id'],batch_id),actor_id=user['id'])
-                    path.unlink()
+                    from avatar.files.word_pdfs import discard_original
+                    discard_original(path)
                     return self.asset(user['id'],previous['id'],db)
                 total=db.execute("SELECT COALESCE(SUM(size),0) FROM knowledge_assets WHERE user_id=? AND source_attachment_id=''",(user['id'],)).fetchone()[0]
                 if not source_attachment_id and total+len(data)>MAX_ASSET:
@@ -151,7 +152,9 @@ class KnowledgeService:
                 event(db,user['id'],user['username'],'上传知识库素材',audit_detail(identifier,batch_id),actor_id=user['id'])
                 return self.asset(user['id'],identifier,db)
         except BaseException:
-            path.unlink(missing_ok=True);raise
+            from avatar.files.word_pdfs import discard_original
+            discard_original(path)
+            raise
 
     async def import_material(self,user,identifier,folder=''):
         """只复制本人资料原件，目标知识库始终私有，源可见性与生命周期不变。"""

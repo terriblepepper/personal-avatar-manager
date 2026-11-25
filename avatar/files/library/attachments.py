@@ -194,7 +194,7 @@ class AttachmentService:
         self.directory.chmod(0o700)
         identifier = str(uuid.uuid4())
         path = self.directory.new(user['id'],identifier + '.blob')
-        checksum = write_original(path,data)
+        checksum = write_original(path,data,extension=extension)
         try:
             extracted,status='','rag_pending'
             with self.database.connect(write=True) as db:
@@ -216,7 +216,8 @@ class AttachmentService:
                 from avatar.files.uploads.batches import audit_detail
                 event(db, user['id'], user['username'], '上传资料附件', audit_detail(identifier,batch_id), actor_id=user['id'])
         except BaseException:
-            path.unlink(missing_ok=True)
+            from avatar.files.word_pdfs import discard_original
+            discard_original(path)
             raise
         ref = {'id': identifier, 'visibility': effective_visibility, 'caption': caption}
         return {**self.metadata(user['id'], [ref])[0], 'last_modified_at': modified}

@@ -32,7 +32,7 @@ def read_original(path,extension,**options):
     if supports(extension):
         return parse(path, extension, 'read', **options)
     from avatar.core.config import ROOT
-    result=subprocess.run([sys.executable,'-m','avatar.files.parsing.reader',str(path),extension],input=json.dumps(options).encode(),cwd=ROOT,capture_output=True,timeout=90 if extension in ('.doc','.docx') else 45,check=True)
+    result=subprocess.run([sys.executable,'-m','avatar.files.parsing.reader',str(path),extension],input=json.dumps(options).encode(),cwd=ROOT,capture_output=True,timeout=45,check=True)
     return json.loads(result.stdout)
 
 
