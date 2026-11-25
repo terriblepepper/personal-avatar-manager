@@ -166,16 +166,11 @@ async function load() {
     if (!safeURL.value) throw Error('只能预览本平台有权访问的文件')
     const ext = extension.value
     const url = new URL(safeURL.value)
-    if (ext === 'docx' && /^\/api\/me\/attachments\/[\w-]+$/.test(url.pathname)) {
-      kind.value = 'text'
-      const bytes = await readPreviewBytes(url.pathname+'/preview-text',TEXT_PREVIEW_LIMIT,active.signal)
-      if (!active.signal.aborted) text.value = new TextDecoder().decode(bytes)
-      return
-    }
+    if (ext === 'doc' || ext === 'docx') url.searchParams.set('preview_pdf', 'true')
     kind.value = previewKind(ext)
     if (!kind.value) return
     const limit = kind.value === 'html' ? MAX_HTML_BYTES : ['audio','video'].includes(kind.value) ? 64 * 1024 * 1024 : ['text','mermaid'].includes(kind.value) ? TEXT_PREVIEW_LIMIT : 10 * 1024 * 1024
-    const bytes = await readPreviewBytes(safeURL.value,limit,active.signal)
+    const bytes = await readPreviewBytes(url.href,limit,active.signal)
     if (active.signal.aborted) return
     if (['text','mermaid','html'].includes(kind.value)) {
       text.value = decodePreviewText(bytes)

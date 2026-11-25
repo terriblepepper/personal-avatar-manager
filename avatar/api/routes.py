@@ -8,6 +8,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field
 from wit import __version__ as wit_version
 from fastapi.responses import FileResponse
+from avatar.api.file_previews import word_pdf
 from avatar.files.library.folders import MaterialFolders,FolderRequest,NameRequest,FolderRenameRequest,rename_folder,rename_file
 from avatar.files.artifact_limits import MAX_SOURCE_BYTES
 from avatar.files.uploads.batches import batch_id as upload_batch_id, UploadComplete
@@ -599,8 +600,11 @@ def list_attachments(request: Request, user=Depends(auth.current_user)):
 # 输入：attachment_id 指定文件，user 为已认证所有人。
 # 结果与约束：不能通过 ID 访问他人文件；强制附件下载且禁止缓存，不在页面内执行文件内容。
 @router.get('/me/attachments/{attachment_id}')
-def own_attachment(attachment_id: str, request: Request, user=Depends(auth.current_user)):
-    path, row = request.app.state.service.attachments.file_for(user, attachment_id)
+def own_attachment(attachment_id: str, request: Request, user=Depends(auth.current_user), preview_pdf: bool=False):
+    files = request.app.state.service.attachments
+    if preview_pdf:
+        return word_pdf(lambda: files.file_for(user, attachment_id))
+    path, row = files.file_for(user, attachment_id)
     return FileResponse(path, media_type=row['content_type'], filename=row['filename'], headers={'Content-Security-Policy': "sandbox; default-src 'none'"})
 
 
@@ -628,8 +632,11 @@ async def own_word_preview(attachment_id: str, request: Request, user=Depends(au
 # 输入：attachment_id 为快照引用文件，user 必须通过 admin 依赖。
 # 结果与约束：管理员可核验私密材料，普通账户及临时资料会话不能访问管理路径。
 @router.get('/admin/attachments/{attachment_id}')
-def review_attachment(attachment_id: str, request: Request, user=Depends(admin)):
-    path, row = request.app.state.service.attachments.file_for(user, attachment_id, admin=True)
+def review_attachment(attachment_id: str, request: Request, user=Depends(admin), preview_pdf: bool=False):
+    files = request.app.state.service.attachments
+    if preview_pdf:
+        return word_pdf(lambda: files.file_for(user, attachment_id, admin=True))
+    path, row = files.file_for(user, attachment_id, admin=True)
     return FileResponse(path, media_type=row['content_type'], filename=row['filename'], headers={'Content-Security-Policy': "sandbox; default-src 'none'"})
 
 

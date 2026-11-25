@@ -4,6 +4,7 @@ from contextlib import ExitStack
 from typing import Literal
 from fastapi import APIRouter, Depends, Request, Query, HTTPException
 from fastapi.responses import FileResponse
+from avatar.api.file_previews import word_pdf
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, TypeAdapter, ValidationError
 from starlette.formparsers import MultiPartParser, MultiPartException
 from avatar.files.uploads.buffer import upload_buffer
@@ -133,12 +134,20 @@ async def upload(conversation_id: str, request: Request, user=Depends(current_us
 # 输入：会话和文件 ID，不接受任意路径。
 # 结果与约束：原件作为附件返回，不公开内联脚本或 HTML。
 @router.get('/{conversation_id}/files/{file_id}')
-def download(conversation_id: str, file_id: str, request: Request, user=Depends(current_user), preview: bool=False):
+def download(conversation_id: str, file_id: str, request: Request, user=Depends(current_user), preview: bool=False, preview_pdf: bool=False):
     service=request.app.state.chat.chat_files
-    with service.database.connect() as db:row=service.owned(db,user['id'],conversation_id,file_id)
-    path=service.directory.path(row['user_id'],row['conversation_id'],file_id+'.blob')
-    if not path.is_file():
-        raise HTTPException(404,'会话原件不存在')
+
+    def resolve():
+        with service.database.connect() as db:
+            row=service.owned(db,user['id'],conversation_id,file_id)
+        path=service.directory.path(row['user_id'],row['conversation_id'],file_id+'.blob')
+        if not path.is_file():
+            raise HTTPException(404,'会话原件不存在')
+        return path, row
+
+    if preview_pdf:
+        return word_pdf(resolve)
+    path, row = resolve()
     if preview:
         # 内联只使用服务端重新编码的 JPEG，下载仍返回授权原件。
         image=service.directory.path(row['user_id'],row['conversation_id'],file_id+'.jpg')
