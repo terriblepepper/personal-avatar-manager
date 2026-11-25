@@ -54,21 +54,18 @@ class HTMLText(HTMLParser):
             self.parts.append(' '.join(data.split()))
 
 
-# 职责：提取 DOCX 或 PPTX 中可直接读取的段落文字。
+# 职责：提取 PPTX 中可直接读取的段落文字。
 # 输入：path 为服务器保存的附件，extension 为经过服务端校验的扩展名。
 # 结果与约束：不解压到磁盘；限制条目与解压总量，按幻灯片顺序读取，仅输出有限文字。
-def office_text(path, extension):
+def powerpoint_text(path):
     with zipfile.ZipFile(path) as archive:
         infos = archive.infolist()
         if len(infos) > 5000 or sum(item.file_size for item in infos) > 64 * 1024 * 1024:
             raise ValueError('archive limits')
         if any('vbaproject' in item.filename.lower() for item in infos):
             raise ValueError('macros not accepted')
-        if extension == '.docx':
-            names = ['word/document.xml']
-        else:
-            names = sorted((item.filename for item in infos if re.fullmatch(r'ppt/slides/slide\d+\.xml', item.filename)),
-                           key=lambda name: int(re.search(r'(\d+)\.xml$', name)[1]))
+        names = sorted((item.filename for item in infos if re.fullmatch(r'ppt/slides/slide\d+\.xml', item.filename)),
+                       key=lambda name: int(re.search(r'(\d+)\.xml$', name)[1]))
         parts = []
         for name in names:
             info = archive.getinfo(name)
@@ -134,14 +131,13 @@ def extract(path, extension):
         if len(source) > 1024 * 1024:
             return text[:MAX_TEXT], 'truncated'
     elif extension in ('.doc','.docx'):
-        from avatar.files.parsing.document_images import word_source
-        from avatar.files.parsing.word import docx_text
-        with word_source(path,extension) as source:
-            return docx_text(source)
+        from avatar.files.parsing.document_images import word_pdf
+        with word_pdf(path, extension) as (pdf, _):
+            return extract(pdf, '.pdf')
     elif extension == '.xlsx':
         text = spreadsheet_text(path)
     elif extension == '.pptx':
-        text = office_text(path, extension)
+        text = powerpoint_text(path)
     elif extension == '.pdf':
         from pypdf import PdfReader
         reader = PdfReader(path, strict=False)

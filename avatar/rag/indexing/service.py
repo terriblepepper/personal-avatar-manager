@@ -2,7 +2,7 @@
 import asyncio
 
 from avatar.core.dispatch import begin_work, wait_work
-from contextlib import aclosing
+from contextlib import ExitStack, aclosing
 import base64
 import hashlib
 import json
@@ -17,6 +17,7 @@ import threading
 from fastapi import HTTPException
 from avatar.files.uploads.buffer import upload_work
 from avatar.files.parsing import text_worker
+from avatar.files.parsing.document_images import WORD_SUFFIXES, word_pdf
 from avatar.core.config import ROOT
 from avatar.core.performance import measure
 from avatar.rag.invalidation import invalidate, signature
@@ -35,8 +36,8 @@ def revision(row):
 def native_text(path,extension):
     if text_worker.supports(extension):
         return {**text_worker.parse(path, extension, 'native'), 'format': extension}
-    command=[sys.executable,'-m','avatar.files.parsing.word',str(path),extension] if extension in ('.doc','.docx') else [sys.executable,'-m','avatar.files.parsing.extract',str(path),extension,'--native-only']
-    result=subprocess.run(command,cwd=ROOT,capture_output=True,timeout=90 if extension in ('.doc','.docx') else 45,check=True)
+    command=[sys.executable,'-m','avatar.files.parsing.extract',str(path),extension,'--native-only']
+    result=subprocess.run(command,cwd=ROOT,capture_output=True,timeout=45,check=True)
     parsed=json.loads(result.stdout)
     if parsed.get('error'):raise ValueError(parsed['error'])
     return {**parsed,'format':extension}
@@ -141,7 +142,8 @@ class FileRag:
                         db.execute('DELETE FROM file_rag_documents WHERE source=? AND file_id=?',(document['source'],document['file_id']))
                         continue
                     if document['source']=='chat' and not row['referenced']:continue
-                    if document['status']=='ready' and not document['force_rebuild'] and document['revision']==revision(row) and document['signature']==token:
+                    needs_word_pdf = Path(row['filename']).suffix.lower() in WORD_SUFFIXES and 'word_pdf' not in document['coverage'].split(',')
+                    if document['status']=='ready' and not document['force_rebuild'] and not needs_word_pdf and document['revision']==revision(row) and document['signature']==token:
                         nodes=db.execute('SELECT ordinal,collection,record_id FROM file_rag_nodes WHERE source=? AND file_id=? AND user_id=? ORDER BY ordinal',(document['source'],document['file_id'],user['id'])).fetchall()
                         if nodes and all(node['ordinal']==index and node['collection']==document['collection'] for index,node in enumerate(nodes)) and self.store.contains(user['id'],document['collection'],[node['record_id'] for node in nodes],db):continue
                     db.execute("UPDATE file_rag_documents SET status='queued',error='',generation=generation+1 WHERE source=? AND file_id=?",(document['source'],document['file_id']))
@@ -209,8 +211,20 @@ class FileRag:
                 db.execute('INSERT INTO model_calls(user_id,provider,model,usage,created_at,purpose,caller_id) VALUES(?,?,?,?,?,?,?)',(row['user_id'],model['provider'],model['model'],dump(usage),now(),'file_parse',row['user_id']))
 
     async def prepare(self,row,source,embedding,model):
-        path=self.original_path(row,source);caption=row.get('caption',row.get('description',''))
-        label=row['filename']+'\n'+caption;rows=[];coverage=[]
+        path = self.original_path(row, source)
+        extension = Path(row['filename']).suffix.lower()
+        if extension in WORD_SUFFIXES:
+            with ExitStack() as stack:
+                try:
+                    pdf, vector = await self.work.execute(row['user_id'], 'parse', stack.enter_context, word_pdf(path, extension))
+                except (ValueError, OSError, subprocess.SubprocessError):
+                    raise HTTPException(422, 'Word 转 PDF 失败，请检查原件及 LibreOffice 运行环境') from None
+                return await self._prepare(row, embedding, model, pdf, '.pdf', vector=vector, coverage=['word_pdf'])
+        return await self._prepare(row, embedding, model, path, extension, vector=True, coverage=[])
+
+    async def _prepare(self, row, embedding, model, path, extension, *, vector, coverage):
+        caption=row.get('caption',row.get('description',''))
+        label=row['filename']+'\n'+caption;rows=[]
         if row['content_type'].startswith(('audio/','video/')):
             coverage.append('metadata_only:media')
             rows.append({'page':None,'text':label+'\n[音视频原件已保存，未解析音轨或画面；仅索引文件名和资料说明]','modality':'text'})
@@ -224,26 +238,26 @@ class FileRag:
                 rows.append({'page':None,'text':text or label+'\n[仅文件名和资料说明，未解析图片内容]','modality':'text'})
                 if text:rows.append({'page':None,'text':label,'modality':'text'})
         else:
-            native_key=[row['sha256'],Path(row['filename']).suffix.lower()];native_target='native-v3-document-images'+(':'+row['_cache_epoch'] if row.get('_cache_epoch') else '')
+            native_key=[row['sha256'],extension];native_target='native-v3-document-images'+(':'+row['_cache_epoch'] if row.get('_cache_epoch') else '')
             try:
                 extracted=await upload_work(self.cache.get,row['user_id'],'parse',native_target,native_key)
                 if extracted is None:
                     extracted=await self.work.execute(row['user_id'],'parse',native_text,path,native_key[1]);await upload_work(self.cache.put,row['user_id'],'parse',native_target,native_key,extracted,row['sha256'])
             except (OSError,ValueError,subprocess.SubprocessError) as error:
-                if native_key[1] in ('.doc','.docx'):raise HTTPException(422,str(error) if isinstance(error,ValueError) else 'Word 正文转换失败，请检查转换工具和文件格式') from None
+                if 'word_pdf' in coverage:
+                    raise HTTPException(422, '无法提取 Word 转换后的 PDF 正文') from error
                 extracted={'text':'','status':'needs_description'}
             text=extracted['text'];coverage.append('native_text' if text.strip() else 'metadata_only')
             if text.strip():
                 from avatar.rag.indexing.partition import partition
                 rows.extend(await self.work.execute(row['user_id'],'parse',partition,extracted,embedding_window(embedding)))
-                if extracted.get('html'):coverage.append('docx_html')
                 rows.append({'page':None,'text':label,'modality':'text'})
                 if extracted['status'] in ('truncated','ocr_partial','partial'):coverage.append('partial')
             else:
                 rows.append({'page':None,'text':label+'\n[仅文件名和资料说明，正文未解析]','modality':'text'})
-            if native_key[1] in ('.pdf','.doc','.docx'):
+            if extension == '.pdf':
                 from avatar.files.parsing.document_images import traverse
-                async with aclosing(traverse(path,native_key[1])) as visuals:
+                async with aclosing(traverse(path, vector=vector)) as visuals:
                     async for item in visuals:
                         if embedding.get('multimodal_enabled'):
                             rows.append({'page':item['page'],'text':item['label'],'modality':'image','input':{'image':'data:image/jpeg;base64,'+base64.b64encode(item['data']).decode()}})

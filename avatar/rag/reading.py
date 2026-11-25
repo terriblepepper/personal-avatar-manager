@@ -1,6 +1,6 @@
 """模型原生资料读取工具；检索找来源，读取工具按需读取原件或遍历全文。"""
 import asyncio
-from contextlib import aclosing
+from contextlib import ExitStack, aclosing
 import json
 from pathlib import Path
 import subprocess
@@ -110,18 +110,27 @@ class MaterialReading:
             result=await read_media(self,context,row,path,request,limit)
             self.validate(context)
             return {'file_id':row['id'],'filename':row['filename'],'relative_path':row.get('relative_path') or row['filename'],**result}
+        from avatar.files.parsing.document_images import WORD_SUFFIXES, word_pdf
+        if extension in WORD_SUFFIXES:
+            from avatar.files.uploads.buffer import upload_work
+            with ExitStack() as stack:
+                pdf, vector = await upload_work(stack.enter_context, word_pdf(path, extension))
+                return await self._read_document(context, row, request, pdf, '.pdf', limit, vector=vector)
+        return await self._read_document(context, row, request, path, extension, limit)
+
+    async def _read_document(self, context, row, request, path, extension, limit, *, vector=True):
         end=request.end if request.mode!='full' else None
         if request.mode=='range' and extension!='.pdf':end=1
         if request.mode=='pages' and end is None:end=request.start
         visual_text={};unparsed=False
-        if extension in ('.pdf','.doc','.docx'):
+        if extension == '.pdf':
             from avatar.files.parsing.document_images import traverse
             from avatar.models.artifact_cache import fingerprint
             import base64
             config=context[0];owner=config['_rag_access']['scope'][0]
             target='document-visual-v1:'+fingerprint({key:config.get(key) for key in ('provider','api_format','base_url','model','vision_enabled')})
             selected=set(range(request.start,end+1)) if end is not None and request.mode!='search' else None
-            async with aclosing(traverse(path,extension,selected)) as visuals:
+            async with aclosing(traverse(path, selected, vector=vector)) as visuals:
                 async for item in visuals:
                     self.validate(context)
                     if not config.get('vision_enabled'):

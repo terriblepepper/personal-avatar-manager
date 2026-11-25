@@ -11,7 +11,7 @@ import zipfile
 from xml.etree import ElementTree
 from fastapi import HTTPException
 
-DOCUMENTS = ('.pdf', '.doc', '.docx')
+WORD_SUFFIXES = ('.doc', '.docx')
 RASTER = ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tif', '.tiff', '.webp')
 
 
@@ -64,29 +64,48 @@ def converted(path, extension, output):
 
 
 @contextmanager
-def word_source(path, extension):
-    if extension == '.doc':
-        with converted(path, extension, 'docx') as source:
-            yield source
-    else:
-        yield Path(path)
+def word_pdf(path, extension):
+    if path.stat().st_size > 64 * 1024 * 1024:
+        raise ValueError('Word 原件超过 64 MiB 转换上限')
+    vector = True
+    if extension == '.docx':
+        try:
+            with zipfile.ZipFile(path) as archive:
+                entries = archive.infolist()
+                if len(entries) > 5000 or sum(item.file_size for item in entries) > 64 * 1024 * 1024:
+                    raise ValueError('DOCX 解压规模超限')
+                if any('vbaproject' in item.filename.lower() for item in entries):
+                    raise ValueError('DOCX 不接受宏')
+                if archive.getinfo('word/document.xml').file_size > 5 * 1024 * 1024:
+                    raise ValueError('DOCX XML 超限')
+                names = archive.namelist()
+                vector = any(name.startswith(('word/charts/', 'word/diagrams/'))
+                             or name.startswith('word/media/') and not name.endswith('/') and Path(name).suffix.lower() not in RASTER
+                             or name.startswith('word/') and name.endswith('.xml') and needs_word_render(archive.read(name))
+                             for name in names)
+        except (zipfile.BadZipFile, KeyError, ElementTree.ParseError):
+            raise ValueError('DOCX 文件结构无效') from None
+    with converted(path, extension, 'pdf') as pdf:
+        yield pdf, vector
 
 
-def pdf_visual_pages(reader):
-    paints = {b'Do', b'INLINE IMAGE', b'sh', b'S', b's', b'f', b'f*', b'F', b'B', b'B*', b'b', b'b*'}
+def pdf_visual_pages(reader, *, vector=True):
+    paints = {b'Do', b'INLINE IMAGE'}
+    if vector:
+        paints.update((b'sh', b'S', b's', b'f', b'f*', b'F', b'B', b'B*', b'b', b'b*'))
     for index, page in enumerate(reader.pages, 1):
         content = page.get_contents()
         if content is not None and any(operator in paints for _, operator in content.operations):
             yield index
 
 
-def pdf_images(path, pages=None):
+def pdf_images(path, pages=None, *, vector=True):
     from pypdf import PdfReader
     from avatar.files.parsing.images import jpeg_bytes
     reader = PdfReader(path, strict=False)
     if reader.is_encrypted:
         raise ValueError('PDF 已加密，无法解析图片')
-    for number in pdf_visual_pages(reader):
+    for number in pdf_visual_pages(reader, vector=vector):
         if pages is not None and number not in pages:
             continue
         # Render the page as well: vector plots, masks and nested forms are visual evidence too.
@@ -127,45 +146,7 @@ def needs_word_render(xml):
     return False
 
 
-def images(path, extension, pages=None):
-    """Yield every raster asset and a page fallback for drawings; never sample the first N."""
-    if extension == '.pdf':
-        yield from pdf_images(path, pages)
-        return
-    if extension not in ('.doc', '.docx') or pages is not None and 1 not in pages:
-        return
-    from avatar.files.parsing.word import docx_html
-    from avatar.files.parsing.images import jpeg_bytes
-    with word_source(path, extension) as source:
-        docx_html(source)  # Reuse ZIP, macro and expansion validation before traversing media.
-        fallback = False
-        with zipfile.ZipFile(source) as archive:
-            for name in archive.namelist():
-                if name.startswith('word/media/') and not name.endswith('/'):
-                    try:
-                        if Path(name).suffix.lower() not in RASTER:
-                            raise ValueError('vector')
-                        data = jpeg_bytes(io.BytesIO(archive.read(name)))
-                    except (ValueError, OSError, HTTPException):
-                        fallback = True
-                        continue
-                    yield {'id':name, 'page':1, 'label':'Word 内嵌图片 '+Path(name).name+'（资源序号，不代表物理页码）', 'data':data}
-                elif name.startswith(('word/charts/', 'word/diagrams/')):
-                    fallback = True
-                elif not fallback and name.startswith('word/') and name.endswith('.xml'):
-                    fallback = needs_word_render(archive.read(name))
-        if fallback:
-            rendered=False
-            with converted(source, '.docx', 'pdf') as pdf:
-                for item in pdf_images(pdf):
-                    rendered=True
-                    yield {**item, 'id':'word-render-'+item['id'], 'page':1,
-                           'label':'Word 转换画面 '+item['label']+'（转换后的页码）'}
-            if not rendered:
-                raise ValueError('Word 中存在无法直接解码的图片/绘图，但转换后未获得画面；未标记完整解析')
-
-
-async def traverse(path, extension, pages=None):
+async def traverse(path, pages=None, *, vector=True):
     import asyncio
     import base64
     import json
@@ -175,7 +156,7 @@ async def traverse(path, extension, pages=None):
     with measure('document_image_process_start'):
         process = await asyncio.create_subprocess_exec(
             sys.executable, '-m', 'avatar.files.parsing.document_images', str(path),
-            extension, json.dumps(sorted(pages) if pages is not None else None),
+            json.dumps(sorted(pages) if pages is not None else None), *([] if vector else ['--images-only']),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
             stdin=asyncio.subprocess.DEVNULL, cwd=ROOT, limit=16*1024*1024, start_new_session=True,
         )
@@ -204,15 +185,14 @@ def main():
     import base64
     import json
     import resource
-    extension = sys.argv[2]
     resource.setrlimit(resource.RLIMIT_AS, (4*1024**3, 4*1024**3))
     resource.setrlimit(resource.RLIMIT_CPU, (120, 120))
     resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
     try:
-        pages = json.loads(sys.argv[3]) if len(sys.argv)>3 else None
+        pages = json.loads(sys.argv[2])
         collected = []
         size = 0
-        for item in images(Path(sys.argv[1]), extension, set(pages) if pages is not None else None):
+        for item in pdf_images(Path(sys.argv[1]), set(pages) if pages is not None else None, vector='--images-only' not in sys.argv):
             value = {**item, 'data':base64.b64encode(item['data']).decode()}
             if '--collect' in sys.argv:
                 size += len(value['data'])

@@ -7,6 +7,10 @@ from avatar.files.parsing import PLAIN_TEXT_EXTENSIONS
 
 def read(path,extension,start=1,end=None,offset=0,limit=12000,query='',visual_text=None):
     from avatar.files.parsing.extract import extract
+    if extension in ('.doc', '.docx'):
+        from avatar.files.parsing.document_images import word_pdf
+        with word_pdf(Path(path), extension) as (pdf, _):
+            return read(pdf, '.pdf', start, end, offset, limit, query, visual_text)
     if extension=='.pdf':
         from pypdf import PdfReader
         reader=PdfReader(path,strict=False)
@@ -19,10 +23,6 @@ def read(path,extension,start=1,end=None,offset=0,limit=12000,query='',visual_te
             from avatar.files.parsing.extract import text_content
             body=text_content(path)
             status='extracted'
-        elif extension in ('.doc','.docx'):
-            from avatar.files.parsing.word import docx_text
-            from avatar.files.parsing.document_images import word_source
-            with word_source(Path(path),extension) as source:body,status=docx_text(source)
         else:body,status=extract(Path(path),extension)
         body+=(visual_text or {}).get('1','')
         total=1;end=1;pages=[(1,lambda:body)]
