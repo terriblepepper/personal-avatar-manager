@@ -44,7 +44,7 @@ class PeerResources:
     def settings_workspace(self,db,user_id,session_id,task_id=None):
         """沿用本人设置和旧私有文件的会话编号。"""
         if task_id:
-            task=self.dialogues.owned(db,{'id':user_id},task_id)
+            task=self.dialogues.session_store.owned(db,{'id':user_id},task_id)
             if task['session_id']!=session_id:raise HTTPException(404,'任务不存在')
             if task['delivery_mode']=='message':task_id=None
         table,key=('agent_task_members','task_id') if task_id else ('agent_session_members','session_id')
@@ -66,12 +66,12 @@ class PeerResources:
         return row[0] if row else None
 
     def workspace(self, db, user_id, session_id, task_id=None):
-        task=self.dialogues.owned(db,{'id':user_id},task_id) if task_id else None
+        task=self.dialogues.session_store.owned(db,{'id':user_id},task_id) if task_id else None
         if task and task['session_id']!=session_id:
             raise HTTPException(404,'任务不存在')
         if task and task['delivery_mode']=='message':
             task_id=None
-        self.dialogues.member(db,{'id':user_id},session_id,hidden=bool(task_id))
+        self.dialogues.session_store.member(db,{'id':user_id},session_id,hidden=bool(task_id))
         if task_id and workspace_expired(task):
             raise HTTPException(410,'任务工作区已过期')
         if workspace:=self.shared_id(db,session_id,task_id):
@@ -210,7 +210,7 @@ class PeerResources:
         identifiers=list(dict.fromkeys(file_ids))
         if not generated and len(identifiers)>5:raise HTTPException(422,'一次最多发送五个文件')
         if not identifiers:return []
-        task=self.dialogues.owned(db,user,task_id)
+        task=self.dialogues.session_store.owned(db,user,task_id)
         workspace=self.workspace(db,user['id'],task['session_id'],task_id)
         source=source or workspace
         owner=self.files.session(db,user['id'],workspace)['user_id']
@@ -284,7 +284,7 @@ class PeerResources:
 
     def session_file_grants(self,db,task,owner,workspace):
         """Only this speaker's shared copies and this turn's saved outputs can be read."""
-        current=self.dialogues.owned(db,{'id':owner},task['id'])
+        current=self.dialogues.session_store.owned(db,{'id':owner},task['id'])
         speaker=current['target_user_id'] if current['next_speaker'] else current['user_id']
         if current['status']!='running' or current['revision']!=task['revision'] or speaker!=owner:
             return {}
@@ -301,7 +301,7 @@ class PeerResources:
             grants={item['id']:item['sha256'] for item in selected if item['conversation_id']==workspace}
         held=json.loads(current['agent_checkpoint'] or '{}')
         ids=held.get('file_ids',()) if held.get('speaker_id')==owner else ()
-        if ids and held.get('source_revision')==self.dialogues.output_revision(db,current,owner,selected,style=held.get('peer_style')):
+        if ids and held.get('source_revision')==self.dialogues.executor.output_revision(db,current,owner,selected,style=held.get('peer_style')):
             rows=db.execute("""SELECT id,sha256,size FROM chat_files WHERE user_id=? AND conversation_id=?
                 AND origin='generated' AND id=ANY(?::text[])
                 AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))""",(storage_owner,workspace,list(ids)))

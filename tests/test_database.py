@@ -89,6 +89,9 @@ def test_schema_initializes_and_rejects_cross_account_owner(postgres_url):
     with psycopg.connect(postgres_url) as conn:
         with conn.transaction():
             install_schema(conn)
+            indexes = {row[0] for row in conn.execute("""SELECT indexname FROM pg_indexes
+                WHERE schemaname=current_schema() AND tablename='avatar_aip_tasks'""")}
+            assert {'avatar_aip_working_deadline', 'avatar_aip_guest_sent_at'} <= indexes
             conn.execute("INSERT INTO users(id,username,password,role,created_at) VALUES ('schema-u','schema-u','x','user','x')")
             conn.execute("INSERT INTO users(id,username,password,role,created_at) VALUES ('schema-v','schema-v','x','user','x')")
             conn.execute("INSERT INTO knowledge_assets(id,user_id,filename,mime,size,sha256,kind,caption,created_at,relative_path) VALUES ('schema-a','schema-u','x','x',1,'x','x','x','x','x')")
@@ -256,7 +259,7 @@ def test_entity_admin_reads_use_configured_store(tmp_path, postgres_url):
 def test_postgres_soul_progress_is_monotonic_and_preserves_cancellation(pg_database):
     import asyncio
     from types import SimpleNamespace
-    from avatar.knowledge.service import KnowledgeService
+    from avatar.knowledge.build_worker import SoulBuildWorker
 
     with pg_database.connect(write=True) as db:
         db.execute("INSERT INTO users(id,username,password,role,created_at) VALUES('owner','owner','hash','user','2026')")
@@ -264,12 +267,12 @@ def test_postgres_soul_progress_is_monotonic_and_preserves_cancellation(pg_datab
                       VALUES('job','owner','','[]','{}','','running','','2026','2026')""")
     service = SimpleNamespace(database=pg_database)
     for percent in (75, 10):
-        KnowledgeService.progress(service, 'job', percent, 'work')
+        SoulBuildWorker.progress(service, 'job', percent, 'work')
     with pg_database.connect(write=True) as db:
         assert db.execute("SELECT progress FROM soul_builds WHERE id='job'").fetchone()[0] == 75
         db.execute("UPDATE soul_builds SET status='canceled' WHERE id='job'")
     with pytest.raises(asyncio.CancelledError):
-        KnowledgeService.progress(service, 'job', 100, 'late')
+        SoulBuildWorker.progress(service, 'job', 100, 'late')
 
 
 def test_rag_catalog_reads_are_bounded_and_recheck_permissions(pg_database, monkeypatch):

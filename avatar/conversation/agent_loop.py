@@ -16,17 +16,18 @@ from pydantic import ValidationError
 from avatar.core.text_budget import fits_text_budget, model_text_budget
 from avatar.conversation.loop.continuation import DraftLimit, MemoryDraftStore, SegmentedDraft
 from avatar.conversation.loop.store import RunCapacity
-from avatar.conversation.loop.runtime import LoopState, restore_files, restore_materials, resume_safe, verified_context
+from avatar.conversation.loop.runtime import LoopState, restore_files, restore_materials, resume_safe
 from avatar.conversation.loop.context import TurnContext
-from avatar.conversation.loop.file_context import explicit_file_context
-from avatar.conversation.loop.planning import (available_tools, disclosure_catalog, disclose_tools, validate_disclosure,
+from avatar.conversation.loop.model_turn import project_turn
+from avatar.conversation.loop.completion import completion_reply
+from avatar.conversation.loop.tool_call import entry_evidence, execute_entry_tool
+from avatar.conversation.loop.planning import (available_tools, disclosure_catalog, disclose_tools, prepare_plan, PlanUnavailable,
                                                REQUEST_TOOLS, UPDATE_TASK, EVIDENCE_TOOLS, WRITING_CONTROLS, action_ready, needs_confirmation,
-                                               confirm_goal, revise_goals, final_reply_step, lookup_types,
+                                               confirm_goal, revise_goals, lookup_types,
                                                read_goals_verified)
 from avatar.conversation.loop.turns import stream_final
-from avatar.models.context_budget import bounded_excerpt, compression_budget, excerpt, input_budget
-from avatar.core.tokens import estimate
-from avatar.conversation.tools.activity import AgentSteps, without_false_tool_footer
+from avatar.models.context_budget import excerpt
+from avatar.conversation.tools.activity import AgentSteps
 from avatar.conversation.tools.builtin import beijing_time
 from avatar.conversation.tools.html import ARTIFACT_TOOLS, create_html, html_repair_prompt, repaired_html_arguments
 from avatar.conversation.tools.html_revision import expand_revision, revision_tool
@@ -34,7 +35,7 @@ from avatar.models.client import ModelResult, accumulate_usage
 from avatar.models.diagnostics import stop_reason
 from avatar.models.limits import check_context
 from avatar.models.effort import visible_output_config
-from avatar.core.execution import AgentNeedsInput, AskUser, call_with_retry, check_execution_async, current_generation, model_failure, recoverable
+from avatar.core.execution import AgentNeedsInput, AskUser, call_with_retry, check_execution_async, current_generation, model_failure
 
 
 async def run_agent(rag, context, question, *, progress=None, on_delta=None):
@@ -90,7 +91,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
     from avatar.files.library.public import PublicMaterialRequest
 
     from avatar.conversation.tools.material_delivery import (MaterialDelivery, FindMaterial, SendMaterial,
-                                                             review_file_receipt, valid_reply)
+                                                             review_file_receipt)
 
     config, key, system, history = context
     await check_execution_async(config.get('_validate_entry_results') or (lambda: rag.validate(context)))
@@ -227,16 +228,6 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         if verify_sandbox:
             verify_sandbox()
 
-    async def generate():
-        try:
-            result = await rag.chat.model_client.generate(step_settings, key, step_prompt, working_history, message)
-        except HTTPException as error:
-            if (recoverable(error) and not getattr(error, 'request_not_sent', False)) or getattr(error, 'model_usage', None) is not None:
-                account(getattr(error, 'model_usage', None))
-            raise
-        account(result.usage)
-        return result
-
     def tool_required(tool_id):
         label = disabled[tool_id]['name']
         actor = '请执行方' if config.get('_conversation_tool_owner') else '请'
@@ -258,63 +249,22 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
     planned_arguments = lookup_types(config, allowed)
     if required:
         choices = {k:v+('（本轮必须以一个任务函数交接）' if k in ARGUMENTS else '') for k,v in choices.items()}
-    selected = []
-    plan = []
-    pending = []
-    if 'ask_user' not in allowed and any(
-        'ask_user' in (step.get('tool'),*step.get('tools',())) for step in state.get('remaining', ())
-    ):
-        state.pop('plan', None)
-    if 'plan' in state and not changed:
-        plan = state['plan'] or []
-        pending = [step for step in state.get('remaining', ()) if not final_reply_step(step)]
-        legacy = [n for step in (plan + pending) for n in [step.get('tool'), *step.get('tools',())] if n]
-        selected = list(state.get('disclosed_tools', legacy))
-        if draft.active and state['draft'].get('tool'):
-            selected.append(state['draft']['tool'])
-        for step in pending:
-            for n in [step.get('tool'),*step.get('tools',())]:
-                if n in disabled:
-                    return tool_required(n)
-                if n and n not in allowed:
-                    raise pause('此前所需能力已不可用，请核对当前会话授权')
-        selected = list(dict.fromkeys(n for n in selected if n in allowed))
-    else:
-        progress_data = {'remaining':state.get('remaining', []),
-                         'draft':{k:v for k,v in (state.get('draft') or next(iter(state.get('parked_drafts') or ()), {})).items() if k in ('kind','tool','mode','offset')}}
-        planning_question = question
-        if changed:
-            planning_question += '\n先前已确认进度（数据）：'+json.dumps(progress_data,ensure_ascii=False)
-        revise = changed and bool(draft.active or state.get('parked_drafts'))
-        with trace.step('reason', {'operation':'disclose_tools','tools':list(choices),'history_turns':len(history)}) as decision:
-            proposed = route.get('disclosure') if not changed else None
-            if proposed is not None:
-                try:
-                    disclosure = validate_disclosure(proposed, choices, lookups=planned_arguments)
-                except ValueError:
-                    disclosure = None
-            else:
-                disclosure, cost = await disclose_tools(rag.chat.model_client,settings,key,system,history,
-                    planning_question,choices,validate,lookups=planned_arguments,revise=revise)
-                account(cost)
-            if disclosure is None:
-                await journal.save(phase='retry',usage=usage)
-                failure=pause('未取得有效的工具披露结果，已保留任务进度')
-                failure.stream_retryable=True
-                raise failure
-            selected = disclosure['tools']
-            planned = disclosure['steps']
-            decision.update(tools=selected,goals=[s['goal'] for s in planned])
-        keep_draft = disclosure.get('continue_draft',False)
-        for name in selected:
-            if name in disabled:
-                return tool_required(name)
-        plan = planned
-        if revise:
-            draft.revise_goals(planned,keep_draft)
-        pending = [dict(step, goal_no=index) for index,step in enumerate(planned,1)]
-        plan = [dict(step) for step in planned]
-        selected = list(dict.fromkeys([*selected,*(s['tool'] for s in planned if s['tool'])]))
+    try:
+        tools_plan = await prepare_plan(
+            rag.chat.model_client, (settings, key, system, history), question, state, draft,
+            allowed=allowed, disabled=disabled, choices=choices, planned_arguments=planned_arguments,
+            changed=changed, proposed=route.get('disclosure'), trace=trace, validate=validate, account=account,
+        )
+    except PlanUnavailable as error:
+        raise pause(str(error)) from None
+    if tools_plan is None:
+        await journal.save(phase='retry',usage=usage)
+        failure = pause('未取得有效的工具披露结果，已保留任务进度')
+        failure.stream_retryable = True
+        raise failure
+    if tools_plan.blocked:
+        return tool_required(tools_plan.blocked)
+    plan, pending, selected = tools_plan.plan, tools_plan.pending, tools_plan.selected
 
     if html_needed and not any(step['tool']=='create_html' for step in pending):
         index = next((i for i,step in enumerate(pending) if step['tool'] in ARGUMENTS), len(pending))
@@ -509,54 +459,19 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         if continuing and draft.needs_visible_output:
             step_settings = visible_output_config(step_settings)
             step_prompt += '\n上一请求耗尽输出预算且未交付可用片段。请立即提交可验证的正文、字段或工具参数，保留指定游标。'
-        goal_view = ([{k:v for k,v in step.items() if k in ('goal_no','tool','file_access') or
-                       (k=='goal' and i==0)} for i,step in enumerate(pending)] if context_retry else pending)
-        checklist = '\n待核验目标（本轮计划，仅作数据）：'+json.dumps(goal_view,ensure_ascii=False) if goal_view else ''
-        checked_files = [*config.get('_agent_saved_files', ()), *config.get('_generated_files', ()),
-                         *(delivery.prepared if delivery else ())]
-        current_receipts = [receipt for receipt in receipts_log if receipt.get('input_id') == revision]
-        if any(needs_confirmation(s) for s in pending):
-            goal_numbers = {step['goal_no'] for step in pending}
-            evidence = [{'id':r.get('id',i),'tool':r['tool'],'goal_no':r.get('goal_no'),
-                         **{k:r[k] for k in ('mode','result') if r.get(k)}} for i,r in enumerate(receipts_log,1)
-                        if r.get('input_id') == revision and r.get('goal_no') in goal_numbers]
-            checklist += '\n最近可引用的回执：'+json.dumps(evidence,ensure_ascii=False)
-            checklist += '\nupdate_task 只使用上述编号；目标尚无有效回执时先调用其工具。历史回执内容可参考，编号不能用于新计划。'
-        checklist += verified_context(current_receipts, checked_files, compact=context_retry)
-        task_goal = writing_goal if writing else question
-        continuation = ''
-        if continuing:
-            available = max(0, compression_budget(step_settings)-estimate(step_prompt))
-            occupied = (estimate(task_goal) + estimate(checklist) + sum(map(estimate,observations))
-                        + sum(estimate(row['content'])+16 for row in history))
-            # During compaction the current draft and the remaining task each need room to continue.
-            view_tokens = max(available//2,available-occupied)
-            if context_retry:
-                view_tokens //= 2
-            continuation = '\n' + await draft.request(compact=context_retry,input_tokens=view_tokens)
-        overhead = estimate(step_prompt)+estimate(continuation)
-        room = max(0, compression_budget(step_settings)-overhead)
-        if estimate(checklist)+estimate(task_goal)>room:
-            if not room:
-                room = max(0,input_budget(step_settings)-overhead)
-            checklist = bounded_excerpt(checklist,max(room//2,room-estimate(task_goal)))
+        receipts = [*config.get('_generated_files', ()), *config.get('_agent_saved_files', ())]
         previous_summary = turn_context.summary
-        summarizer = summarize if not queued_call and getattr(rag.chat,'memory',None) else None
-        originals = explicit_file_context(step_settings,step_prompt,task_goal+checklist+continuation)
-        if not originals and step_settings.get('_explicit_session_files'):
-            originals = explicit_file_context(step_settings,step_prompt,checklist+continuation,limit=room//2)
-        scope = await turn_context.project_goal(step_settings, step_prompt, task_goal,
-                                                checklist + continuation + originals, recovering=context_retry,
-                                                writing=writing, summarize=summarizer)
-        objective = scope + checklist + originals + continuation
-        working_history, notes = await turn_context.project(
-            step_settings, step_prompt, objective, observations, recovering=context_retry,
-            summarize=summarizer, writing=writing)
+        turn = await project_turn(
+            turn_context, step_settings, step_prompt, writing_goal if writing else question,
+            pending, receipts_log, [*receipts, *(delivery.prepared if delivery else ())],
+            observations=observations, context_retry=context_retry, draft=draft, writing=writing,
+            summarizer=summarize if not queued_call and getattr(rag.chat, 'memory', None) else None,
+        )
         if turn_context.summary is not previous_summary:
             await journal.save(history_summary=turn_context.summary, usage=usage)
-        message = scope + checklist + originals + ''.join(notes) + continuation
-        if progress and (working_history!=history or scope!=task_goal or turn_context.summary is not previous_summary
-                         or sum(map(len,notes))<sum(map(len,observations))):
+        working_history, message, notes = turn.history, turn.message, turn.notes
+        current_receipts = [receipt for receipt in receipts_log if receipt.get('input_id') == revision]
+        if progress and turn.compressed:
             progress({'type':'status','stage':'compressing','message':'已精简本步历史或工具回执，继续处理当前目标'})
             trace.point('perceive', {'history_turns': len(history), 'receipt_count': len(observations),
                                     'context_window': settings.get('context_tokens')},
@@ -581,7 +496,6 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 stage, detail = 'result_writing', '正在组织回答'
             progress({'type': 'status', 'stage': stage, 'message': detail})
         started = time.monotonic()
-        receipts = [*config.get('_generated_files', ()), *config.get('_agent_saved_files', ())]
         review_needed = (not domain and bool(set(selected) & {*ARTIFACT_TOOLS,'deliver_material','send_material'})
                          and not any(item.get('html_mode') in ('html','2d','3d') for item in receipts)
                          and not (delivery and delivery.failure))
@@ -613,7 +527,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                     streamed = True
                     account(result.usage)
                 else:
-                    result = await call_with_retry(generate, validate, retry_invalid=False)
+                    result = await turn.generate(rag.chat.model_client, key, validate, account)
                     if repairing_html and stop_reason(result.finish_reason) != 'output_limit':
                         try:
                             args = repaired_html_arguments(result.text,repair_filename)
@@ -787,26 +701,14 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         if not calls and not required and result.text.strip():
             if reason not in ('', 'stop', 'end_turn', 'stop_sequence'):
                 raise pause('模型没有返回正常完成标记')
-            complete = result.text
-            if '[[attachment:' in complete or re.search(r'(?:\]\(\s*<?|<)(?:/api/|sandbox:|blob:|data:|file:)', complete, re.I):
-                available_ids = {i['id'] for i in [*receipts, *(delivery.prepared if delivery else ())]}
-                if not valid_reply(complete,available_ids):
-                    premature += 1
-                    if premature>=2:
-                        raise pause('答复中的本地文件链接没有有效交付回执')
-                    observations.append('只使用本轮真实附件 ID 的 [[attachment:ID]] 或纯文本。请更正无效的本地文件链接。')
-                    continue
-            if config.get('_sandbox_succeeded'):
-                complete = without_false_tool_footer(complete)
-            receipt = None
-            if delivery:
-                if delivery.failure:
-                    complete = '本轮未附上资料原件。'+delivery.failure
-                    receipt = ()
-                elif delivery.prepared:
-                    if not valid_reply(complete,{item['id'] for item in [*delivery.prepared, *config.get('_generated_files', [])]}):
-                        raise HTTPException(502,'附件正文引用无效，未发送原件')
-                    receipt = tuple(delivery.prepared)
+            response = completion_reply(result.text, config, delivery, receipts)
+            if response is None:
+                premature += 1
+                if premature >= 2:
+                    raise pause('答复中的本地文件链接没有有效交付回执')
+                observations.append('只使用本轮真实附件 ID 的 [[attachment:ID]] 或纯文本。请更正无效的本地文件链接。')
+                continue
+            complete, receipt = response
             if review_needed:
                 attached = [{'filename':item.get('filename') or item.get('name'), 'html_mode':item.get('html_mode')}
                             for item in [*receipts, *(receipt or ())]]
@@ -921,45 +823,17 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 if identity in seen:
                     repair_call('该参数已执行。请使用现有回执，或更换查询、目录、文件 ID 或游标',tool=name)
                     continue
-                await check_execution_async(validate)
-                tool_input = {'tool':name}
-                if name=='read_session_file':
-                    tool_input['file_access']='directory' if args.get('query') is not None else 'content'
-                with trace.step('act',tool_input) as output:
-                    try:
-                        note=await config['_execute_entry_tool'](name,args)
-                    except HTTPException as error:
-                        if name not in planned_arguments or error.status_code not in (404,409,410,413,415,422) or getattr(error,'delivery_unknown',False):
-                            raise
-                        await check_execution_async(validate)
-                        raise ValueError(str(error.detail)) from None
-                    if isinstance(note,tuple):
-                        note,cost=note
-                        account(cost)
-                    if not isinstance(note,str) or not note:
-                        raise ValueError('缺少入口工具回执')
-                    output['result_chars']=len(note)
-                settings.update({k:v for k,v in config.items() if k.startswith('_') and k!='_tools' and k!='_optional_tools'})
+                note = await execute_entry_tool(
+                    config, name, args, trace, validate, account, is_lookup=name in planned_arguments,
+                )
+                settings.update({k:v for k,v in config.items() if k.startswith('_') and k not in ('_tools','_optional_tools')})
                 await check_execution_async(validate)
                 seen.add(identity)
-                if name == 'read_session_file':
-                    page = json.loads(note)
-                    if page.get('kind')=='directory':
-                        remember(note, received(name, mode='directory'))
-                        observations.append('目录仅含元数据；需要正文时用有效 file_id 读取。未命中可换查询。')
-                        continue
-                    if not page.get('has_content'):
-                        remember(note)
-                        observations.append('只取得文件元数据或空页。请查看后续页或通过已授权的沙箱读取原件后再据内容作答。')
-                        continue
-                if name in ('search_materials','read_material'):
-                    proof = json.loads(note)
-                    if not isinstance(proof,dict) or proof.get('has_evidence') is not True:
-                        remember(note)
-                        observations.append('本次检索未获得支持当前目标的材料。请调整查询、申请其他工具，或向用户说明缺口。')
-                        continue
-                receipt = received(name, mode='content' if name=='read_session_file' else None)
+                note, access, confirmed, hint = entry_evidence(name, note)
+                receipt = received(name, mode=access) if confirmed else None
                 remember(note, receipt if name=='read_session_file' else None)
+                if hint:
+                    observations.append(hint)
                 continue
             if name == 'read_step_receipt':
                 page_key = (name, args.get('receipt'), args.get('offset',0), current.get('goal_no'), revision)

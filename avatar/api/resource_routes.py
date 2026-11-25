@@ -1,7 +1,7 @@
 """Administrator resource budgets; never claims an unconfirmed OS limit."""
 import asyncio
 from fastapi import APIRouter,Depends,Request,HTTPException
-from avatar.api.routes import admin
+from avatar.api.dependencies import admin
 from avatar.core.execution import finish_on_cancel
 from avatar.core.resource_budget import ResourcePolicy
 from avatar.core.resource_limits import ServiceLimits

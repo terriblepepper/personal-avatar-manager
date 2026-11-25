@@ -7,7 +7,7 @@ import httpx
 import logging
 import traceback
 from fastapi import HTTPException
-from avatar.conversation.collaboration.dialogues import confirmed_message
+from avatar.conversation.collaboration.results import confirmed_message
 from avatar.conversation.collaboration.tools import task_tool_result
 from avatar.conversation.loop.peer import PeerTurn, speaker as turn_speaker, wire_id
 from avatar.conversation.loop.runtime import resume_safe
@@ -117,7 +117,7 @@ class PeerDialogueTasks:
                 if (latest and latest['state'] == 'working' and scope not in self.running
                         and task.get('status') == 'running' and task.get('id') and turn_speaker(task)==user_id
                         and latest['command_id']==wire_id(db,task,user_id)
-                        and PeerTurn.recoverable(self.dialogues,db,task)):
+                        and PeerTurn.recoverable(self.dialogues.executor,db,task)):
                     self.schedule(task,user_id,command,context,scope,(*key[:2],latest['command_id']))
             if not latest:
                 raise ManagementTaskError(-32001,'该方向没有已受理的任务')
@@ -201,7 +201,7 @@ class PeerDialogueTasks:
                 if linked:
                     task = dict(linked)
                     if (task['status'] in ('running','queued') and row['command_id']==wire_id(db,task,turn_speaker(task))
-                            and PeerTurn.recoverable(self.dialogues,db,task)):
+                            and PeerTurn.recoverable(self.dialogues.executor,db,task)):
                         continue
                 result=json.loads(row['document'])
                 result.update(id=uuid.uuid4().hex,sentAt=now())
@@ -210,7 +210,7 @@ class PeerDialogueTasks:
 
     async def generate(self,task,user_id,command,context,scope,key):
         try:
-            answer=await self.dialogues.answer_peer(task,user_id)
+            answer=await self.dialogues.executor.answer_peer(task,user_id)
             result=self.result(command,context,'awaiting-completion',answer.text,answer.usage,answer.task_action)
         except AgentNeedsInput as pause:
             result=self.result(command,context,'awaiting-input')
@@ -234,7 +234,7 @@ class PeerDialogueTasks:
         with self.database.connect(write=True) as db:
             if result['status']['state'] in ('awaiting-completion','awaiting-input') and task.get('id'):
                 try:
-                    current=self.dialogues.owned(db,{'id':user_id},task['id'])
+                    current=self.dialogues.session_store.owned(db,{'id':user_id},task['id'])
                     if current['revision']!=task['revision'] or current['status']!='running' or turn_speaker(current)!=user_id:
                         raise HTTPException(409, '任务状态已改变')
                     if run := task.get('_peer_run'):

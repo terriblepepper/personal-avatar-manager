@@ -57,7 +57,7 @@ it('copies the rendered personal reply and preserves native selection and nested
 
 it('opens peer copy from the keyboard, restores focus, and falls back to a temporary textarea', async () => {
   request.mockImplementation((path:string) => {
-    if(path==='/agent-sessions/s') return {peer_name:'对方',resource_conversation_id:'c',embedding_status:{configured:true,peerConfigured:false},messages:[{turn:1,speaker_role:'user',speaker_name:'我',content:'补充正文'}]}
+    if(path==='/agent-sessions/s') return {task_page:{items:[],offset:0,total:0},peer_name:'对方',resource_conversation_id:'c',embedding_status:{configured:true,peerConfigured:false},messages:[{turn:1,speaker_role:'user',speaker_name:'我',content:'补充正文'}]}
     if(path==='/me/skills')return []
     return {items:[],max_rounds:5,offset:0,total:0}
   })

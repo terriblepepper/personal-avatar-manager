@@ -3,6 +3,7 @@ import hashlib
 import json
 import uuid
 from pathlib import Path
+from dataclasses import dataclass
 from typing import TypedDict
 from fastapi import HTTPException
 from langgraph.graph import StateGraph, START, END
@@ -68,6 +69,18 @@ class ExecutionState(TypedDict, total=False):
 
 
 # 职责：运行已加载技能脚本；本人 Web 开启工具后也可执行任务代码，结果和下载元信息作为数据交给最终回答。
+@dataclass(frozen=True)
+class SkillEnrichRequest:
+    user_id: str
+    message: str
+    conversation_id: str
+    caller_id: str | None = None
+    parent_id: str | None = None
+    inputs: dict | None = None
+    enabled: bool = True
+    allow_code: bool = False
+
+
 class SkillExecution:
     # 职责：复用本人技能服务，并为所有通道共享一个并发受限的本地执行器。
     def __init__(self, skills):
@@ -76,7 +89,10 @@ class SkillExecution:
 
     # 职责：按模型判断按需执行，最多四次；资料输入必须由调用方先完成归属验证且只按显式文件 ID 选取。
     # 结果与约束：无脚本不增加模型调用；取消不吞掉，失败提示原因并继续最终回答，不伪造成功。
-    async def enrich(self,user_id,context,message,model_client,*,caller_id=None,conversation_id=None,inputs=None,progress=None,enabled=True,allow_code=False,parent_id=None):
+    async def enrich(self, context, request: SkillEnrichRequest, model_client, *, progress=None):
+        user_id, message, conversation_id = request.user_id, request.message, request.conversation_id
+        caller_id, parent_id, inputs = request.caller_id, request.parent_id, request.inputs
+        enabled, allow_code = request.enabled, request.allow_code
         config,key,system,history=context
         store=config.get('_run_store')
         agent=bool(config.get('_avatar_agent') or store is not None)

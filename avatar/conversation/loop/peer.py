@@ -72,7 +72,7 @@ class PeerTurn:
             self.source = self.authority(db)
 
     def authority(self, db):
-        task = self.service.owned(db, {'id': self.owner}, self.task['id'])
+        task = self.service.sessions.owned(db, {'id': self.owner}, self.task['id'])
         if (task['status'] != 'running' or task['revision'] != self.task['revision']
                 or speaker(task) != self.owner or not (task['accepted'] or task['delivery_mode'] == 'message')):
             raise HTTPException(409, '分身任务状态或当前发言方已变化')
@@ -112,7 +112,7 @@ class PeerTurn:
                          (task['session_id'], settings[0] if settings else workspace, owner)).fetchone()
         if row is None:
             raise HTTPException(409, '分身会话资料授权已失效')
-        own, target = service.participants(db, task['user_id'], task['target_aic'])
+        own, target = service.sessions.participants(db, task['user_id'], task['target_aic'])
         if own['aic'] != task['own_aic'] or target['user_id'] != task['target_user_id']:
             raise HTTPException(409, '参与分身的身份已变化')
         return hashlib.sha256(dump([service.output_revision(db,task,owner,style=style), task[side+'_skills'],

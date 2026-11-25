@@ -2,7 +2,7 @@
 import json
 from fastapi import APIRouter, Request, HTTPException, Depends
 from avatar.accounts.auth import current_user
-from avatar.api.routes import admin
+from avatar.api.dependencies import admin
 from avatar.protocols.identity.system import build_system_acs, system_identity_paths
 
 router = APIRouter(tags=['系统协议'])

@@ -161,7 +161,7 @@ def dialogue_targets(request: Request,user=Depends(current_user)):
 # 结果与约束：仅双方可见，与普通聊天历史隔离。
 @router.get('/agent-dialogues')
 def dialogues(request: Request,offset: int=0,user=Depends(current_user)):
-    return request.app.state.dialogues.list(user,offset)
+    return request.app.state.dialogues.session_store.list(user,offset)
 
 
 # 职责：创建双方分身交替发言的后台任务。
@@ -178,7 +178,7 @@ def create_dialogue(body: DialogueRequest,request: Request,user=Depends(current_
 @router.get('/agent-dialogues/{identifier}')
 def dialogue(identifier: str, request: Request, before: int|None=None, after: int|None=None,
         task_offset: int=Query(0,ge=0), task_search: str=Query('',max_length=200), user=Depends(current_user)):
-    return request.app.state.dialogues.get(user,identifier,before=before,after=after,task_paging=(task_offset,task_search))
+    return request.app.state.dialogues.session_store.get(user,identifier,before=before,after=after,task_paging=(task_offset,task_search))
 
 
 @router.post('/agent-dialogues/{identifier}/retry-draft')
@@ -255,24 +255,24 @@ class IntentConfirm(BaseModel):
 
 @router.get('/agent-dialogue-settings')
 def dialogue_settings(request:Request,user=Depends(current_user)):
-    return request.app.state.dialogues.preferences(user['id'])
+    return request.app.state.dialogues.session_store.preferences(user['id'])
 
 @router.put('/agent-dialogue-settings')
 def save_dialogue_settings(body:DialogueSettings,request:Request,user=Depends(current_user)):
-    return request.app.state.dialogues.preferences(user['id'],body.max_rounds)
+    return request.app.state.dialogues.session_store.preferences(user['id'],body.max_rounds)
 
 @router.get('/agent-sessions')
 def agent_sessions(request:Request,offset:int=0,search:str=Query(default='',max_length=200),summary:bool=False,user=Depends(current_user)):
-    return request.app.state.dialogues.sessions(user,offset,search,summary=summary)
+    return request.app.state.dialogues.session_store.sessions(user,offset,search,summary=summary)
 
 @router.get('/agent-sessions/{identifier}')
 def agent_session(identifier: str, request: Request, before: int|None=None, after: int|None=None,
         task_offset: int=Query(0,ge=0), task_search: str=Query('',max_length=200), user=Depends(current_user)):
-    return request.app.state.dialogues.session(user,identifier,before=before,after=after,task_paging=(task_offset,task_search))
+    return request.app.state.dialogues.session_store.session(user,identifier,before=before,after=after,task_paging=(task_offset,task_search))
 
 @router.put('/agent-sessions/{identifier}/auto-accept')
 def set_auto_accept(identifier: str, body: SkillToggle, request: Request, user=Depends(current_user)):
-    return request.app.state.dialogues.auto_accept(user,identifier,body.enabled)
+    return request.app.state.dialogues.session_store.auto_accept(user,identifier,body.enabled)
 
 
 @router.post('/agent-dialogues/{identifier}/accept')
@@ -376,4 +376,4 @@ def change_notification(identifier:int,action:str,request:Request,user=Depends(c
 
 @router.get('/agent-sessions/{identifier}/tasks')
 def agent_session_tasks(identifier:str,request:Request,offset:int=0,search:str=Query(default='',max_length=200),user=Depends(current_user)):
-    return request.app.state.dialogues.task_page(user,identifier,offset,search)
+    return request.app.state.dialogues.session_store.task_page(user,identifier,offset,search)

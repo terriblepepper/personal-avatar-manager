@@ -140,9 +140,9 @@ class StyleLearning:
             try:self.queue(user,automatic=True,day=day)
             except HTTPException:continue
 
-    async def process(self,row,config,key):
-        from avatar.knowledge.service import FIELDS,approved_style
-        k=self.knowledge
+    async def process(self,row,config,key,worker):
+        from avatar.knowledge.soul_document import FIELDS,approved_style
+        k=worker
         with self.database.connect() as db:
             parent=self.active_build(db,row['user_id'])
             if not parent:raise HTTPException(409,NEEDS_ACTIVE_SOUL)

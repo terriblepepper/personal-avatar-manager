@@ -51,7 +51,7 @@ class EverOSMemory:
 
     async def compile(self,row,config,key,evidence):
         k=self.knowledge
-        from avatar.knowledge.service import approved_style
+        from avatar.knowledge.soul_document import approved_style
         with k.database.connect() as db:
             if not db.execute('SELECT 1 FROM soul_builds WHERE id=? AND user_id=?',(row['id'],row['user_id'])).fetchone():raise HTTPException(404,'记忆构建不存在')
             embedding=EmbeddingSettings.current(db,row['user_id'])

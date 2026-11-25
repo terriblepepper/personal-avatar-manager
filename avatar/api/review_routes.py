@@ -5,7 +5,7 @@ from fastapi.responses import FileResponse
 from avatar.api.file_previews import word_pdf
 import json
 from pydantic import BaseModel,ConfigDict,Field,StrictBool
-from avatar.api.routes import admin
+from avatar.api.dependencies import admin
 from avatar.profiles.review_queue import ReviewQueue
 
 router=APIRouter(prefix='/api/admin/review-queue',tags=['统一审核'])

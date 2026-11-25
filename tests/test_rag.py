@@ -203,7 +203,7 @@ def test_index_consumer_survives_unexpected_task_failure(context,monkeypatch):
 
 
 def test_soul_progress_is_isolated_between_concurrent_builds(context):
-    app,_,_=context;service=app.state.knowledge
+    app,_,_=context;service=app.state.soul_builds
     async def check():
         ready=asyncio.Event();release=asyncio.Event();values=[]
         async def first():
@@ -223,7 +223,7 @@ def insert_soul(database,identifier,uid,status='queued'):
 
 
 def test_soul_consumer_starts_other_users_without_waiting_for_first(context,monkeypatch):
-    app,client,admin=context;service=app.state.knowledge
+    app,client,admin=context;service=app.state.soul_builds
     ids=[client.get('/api/auth/me').json()['user']['id'],admin.get('/api/auth/me').json()['user']['id']]
     for i,uid in enumerate(ids):insert_soul(app.state.database,'parallel-'+str(i),uid)
     async def check():
@@ -249,7 +249,7 @@ def test_soul_consumer_starts_other_users_without_waiting_for_first(context,monk
 
 
 def test_soul_material_analysis_uses_bounded_workers(context,monkeypatch):
-    app,client,_=context;service=app.state.knowledge;uid=client.get('/api/auth/me').json()['user']['id']
+    app,client,_=context;service=app.state.soul_builds;uid=client.get('/api/auth/me').json()['user']['id']
     insert_soul(app.state.database,'materials',uid,status='running')
     async def check():
         active=0;peak=0;gate=asyncio.Event()
@@ -346,6 +346,22 @@ def test_index_does_not_publish_when_vector_write_is_incomplete(context,monkeypa
     with rag.database.connect() as db:
         assert db.execute('SELECT status FROM file_rag_documents WHERE file_id=?',(fid,)).fetchone()[0]=='failed'
 
+
+
+def test_sync_only_requeues_incomplete_publications(context,monkeypatch):
+    postgres = context[0].state.chat.rag.store
+    rag,owner,identifier,_ = prepared_index(context,monkeypatch)
+    monkeypatch.setattr(rag,'store',postgres)
+    asyncio.run(rag.index('profile',identifier,owner))
+    def sync_status():
+        status = rag.sync({'id':owner})
+        return next(item['status'] for item in status['items'] if item['file_id']==identifier)
+    assert sync_status() == 'ready'
+    with rag.database.connect(write=True) as db:
+        db.execute("""DELETE FROM rag_vector_records
+            WHERE user_id=? AND record_id=(SELECT record_id FROM file_rag_nodes WHERE file_id=? LIMIT 1)""",
+            (owner,identifier))
+    assert sync_status() == 'queued'
 
 def test_published_index_survives_failed_same_content_rebuild(context,monkeypatch):
     from avatar.rag.indexing.service import revision,signature
