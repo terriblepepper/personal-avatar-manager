@@ -11,7 +11,6 @@ import zipfile
 from xml.etree import ElementTree
 from fastapi import HTTPException
 
-WORD_SUFFIXES = ('.doc', '.docx')
 RASTER = ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tif', '.tiff', '.webp')
 
 
@@ -63,8 +62,7 @@ def converted(path, extension, output):
         yield target
 
 
-@contextmanager
-def word_pdf(path, extension):
+def word_vectors(path, extension):
     if path.stat().st_size > 64 * 1024 * 1024:
         raise ValueError('Word 原件超过 64 MiB 转换上限')
     vector = True
@@ -85,8 +83,7 @@ def word_pdf(path, extension):
                              for name in names)
         except (zipfile.BadZipFile, KeyError, ElementTree.ParseError):
             raise ValueError('DOCX 文件结构无效') from None
-    with converted(path, extension, 'pdf') as pdf:
-        yield pdf, vector
+    return vector
 
 
 def pdf_visual_pages(reader, *, vector=True):

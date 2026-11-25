@@ -8,9 +8,9 @@ from avatar.files.parsing import PLAIN_TEXT_EXTENSIONS
 def read(path,extension,start=1,end=None,offset=0,limit=12000,query='',visual_text=None):
     from avatar.files.parsing.extract import extract
     if extension in ('.doc', '.docx'):
-        from avatar.files.parsing.document_images import word_pdf
-        with word_pdf(Path(path), extension) as (pdf, _):
-            return read(pdf, '.pdf', start, end, offset, limit, query, visual_text)
+        from avatar.files.word_pdfs import read_word_pdf
+        pdf, _ = read_word_pdf(Path(path))
+        return read(pdf, '.pdf', start, end, offset, limit, query, visual_text)
     if extension=='.pdf':
         from pypdf import PdfReader
         reader=PdfReader(path,strict=False)

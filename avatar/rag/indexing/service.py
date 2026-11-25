@@ -2,7 +2,7 @@
 import asyncio
 
 from avatar.core.dispatch import begin_work, wait_work
-from contextlib import ExitStack, aclosing
+from contextlib import aclosing
 import base64
 import hashlib
 import json
@@ -17,7 +17,7 @@ import threading
 from fastapi import HTTPException
 from avatar.files.uploads.buffer import upload_work
 from avatar.files.parsing import text_worker
-from avatar.files.parsing.document_images import WORD_SUFFIXES, word_pdf
+from avatar.files.word_pdfs import WORD_SUFFIXES, read_word_pdf
 from avatar.core.config import ROOT
 from avatar.core.performance import measure
 from avatar.rag.invalidation import invalidate, signature
@@ -214,12 +214,11 @@ class FileRag:
         path = self.original_path(row, source)
         extension = Path(row['filename']).suffix.lower()
         if extension in WORD_SUFFIXES:
-            with ExitStack() as stack:
-                try:
-                    pdf, vector = await self.work.execute(row['user_id'], 'parse', stack.enter_context, word_pdf(path, extension))
-                except (ValueError, OSError, subprocess.SubprocessError):
-                    raise HTTPException(422, 'Word 转 PDF 失败，请检查原件及 LibreOffice 运行环境') from None
-                return await self._prepare(row, embedding, model, pdf, '.pdf', vector=vector, coverage=['word_pdf'])
+            try:
+                pdf, vector = await upload_work(read_word_pdf, path)
+            except ValueError as error:
+                raise HTTPException(422, str(error)) from None
+            return await self._prepare(row, embedding, model, pdf, '.pdf', vector=vector, coverage=['word_pdf'])
         return await self._prepare(row, embedding, model, path, extension, vector=True, coverage=[])
 
     async def _prepare(self, row, embedding, model, path, extension, *, vector, coverage):

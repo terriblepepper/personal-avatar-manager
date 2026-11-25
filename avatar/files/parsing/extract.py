@@ -131,9 +131,9 @@ def extract(path, extension):
         if len(source) > 1024 * 1024:
             return text[:MAX_TEXT], 'truncated'
     elif extension in ('.doc','.docx'):
-        from avatar.files.parsing.document_images import word_pdf
-        with word_pdf(path, extension) as (pdf, _):
-            return extract(pdf, '.pdf')
+        from avatar.files.word_pdfs import read_word_pdf
+        pdf, _ = read_word_pdf(path)
+        return extract(pdf, '.pdf')
     elif extension == '.xlsx':
         text = spreadsheet_text(path)
     elif extension == '.pptx':

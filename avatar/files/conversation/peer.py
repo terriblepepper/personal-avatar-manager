@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from avatar.core.db import now
 from avatar.files.conversation.resources import original_hashes, reference_count
 from avatar.files.library.attachments import MAX_FILE
+from avatar.files.word_pdfs import WORD_PDF_SUFFIXES, link_word_pdf
 
 
 GENERATED_FILE = """(f.origin='generated' OR (f.origin='reference' AND f.sha256!='' AND EXISTS (
@@ -129,6 +130,9 @@ class PeerResources:
                     if (row['sha256'] and row['sha256']!=digest) or (row['md5'] and row['md5']!=md5):
                         raise HTTPException(409,'会话文件校验失败，未发送原件')
                     sha=digest
+                    source_blob, target_blob = original, path
+            if pdf := link_word_pdf(source_blob, target_blob):
+                paths.append(pdf)
             db.execute("""INSERT INTO chat_files(id,user_id,conversation_id,filename,content_type,size,extracted_text,
                 extraction_status,created_at,origin,description,source_label,sha256,referenced,parse_checked,extraction_version,
                 animation_metadata,animation_digest)
@@ -369,13 +373,14 @@ class PeerResources:
         # 异常断电可能留下已写文件而未提交元数据的孤儿；最多七天后同样回收。
         with self.database.connect() as db:
             for path in self.files.directory.glob():
-                if path.is_symlink() or path.suffix not in ('.blob','.jpg'):continue
+                if path.is_symlink() or (path.suffix not in ('.blob','.jpg') and not path.name.endswith(WORD_PDF_SUFFIXES)):continue
                 try:modified=path.stat().st_mtime
                 except FileNotFoundError:continue
                 if modified>time.time()-7*86400:continue
-                try:uuid.UUID(path.stem)
+                identifier=path.name.partition('.')[0]
+                try:uuid.UUID(identifier)
                 except ValueError:continue
-                if not db.execute('SELECT 1 FROM chat_files WHERE id=?',(path.stem,)).fetchone():
+                if not db.execute('SELECT 1 FROM chat_files WHERE id=?',(identifier,)).fetchone():
                     path.unlink(missing_ok=True)
                     parent=path.parent
                     if parent.name != 'chat_attachments':
