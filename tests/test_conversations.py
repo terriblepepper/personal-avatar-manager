@@ -266,6 +266,30 @@ def test_peer_protocol_accepts_before_generation_and_deduplicates(context):
     asyncio.run(check())
 
 
+def test_agent_disclosure_can_finish_plain_answer():
+    from avatar.conversation.agent_loop import run_agent
+    from avatar.models.client import ModelResult
+
+    purposes = []
+
+    async def generate(config, *args):
+        purposes.append(config['_call_purpose'])
+        if config['_call_purpose'] == 'task_planning':
+            schema = config['_tools'][0]['parameters']['properties']
+            arguments = {'steps': []}
+            if 'reply' in schema:
+                arguments['reply'] = 'TCP 提供可靠且有序的传输。'
+            return ModelResult('', {'total_tokens': 20}, ({'name':'plan_task','arguments':arguments},), 'tool_calls')
+        return ModelResult('TCP 提供可靠且有序的传输。', {'total_tokens': 20}, finish_reason='stop')
+
+    rag = SimpleNamespace(chat=SimpleNamespace(model_client=SimpleNamespace(generate=generate)), validate=lambda _: None)
+    config = {'provider':'custom','model':'test','api_format':'openai','context_tokens':32768,'max_tokens':1024}
+    result = asyncio.run(run_agent(rag, (config,'key','测试分身',[]), '用一句话介绍 TCP。'))
+    assert result.text == 'TCP 提供可靠且有序的传输。'
+    assert result.usage['total_tokens'] == 20
+    assert purposes == ['task_planning']
+
+
 def test_peer_transport_polls_accepted_task_without_resending(context):
     import asyncio
     from types import SimpleNamespace
@@ -429,6 +453,38 @@ def supplemented_task(context,monkeypatch):
     async def no_controls(*args):pass
     monkeypatch.setattr(service.recovery,'flush_controls',no_controls)
     return service,users,identifier
+
+
+def test_acps_get_revalidates_saved_peer_reply(supplemented_task):
+    from hashlib import sha256
+    from avatar.conversation.loop.peer import PeerTurn
+    from avatar.core.db import dump
+
+    service, users, task_id = supplemented_task
+    owner = users[1]['id']
+    with service.database.connect(write=True) as db:
+        db.execute("UPDATE agent_dialogues SET status='running',next_speaker=1 WHERE id=?", (task_id,))
+        task = dict(service.session_store.owned(db, users[1], task_id))
+    turn = PeerTurn(service.executor, task, owner)
+    handler = PeerDialogueTasks(service, SimpleNamespace())
+    handler.scope = lambda command, context, user_id, db: dict(service.session_store.owned(db, users[1], task_id))
+    wire = SimpleNamespace(local_aic=task['target_aic'],peer_aic=task['own_aic'])
+    command = dict(id='query',taskId=task_id,sessionId=task['session_id'],command='get')
+    receipt = handler.result(command, wire, 'awaiting-completion', '已保存答复')
+    delivery = dict(revision=task['revision'],speaker=owner,authority=turn.source,
+                    peer_style=turn.style,workspace=turn.workspace,answer={'text':'已保存答复'},
+                    reply_sha=sha256('已保存答复'.encode()).hexdigest())
+    with service.database.connect(write=True) as db:
+        db.execute('UPDATE agent_dialogues SET pending_file_delivery=? WHERE id=?', (dump(delivery),task_id))
+        db.execute('INSERT INTO agent_wire_results VALUES(?,?,?,?,?,?,?)',
+                   ('reply',wire.local_aic,wire.peer_aic,task['session_id'],task_id,'awaiting-completion',dump(receipt)))
+
+    assert asyncio.run(handler.handle(command, wire, owner)) == receipt
+    with service.database.connect(write=True) as db:
+        db.execute("UPDATE avatar_records SET last_modified_at='changed' WHERE user_id=?", (owner,))
+    with pytest.raises(ManagementTaskError) as revoked:
+        asyncio.run(handler.handle(command, wire, owner))
+    assert revoked.value.code == -32009
 
 
 def test_peer_polling_snapshot_tracks_viewer_history(supplemented_task,context,monkeypatch):

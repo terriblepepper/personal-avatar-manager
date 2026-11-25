@@ -67,15 +67,8 @@ class PeerTurnExecutor:
         job['_peer_run'] = run
         with self.database.connect() as db:
             run.validate(db)
-            row = db.execute('SELECT pending_file_delivery FROM agent_dialogues WHERE id=?', (job['id'],)).fetchone()
-            receipt = json.loads(row[0] or '{}')
-            if receipt.get('revision') == job['revision'] and receipt.get('speaker') == speaker_id and receipt.get('answer'):
-                if receipt.get('authority') != run.source:
-                    raise HTTPException(409, '分身资料授权已改变，未发送原答复')
-                if proofs:=receipt.get('session_file_reads'):
-                    run.validate_session_files=partial(self.resources.validate_file_receipts,task=job,
-                        owner=speaker_id,workspace=run.workspace,proofs=proofs)
-                    run.commit(db)
+            current = self.sessions.owned(db, {'id': speaker_id}, job['id'])
+            if receipt := self.verified_delivery(db, current, speaker_id):
                 return SimpleNamespace(**receipt['answer'])
         events = []
         activity = ToolActivity(events, lambda event: self.record_turn_activity(job, speaker_id, event))
@@ -105,6 +98,20 @@ class PeerTurnExecutor:
                 db.execute('UPDATE agent_dialogues SET agent_checkpoint=? WHERE id=?',(dump(checkpoint),job['id']))
                 pause.usage = run.settle(db)
             raise
+
+    def verified_delivery(self, db, task, owner, *, text=None, lock=False):
+        receipt = json.loads(task['pending_file_delivery'] or '{}')
+        if receipt.get('revision') != task['revision'] or receipt.get('speaker') != owner:
+            return None
+        workspace = receipt['workspace']
+        answer = receipt['answer']['text']
+        if (text is not None and answer != text) or receipt['reply_sha'] != hashlib.sha256(answer.encode()).hexdigest():
+            raise HTTPException(409, '分身答复与交付回执不一致')
+        if receipt['authority'] != PeerTurn.source_version(self, db, task, owner, workspace, style=receipt['peer_style']):
+            raise HTTPException(409, '分身资料或工具授权已改变，未交付答复')
+        if proofs := receipt.get('session_file_reads'):
+            self.resources.validate_file_receipts(db, task, owner, workspace, proofs, lock=lock)
+        return receipt
 
     def output_revision(self,db,job,speaker_id,files=None,*,style=None):
         # 补充前撤销的资料权限也约束旧草稿的交付。
@@ -461,7 +468,7 @@ class PeerTurnExecutor:
             answer = {'text':text,'usage':run.settle(db),'task_action':action}
             # 本地交付与已验证的答复共用一个事务，重启后只提取收据。
             delivery={'speaker':speaker_id,'revision':job['revision'],'reply_sha':hashlib.sha256(text.encode()).hexdigest(),
-                      'source_revision':job['_output_source_revision'],'authority':run.source,'peer_style':run.style,'workspace':workspace,'answer':answer,
+                      'authority':run.source,'peer_style':run.style,'workspace':workspace,'answer':answer,
                       'public':public,'file_ids':list(dict.fromkeys(item['id'] for item in [*saved,*outputs]))}
             if proofs:=config.get('_session_read_proofs'):
                 delivery['session_file_reads']=proofs
@@ -533,22 +540,13 @@ class PeerTurnExecutor:
                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                     (job['id'],turn,speaker['aic'],json.loads(speaker['profile']).get('avatar_name','分身'),speaker['user_id'],
                      text,dump(result.get('usage')),now(),state,waiting,activity,mode,action_name)).lastrowid
-            delivery=json.loads(current['pending_file_delivery'] or '{}')
-            if delivery.get('revision')==job['revision'] and delivery.get('speaker')==speaker['user_id']:
-                uid=speaker['user_id']
-                workspace=self.resources.workspace(db,uid,job['session_id'],job['id'])
-                style=PeerTurn.resolve_style(self,db,dict(current),uid,workspace,delivery) if delivery.get('authority') else None
-                if (delivery['reply_sha']!=hashlib.sha256(result['text'].encode()).hexdigest()
-                        or delivery['source_revision']!=self.output_revision(db,job,uid,style=style)):
-                    raise HTTPException(409,'文件交付回执或授权已改变，请重新发送')
-                if delivery.get('authority') and delivery['authority'] != PeerTurn.source_version(self,db,dict(current),uid,workspace,style=style):
-                    raise HTTPException(409,'分身资料或工具授权已改变，未交付答复')
-                if proofs:=delivery.get('session_file_reads'):
-                    self.resources.validate_file_receipts(db,dict(current),speaker['user_id'],workspace,proofs)
-                if delivery['file_ids']:
-                    paths=cleanup.enter_context(self.chat.chat_files.storing_outputs(db,uid,workspace,None,delivery['public']))
-                    paths.extend(self.resources.share(db,{'id':uid},job['id'],delivery['file_ids'],workspace,generated=True,
-                                                      authorize_ids={item['id'] for item in delivery['public']}))
+            uid = speaker['user_id']
+            delivery = self.verified_delivery(db, current, uid, text=result['text'], lock=True)
+            if delivery and delivery['file_ids']:
+                workspace = delivery['workspace']
+                paths = cleanup.enter_context(self.chat.chat_files.storing_outputs(db,uid,workspace,None,delivery['public']))
+                paths.extend(self.resources.share(db,{'id':uid},job['id'],delivery['file_ids'],workspace,generated=True,
+                                                  authorize_ids={item['id'] for item in delivery['public']}))
             if delivery:
                 db.execute('UPDATE agent_dialogues SET pending_file_delivery=NULL WHERE id=?',(job['id'],))
             PeerTurn.clear(db, job['id'], speaker['user_id'])

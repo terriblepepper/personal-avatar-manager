@@ -68,7 +68,9 @@ class PeerTurn:
             state=RunStore.inspect_in(db,owner,'dialogue',task['id'],'turn') or {}
             receipt=json.loads(task.get('pending_file_delivery') or '{}')
             prior=state or (receipt if receipt.get('speaker')==owner else {})
-            self.style=self.resolve_style(service,db,task,owner,self.workspace,prior)
+            if prior and 'peer_style' not in prior:
+                raise HTTPException(409, '原任务缺少已确认的分身风格凭证')
+            self.style = prior['peer_style'] if prior else active_peer_style(db,owner)
             self.source = self.authority(db)
 
     def authority(self, db):
@@ -81,23 +83,6 @@ class PeerTurn:
                               "AND task_id=? AND session_id=? AND state='working'", (*key,task['id'],task['session_id'])).fetchone():
                 raise HTTPException(409, '分身协议命令已停止')
         return self.source_version(self.service, db, task, self.owner, self.workspace, style=self.style)
-
-    @staticmethod
-    def resolve_style(service, db, task, owner, workspace, state):
-        if 'peer_style' in state:
-            return state['peer_style']
-        current=active_peer_style(db,owner)
-        expected=state.get('peer_source') or state.get('authority')
-        if not expected or PeerTurn.source_version(service,db,task,owner,workspace,style=current)==expected:
-            return current
-        # Legacy receipts contain only a source hash. Try an original approved ancestor and recheck every other source.
-        older=db.execute("SELECT id,md5(document) AS checksum FROM soul_builds WHERE user_id=? AND status='approved' AND id IS DISTINCT FROM ?",
-                         (owner,current['id'])).fetchall()
-        for candidate in [*(dict(row) for row in older),{'id':None,'checksum':None}]:
-            if auto_style_advance(db,owner,candidate['id'],candidate['checksum'],current['id']):
-                if PeerTurn.source_version(service,db,task,owner,workspace,style=candidate)==expected:
-                    return candidate
-        return current
 
     @staticmethod
     def source_version(service, db, task, owner, workspace, *, style=None):
@@ -176,13 +161,15 @@ class PeerTurn:
                  and bool(receipt.get('answer')))
         state = RunStore.inspect_in(db, owner, 'dialogue', task['id'], 'turn') or {}
         if state or known:
+            snapshot = state or receipt
+            if 'peer_style' not in snapshot:
+                return False
             workspace = state.get('peer_workspace') or receipt.get('workspace')
             try:
-                style = PeerTurn.resolve_style(service,db,task,owner,workspace,state or receipt)
-                current = PeerTurn.source_version(service,db,task,owner,workspace,style=style)
+                current = PeerTurn.source_version(service, db, task, owner, workspace, style=snapshot['peer_style'])
             except HTTPException:
                 return False
-            if (state and state.get('peer_source')!=current) or (known and receipt.get('authority')!=current):
+            if (state and state.get('peer_source') != current) or (known and receipt.get('authority') != current):
                 return False
         if state.get('peer_export') and not (state.get('sandbox') or {}).get('in_flight') and state.get('phase') != 'effect_unknown':
             state = RunStore.inspect_in(db, owner, 'dialogue', task['id'], 'public-reply') or {'phase':'planning'}

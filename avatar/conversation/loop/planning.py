@@ -75,14 +75,20 @@ def lookup_types(config, allowed):
     return planned
 
 
-def validate_disclosure(value, choices, *, lookups=None, revise=False):
+def validate_disclosure(value, choices, *, lookups=None, revise=False, allow_reply=False):
     lookups = lookups or {}
     fields = {'tools','steps','continue_draft'} if revise else {'tools','steps'}
+    if allow_reply:
+        fields.add('reply')
     if not isinstance(value,dict) or set(value)-fields or not isinstance(value.get('steps'),list):
         raise ValueError('披露缺少子目标')
     if len(value['steps'])>16:
         raise ValueError('单次披露最多十六项子目标，可后续补充')
     selected = _selected(value.get('tools',[]),choices)
+    if reply := value.get('reply'):
+        if not isinstance(reply, str) or not reply.strip() or selected or value['steps'] or not fits_text_budget(reply):
+            raise ValueError('直接答复须包含完整正文，且不能同时选择工具或目标')
+        return {'tools': [], 'steps': [], 'reply': reply}
     steps=[]
     text_parts=[]
     for source in value['steps']:
@@ -127,7 +133,7 @@ def validate_disclosure(value, choices, *, lookups=None, revise=False):
     return ret
 
 
-async def disclose_tools(model, settings, key, system, history, question, catalog, validate, *, lookups=None, revise=False):
+async def disclose_tools(model, settings, key, system, history, question, catalog, validate, *, lookups=None, revise=False, allow_reply=False):
     lookup_schemas = list(dict.fromkeys((lookups or {}).values()))
     name={'type':'string','enum':list(catalog)}
     names={'type':'array','items':name,'uniqueItems':True}
@@ -139,13 +145,15 @@ async def disclose_tools(model, settings, key, system, history, question, catalo
     if lookup_schemas:
         steps['items']['properties']['lookup']={'anyOf':[schema.model_json_schema() for schema in lookup_schemas]}
     properties={'tools':names,'steps':steps}
+    if allow_reply:
+        properties['reply'] = {'type':'string','description':'已有足够信息时的完整最终答复。仅在 tools 和 steps 均为空时填写。'}
     if revise:
         properties['continue_draft']={'type':'boolean','description':'当前草稿满足补充要求，继续从原游标写作'}
     form={'name':'plan_task','description':'为当前需要选择最小工具集，并分解可验证的交付。'+TEXT_LIMIT,'parameters':{
         'type':'object','properties':properties,'required':['steps'],'additionalProperties':False}}
     config={**settings,'_tools':[form],'_batch_tools':False,'_optional_tools':False,'_call_purpose':'task_planning'}
     prompt=(system+'\n你担任当前分身的工具披露步骤。根据本轮用户的实际目标、已有证据和工具目录决定。'
-            'tools 只选实际需要的工具。仅需文字或 Mermaid 且已有足够信息时，不规划生成文件或检索。正文和 Mermaid 由下一阶段直接输出，协议要求的会话动作仍须规划。'
+            'tools 只选实际需要的工具。仅需文字或 Mermaid 且已有足够信息时，不规划生成文件或检索。协议要求的会话动作仍须规划。'
             '复杂任务拆为可核对的必要目标，给出 goal 和 criterion。先核对，再决定是否需要追加修订。'
             '可用同一子目标的 tools 列出替代工具。先取证再创作时，将取证与交付分别列为前后两个子目标。'
             '规划只选择一次终态动作，作为独立最后一步。需要发送最后发言并结束时，只规划 end_task，可附发言。'
@@ -153,7 +161,13 @@ async def disclose_tools(model, settings, key, system, history, question, catalo
             '简单单次动作可只写 goal 和 tool。已确定的只读参数可以填 lookup；有依赖或不确定时留待执行。'
             '每个独立作品只列一项生成目标。生成回执已经证明文件存在，无需另列目录查询或交付确认。只有用户要求检查内容时才规划复查。'
             '当前授权目录只列摘要；不可选择目录外工具。已关闭的能力如确实需要，可选择其 ID 以提示用户。'
-            '当前只规划工具和目标，调用 plan_task 或返回相同结构的 JSON。最终发言留到执行阶段。'+json.dumps(catalog,ensure_ascii=False))
+            '调用 plan_task 或返回相同结构的 JSON。'+json.dumps(catalog,ensure_ascii=False))
+    if allow_reply:
+        prompt += ('信息充分且无需工具时，直接在 reply 写本轮完整正文或 Mermaid，tools 和 steps 留空。'
+                   '凡需查证、询问、生成、修改或交付文件、执行操作时，规划所需工具，不写 reply。'
+                   '正文只写结果和解释，禁止声称已执行未取得回执的操作，不写内部计划、HTML 源码或沙箱脚本。')
+    else:
+        prompt += '本步只给出工具和目标，最终发言由执行阶段提交。'
     if 'read_session_file' in catalog:
         prompt+='read_session_file 用 query 查目录，用 file_id 读原件。仅需目录时为目标设置 file_access=directory；需要正文时用 content，目录只是定位。修订作品时先读原件，再提交局部修改。'
     if revise:
@@ -201,7 +215,7 @@ async def disclose_tools(model, settings, key, system, history, question, catalo
                 proposal=result.tool_calls[0]['arguments']
             else:
                 proposal=json.loads(result.text.strip().removeprefix('```json').removesuffix('```'))
-            return validate_disclosure(proposal,catalog,lookups=lookups,revise=revise),usage
+            return validate_disclosure(proposal,catalog,lookups=lookups,revise=revise,allow_reply=allow_reply),usage
         except (ValueError,TypeError) as error:
             issue=bounded_excerpt(str(error),120)
     return None,usage
@@ -325,10 +339,11 @@ class ToolPlan:
     pending: list
     selected: list
     blocked: str | None = None
+    reply: str | None = None
 
 
 async def prepare_plan(model, context, question, state, draft, *, allowed, disabled, choices,
-                       planned_arguments, changed, proposed, trace, validate, account):
+                       planned_arguments, changed, proposed, trace, validate, account, allow_reply):
     settings, key, system, history = context
     plan, pending, selected = [], [], []
     if 'ask_user' not in allowed and any(
@@ -365,13 +380,16 @@ async def prepare_plan(model, context, question, state, draft, *, allowed, disab
                     disclosure = None
             else:
                 disclosure, cost = await disclose_tools(model,settings,key,system,history,
-                    planning_question,choices,validate,lookups=planned_arguments,revise=revise)
+                    planning_question,choices,validate,lookups=planned_arguments,revise=revise,allow_reply=allow_reply and not revise)
                 account(cost)
             if disclosure is None:
                 return None
             selected = disclosure['tools']
             planned = disclosure['steps']
             decision.update(tools=selected,goals=[s['goal'] for s in planned])
+            if reply := disclosure.get('reply'):
+                decision['decision'] = '已有足够信息，直接作答'
+                return ToolPlan(plan, pending, selected, reply=reply)
         keep_draft = disclosure.get('continue_draft',False)
         for name in selected:
             if name in disabled:
