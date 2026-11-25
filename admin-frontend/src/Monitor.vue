@@ -52,13 +52,14 @@ function submit() {
         <button v-if="failure" class="button primary" :disabled="loading" @click="refresh">重新检查</button>
       </template>
       <form v-else method="post" @submit.prevent="submit">
-        <label for="username">本地管理员账号</label>
+        <label for="username">本地账号</label>
         <input id="username" v-model="username" name="username" autocomplete="username" required>
         <label for="password">密码</label>
         <input id="password" v-model="password" name="password" type="password"
                autocomplete="current-password" required>
         <p v-if="failure" class="alert" role="alert">{{ failure }}</p>
         <button class="button primary" type="submit" :disabled="submitting">{{ submitting ? '正在登录…' : '登录' }}</button>
+        <a class="button subtle" href="/">通过平台登录</a>
       </form>
     </section>
   </main>

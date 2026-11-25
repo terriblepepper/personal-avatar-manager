@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElButton, ElConfigProvider } from 'element-plus'
 import zhCn from 'element-plus/es/locale/lang/zh-cn'
 import { useSessionStore } from './stores/session'
+import { isAdministrator } from './utils/accountRole'
 import LoginView from './views/LoginView.vue'
 import ConsoleLayout from './layouts/ConsoleLayout.vue'
 import { bindDisclosures } from './utils/disclosures'
@@ -14,7 +15,7 @@ const platformToken = location.pathname === '/platform-entry' ? new URLSearchPar
 if (platformToken) history.replaceState(null, '', '/platform-entry')
 watch([() => session.user, () => route.path], ([user, path]) => {
   if (user?.access_scope === 'profile' && !['/profile','/files','/models','/history','/platform-entry'].includes(path)) void router.replace('/profile')
-  else if (user && user.role !== 'admin' && path.startsWith('/admin')) void router.replace('/')
+  else if (user && !isAdministrator(user) && path.startsWith('/admin')) void router.replace('/')
 })
 const events = new AbortController()
 onMounted(() => { bindDisclosures(events.signal); void session.initialize() })

@@ -2,6 +2,7 @@
 import json
 from contextlib import contextmanager
 from fastapi import HTTPException
+from avatar.accounts.roles import ADMIN_ROLES
 from avatar.core.db import now
 from avatar.core.activity_visibility import event_scope,notification_scope,REVIEW_REQUEST
 
@@ -31,11 +32,11 @@ def notify(db,user_id,kind,session_id,task_id,title,content,key):
 # 从审计增量生成个人动态；角色变化时重新投影，幂等键保留已读/删除状态，降权立即隐藏管理动态。
 def sync_activity(db,user_id,*,check_only=False):
     state = db.execute("""
-        SELECT COALESCE((SELECT role='admin' FROM users WHERE id=?),false) AS is_admin,
+        SELECT COALESCE((SELECT role IN (?,?) FROM users WHERE id=?),false) AS is_admin,
                c.admin AS cursor_admin,c.last_event,h.upper_event
         FROM (SELECT COALESCE(MAX(id),0) AS upper_event FROM audit_events) h
         LEFT JOIN agent_activity_cursors c ON c.user_id=?
-    """, (user_id, user_id)).fetchone()
+    """, (*ADMIN_ROLES, user_id, user_id)).fetchone()
     admin, upper = state['is_admin'], state['upper_event']
     same_role = state['cursor_admin'] is not None and bool(state['cursor_admin']) == admin
     last = state['last_event'] if same_role else 0
@@ -148,7 +149,7 @@ class AgentInbox:
         if not 1<=len(identifiers)<=100 or any(type(i) is not int or i<=0 for i in identifiers):raise HTTPException(422,'请选择 1～100 条有效消息')
         slots=','.join('?' for _ in identifiers)
         with self.database.connect(write=True) as db:
-            admin=bool(db.execute("SELECT role='admin' FROM users WHERE id=?",(user_id,)).fetchone()[0])
+            admin=bool(db.execute("SELECT role IN (?,?) FROM users WHERE id=?",(*ADMIN_ROLES,user_id)).fetchone()[0])
             visible,values=visible_notifications(user_id,admin)
             if db.execute(f'SELECT COUNT(*) FROM agent_notifications WHERE {visible} AND id IN ({slots})',(*values,*identifiers)).fetchone()[0]!=len(identifiers):raise HTTPException(404,'消息不存在或无权操作')
             field='deleted_at' if action=='delete' else 'read_at'

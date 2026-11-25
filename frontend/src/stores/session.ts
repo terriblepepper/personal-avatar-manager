@@ -2,6 +2,7 @@ import { ref } from 'vue'
 import { defineStore } from 'pinia'
 import { request, ApiError, setCsrfToken, setSessionExpiryHandler } from '../api/client'
 import type { AuthConfig, SessionResponse, User } from '../types'
+import { isAdministrator } from '../utils/accountRole'
 
 export const useSessionStore = defineStore('session', () => {
   const user = ref<User | null>(null), csrf = ref(''), authConfig = ref<AuthConfig | null>(null)
@@ -9,7 +10,7 @@ export const useSessionStore = defineStore('session', () => {
   let revision = 0
   function clear() { revision++; pending.value = 0; user.value = null; csrf.value = ''; setCsrfToken('') }
   function accept(value: SessionResponse) {
-    if (value.user.id !== user.value?.id || value.user.role !== 'admin') pending.value = 0
+    if (value.user.id !== user.value?.id || !isAdministrator(value.user)) pending.value = 0
     revision++
     user.value = value.user
     csrf.value = value.csrf

@@ -2,6 +2,7 @@
 import json
 from fastapi import HTTPException
 from avatar.accounts.auth import require_admin
+from avatar.accounts.roles import ADMIN_ROLES
 from avatar.core.activity_visibility import event_scope
 
 
@@ -23,7 +24,7 @@ def record_page(state,user,collection,scope='user',offset=0,search='',status='al
         decode=lambda row:service._submission(row,admin=admin)
     elif collection=='events':
         source='audit_events e';fields='e.*';order='e.id DESC'
-        current_admin=user['role']=='admin'
+        current_admin=user['role'] in ADMIN_ROLES
         condition,args=event_scope(user['id'],current_admin)
         where.append(condition);values.extend(args)
     elif collection=='model_calls' and not admin:
@@ -106,7 +107,7 @@ def dismiss_all_records(state,user,collection):
     if collection=='jobs':where.append("status='done'")
     if collection=='identity_jobs':where.append("status IN ('done','failed')")
     if collection=='events':
-        clause,args=event_scope(user['id'],user['role']=='admin');where.append(clause);values.extend(args)
+        clause,args=event_scope(user['id'],user['role'] in ADMIN_ROLES);where.append(clause);values.extend(args)
     where.append('NOT EXISTS(SELECT 1 FROM record_dismissals h WHERE h.user_id=? AND h.collection=? AND h.record_id=CAST('+('e' if collection=='events' else tables[collection])+'.id AS TEXT))');values.extend((user['id'],collection))
     with state.service.database.connect(write=True) as db:
         changed=db.execute('INSERT INTO record_dismissals(user_id,collection,record_id,created_at) SELECT ?,?,CAST(id AS TEXT),? FROM '+tables[collection]+(' e' if collection=='events' else '')+' WHERE '+' AND '.join(where),(user['id'],collection,now(),*values)).rowcount

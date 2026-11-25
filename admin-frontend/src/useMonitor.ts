@@ -66,7 +66,7 @@ export function useMonitor() {
       if (error instanceof ResponseError && [401, 403].includes(error.status)) {
         snapshot.value = undefined
         phase.value = 'login'
-        failure.value = error.status === 403 ? '请使用本地管理员账号登录。' : ''
+        failure.value = error.status === 403 ? error.message : ''
       } else {
         failure.value = '监控暂不可用，请稍后重试。'
       }

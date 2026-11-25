@@ -7,6 +7,7 @@ import ThemePicker from '../components/ThemePicker.vue'
 import { request } from '../api/client'
 import { useSessionStore } from '../stores/session'
 import type { SessionResponse } from '../types'
+import { isAdministrator } from '../utils/accountRole'
 const props = defineProps<{ platformToken: string }>()
 const session = useSessionStore(), route = useRoute(), router = useRouter()
 const mode = ref<'login' | 'register' | 'recover'>('login'), busy = ref(false), error = ref(''), message = ref(''), platformAccount = ref('')
@@ -17,7 +18,7 @@ const subtitle = computed(() => mode.value === 'register' ? '选择学生或教�
 async function authenticated(result: SessionResponse) {
   session.accept(result)
   if (props.platformToken && result.user.access_scope !== 'profile') await request('/platform/bind', 'POST', { token: props.platformToken })
-  await router.replace(result.user.access_scope === 'profile' ? '/profile' : result.user.role === 'admin' && route.path.startsWith('/admin') ? '/admin' : '/')
+  await router.replace(result.user.access_scope === 'profile' ? '/profile' : isAdministrator(result.user) && route.path.startsWith('/admin') ? '/admin' : '/')
 }
 async function oidc() {
   busy.value = true; error.value = ''

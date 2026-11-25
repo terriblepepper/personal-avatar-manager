@@ -1,6 +1,7 @@
 # 模块说明：输入契约：Pydantic 负责字段结构、格式和部分跨字段约束，数据库归属与业务权限另行检查。
 from pydantic import StrictBool, BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from typing import Literal, Annotated
+from avatar.accounts.roles import AccountRole
 from avatar.core.text_budget import AgentText
 from avatar.models.effort import Effort
 from avatar.protocols.identity.acs import AcsInput
@@ -369,11 +370,11 @@ class ConversationTitleRequest(BaseModel):
 
 
 # 职责：定义管理员授权或自主降级的目标角色。
-# 输入：role 只允许 user 或 admin，禁止多余请求字段。
+# 输入：role 是平台账户角色，禁止多余请求字段。
 # 结果与约束：不能通过附加 is_root 取得根身份，实际可升降级范围由账户管理服务检查。
 class AccountRoleRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    role: Literal['user','admin']
+    role: AccountRole
 
 
 # 职责：定义运维可保存的 Registry、CA、mTLS 和公开服务地址。

@@ -1,7 +1,7 @@
 export interface User {
   id: string
   username: string
-  role: 'admin' | 'user'
+  role: 'admin' | 'super_admin' | 'user'
   person_type: 'student' | 'teacher'
   account_status: string
   is_root?: boolean | number
