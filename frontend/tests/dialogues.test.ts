@@ -13,8 +13,7 @@ it('retries a failed message with the same request ID',async()=>{
     if(path==='/me/skills')return []
     if(path==='/agent-dialogue-settings')return {max_rounds:10}
     if(path?.startsWith('/agent-sessions?'))return {items:[],offset:0,total:0}
-    if(path?.startsWith('/agent-sessions/session-1/tasks'))return {items:[],offset:0,total:0}
-    if(path==='/agent-sessions/session-1')return {peer_name:'peer',resource_conversation_id:'resource',messages:[],has_more:false}
+    if(path==='/agent-sessions/session-1')return {task_page:{items:[],offset:0,total:0},peer_name:'peer',resource_conversation_id:'resource',messages:[],has_more:false}
     if(path==='/agent-sessions/session-1/messages'&&method==='POST'){if(++sends===1)throw Error('network');return {}}
     return {items:[]}
   })
@@ -33,8 +32,7 @@ it('renders task boundaries, message attachments and public tool details',async(
     if(path==='/me/skills')return []
     if(path==='/agent-dialogue-settings')return {max_rounds:10}
     if(path?.startsWith('/agent-sessions?'))return {items:[],offset:0,total:0}
-    if(path?.startsWith('/agent-sessions/session-1/tasks'))return {items:[],offset:0,total:0}
-    if(path==='/agent-sessions/session-1')return {peer_name:'peer',resource_conversation_id:'resource',has_more:false,messages:[{turn:1,dialogue_id:'d',speaker_name:'peer',speaker_role:'agent',content:'hello',tool_activity:[{id:'tool',name:'Python',status:'completed',output:'42'}]},
+    if(path==='/agent-sessions/session-1')return {task_page:{items:[],offset:0,total:0},peer_name:'peer',resource_conversation_id:'resource',has_more:false,messages:[{turn:1,dialogue_id:'d',speaker_name:'peer',speaker_role:'agent',content:'hello',tool_activity:[{id:'tool',name:'Python',status:'completed',output:'42'}]},
       {turn:2,dialogue_id:'d',speaker_role:'user',speaker_name:'Alice',is_own:true,content:'first'},
       {turn:3,dialogue_id:'d',speaker_role:'user',speaker_name:'Bob',is_own:false,content:'second'}],message_tasks:[{id:'d',delivery_mode:'message',status:'ended',created_at:'start',ended_at:'end',files:[{id:'f',message_id:1,filename:'result.txt',download_url:'/api/conversations/resource/files/f'}]}]}
     return {items:[]}
@@ -220,7 +218,7 @@ it.each([undefined, ''])('discards previous messages when history revision is %s
     const messages = Array.from({length: 10}, (_, i) => ({
       turn: i + first, dialogue_id: 'chat', speaker_name: 'Peer', speaker_role: 'agent', content: String(i + first),
     }))
-    return {peer_name: 'Peer', resource_conversation_id: '', messages, has_more: true,
+    return {task_page:{items:[],offset:0,total:0},peer_name: 'Peer', resource_conversation_id: '', messages, has_more: true,
       ...(revision === undefined ? {} : {history_revision: revision})}
   })
   const view = mount(DialoguesView, {global: {stubs: {Teleport: true, ChatFilesManager: true,

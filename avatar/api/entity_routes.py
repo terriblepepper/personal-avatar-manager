@@ -1,7 +1,7 @@
 # 模块说明：个人派生身份管理 API，沿用完整会话、管理员权限及 CSRF 校验。
 from typing import Literal
 from fastapi import APIRouter, Depends, Request
-from avatar.api.routes import admin
+from avatar.api.dependencies import admin
 
 router = APIRouter(prefix='/api/admin/agents', tags=['个人正式身份'])
 

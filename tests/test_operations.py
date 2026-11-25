@@ -492,18 +492,24 @@ def internal_dependencies(path):
             yield from (alias.name for alias in node.names if alias.name.startswith('avatar.'))
 
 
-def test_file_and_model_layers_do_not_import_conversation_or_rag_implementation():
+def test_application_packages_follow_one_way_dependencies():
+    edges = set()
     violations = []
-    for package, forbidden in (
-        ('files', ('avatar.rag', 'avatar.conversation', 'avatar.knowledge')),
-        ('models', ('avatar.conversation', 'avatar.rag.indexing')),
-        ('rag', ('avatar.conversation',)),
-    ):
-        for path in (ROOT / 'avatar' / package).rglob('*.py'):
-            for dependency in internal_dependencies(path):
-                if any(dependency == prefix or dependency.startswith(prefix + '.') for prefix in forbidden):
-                    violations.append(f'{path.relative_to(ROOT)} -> {dependency}')
+    root = ROOT / 'avatar'
+    for path in root.rglob('*.py'):
+        package = path.relative_to(root).parts[0]
+        for dependency in internal_dependencies(path):
+            target = dependency.split('.')[1]
+            if target == package:
+                continue
+            edges.add((package, target))
+            if (package == 'core' or package == 'models' and target not in ('core', 'contracts')
+                    or package == 'files' and target in ('conversation', 'rag', 'knowledge')
+                    or package == 'rag' and target == 'conversation'):
+                violations.append(f'{path.relative_to(ROOT)} -> {dependency}')
+    cycles = sorted((left, right) for left, right in edges if left < right and (right, left) in edges)
     assert not violations, '\n'.join(violations)
+    assert not cycles, cycles
 
 
 def test_all_internal_imports_and_subprocess_modules_resolve():
@@ -534,19 +540,26 @@ def test_original_reader_runs_as_an_isolated_module(tmp_path):
     assert parsed['complete'], parsed
 
 
-def test_word_parser_runs_as_an_isolated_module_and_rejects_macros(tmp_path):
+def test_word_pdf_is_read_by_the_isolated_reader_and_upload_rejects_macros(tmp_path):
     from tests.support import word_document
+    from avatar.files.word_pdfs import prepare_word_pdf
     import zipfile
 
     original = tmp_path / 'sample.docx'
     original.write_bytes(word_document('Word 原件正文'))
-    command = [sys.executable, '-m', 'avatar.files.parsing.word', str(original), '.docx']
-    result = subprocess.run(command, text=True, capture_output=True, check=True, cwd=ROOT, timeout=30)
-    assert 'Word 原件正文' in json.loads(result.stdout)['text'], result.stdout
-    with zipfile.ZipFile(original, 'a') as archive:
+    pdf, _ = prepare_word_pdf(original, '.docx')
+    result = subprocess.run(
+        [sys.executable, '-m', 'avatar.files.parsing.reader', str(pdf), '.pdf'],
+        input='{}', text=True, capture_output=True, check=True, cwd=ROOT, timeout=30,
+    )
+    assert 'Word原件正文' in json.loads(result.stdout)['pages'][0]['text'].replace(' ', ''), result.stdout
+
+    rejected = tmp_path / 'macro.docx'
+    rejected.write_bytes(original.read_bytes())
+    with zipfile.ZipFile(rejected, 'a') as archive:
         archive.writestr('word/vbaProject.bin', b'macro')
-    rejected = subprocess.run(command, text=True, capture_output=True, cwd=ROOT, timeout=30)
-    assert rejected.returncode != 0 and 'DOCX 不接受宏' in rejected.stderr, rejected.stderr
+    with pytest.raises(ValueError, match='DOCX 不接受宏'):
+        prepare_word_pdf(rejected, '.docx')
 
 
 def test_generation_and_rag_share_the_execution_authorization_context():

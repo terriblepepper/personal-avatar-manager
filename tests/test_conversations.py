@@ -1,4 +1,3 @@
-from avatar.runtime.schema import install_schema
 """聊天任务、跨分身协作与技能执行。"""
 import asyncio
 import json
@@ -15,13 +14,14 @@ import httpx
 import pytest
 from fastapi import HTTPException
 
+from avatar.runtime.schema import install_schema
 from avatar.core.db import now
 from avatar.conversation.schemas import ChatRequest
 from avatar.models.client import ModelClient
 from avatar.protocols.tasks.dialogues import PeerDialogueTasks
 from avatar.protocols.tasks.store import ManagementTaskError
 from avatar.protocols.transport.peer import PeerAcpsTransport
-from avatar.skills.execution import SkillExecution
+from avatar.skills.execution import SkillExecution, SkillEnrichRequest
 from tests.support import legacy_sqlite
 
 
@@ -240,7 +240,7 @@ def test_peer_protocol_accepts_before_generation_and_deduplicates(context):
         async def answer(*args):
             calls.append(1);await gate.wait()
             return SimpleNamespace(text='peer answer',usage=None,task_action=None)
-        handler=PeerDialogueTasks(SimpleNamespace(database=app.state.database,answer_peer=answer),app.state.settings)
+        handler=PeerDialogueTasks(SimpleNamespace(database=app.state.database, executor=SimpleNamespace(answer_peer=answer)),app.state.settings)
         handler.scope=lambda *args:dict(user_id='left',target_user_id='right',next_speaker=1,status='running')
         wire=SimpleNamespace(local_aic='right-aic',peer_aic='left-aic')
         command=dict(id='peer-command',taskId='peer-task',sessionId='peer-session',command='start')
@@ -391,8 +391,8 @@ def test_sandbox_inputs_cannot_expand_after_submission(context,jobs,monkeypatch)
     async def memory(session,modified,context,*args,**kwargs):return context
     async def skills(uid,context,*args,**kwargs):return context
     async def rag(uid,aic,session,files,context,*args,**kwargs):return context
-    async def execute(uid,context,*args,inputs,**kwargs):
-        captured.update(inputs)
+    async def execute(context, enrichment, model, **kwargs):
+        captured.update(enrichment.inputs)
         prefix, data = context[2].split('\n',1)
         evidence = {**json.loads(data), 'skill_execution_results':[{'status':'success'}]}
         return context[0],context[1],prefix+'\n'+json.dumps(evidence),context[3]
@@ -427,7 +427,7 @@ def supplemented_task(context,monkeypatch):
     identifier=service.create(users[0],SimpleNamespace(target_aic='peer-1',objective='商定会议时间',request_id='task-test'))
     with service.database.connect(write=True) as db:db.execute("UPDATE agent_dialogues SET accepted=1,status='paused',round_limit=1 WHERE id=?",(identifier,))
     async def no_controls(*args):pass
-    monkeypatch.setattr(service,'flush_controls',no_controls)
+    monkeypatch.setattr(service.recovery,'flush_controls',no_controls)
     return service,users,identifier
 
 
@@ -435,7 +435,7 @@ def test_peer_polling_snapshot_tracks_viewer_history(supplemented_task,context,m
     from avatar.core.db import now
     service, users, identifier = supplemented_task
     app, user, other = context
-    sid = service.get(users[0], identifier)['session_id']
+    sid = service.session_store.get(users[0], identifier)['session_id']
     path = '/api/agent-sessions/' + sid
     response = user.get(path)
     assert response.is_success, response.text
@@ -449,7 +449,7 @@ def test_peer_polling_snapshot_tracks_viewer_history(supplemented_task,context,m
         db.execute('''INSERT INTO agent_dialogue_messages(dialogue_id,turn,speaker_aic,speaker_name,speaker_role,content,usage,created_at)
                       VALUES(?,1,'peer-1','Peer','agent','summary text','null',?)''',(identifier,now()))
     with monkeypatch.context() as patch:
-        patch.setattr(service, 'session', lambda *a, **kw: pytest.fail('compact list hydrated entire session'))
+        patch.setattr(service.session_store, 'session', lambda *a, **kw: pytest.fail('compact list hydrated entire session'))
         summary = user.get('/api/agent-sessions?summary=true').json()['items'][0]
         assert summary['messages'] == [{'speaker_role':'agent','content':'summary text'}]
     with app.state.database.connect(write=True) as db:
@@ -473,13 +473,13 @@ def test_task_supplement_is_attributed_and_peer_replies_before_end(supplemented_
         service.apply_inputs(db,identifier)
     # Both viewers must see the same author, with opposite ownership.
     for index,user in enumerate(users):
-        message=service.get(user,identifier)['messages'][-1]
+        message=service.session_store.get(user,identifier)['messages'][-1]
         assert message['is_own']==(index==side)
         assert message['speaker_name']==['测试甲','测试乙'][side]
     # Legacy rows without speaker_user_id still resolve by the task's original AIC.
     with service.database.connect(write=True) as db:
         db.execute('UPDATE agent_dialogue_messages SET speaker_user_id=NULL WHERE dialogue_id=?',(identifier,))
-    legacy=service.get(users[1-side],identifier)['messages'][-1]
+    legacy=service.session_store.get(users[1-side],identifier)['messages'][-1]
     assert not legacy['is_own'] and legacy['speaker_name']==['测试甲','测试乙'][side]
     speakers=[]
     async def exchange(job,peer_id,speaker_id):
@@ -491,7 +491,7 @@ def test_task_supplement_is_attributed_and_peer_replies_before_end(supplemented_
         with service.database.connect(write=True) as db:
             db.execute("UPDATE agent_dialogues SET status='running' WHERE id=?",(identifier,))
             job=dict(db.execute('SELECT * FROM agent_dialogues WHERE id=?',(identifier,)).fetchone())
-        await service.turn(job)
+        await service.executor.turn(job)
     asyncio.run(advance())
     with service.database.connect() as db:
         task=dict(db.execute('SELECT * FROM agent_dialogues WHERE id=?',(identifier,)).fetchone())
@@ -516,7 +516,7 @@ def test_task_supplement_during_final_answer_keeps_task_running(supplemented_tas
     with service.database.connect(write=True) as db:
         db.execute("UPDATE agent_dialogues SET status='running' WHERE id=?",(identifier,))
         job=dict(db.execute('SELECT * FROM agent_dialogues WHERE id=?',(identifier,)).fetchone())
-    asyncio.run(service.turn(job))
+    asyncio.run(service.executor.turn(job))
     with service.database.connect() as db:
         task=db.execute('SELECT status,next_speaker FROM agent_dialogues WHERE id=?',(identifier,)).fetchone()
         assert tuple(task)==('queued',1)
@@ -536,7 +536,7 @@ def test_task_supplement_requires_actual_peer_reply_not_empty_end(supplemented_t
         job=dict(db.execute('SELECT * FROM agent_dialogues WHERE id=?',(identifier,)).fetchone())
     async def exchange(*args):return {'text':'','task_action':{'name':'end_task','arguments':{'reason':'结束'}}}
     service.transport=SimpleNamespace(exchange=exchange)
-    with pytest.raises(HTTPException) as error:asyncio.run(service.turn(job))
+    with pytest.raises(HTTPException) as error:asyncio.run(service.executor.turn(job))
     assert error.value.status_code==502
     with service.database.connect() as db:
         assert db.execute('SELECT status FROM agent_dialogues WHERE id=?',(identifier,)).fetchone()[0]!='ended'
@@ -751,7 +751,7 @@ def test_control_receipt_survives_lost_response_and_late_generation(pg_database,
             return SimpleNamespace(text='model output', usage=None, task_action=None)
 
         def handler():
-            h = PeerDialogueTasks(SimpleNamespace(database=pg_database, answer_peer=answer), SimpleNamespace())
+            h = PeerDialogueTasks(SimpleNamespace(database=pg_database, executor=SimpleNamespace(answer_peer=answer)), SimpleNamespace())
             h.scope = lambda *args: dict(user_id='left', target_user_id='right', next_speaker=1, status='running')
             return h
 
@@ -883,15 +883,15 @@ def test_control_queue_recovers_running_delivery_after_restart(peers, monkeypatc
     async def idle():
         pass
     monkeypatch.setattr(service,'transport',SimpleNamespace(cancel=deliver))
-    monkeypatch.setattr(service,'worker',idle)
-    monkeypatch.setattr(service,'control_loop',lambda: service.flush_controls(task))
-    monkeypatch.setattr(service,'cleanup_loop',idle)
-    asyncio.run(service.run())
+    monkeypatch.setattr(service.recovery,'worker',idle)
+    monkeypatch.setattr(service.recovery,'control_loop',lambda: service.recovery.flush_controls(task))
+    monkeypatch.setattr(service.recovery,'cleanup_loop',idle)
+    asyncio.run(service.recovery.run())
     with service.database.connect(write=True) as db:
         row = db.execute('SELECT status,error FROM agent_protocol_controls WHERE task_id=?',(task,)).fetchone()
         assert tuple(row) == ('queued','TimeoutError')
         db.execute('UPDATE agent_protocol_controls SET next_attempt=0 WHERE task_id=?',(task,))
-    assert asyncio.run(service.flush_controls(task))
+    assert asyncio.run(service.recovery.flush_controls(task))
     with service.database.connect() as db:
         row = db.execute('SELECT status,error FROM agent_protocol_controls WHERE task_id=?',(task,)).fetchone()
         assert tuple(row) == ('done','')
@@ -972,7 +972,7 @@ def test_repeated_python_action_terminates_and_keeps_result(context):
     execution,user_id=make_execution(context)
     model=FakeModel([{'action':'python','code':'print(17348 * 114514)','input_ids':[]}])
     config,key,system,history=build_context()
-    merged,_,merged_system,_=asyncio.run(execution.enrich(user_id,(config,key,system,history),'调用sandbox计算17348×114514',model,conversation_id='c1',allow_code=True))
+    merged,_,merged_system,_=asyncio.run(execution.enrich((config,key,system,history),SkillEnrichRequest(user_id,'调用sandbox计算17348×114514','c1',allow_code=True),model))
     assert model.calls==2
     results=background_of(merged_system)['skill_execution_results']
     assert len(results)==1 and results[0]['status']=='success'
@@ -987,7 +987,7 @@ def test_distinct_actions_stop_at_four_run_cap(context):
     actions=[{'action':'python','code':'print('+str(n)+')','input_ids':[]} for n in range(6)]
     model=FakeModel(actions)
     config,key,system,history=build_context()
-    merged,_,_,_=asyncio.run(execution.enrich(user_id,(config,key,system,history),'多步计算',model,conversation_id='c1',allow_code=True))
+    merged,_,_,_=asyncio.run(execution.enrich((config,key,system,history),SkillEnrichRequest(user_id,'多步计算','c1',allow_code=True),model))
     assert model.calls==4
     assert any('已运行四次' in notice for notice in merged['_workflow_notices'])
 
@@ -996,7 +996,7 @@ def test_finish_action_never_executes(context):
     execution,user_id=make_execution(context)
     model=FakeModel([{'action':'finish'}])
     config,key,system,history=build_context()
-    _,_,merged_system,_=asyncio.run(execution.enrich(user_id,(config,key,system,history),'普通聊天',model,conversation_id='c1',allow_code=True))
+    _,_,merged_system,_=asyncio.run(execution.enrich((config,key,system,history),SkillEnrichRequest(user_id,'普通聊天','c1',allow_code=True),model))
     assert model.calls==1 and background_of(merged_system)['skill_execution_results']==[]
 
 

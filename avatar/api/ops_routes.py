@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse
 
 from avatar.accounts import auth
 from avatar.accounts.roles import can_view_ops
-from avatar.api.routes import password_session
+from avatar.api.auth_routes import password_session
 from avatar.accounts.schemas import LoginRequest
 
 router = APIRouter(prefix='/api/ops', tags=['运行监控'])

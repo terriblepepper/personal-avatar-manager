@@ -133,7 +133,7 @@ class PeerTransport:
             pair=db.execute('SELECT * FROM agent_peer_sessions WHERE id=?',(job['session_id'],)).fetchone()
             if not row or not pair or row['status']!='running' or row['revision']!=job['revision']:
                 raise HTTPException(409,'分身任务状态已变化，本次未发送')
-            own,target=self.dialogues.participants(db,row['user_id'],row['target_aic'])
+            own,target=self.dialogues.session_store.participants(db,row['user_id'],row['target_aic'])
             mode='internal' if checkpoint.get('resume_internal') else current_protocol(own['aic'],target['aic'],ready=mode=='acps')
             speaker=row['user_id'] if row['next_speaker']==0 else row['target_user_id']
             if {leader_id,partner_id}!={own['user_id'],target['user_id']} or partner_id!=speaker or {pair['left_user_id'],pair['right_user_id']}!={leader_id,partner_id}:
@@ -146,7 +146,7 @@ class PeerTransport:
             result=await self.acps.exchange(job,leader_id,partner_id)
         else:
             try:
-                answer=await self.dialogues.answer_peer(current,partner_id)
+                answer=await self.dialogues.executor.answer_peer(current,partner_id)
                 result={'text':answer.text,'usage':answer.usage,'task_action':answer.task_action}
             except AgentNeedsInput as pause:
                 result={'needs_input':str(pause),'checkpoint':pause.checkpoint}

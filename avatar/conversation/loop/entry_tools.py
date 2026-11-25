@@ -1,4 +1,6 @@
 """Bind the current actor's authorized retrieval and sandbox to one execution turn."""
+from collections.abc import Callable
+from dataclasses import dataclass
 import json
 
 from fastapi import HTTPException
@@ -36,11 +38,28 @@ def background(system):
     return json.JSONDecoder().raw_decode(system.split('\n', 1)[1])[0]
 
 
-async def bind_entry_tools(chat, context, owner, aic, session, files, *, include_private=False,
-                           sandbox=None, status=None, directory_reply=None, progress=None, session_file_scope=None,
-                           session_file_grants=None, session_file_owner=None, temporary_files=None):
+@dataclass(frozen=True)
+class EntryToolContext:
+    owner: str
+    aic: str
+    session: dict
+    files: list
+    include_private: bool = False
+
+
+@dataclass(frozen=True)
+class SessionFileAccess:
+    conversation: str
+    owner: str | None = None
+    grants: Callable | None = None
+
+
+async def bind_entry_tools(chat, context, entry, *, sandbox=None, status=None, directory_reply=None,
+                           progress=None, session_access=None, temporary_files=None):
     """Keep grants and source revisions in Python; only schemas and sanitized results reach the LLM."""
     config, key, system, history = context
+    owner, aic, session, files = entry.owner, entry.aic, entry.session, entry.files
+    include_private = entry.include_private
     scope = (owner, aic, session, files, include_private)
     store = config.get('_run_store')
     state = await run_blocking(store.load) if store else {}
@@ -73,12 +92,12 @@ async def bind_entry_tools(chat, context, owner, aic, session, files, *, include
         return len(explicit_images)+len(read_images)
 
     previous_reads = state.get('session_file_reads', state.get('generated_reads', {}))
-    if session_file_scope is not None:
+    if session_access is not None:
         from avatar.files.conversation.session_files import SessionFiles
-        session_files = SessionFiles(chat.chat_files, session_file_owner or owner, session_file_scope, previous_reads,
-                                    grants=session_file_grants, sandbox_ids=[f['id'] for f in (*files,*config.get('_agent_saved_files',()))], outputs=outputs,
+        session_files = SessionFiles(chat.chat_files, session_access.owner or owner, session_access.conversation, previous_reads,
+                                    grants=session_access.grants, sandbox_ids=[f['id'] for f in (*files,*config.get('_agent_saved_files',()))], outputs=outputs,
                                     staged_reads=state.get('staged_html_reads'))
-        config.update(_session_file_scope=session_file_scope, _load_session_source=session_files.html,
+        config.update(_session_file_scope=session_access.conversation, _load_session_source=session_files.html,
                       _session_read_proofs=session_files.proofs, _has_html_source=session_files.has_html_source,
                       _session_sandbox_inputs=session_files.sandbox_inputs,
                       _validate_session_files_in=session_files.validate_in)

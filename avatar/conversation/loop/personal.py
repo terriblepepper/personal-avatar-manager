@@ -154,7 +154,7 @@ def attach(chat, user, original, parent, session, overview, context, job, held, 
                 prefix, raw = context[2].split('\n',1)
                 background = json.loads(raw)
                 if 'approved_soul_style' in background:
-                    from avatar.knowledge.service import approved_style
+                    from avatar.knowledge.soul_document import approved_style
                     if old_style:
                         background['approved_soul_style'] = approved_style(db,binding['owner'],build_id=old_style)
                     else:

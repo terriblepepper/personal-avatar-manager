@@ -3,7 +3,7 @@ import asyncio
 from fastapi import APIRouter,Depends,Request,Query,HTTPException
 from pydantic import ValidationError
 from typing import Literal
-from avatar.api.routes import admin
+from avatar.api.dependencies import admin
 from avatar.knowledge.question_bank import BankInput,CategoryInput,QuestionInput
 
 router=APIRouter(prefix='/api/admin/soul-question-bank',tags=['soul 分类题库'])

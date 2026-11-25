@@ -34,7 +34,7 @@ def record_page(state,user,collection,scope='user',offset=0,search='',status='al
     elif collection=='dialogues' and not admin:
         source='agent_dialogues d JOIN agent_session_members visible ON visible.session_id=d.session_id';fields='d.*';order='d.created_at DESC,d.id DESC'
         where.append("visible.user_id=? AND visible.hidden=0 AND (d.status!='ended' OR EXISTS(SELECT 1 FROM agent_dialogue_messages WHERE dialogue_id=d.id AND id>visible.cleared_through))");values.append(user['id'])
-        decode=lambda row:state.dialogues.view(dict(row),user)
+        decode=lambda row:state.dialogues.session_store.view(dict(row),user)
     elif admin:
         definitions={
             'agents':('avatar_records a JOIN users u ON u.id=a.user_id','a.*,u.username','a.updated_at DESC,a.user_id'),

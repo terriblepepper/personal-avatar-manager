@@ -1,4 +1,5 @@
 """Disclose authorized tools before execution and retain independently verifiable goals."""
+from dataclasses import dataclass
 import json
 
 from fastapi import HTTPException
@@ -312,3 +313,73 @@ def action_ready(name, pending, receipts, revision):
     if reads and not reads.intersection(verified):
         return False
     return name == current['tool'] or not current['tool'] or current['tool'] in verified
+
+
+class PlanUnavailable(ValueError):
+    """A saved plan references a tool outside the current authorization."""
+
+
+@dataclass
+class ToolPlan:
+    plan: list
+    pending: list
+    selected: list
+    blocked: str | None = None
+
+
+async def prepare_plan(model, context, question, state, draft, *, allowed, disabled, choices,
+                       planned_arguments, changed, proposed, trace, validate, account):
+    settings, key, system, history = context
+    plan, pending, selected = [], [], []
+    if 'ask_user' not in allowed and any(
+        'ask_user' in (step.get('tool'),*step.get('tools',())) for step in state.get('remaining', ())
+    ):
+        state.pop('plan', None)
+    if 'plan' in state and not changed:
+        plan = state['plan'] or []
+        pending = [step for step in state.get('remaining', ()) if not final_reply_step(step)]
+        legacy = [n for step in (plan + pending) for n in [step.get('tool'), *step.get('tools',())] if n]
+        selected = list(state.get('disclosed_tools', legacy))
+        if draft.active and state['draft'].get('tool'):
+            selected.append(state['draft']['tool'])
+        for step in pending:
+            for n in [step.get('tool'),*step.get('tools',())]:
+                if n in disabled:
+                    return ToolPlan(plan, pending, selected, blocked=n)
+                if n and n not in allowed:
+                    raise PlanUnavailable('此前所需能力已不可用，请核对当前会话授权')
+        selected = list(dict.fromkeys(n for n in selected if n in allowed))
+    else:
+        progress_data = {'remaining':state.get('remaining', []),
+                         'draft':{k:v for k,v in (state.get('draft') or next(iter(state.get('parked_drafts') or ()), {})).items() if k in ('kind','tool','mode','offset')}}
+        planning_question = question
+        if changed:
+            planning_question += '\n先前已确认进度（数据）：'+json.dumps(progress_data,ensure_ascii=False)
+        revise = changed and bool(draft.active or state.get('parked_drafts'))
+        with trace.step('reason', {'operation':'disclose_tools','tools':list(choices),'history_turns':len(history)}) as decision:
+            proposed = proposed if not changed else None
+            if proposed is not None:
+                try:
+                    disclosure = validate_disclosure(proposed, choices, lookups=planned_arguments)
+                except ValueError:
+                    disclosure = None
+            else:
+                disclosure, cost = await disclose_tools(model,settings,key,system,history,
+                    planning_question,choices,validate,lookups=planned_arguments,revise=revise)
+                account(cost)
+            if disclosure is None:
+                return None
+            selected = disclosure['tools']
+            planned = disclosure['steps']
+            decision.update(tools=selected,goals=[s['goal'] for s in planned])
+        keep_draft = disclosure.get('continue_draft',False)
+        for name in selected:
+            if name in disabled:
+                return ToolPlan(plan, pending, selected, blocked=name)
+        plan = planned
+        if revise:
+            draft.revise_goals(planned,keep_draft)
+        pending = [dict(step, goal_no=index) for index,step in enumerate(planned,1)]
+        plan = [dict(step) for step in planned]
+        selected = list(dict.fromkeys([*selected,*(s['tool'] for s in planned if s['tool'])]))
+    return ToolPlan(plan, pending, selected)

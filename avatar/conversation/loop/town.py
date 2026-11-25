@@ -7,7 +7,7 @@ from pathlib import Path
 
 from fastapi import HTTPException
 
-from avatar.conversation.loop.entry_tools import bind_entry_tools
+from avatar.conversation.loop.entry_tools import bind_entry_tools, EntryToolContext
 from avatar.conversation.loop.runtime import restore_files
 from avatar.conversation.tools.material_delivery import FindMaterial
 from avatar.conversation.tools.material_search import MaterialDiscovery
@@ -168,13 +168,15 @@ async def bind_town_tools(chat, model, actor, caller, conversation, path, store,
 
     async def sandbox(context, objective):
         inputs = await run_blocking(sandbox_catalog)
-        return await chat.skill_execution.enrich(owner,context,objective,chat.model_client,caller_id=caller,
-            conversation_id=conversation['id'],parent_id=conversation['id'],inputs=inputs,
-            progress=progress,allow_code=True)
+        from avatar.skills.execution import SkillEnrichRequest
+        return await chat.skill_execution.enrich(context, SkillEnrichRequest(
+            owner, objective, conversation['id'], caller_id=caller, parent_id=conversation['id'],
+            inputs=inputs, allow_code=True,
+        ), chat.model_client, progress=progress)
 
     config.update(_html_enabled=True,_sandbox_https_enabled=False,_sandbox_workspace=path/'python',
                   _town_exports=exports)
-    model = await bind_entry_tools(chat,model,owner,actor['aic'],conversation,[],progress=progress,
+    model = await bind_entry_tools(chat, model, EntryToolContext(owner, actor['aic'], conversation, []), progress=progress,
                                    sandbox=sandbox,temporary_files=workspace)
     entry = config['_execute_entry_tool']
 

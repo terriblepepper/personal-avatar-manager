@@ -1,4 +1,3 @@
-from avatar.runtime.schema import install_schema
 """账户、审核、通知与分身生命周期。"""
 import asyncio
 import hashlib
@@ -13,6 +12,7 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from avatar.runtime.schema import install_schema
 from avatar.accounts.auth import issue_session
 from avatar.accounts.management import AccountManagement
 from avatar.core.db import now
@@ -604,6 +604,32 @@ def redis_socket():
         pytest.skip('requires a dedicated Redis socket')
     return socket_path
 
+
+
+def test_overview_push_uses_committed_owner_scope(pg_database, redis_socket):
+    from avatar.core.dispatch import Changes
+
+    pg_database.dispatch_enabled = True
+    def save_profile():
+        with pg_database.connect(write=True, account_scope='overview-owner') as db:
+            db.execute("INSERT INTO users(id,username,password,role,created_at) VALUES('overview-owner','overview-owner','hash','user','2026')")
+            db.execute("INSERT INTO profile_records(user_id,draft,status,updated_at) VALUES('overview-owner','{}','draft','2026')")
+    async def check():
+        changes = Changes(pg_database, redis_socket, '', lambda: None)
+        worker = asyncio.create_task(changes.run())
+        try:
+            async with asyncio.timeout(10):
+                while not changes.can_push:
+                    await asyncio.sleep(.05)
+            with changes.watch(('overview','overview-owner')) as selected, changes.watch(('overview','unrelated')) as other:
+                await asyncio.to_thread(save_profile)
+                await asyncio.wait_for(selected.wait(), timeout=5)
+                assert selected.take() == {'overview'}
+                assert not other.is_set()
+        finally:
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+    asyncio.run(check())
 
 def test_redis_hit_and_concurrent_invalidation(context, monkeypatch, redis_socket):
     from avatar.profiles.pending_reviews import PendingReviews

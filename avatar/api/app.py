@@ -47,9 +47,11 @@ def create_app(settings=None, provider=None, run_worker=True, model_client=None)
     monitor = PlatformMonitor(resources.database, changes, pending_reviews.client)
     rag_resources=resources.chat.rag.resources
     from avatar.knowledge.service import KnowledgeService
+    from avatar.knowledge.build_worker import SoulBuildWorker
 
     knowledge = KnowledgeService(resources.database, resources.chat)
     resources.profiles.knowledge = knowledge
+    soul_builds = SoulBuildWorker(knowledge)
     system_aip = SystemAipRuntime(settings, resources.database)
     system_registration = SystemRegistrationRuntime(settings, system_aip)
     from avatar.runtime.platform_certificate import PlatformCertificate
@@ -119,7 +121,7 @@ def create_app(settings=None, provider=None, run_worker=True, model_client=None)
                     )
                 )
                 tasks.append(
-                    asyncio.create_task(knowledge.run(), name="avatar-soul-builds")
+                    asyncio.create_task(soul_builds.run(), name="avatar-soul-builds")
                 )
                 tasks.append(
                     asyncio.create_task(
@@ -127,7 +129,7 @@ def create_app(settings=None, provider=None, run_worker=True, model_client=None)
                     )
                 )
                 tasks.append(
-                    asyncio.create_task(dialogues.run(), name="avatar-dialogues")
+                    asyncio.create_task(dialogues.recovery.run(), name="avatar-dialogues")
                 )
                 tasks.append(
                     asyncio.create_task(
@@ -197,6 +199,7 @@ def create_app(settings=None, provider=None, run_worker=True, model_client=None)
     app.state.system_registration = system_registration
     app.state.entity_lifecycle, app.state.personal_aip = entity_lifecycle, personal_aip
     app.state.knowledge = knowledge
+    app.state.soul_builds = soul_builds
     app.state.dialogues = dialogues
     app.state.oidc = OidcService(resources.database, settings)
     app.state.identity_migration = IdentityMigrationService(
