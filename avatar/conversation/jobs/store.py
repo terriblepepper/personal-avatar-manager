@@ -84,7 +84,7 @@ class GenerationStore:
         if not body.agent_control:
             fields.pop('agent_pause_id');fields.pop('agent_control')
         raw=canonical(fields);fingerprint=hashlib.sha256(raw.encode()).hexdigest()
-        with self.database.connect(write=True) as db:
+        with self.database.connect(write=True, account_scope=user['id']) as db:
             owner=db.execute('SELECT user_id,platform FROM chat_conversations WHERE id=?',(body.conversation_id,)).fetchone()
             if not owner or owner['user_id']!=user['id']:raise HTTPException(404,'会话不存在')
             previous=db.execute('SELECT * FROM chat_generation_jobs WHERE user_id=? AND request_id=?',(user['id'],body.request_id)).fetchone()

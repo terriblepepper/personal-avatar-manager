@@ -1,4 +1,5 @@
 """PostgreSQL adapter for the application's existing DB-API usage."""
+import os
 import re
 import sys
 from functools import lru_cache, partial
@@ -67,7 +68,6 @@ def _translate(sql):
     parts = _tokens(sql)
     for i in range(0, len(parts), 2):
         part = parts[i].replace('%', '%%').replace('?', '%s')
-        part = re.sub(r'\bLIKE\b', 'ILIKE', part, flags=re.I)
         part = re.sub(r'\bLIMIT\s+-1\b', 'LIMIT ALL', part, flags=re.I)
         part = re.sub(r'\bMAX\s*\(\s*last_message_id\s*,', 'GREATEST(last_message_id,', part, flags=re.I)
         part = re.sub(r'\bMIN\s*\(\s*round_limit\s*,', 'LEAST(round_limit,', part, flags=re.I)
@@ -214,7 +214,11 @@ class Connection:
 
 class PostgresDatabase:
     def __init__(self, url):
-        self.pool = ConnectionPool(url, min_size=1, max_size=10, open=True)
+        self.pool = ConnectionPool(
+            url, min_size=int(os.getenv('AVATAR_PG_POOL_MIN', '1')),
+            max_size=int(os.getenv('AVATAR_PG_POOL_MAX', '10')),
+            timeout=float(os.getenv('AVATAR_PG_POOL_TIMEOUT', '30')), open=True,
+        )
         self.metadata = {}
         self.dispatch_enabled = False
         self.compile_static = lru_cache(maxsize=512)(partial(_compile_sql, self.metadata))

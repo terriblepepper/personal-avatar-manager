@@ -17,7 +17,7 @@ export const useSessionStore = defineStore('session', () => {
     setCsrfToken(value.csrf)
   }
   setSessionExpiryHandler(clear)
-  async function refresh() { const before = revision; const value = await request<SessionResponse>('/auth/me'); if (before === revision) accept(value) }
+  async function refresh(signal?: AbortSignal) { const before = revision; const value = await request<SessionResponse>('/auth/me', 'GET', undefined, signal); if (!signal?.aborted && before === revision) accept(value) }
   async function initialize() {
     failure.value = ''
     try {

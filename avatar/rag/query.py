@@ -7,7 +7,9 @@ from pathlib import Path
 from typing import Literal
 from pydantic import BaseModel,ConfigDict,Field,ValidationError,model_validator
 from fastapi import HTTPException
-from avatar.core.db import dump,now
+from avatar.core.db import dump
+from avatar.core.execution import run_blocking
+from avatar.models.usage import record_usage
 from avatar.models.limits import check_context
 
 
@@ -114,4 +116,4 @@ async def construct(rag,context,message,documents):
         raise
     finally:
         owner=config['_rag_access']['scope'][0]
-        with rag.database.connect(write=True) as db:db.execute('INSERT INTO model_calls(user_id,provider,model,usage,created_at,purpose,caller_id) VALUES(?,?,?,?,?,?,?)',(owner,config['provider'],config['model'],dump(usage),now(),'rag_query_construction',owner))
+        await run_blocking(record_usage, rag.database, owner, config, usage, 'rag_query_construction')

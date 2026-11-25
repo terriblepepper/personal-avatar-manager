@@ -231,10 +231,21 @@ class ChatFiles(ConversationResources):
     # 输入：file_id 必须归属于 user_id 和 conversation_id。
     # 结果与约束：无权限与不存在均返回 404，不授予非所有人管理员读取权限。
     def owned(self, db, user_id, conversation_id, file_id):
-        storage_owner=self.session(db,user_id,conversation_id)['user_id']
-        row=db.execute("SELECT * FROM chat_files WHERE id=? AND user_id=? AND conversation_id=? AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))",(file_id,storage_owner,conversation_id)).fetchone()
-        if not row or not self.directory.available_in(storage_owner,conversation_id,file_id,row['size']):raise HTTPException(404,'会话附件不存在')
-        return dict(row)
+        return self.owned_many(db, user_id, conversation_id, [file_id])[0]
+
+    def owned_many(self, db, user_id, conversation_id, identifiers):
+        owner = self.session(db,user_id,conversation_id)['user_id']
+        rows = {row['id']: row for row in db.execute("""SELECT * FROM chat_files
+            WHERE id=ANY(?::text[]) AND user_id=? AND conversation_id=?
+            AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))""",
+            (identifiers,owner,conversation_id))}
+        result = []
+        for identifier in identifiers:
+            row = rows.get(identifier)
+            if not row or not self.directory.available_in(owner,conversation_id,identifier,row['size']):
+                raise HTTPException(404,'会话附件不存在')
+            result.append(dict(row))
+        return result
 
     # 职责：在调用方事务期间移除选中文件，并在事务失败时恢复原件。
     # 输入：rows 必须由已授权查询取得，元数据在同一事务删除。

@@ -2,6 +2,7 @@
 import asyncio
 
 from avatar.core.dispatch import begin_work, wait_work
+from avatar.core.execution import run_blocking
 import json
 import logging
 import time
@@ -121,16 +122,45 @@ class EntityLifecycleService:
             event(db,job['user_id'],admin['username'],'手动刷新身份审核与证书状态',identifier,actor_id=admin['id'])
         return {'status':'queued'}
 
+    def claim(self):
+        with self.database.connect(write=True) as db:
+            job = db.execute("SELECT * FROM avatar_identity_jobs WHERE status='queued' OR (status='waiting' AND next_attempt_at<=?) ORDER BY created_at LIMIT 1", (time.time(),)).fetchone()
+            if not job:
+                return
+            db.execute("UPDATE avatar_identity_jobs SET status='running',attempts=attempts+1,updated_at=? WHERE id=?", (now(), job['id']))
+            row = db.execute('SELECT * FROM avatar_records WHERE user_id=?', (job['user_id'],)).fetchone()
+        return job, row
+
+    def restore_unstarted(self, job):
+        with self.database.connect(write=True, account_scope=job['user_id']) as db:
+            db.execute("UPDATE avatar_identity_jobs SET status=?,attempts=attempts-1,updated_at=? WHERE id=? AND status='running'",
+                       (job['status'],now(),job['id']))
+
+    def finish_cleanup(self, job):
+        remove_retired_identity(self.settings.data_dir, job['user_id'])
+        with self.database.connect(write=True, account_scope=job['user_id']) as db:
+            self.complete(db, job)
+
     # 职责：执行队列中的一项个人身份维护操作。
     # 输入：从服务器持久队列认领最早的到期任务。
     # 结果与约束：并发更改、活跃会话及 AIC 不一致拒绝提交；失败保存固定提示，不写远端正文或私钥。
     async def once(self):
-        with self.database.connect(write=True) as db:
-            job = db.execute("SELECT * FROM avatar_identity_jobs WHERE status='queued' OR (status='waiting' AND next_attempt_at<=?) ORDER BY created_at LIMIT 1", (time.time(),)).fetchone()
-            if not job:
-                return False
-            db.execute("UPDATE avatar_identity_jobs SET status='running',attempts=attempts+1,updated_at=? WHERE id=?", (now(), job['id']))
-            row = db.execute('SELECT * FROM avatar_records WHERE user_id=?', (job['user_id'],)).fetchone()
+        job, row = None, None
+
+        def claim():
+            nonlocal job, row
+            current = self.claim()
+            if current:
+                job, row = current
+
+        try:
+            await run_blocking(claim)
+        except asyncio.CancelledError:
+            if job:
+                await run_blocking(self.restore_unstarted, job)
+            raise
+        if not job:
+            return False
         cleanup = False
         try:
             if not row or row['aic'] != job['expected_aic']:
@@ -147,11 +177,9 @@ class EntityLifecycleService:
                         result = await self.runner.advance(job['user_id'], json.loads(row['profile']))
                     else:
                         result = await self.maintainer(self.settings, job['user_id'], job['remote_aic'] or row['aic'], job['action'])
-                cleanup = self.commit(job, row, result)
+                cleanup = await run_blocking(self.commit, job, row, result)
             if cleanup:
-                remove_retired_identity(self.settings.data_dir, job['user_id'])
-                with self.database.connect(write=True) as db:
-                    self.complete(db, job)
+                await run_blocking(self.finish_cleanup, job)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -168,10 +196,12 @@ class EntityLifecycleService:
             elif isinstance(exc, httpx.HTTPStatusError):
                 message = identity_error_detail(exc) + '；请核对 Registry/CA 状态和权限，原身份及私有状态保留'
             log.warning('个人身份维护未完成：action=%s type=%s', job['action'], type(exc).__name__)
-            with self.database.connect(write=True) as db:
-                db.execute('UPDATE avatar_identity_jobs SET status=?,error=?,next_attempt_at=?,updated_at=? WHERE id=?',
-                    ('waiting' if waiting else 'failed', message, time.time() + delay, now(), job['id']))
-                event(db, job['user_id'], job['actor'], '个人身份维护等待' if waiting else '个人身份维护失败', message)
+            def record_failure():
+                with self.database.connect(write=True, account_scope=job['user_id']) as db:
+                    db.execute('UPDATE avatar_identity_jobs SET status=?,error=?,next_attempt_at=?,updated_at=? WHERE id=?',
+                        ('waiting' if waiting else 'failed', message, time.time() + delay, now(), job['id']))
+                    event(db, job['user_id'], job['actor'], '个人身份维护等待' if waiting else '个人身份维护失败', message)
+            await run_blocking(record_failure)
         return True
 
     # 职责：原子提交已被 wit 核验的迁移或证书维护结果。

@@ -214,7 +214,7 @@ class PeerResources:
         workspace=self.workspace(db,user['id'],task['session_id'],task_id)
         source=source or workspace
         owner=self.files.session(db,user['id'],workspace)['user_id']
-        rows=[self.files.owned(db,user['id'],source,identifier) for identifier in identifiers]
+        rows = self.files.owned_many(db, user['id'], source, identifiers)
         if not (generated or attachments) and any(not row['referenced'] or row['origin']=='attachment' for row in rows):
             raise HTTPException(409,'请先开启文件引用')
         paths=[]

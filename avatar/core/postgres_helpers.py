@@ -25,6 +25,11 @@ STATEMENTS = [
     $$""",
     """CREATE INDEX IF NOT EXISTS rag_lexical_records_tokens ON rag_lexical_records
       USING gin (to_tsvector('simple', tokens))""",
+    """CREATE INDEX IF NOT EXISTS avatar_aip_working_deadline ON avatar_aip_tasks(deadline)
+      WHERE json_extract(document,'$.status.state')='working'""",
+    """CREATE INDEX IF NOT EXISTS avatar_aip_guest_sent_at
+      ON avatar_aip_tasks (json_extract(document,'$.sentAt'))
+      WHERE instr(peer_aic,'#guest:')>0""",
     """CREATE FUNCTION datetime(value text, modifier text DEFAULT NULL) RETURNS text
       LANGUAGE plpgsql STABLE SET TIME ZONE 'UTC' AS $$
       DECLARE result timestamptz;

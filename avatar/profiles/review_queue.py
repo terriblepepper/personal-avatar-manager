@@ -49,10 +49,12 @@ class ReviewQueue:
             if kind=='soul':
                 row=db.execute('SELECT * FROM soul_builds WHERE id=?',(identifier,)).fetchone()
                 if row:
-                    assets=[]
-                    for asset_id in json.loads(row['asset_ids']):
-                        asset=db.execute('SELECT id,filename,mime,caption FROM knowledge_assets WHERE id=? AND user_id=?',(asset_id,row['user_id'])).fetchone()
-                        if asset:assets.append({**dict(asset),'download_url':'/api/admin/review-queue/soul/'+identifier+'/assets/'+asset_id})
+                    ids = json.loads(row['asset_ids'])
+                    found = {asset['id']: dict(asset) for asset in db.execute(
+                        'SELECT id,filename,mime,caption FROM knowledge_assets WHERE user_id=? AND id=ANY(?::text[])',
+                        (row['user_id'], ids))}
+                    assets = [{**found[asset_id], 'download_url': '/api/admin/review-queue/soul/'+identifier+'/assets/'+asset_id}
+                              for asset_id in ids if asset_id in found]
                     return {'kind':kind,**self.service.knowledge.decode(row),'snapshot':json.loads(row['profile_snapshot']),'assets':assets}
             if kind=='profile':
                 row=db.execute('SELECT s.*,u.username,r.username AS reviewer_name FROM profile_submissions s JOIN users u ON u.id=s.user_id LEFT JOIN users r ON r.id=s.reviewer WHERE s.id=?',(identifier,)).fetchone()

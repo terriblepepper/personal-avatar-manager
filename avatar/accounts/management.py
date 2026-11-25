@@ -24,7 +24,7 @@ class AccountManagement:
         clauses, values = [], []
         if search:
             pattern = '%'+search.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%'
-            clauses.append("(u.username LIKE ? ESCAPE '\\' OR u.email LIKE ? ESCAPE '\\' OR u.phone LIKE ? ESCAPE '\\' OR u.student_id LIKE ? ESCAPE '\\' OR json_extract(p.draft,'$.employee_id') LIKE ? ESCAPE '\\' OR json_extract(p.draft,'$.name') LIKE ? ESCAPE '\\' OR i.username LIKE ? ESCAPE '\\')")
+            clauses.append("(u.username ILIKE ? ESCAPE '\\' OR u.email ILIKE ? ESCAPE '\\' OR u.phone ILIKE ? ESCAPE '\\' OR u.student_id ILIKE ? ESCAPE '\\' OR json_extract(p.draft,'$.employee_id') ILIKE ? ESCAPE '\\' OR json_extract(p.draft,'$.name') ILIKE ? ESCAPE '\\' OR i.username ILIKE ? ESCAPE '\\')")
             values.extend([pattern]*7)
         if role != 'all':
             clauses.append('u.role=?');values.append(role)

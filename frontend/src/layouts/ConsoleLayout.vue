@@ -11,6 +11,7 @@ import { createNotificationInbox, notificationInboxKey } from '../composables/us
 import NotificationBell from '../components/NotificationBell.vue'
 import { request, notifyError } from '../api/client'
 import { createPlatformUpdates, platformUpdatesKey } from '../composables/usePlatformUpdates'
+import { usePolling } from '../composables/usePolling'
 import { useSessionStore } from '../stores/session'
 import { accountRoleLabels, canViewOps, isAdministrator } from '../utils/accountRole'
 
@@ -153,44 +154,28 @@ function menuKeys(event: KeyboardEvent) {
   items[next]?.focus()
 }
 const controller = new AbortController()
-let polling = false, pendingRefresh = false
-async function pollSidebar(fetchPending = true) {
-  if (document.hidden) return
-  if (polling) { pendingRefresh ||= fetchPending; return }
-  polling = true
+const sidebarPolling = usePolling(async signal => {
   try {
-    await session.refresh()
+    await session.refresh(signal)
     const user = session.user
-    if (!fetchPending || !admin.value || !user || !isAdministrator(user) || user.access_scope === 'profile') return
-    const { pending } = await request<{ pending: number }>('/admin/pending-count', 'GET', undefined, controller.signal)
-    if (!controller.signal.aborted && admin.value && session.user?.id === user.id && isAdministrator(session.user)) session.pending = pending
+    if (signal.aborted || !admin.value || !user || !isAdministrator(user) || user.access_scope === 'profile') return
+    const { pending } = await request<{ pending: number }>('/admin/pending-count', 'GET', undefined, signal)
+    if (!signal.aborted && admin.value && session.user?.id === user.id && isAdministrator(session.user)) session.pending = pending
   } catch { /* 短暂断连时保留最后一次成功结果。 */ }
-  finally {
-    polling = false
-    if (pendingRefresh) { pendingRefresh = false; void pollSidebar() }
-  }
-}
+}, () => updates.connected.value ? 60000 : 8000)
 function dismissMore(event: MouseEvent) { if (more.value && event.target instanceof Element && !event.target.closest('.sidebar-menu-anchor')) closeMore() }
-let timer: ReturnType<typeof setInterval>
 onMounted(() => {
   navMedia?.addEventListener('change', event => {
     narrowNav.value = event.matches
     mobile.value = false
   }, { signal: controller.signal })
-  void pollSidebar()
-  let nextPending = 0
-  timer = setInterval(() => {
-    const shouldRead = !updates.connected.value || Date.now() >= nextPending
-    if (shouldRead) nextPending = Date.now() + 60000
-    void pollSidebar(shouldRead)
-  }, 8000)
-  document.addEventListener('visibilitychange', () => { void pollSidebar() }, { signal: controller.signal })
   document.addEventListener('click', dismissMore)
   document.addEventListener('keydown', menuKeys)
 })
-updates.on('reviews', () => { void pollSidebar() })
-watch(admin, () => { void pollSidebar() })
-onUnmounted(() => { controller.abort(); clearInterval(timer); document.removeEventListener('click', dismissMore); document.removeEventListener('keydown', menuKeys) })
+updates.on('reviews', () => { if (admin.value) void sidebarPolling.refresh() })
+watch(admin, sidebarPolling.refresh)
+watch(updates.connected, connected => { if (!connected) void sidebarPolling.refresh() })
+onUnmounted(() => { controller.abort(); document.removeEventListener('click', dismissMore); document.removeEventListener('keydown', menuKeys) })
 async function logout() { try { await session.logout() } catch (e) { notifyError(e) } }
 </script>
 <template>

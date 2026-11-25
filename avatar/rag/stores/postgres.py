@@ -203,6 +203,16 @@ class PostgresFiles:
             return [dict(id=key, text=text, metadata=meta, tokens=terms, version=version)
                     for key, text, meta, terms, version in rows]
 
+    def complete_publications(self, db, owner):
+        """Return documents with a contiguous manifest and all of its stored vectors."""
+        return {tuple(row) for row in db.execute("""SELECT n.source,n.file_id
+            FROM file_rag_nodes n JOIN file_rag_documents d USING (source,file_id,user_id)
+            LEFT JOIN rag_vector_records v ON (v.user_id,v.collection,v.record_id)=(n.user_id,n.collection,n.record_id)
+            WHERE n.user_id=? AND d.status='ready' AND d.collection<>''
+            GROUP BY n.source,n.file_id
+            HAVING min(n.ordinal)=0 AND max(n.ordinal)=count(*)-1
+                AND bool_and(n.collection=d.collection AND v.record_id IS NOT NULL)""", (owner,))}
+
     def contains(self, user_id, name, ids, connection=None):
         if not name or not ids:
             return False
