@@ -8,7 +8,7 @@ import uuid
 from fastapi import HTTPException, Request
 from avatar.accounts.roles import ADMIN_ROLES, can_view_ops
 from avatar.core.db import event, now, dump
-from avatar.core.schemas import normalize_email, normalize_phone
+from avatar.accounts.schemas import normalize_email, normalize_phone
 
 
 # 职责：使用随机盐和 PBKDF2-SHA256 生成账户密码哈希。

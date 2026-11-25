@@ -10,6 +10,8 @@ from avatar.accounts.auth import bootstrap
 from avatar.conversation.chat import AvatarChat
 from avatar.core.config import Settings
 from avatar.core.db import Database
+from avatar.runtime.schema import install_schema
+from avatar.runtime.model_changes import model_changed
 from avatar.conversation.memory import MemoryPolicy
 from avatar.models.model_config import SecretVault
 from avatar.accounts.platform_binding import PlatformBindingService
@@ -48,7 +50,7 @@ class ApplicationServices:
     # 结果与约束：返回共享服务对象；兼容初始化数据库与根账户，不启动任务、不发起正式注册或模型请求。
     @classmethod
     def create(cls, settings: Settings, provider=None, model_client=None):
-        database = Database(settings.data_dir, settings.database_url)
+        database = Database(settings.data_dir, settings.database_url, schema=install_schema)
         database.dispatch_enabled = bool(settings.redis_socket or settings.kafka_bootstrap)
         database.initialize()
         try:
@@ -57,7 +59,7 @@ class ApplicationServices:
             vault = SecretVault(settings.data_dir, database)
             model_client = model_client or ModelClient(
                 proxy=settings.model_proxy, resolver=ModelResolver(settings.model_dns_aliases))
-            profiles = AvatarService(database, provider, vault)
+            profiles = AvatarService(database, provider, vault, model_changed)
             chat = AvatarChat(profiles, model_client)
             chat.memory.policy = MemoryPolicy(
                 recent_messages=settings.memory_recent_messages)

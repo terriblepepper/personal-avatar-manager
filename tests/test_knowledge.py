@@ -713,7 +713,7 @@ def test_mismatched_project_record_key_and_queue_path_rejected(postgres_url, tmp
 def test_local_store_import_can_overlap_schema_initialization(tmp_path, postgres_url, postgres_schema):
     from psycopg.conninfo import conninfo_to_dict, make_conninfo
     from avatar.core.postgres import SCHEMA_LOCK, lock_schema_transaction
-    from avatar.core.postgres_schema import install_schema
+    from avatar.runtime.schema import install_schema
     from scripts.migrate_local_stores import migrate
 
     root = tmp_path / 'snapshot'

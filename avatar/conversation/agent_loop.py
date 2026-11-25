@@ -1031,7 +1031,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                         creation = await asyncio.to_thread(expand_revision,args,config.get('_load_session_source'))
                     item = await asyncio.to_thread(create_html,creation,candidates)
                     if saved:
-                        from avatar.files.artifact_limits import MAX_SOURCE_BYTES
+                        from avatar.core.artifact_limits import MAX_SOURCE_BYTES
                         sizes = {old['id']: old.get('size', 0) for old in saved}
                         sizes.update({old['id']:len(old.get('data', b'')) for old in candidates})
                         if sum(sizes.values()) > MAX_SOURCE_BYTES:

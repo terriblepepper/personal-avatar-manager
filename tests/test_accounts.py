@@ -1,3 +1,4 @@
+from avatar.runtime.schema import install_schema
 """账户、审核、通知与分身生命周期。"""
 import asyncio
 import hashlib
@@ -15,7 +16,7 @@ from fastapi.testclient import TestClient
 from avatar.accounts.auth import issue_session
 from avatar.accounts.management import AccountManagement
 from avatar.core.db import now
-from avatar.core.schemas import Credentials
+from avatar.accounts.schemas import Credentials
 from avatar.profiles.entity_lifecycle import EntityLifecycleService
 from avatar.protocols.registration.base import RegistrationPending
 from avatar.protocols.registration.entity import entity_identity_paths
@@ -549,7 +550,7 @@ def test_postgres_admin_operations_preserve_pages(tmp_path, postgres_url):
     from avatar.core.db import Database
     from avatar.profiles.admin_reads import operations
 
-    database = Database(tmp_path, postgres_url)
+    database = Database(tmp_path, postgres_url, schema=install_schema)
     try:
         database.initialize()
         with database.connect(write=True) as db:
@@ -639,7 +640,7 @@ def test_same_socket_isolates_different_schemas(context, postgres_schema, redis_
     app, user, _ = context
     database = app.state.database
     submit(user)
-    with postgres_schema() as other_url, closing(Database(database.data_dir / 'other-schema', other_url)) as other_db:
+    with postgres_schema() as other_url, closing(Database(database.data_dir / 'other-schema', other_url, schema=install_schema)) as other_db:
         other_db.initialize()
         with closing(PendingReviews(database, redis_socket)) as first, closing(PendingReviews(other_db, redis_socket)) as second:
             try:

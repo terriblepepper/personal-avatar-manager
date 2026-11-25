@@ -9,7 +9,7 @@ interface Environment {registration_adapter?:string;registration_mode?:string;co
 interface PlatformCert {certificate:{id:string;aic:string;generation:number;issuer:string;expires_at:string}|null;renewal:{state?:string;updated_at?:string}}
 const cert=ref<PlatformCert|null>(null), certError=ref(''), certBusy=ref(false)
 const certStates:Record<string,string>={queued:'已排队',running:'正在续签',done:'新证书已核验',changed:'证书已更换',unconfirmed:'续签结果待核对，请先刷新证书详情'}
-interface Registration {enabled:boolean;phase:string;registration_id?:string;aic?:string;aip?:{endpoint?:string;serving?:boolean};updated_at?:string;message?:string;reason?:string;avatar_ontology?:Registration;personal_registration_mode?:string}
+interface Registration {enabled:boolean;phase:string;registration_id?:string;aic?:string;aip?:{endpoint?:string;serving?:boolean};updated_at?:string;message?:string;reason?:string;personal_registration_mode?:string}
 const session=useSessionStore(), registration=ref<Registration|null>(null), registrationError=ref(''), checking=ref(false)
 const resources=ref<ResourceState|null>(null),policy=ref<Record<string,number|boolean>>({}),settings=ref<Record<string,string>>({}),environment=ref<Environment>({}),mode=ref(''),busy=ref(false)
 const phases:Record<string,string>={initial:'尚未提交',pending_review:'等待 Registry 人工审核',approved:'审核通过，正在签发证书',active:'身份与证书就绪',blocked:'流程受阻',rejected:'申请被拒绝'}
@@ -92,15 +92,15 @@ onBeforeUnmount(()=>{disposed=true;clearInterval(timer)})
     <p class="sub">注册审核每小时检查一次，正式证书每 30 分钟检查一次。管理系统提供协议端点，个人分身独立维护身份与证书。</p>
     <p v-if="registrationError" class="notice error" role="alert">{{ registrationError }}</p>
     <div v-if="registration" role="status">
-      <template v-for="(item,i) in [registration,registration.avatar_ontology]" :key="i"><section v-if="item">
-        <h3>{{ i?'个人分身本体（兼容模式）':'管理系统服务' }}</h3>
-        <dl class="kv"><dt>自动注册</dt><dd>{{ item.enabled?'已启用':'未启用' }}</dd><dt>注册阶段</dt><dd>{{ phases[item.phase] || item.phase }}</dd>
-          <dt>注册记录</dt><dd>{{ item.registration_id || '尚未取得' }}</dd><dt>{{ i?'本体 AIC':'系统 AIC' }}</dt><dd>{{ item.aic || '由 Registry 分配' }}</dd>
-          <template v-if="!i"><dt>管理平台端点</dt><dd>{{ item.aip?.endpoint || '尚未配置' }}</dd><dt>AIP 接入</dt><dd>{{ item.aip?.serving?'正在监听':'尚未接入' }}</dd></template>
-          <dt>最近检查</dt><dd>{{ item.updated_at?date(item.updated_at):'尚未运行' }}</dd></dl>
-        <p v-if="item.message" class="sub">{{ item.message }}</p><p v-if="item.reason" class="notice">审核原因：{{ item.reason }}</p>
-      </section></template>
-      <p class="sub">{{ registration.personal_registration_mode==='acps-direct'?'个人实体由本人填写技能，平台审核后提交 Registry，审核通过后签发证书。':'当前为旧派生兼容模式。' }}</p>
+      <section>
+        <h3>管理系统服务</h3>
+        <dl class="kv"><dt>自动注册</dt><dd>{{ registration.enabled?'已启用':'未启用' }}</dd><dt>注册阶段</dt><dd>{{ phases[registration.phase] || registration.phase }}</dd>
+          <dt>注册记录</dt><dd>{{ registration.registration_id || '尚未取得' }}</dd><dt>系统 AIC</dt><dd>{{ registration.aic || '由 Registry 分配' }}</dd>
+          <dt>管理平台端点</dt><dd>{{ registration.aip?.endpoint || '尚未配置' }}</dd><dt>AIP 接入</dt><dd>{{ registration.aip?.serving?'正在监听':'尚未接入' }}</dd>
+          <dt>最近检查</dt><dd>{{ registration.updated_at?date(registration.updated_at):'尚未运行' }}</dd></dl>
+        <p v-if="registration.message" class="sub">{{ registration.message }}</p><p v-if="registration.reason" class="notice">审核原因：{{ registration.reason }}</p>
+      </section>
+      <p class="sub">{{ registration.personal_registration_mode==='acps-direct'?'个人实体由本人填写技能，平台审核后提交 Registry，审核通过后签发证书。':'当前使用 Demo 注册器。' }}</p>
       <a class="button small" href="/api/system/acs" target="_blank" rel="noopener">管理系统 ACS</a>
     </div>
   </section>

@@ -4,7 +4,8 @@ import re
 import uuid
 from contextlib import contextmanager, nullcontext
 from avatar.core.db import now
-from avatar.core.execution import AgentNeedsInput, AgentSteps
+from avatar.core.execution import AgentNeedsInput
+from avatar.models.agent_trace import AgentSteps
 from avatar.models.trace import model_io_scope
 
 # Request/response previews belong to the executor's display, outside the model's future memory.

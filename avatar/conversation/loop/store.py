@@ -3,7 +3,7 @@ import json
 from contextlib import contextmanager
 from threading import RLock
 
-from avatar.files.artifact_limits import MAX_ENVELOPE_BYTES, MAX_SOURCE_BYTES
+from avatar.core.artifact_limits import MAX_ENVELOPE_BYTES, MAX_SOURCE_BYTES
 
 
 class RunConflict(RuntimeError):

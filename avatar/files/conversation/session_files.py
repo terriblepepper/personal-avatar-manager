@@ -11,7 +11,7 @@ from fastapi import HTTPException
 
 from avatar.core.execution import authorization
 from avatar.files.parsing import PLAIN_TEXT_EXTENSIONS
-from avatar.files.artifact_limits import MAX_SOURCE_BYTES
+from avatar.core.artifact_limits import MAX_SOURCE_BYTES
 
 
 _CONTROL = re.compile(r'[\x00-\x08\x0e-\x1f\x7f-\x9f]')

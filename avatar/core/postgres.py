@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from psycopg_pool import ConnectionPool
 
 from avatar.core.performance import measure, record_duration
+from avatar.core.postgres_schema import install_core_schema
 
 
 WRITE_LOCK = 1096172626
@@ -213,7 +214,8 @@ class Connection:
 
 
 class PostgresDatabase:
-    def __init__(self, url):
+    def __init__(self, url, *, schema=install_core_schema):
+        self.install_schema = schema
         self.pool = ConnectionPool(
             url, min_size=int(os.getenv('AVATAR_PG_POOL_MIN', '1')),
             max_size=int(os.getenv('AVATAR_PG_POOL_MAX', '10')),
@@ -229,13 +231,12 @@ class PostgresDatabase:
         return users is not None and raw.execute('SELECT 1 FROM users WHERE is_root=1 LIMIT 1').fetchone() is not None
 
     def initialize(self, *, existing_data=False):
-        from avatar.core.postgres_schema import install_schema
         with self.pool.connection() as raw:
             lock_schema_transaction(raw, SCHEMA_LOCK)
             lock_schema_transaction(raw, WRITE_LOCK)
             if existing_data and not self._has_root(raw):
                 raise ValueError('数据目录已有账户或旧库，须先完成离线迁移并核对 DATABASE_URL')
-            install_schema(raw)
+            self.install_schema(raw)
             self._load_metadata(raw)
 
     def _load_metadata(self, raw):

@@ -194,7 +194,7 @@ class UserSkills:
             return [], revision['updated_at'] if revision else ''
         from avatar.skills.loading import TEXT_SUFFIXES
         rows=db.execute('SELECT id,name,description,manifest FROM agent_skills WHERE user_id=? AND enabled=1 ORDER BY created_at,id', (user_id,)).fetchall()
-        from avatar.conversation.jobs.pipeline import current_generation,authorization
+        from avatar.core.execution import current_generation,authorization
         job=current_generation.get()
         if job and job['user_id']==user_id:
             permitted=authorization().get('skills',{})

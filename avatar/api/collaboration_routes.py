@@ -285,10 +285,6 @@ def reject_agent_task(identifier: str, request: Request, user=Depends(current_us
     return request.app.state.dialogues.reject(user,identifier)
 
 
-@router.post('/agent-sessions/{identifier}/accept')
-def accept_agent_session(identifier:str,request:Request,user=Depends(current_user)):
-    return request.app.state.dialogues.accept(user,identifier)
-
 @router.post('/agent-sessions/{identifier}/messages')
 async def send_agent_session(identifier:str,body:SessionMessage,request:Request,user=Depends(current_user)):
     return await request.app.state.dialogues.send_session(user,identifier,body)

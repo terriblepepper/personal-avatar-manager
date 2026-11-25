@@ -18,7 +18,7 @@ from contextlib import nullcontext,ExitStack
 from fastapi import HTTPException
 from avatar.core.db import now,dump
 from avatar.models.effort import with_chat_effort
-from avatar.core.schemas import ChatRequest
+from avatar.conversation.schemas import ChatRequest
 from avatar.core.execution import AgentNeedsInput,sandbox_checkpoint,execution_guard
 from avatar.conversation.loop.peer import PeerTurn, check_peer_style, speaker as turn_speaker
 from avatar.files.conversation.peer import workspace_expired
@@ -468,7 +468,7 @@ class AgentDialogues:
             embedding_status={'configured':EmbeddingSettings.configured(db,user['id']),'peerConfigured':EmbeddingSettings.configured(db,peer)}
             avatar=db.execute('SELECT aic,profile FROM avatar_records WHERE user_id=?',(peer,)).fetchone()
             own=db.execute('SELECT aic FROM avatar_records WHERE user_id=?',(user['id'],)).fetchone()
-            from avatar.protocols.transport.peer import current_protocol
+            from avatar.conversation.collaboration.transport import current_protocol
             acps=getattr(self.transport,'acps',None)
             protocol=current_protocol(own['aic'],avatar['aic'],ready=bool(acps and acps.ready(user['id'],peer))) if own and avatar else ''
             chat=db.execute("SELECT * FROM agent_dialogues d WHERE session_id=? AND delivery_mode='message' AND NOT EXISTS(SELECT 1 FROM agent_task_members v WHERE v.task_id=d.id AND v.user_id=? AND v.hidden=1) AND (status!='ended' OR ?='' OR julianday(COALESCE(ended_at,updated_at))>julianday(?)) ORDER BY updated_at DESC,id DESC LIMIT 1",(identifier,user['id'],pair['cleared_at'],pair['cleared_at'])).fetchone()
@@ -1584,7 +1584,7 @@ class AgentDialogues:
         except (asyncio.CancelledError,Exception) as exc:
             if isinstance(exc,asyncio.CancelledError) and asyncio.current_task().cancelling():
                 raise
-            from avatar.protocols.transport.peer import PeerEndpointUnavailable
+            from avatar.conversation.collaboration.transport import PeerEndpointUnavailable
             import httpx
             import logging
             import traceback

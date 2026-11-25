@@ -12,7 +12,7 @@ from avatar.conversation.loop.store import OWNER_STORAGE_BYTES, RAW_ARGUMENT_PRE
 from avatar.conversation.tools.html import ARTIFACT_TOOLS, repaired_html_arguments
 from avatar.core.execution import run_blocking
 from avatar.models.tools import IncompleteModelString, load_model_json
-from avatar.files.artifact_limits import MAX_SOURCE_BYTES
+from avatar.core.artifact_limits import MAX_SOURCE_BYTES
 
 
 _MAX_STALLS = 3

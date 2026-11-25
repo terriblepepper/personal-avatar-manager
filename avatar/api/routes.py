@@ -10,17 +10,22 @@ from wit import __version__ as wit_version
 from fastapi.responses import FileResponse
 from avatar.api.file_previews import word_pdf
 from avatar.files.library.folders import MaterialFolders,FolderRequest,NameRequest,FolderRenameRequest,rename_folder,rename_file
-from avatar.files.artifact_limits import MAX_SOURCE_BYTES
+from avatar.core.artifact_limits import MAX_SOURCE_BYTES
 from avatar.files.uploads.batches import batch_id as upload_batch_id, UploadComplete
-from avatar.profiles.profile_dates import ModifiedAt
+from avatar.core.revisions import ModifiedAt
 from avatar.models.model_settings import ModelSettingsRequest
+from avatar.rag.invalidation import index_status
 from avatar.files.library.attachments import ARTIFACT_SUFFIXES, AttachmentDescriptionRequest
 import avatar.accounts.auth as auth
-from avatar.core.schemas import LoginRequest, RecoveryRequest, PasswordChangeRequest, ContactChangeRequest, RegistrationRequest, DraftRequest, SubmitRequest, ReviewRequest, ChatRequest, PlatformSettings
+from avatar.accounts.schemas import LoginRequest, RecoveryRequest, PasswordChangeRequest, ContactChangeRequest, RegistrationRequest
+from avatar.profiles.schemas import DraftRequest, SubmitRequest, ReviewRequest
+from avatar.conversation.schemas import ChatRequest
+from avatar.core.platform_settings import PlatformSettings
 from avatar.models.model_config import catalog
-from avatar.core.schemas import ConversationRequest, ConversationTitleRequest, ModelConfigInput
-from avatar.core.schemas import AccountRoleRequest
-from avatar.core.schemas import PlatformEntryRequest
+from avatar.conversation.schemas import ConversationRequest, ConversationTitleRequest
+from avatar.models.schemas import ModelConfigInput
+from avatar.accounts.schemas import AccountRoleRequest
+from avatar.accounts.schemas import PlatformEntryRequest
 
 router = APIRouter(prefix="/api")
 
@@ -162,7 +167,7 @@ def advance_onboarding(stage: Literal['tour', 'done'], request: Request, user=De
 # 结果与约束：返回字段名称、控件、身份范围和默认隐私定义，不返回个人数据。
 @router.get("/profile-fields")
 def profile_fields(user=Depends(auth.current_user)):
-    from avatar.profiles.profile_fields import catalog
+    from avatar.contracts.profile_fields import catalog
     return catalog()
 
 
@@ -650,7 +655,8 @@ def update_attachment_description(attachment_id: str, body: AttachmentDescriptio
 # 结果与约束：仅返回脱敏配置和更新时间，不返回 Key，不依赖资料审核状态。
 @router.get('/me/model-settings')
 def own_model_settings(request: Request, user=Depends(auth.current_user)):
-    return request.app.state.service.models.get(user['id'])
+    models = request.app.state.service.models
+    return index_status(models.database, user['id'], models.get(user['id']))
 
 
 # 职责：保存立即生效的本人模型配置。
@@ -671,8 +677,8 @@ async def save_model_settings(body: ModelSettingsRequest, request: Request, user
     await verify_api(request.app.state.chat.model_client,config,service.vault)
     saved=await asyncio.to_thread(service.models.save,user,body,validated=config,baseline=baseline)
     from avatar.models.capabilities import detect
-    asyncio.create_task(detect(service.database,user['id'],config,request.app.state.chat.model_client,service.vault),name='avatar-model-capability-detect')
-    return saved
+    asyncio.create_task(detect(service.database,user['id'],config,request.app.state.chat.model_client,service.vault,on_change=service.models.on_change),name='avatar-model-capability-detect')
+    return await asyncio.to_thread(index_status, service.database, user['id'], saved)
 
 
 # 职责：根据本人输入的 Base URL/Key 读取模型目录，不保存设置、不使用其他账户密钥。
@@ -689,7 +695,7 @@ async def own_model_options(body: ModelConfigInput, request: Request, user=Depen
     if not config.get('encrypted_key'):raise HTTPException(422,'请填写此 Base URL 对应的 API Key 后获取模型')
     result=await discover(request.app.state.chat.model_client,config,service.vault.decrypt(config['encrypted_key']))
     from avatar.models.capabilities import remember
-    await asyncio.to_thread(remember,service.database,user['id'],config,result['models'])
+    await asyncio.to_thread(remember,service.database,user['id'],config,result['models'],on_change=service.models.on_change)
     return result
 
 
@@ -717,21 +723,6 @@ def records(collection: Literal['history','submissions','events','model_calls','
             search: str=Query(default='',max_length=100),status: Literal['all','pending','approved','rejected','reviewed']='all',user=Depends(auth.current_user)):
     from avatar.profiles.records import record_page
     return record_page(request.app.state,user,collection,scope,offset,search,status)
-
-
-# 职责：协商结束时把当前助手会话恢复为本人分身，不发送问题或调用模型。
-# 输入：已认证用户及本人 Web 助手父会话 ID。
-# 结果与约束：仅改变这一会话的目标，保持历史/摘要；临时资料会话不能调用，不接受其他用户或目标 AIC。
-@router.post('/conversations/{conversation_id}/self')
-def conversation_self(conversation_id: str,request: Request,user=Depends(auth.current_user)):
-    from fastapi import HTTPException
-    from avatar.core.db import now
-    with request.app.state.database.connect(write=True) as db:
-        if not db.execute("SELECT 1 FROM chat_conversations WHERE id=? AND user_id=? AND channel='assistant' AND platform='web' AND parent_id IS NULL",(conversation_id,user['id'])).fetchone():raise HTTPException(404,'助手会话不存在')
-        own=db.execute("SELECT aic FROM avatar_records WHERE user_id=? AND identity_status='active'",(user['id'],)).fetchone()
-        if not own:raise HTTPException(409,'本人分身暂不可用')
-        db.execute('UPDATE chat_conversations SET selected_aic=?,updated_at=? WHERE id=?',(own['aic'],now(),conversation_id))
-    return {'selected_aic':own['aic']}
 
 
 # 职责：显示本人会话实际使用及移出的技能。

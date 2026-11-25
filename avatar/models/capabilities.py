@@ -10,13 +10,13 @@ def target(config):
     return fingerprint({key:config.get(key,'').rstrip('/') if key=='base_url' else config.get(key,'') for key in ('provider','api_format','base_url')})
 
 
-def remember(database,user_id,config,rows):
+def remember(database,user_id,config,rows,*,on_change):
     signature=target(config)
-    with database.connect(write=True) as db:
+    with database.connect(write=True, account_scope=user_id) as db:
         db.executemany('INSERT OR REPLACE INTO model_artifact_cache VALUES(?,?,?,?,?,?,?)',
             [(user_id,'capabilities',signature,fingerprint(row['id']),'',dump(row),now()) for row in rows])
         db.execute("DELETE FROM model_artifact_cache WHERE rowid IN (SELECT rowid FROM model_artifact_cache WHERE user_id=? AND kind='capabilities' ORDER BY updated_at DESC LIMIT -1 OFFSET 4000)",(user_id,))
-        refresh_saved(db,user_id)
+        refresh_saved(db,user_id,on_change)
 
 
 def automatic(db,user_id,config,*,embedding=False):
@@ -49,36 +49,31 @@ def automatic(db,user_id,config,*,embedding=False):
     return result
 
 
-def refresh_saved(db,user_id):
-    from avatar.rag.invalidation import chat_changed,invalidate
+def refresh_saved(db,user_id,on_change):
     for table,column,embedding in (('model_settings','model_config',False),('embedding_settings','config',True)):
         row=db.execute(f'SELECT {column} FROM {table} WHERE user_id=?',(user_id,)).fetchone()
         if not row:continue
         previous=json.loads(row[0]);config=automatic(db,user_id,previous,embedding=embedding)
         if config!=previous:db.execute(f'UPDATE {table} SET {column}=? WHERE user_id=?',(dump(config),user_id))
-        if not embedding:
-            chat_changed(db,user_id,previous,config)
-        elif bool(config.get('multimodal_enabled'))!=bool(previous.get('multimodal_enabled')):
-            invalidate(db,user_id,force=True)
-            from avatar.knowledge.model_refresh import schedule
-            schedule(db,user_id,embedding=True)
+        if not embedding or bool(config.get('multimodal_enabled')) != bool(previous.get('multimodal_enabled')):
+            on_change(db,user_id,previous,config,embedding=embedding)
 
 
-async def detect(database,user_id,config,client,vault):
+async def detect(database,user_id,config,client,vault,*,on_change):
     if not config.get('encrypted_key'):return
     from avatar.models.discovery import discover
     from fastapi import HTTPException
     try:
         result=await discover(client,config,vault.decrypt(config['encrypted_key']))
     except (HTTPException,AttributeError):return
-    await asyncio.to_thread(remember,database,user_id,config,result['models'])
+    await asyncio.to_thread(remember,database,user_id,config,result['models'],on_change=on_change)
 
 
-async def refresh_all(database,client,vault):
+async def refresh_all(database,client,vault,*,on_change):
     def list_configs():
         with database.connect() as db:return db.execute('SELECT user_id,model_config FROM model_settings UNION ALL SELECT user_id,config FROM embedding_settings').fetchall()
     rows=await asyncio.to_thread(list_configs)
     semaphore=asyncio.Semaphore(2)
     async def one(row):
-        async with semaphore:await detect(database,row[0],json.loads(row[1]),client,vault)
+        async with semaphore:await detect(database,row[0],json.loads(row[1]),client,vault,on_change=on_change)
     await asyncio.gather(*(one(row) for row in rows))

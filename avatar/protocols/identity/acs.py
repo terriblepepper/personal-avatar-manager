@@ -7,8 +7,8 @@ from acps_sdk.acs.models import AgentCapabilitySpec
 from wit import __version__ as wit_version
 from avatar.core.config import public_url
 from avatar.core.db import now
-from avatar.profiles.profile_fields import public_profile
-from avatar.profiles.profile_dates import ModifiedAt
+from avatar.contracts.profile_fields import public_profile
+from avatar.core.revisions import ModifiedAt
 
 VERSION_PATTERN = r'^[A-Za-z0-9][A-Za-z0-9._+-]*$'
 

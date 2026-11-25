@@ -3,8 +3,8 @@ import json
 import asyncio
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict
-from avatar.core.schemas import ModelConfigInput
-from avatar.profiles.profile_dates import ModifiedAt, next_modified_at
+from avatar.models.schemas import ModelConfigInput
+from avatar.core.revisions import ModifiedAt, next_modified_at
 from avatar.models.model_config import public_config
 from avatar.core.db import dump, event
 from avatar.models.capabilities import automatic
@@ -46,8 +46,9 @@ class ModelSettingsService:
     # 职责：组合模型设置存储与保险库。
     # 输入：database 和 vault 为共享应用实例。
     # 结果与约束：不创建新的主密钥，不调用模型或注册服务。
-    def __init__(self, database, vault):
+    def __init__(self, database, vault, on_change):
         self.database, self.vault = database, vault
+        self.on_change = on_change
 
     # 职责：在已有事务内读取目标所有人的当前加密模型配置。
     # 输入：db 为事务，user_id 必须由认证账户或已授权分身目标确定。
@@ -63,9 +64,8 @@ class ModelSettingsService:
     def get(self, user_id):
         with self.database.connect() as db:
             row = db.execute('SELECT model_config,updated_at FROM model_settings WHERE user_id=?', (user_id,)).fetchone()
-            updating=bool(db.execute("SELECT 1 FROM file_rag_documents WHERE user_id=? AND status IN ('queued','running')",(user_id,)).fetchone())
             config=automatic(db,user_id,json.loads(row['model_config'])) if row else {}
-        return {'model_config': public_config(config), 'updated_at': row['updated_at'] if row else None,'index_updating':updating}
+        return {'model_config': public_config(config), 'updated_at': row['updated_at'] if row else None}
 
     # 职责：在账户事务内校验并保存立即生效的模型配置。
     # 输入：db、user、input_config 为已认证配置请求，expected 可选核对此前配置日期。
@@ -78,15 +78,14 @@ class ModelSettingsService:
         previous=json.loads(row['model_config']) if row else {}
         modified = next_modified_at(row['updated_at'] if row else '')
         db.execute('INSERT INTO model_settings(user_id,model_config,updated_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET model_config=excluded.model_config,updated_at=excluded.updated_at', (user['id'],dump(config),modified))
-        from avatar.rag.invalidation import chat_changed
-        chat_changed(db,user['id'],previous,config)
+        self.on_change(db,user['id'],previous,config)
         event(db,user['id'],user['username'],'保存模型配置（立即生效）', actor_id=user['id'])
 
     # 职责：独立保存用户模型配置并返回可显示结果。
     # 输入：user 为当前账户，request 为 ModelSettingsRequest。
     # 结果与约束：资料处于待审核或执行状态时也可保存，既有审核通过任务不会回滚新 Key；修改仅影响后续模型请求。
     def save(self, user, request, *, validated=None, baseline=None):
-        with self.database.connect(write=True) as db:
+        with self.database.connect(write=True, account_scope=user['id']) as db:
             if validated is not None:
                 row=db.execute('SELECT updated_at FROM model_settings WHERE user_id=?',(user['id'],)).fetchone()
                 if (row[0] if row else None)!=baseline:raise HTTPException(409,'校验期间模型配置已变化，请刷新后重新保存')

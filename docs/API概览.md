@@ -76,7 +76,6 @@
 - `GET /api/conversations`、`POST /api/conversations`
 - `PATCH /api/conversations/{conversation_id}`、`DELETE /api/conversations/{conversation_id}`
 - `POST /api/conversations/{conversation_id}/clear`
-- `POST /api/conversations/{conversation_id}/self`
 - `GET /api/conversations/{conversation_id}/skills`、`PATCH /api/conversations/{conversation_id}/skills/{skill_id}`
 - `GET /api/chat` 读取会话历史。
 - `POST /api/chat/stream` — SSE 流式
@@ -156,7 +155,7 @@
 **Agent 会话与任务**
 
 - `GET /agent-sessions`、`GET /agent-sessions/{identifier}`、`DELETE /agent-sessions/{identifier}`
-- `POST /agent-sessions/{identifier}/accept|messages|task-draft|clear`
+- `POST /agent-sessions/{identifier}/messages|task-draft|clear`
 - `POST /agent-sessions/delete-all`、`POST /agent-sessions/{identifier}/tasks/delete-all`
 - `GET /agent-sessions?summary=true` 返回当前可见的会话名单和最近的分身消息预览。省略该参数保留完整响应。
 - 会话和任务详情支持 `after` 消息游标（每页至多 10 条）。`task_offset`、`task_search` 控制同一响应中的 `task_page`。清空历史或隐藏任务后，`history_revision` 的变化通知客户端重新读取可见历史。
@@ -216,7 +215,7 @@
 
 ## 系统身份与注册（`system_routes.py`）
 
-- `GET /api/system/acs`、`GET /api/avatar-ontology/acs`
+- `GET /api/system/acs`
 - `GET /api/system/aip/status`
 - `GET /api/admin/system/registration`、`POST /api/admin/system/registration/refresh`
 - `POST /aip/rpc` — 系统级 ACPS RPC 入口

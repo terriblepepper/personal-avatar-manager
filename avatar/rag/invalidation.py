@@ -22,11 +22,8 @@ def modalities(config):
     return tuple(bool(config.get(key)) for key in ('vision_enabled','audio_enabled'))
 
 
-def chat_changed(db,user_id,previous,config):
-    old,new=modalities(previous),modalities(config)
-    if old!=new:
-        invalidate(db,user_id)
-        if old[0]!=new[0]:
-            from avatar.knowledge.model_refresh import schedule
-            schedule(db,user_id,visual=True)
-        return
+def index_status(database, owner, result):
+    with database.connect() as db:
+        updating = db.execute("""SELECT 1 FROM file_rag_documents
+            WHERE user_id=? AND status IN ('queued','running') LIMIT 1""", (owner,)).fetchone()
+    return {**result, 'index_updating': bool(updating)}

@@ -15,7 +15,7 @@ from langgraph.config import get_stream_writer
 from langsmith import tracing_context
 from avatar.core.text_budget import TEXT_LIMIT, fits_text_budget
 from avatar.core.execution import call_with_retry, recoverable
-from avatar.core.execution import AgentSteps
+from avatar.models.agent_trace import AgentSteps
 from avatar.core.tokens import estimate
 from avatar.models.context_budget import fit_turn
 from avatar.models.embedding import EmbeddingSettings,embedding_window

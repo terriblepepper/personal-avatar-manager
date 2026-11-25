@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT))
 from avatar.accounts.auth import hash_password
 from avatar.core.config import Settings
 from avatar.core.db import Database, event, now, dump
-from avatar.core.schemas import Credentials
+from avatar.accounts.schemas import Credentials
 from pydantic import ValidationError
 
 

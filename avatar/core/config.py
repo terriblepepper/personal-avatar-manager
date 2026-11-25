@@ -95,7 +95,6 @@ class Settings:
     registry_password: str = field(default='', repr=False)
     system_atr_poll_interval: float = 3600.0
     system_atr_call_timeout: float = 60.0
-    avatar_atr_enabled: bool = False
     entity_aip_enabled: bool = False
     entity_aip_port: int = 10001
     entity_aip_port_end: int = 15000
@@ -134,7 +133,6 @@ class Settings:
                    os.getenv('WIT_REGISTRY_PASSWORD', ''),
                    max(3600.0, float(os.getenv('AVATAR_SYSTEM_ATR_POLL_INTERVAL', '3600'))),
                    float(os.getenv('AVATAR_SYSTEM_ATR_CALL_TIMEOUT', '60')),
-                   os.getenv('AVATAR_PERSONAL_ATR_ENABLED', '0') == '1',
                    os.getenv('AVATAR_ENTITY_AIP_ENABLED', '0') == '1',
                    int(os.getenv('AVATAR_ENTITY_AIP_PORT', '10001')),
                    int(os.getenv('AVATAR_ENTITY_AIP_PORT_END', '15000')),

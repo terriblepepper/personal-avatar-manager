@@ -17,7 +17,7 @@ from avatar.protocols.identity.system import private_directory,create_identity_j
 from avatar.protocols.identity.document import wit_candidate_config,sync_component_acs
 from avatar.protocols.registration.system import plain_json,publish_identity_document
 from avatar.protocols.transport.endpoints import entity_connection,entity_endpoint,entity_oidc_identity
-from avatar.profiles.profile_fields import public_profile
+from avatar.contracts.profile_fields import public_profile
 
 
 def legacy_description(public):

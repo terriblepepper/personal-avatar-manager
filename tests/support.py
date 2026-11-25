@@ -21,8 +21,8 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from avatar.accounts.auth import hash_password
 from avatar.api.app import create_app
 from avatar.core.config import Settings
-from avatar.core.migrations.rag_publications import migrate_rag_publications
-from avatar.core.postgres_schema import SOURCE_SCHEMA
+from scripts.migrations.rag_publications import migrate_rag_publications
+from scripts.migrations.sqlite_schema import SOURCE_SCHEMA
 from avatar.models.client import ModelClient
 
 
@@ -256,7 +256,7 @@ def setup(app):
 
 def serve_browser(path):
     with isolated_schema() as database_url:
-        app=create_app(Settings(data_dir=path,database_url=database_url,oidc_public_url='http://127.0.0.1:18081',provider='demo',system_atr_enabled=False,avatar_atr_enabled=False,entity_aip_enabled=False),run_worker=True,model_client=ModelClient(httpx.MockTransport(completion),resolver=fake_dns))
+        app=create_app(Settings(data_dir=path,database_url=database_url,oidc_public_url='http://127.0.0.1:18081',provider='demo',system_atr_enabled=False,entity_aip_enabled=False),run_worker=True,model_client=ModelClient(httpx.MockTransport(completion),resolver=fake_dns))
         try:
             setup(app)
             uvicorn.run(app,host='127.0.0.1',port=18081,log_level='warning')

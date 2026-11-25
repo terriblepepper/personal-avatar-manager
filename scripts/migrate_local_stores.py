@@ -29,7 +29,8 @@ from avatar.core.config import require_database_url
 from avatar.core.db import dump
 from avatar.core.postgres import Connection, SCHEMA_LOCK, WRITE_LOCK, lock_schema_transaction
 from avatar.knowledge import everos_storage as storage
-from avatar.protocols.tasks.store import import_system_tasks, initialize_system_tasks
+from avatar.protocols.tasks.store import initialize_system_tasks
+from scripts.migrations.system_tasks import import_system_tasks
 from avatar.rag.stores.postgres import install_vector_schema
 from avatar.rag.stores.lexical import LexicalStore
 from avatar.rag.invalidation import signature
@@ -508,7 +509,7 @@ def main():
         print('文件目录迁移已完成')
         return
     if args.postgres_only:
-        from avatar.core.migrations.chat_generations import restore_legacy_generations
+        from scripts.migrations.chat_generations import restore_legacy_generations
         with psycopg.connect(require_database_url(os.getenv('DATABASE_URL',''))) as db:
             report = migrate_postgres_publications(db)
             restore_legacy_generations(Connection(db, {}))

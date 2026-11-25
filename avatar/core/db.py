@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from avatar.core.config import require_database_url
 from avatar.core.postgres import PostgresDatabase
+from avatar.core.postgres_schema import install_core_schema
 
 # 审计查询统一使用 e 别名；登录记录只对本人展示，管理员也不例外。
 LOGIN_EVENT_VISIBILITY = "(e.action!='统一认证登录' OR e.user_id=?)"
@@ -25,12 +26,12 @@ def dump(value):
 
 
 class Database(PostgresDatabase):
-    def __init__(self, data_dir, database_url=""):
+    def __init__(self, data_dir, database_url="", *, schema=install_core_schema):
         url = require_database_url(database_url)
         data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         data_dir.chmod(0o700)
         self.data_dir = data_dir
-        super().__init__(url)
+        super().__init__(url, schema=schema)
 
     @classmethod
     @contextmanager

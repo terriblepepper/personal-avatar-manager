@@ -6,12 +6,12 @@ from fastapi import HTTPException
 from avatar.accounts.roles import ADMIN_ROLES
 from avatar.core.db import dump, event, now
 from avatar.core.activity_visibility import event_scope
-from avatar.core.schemas import Profile
+from avatar.profiles.schemas import Profile
 from avatar.protocols.identity.acs import resolve_input, build_acs, public_base_url
 from avatar.protocols.registration.base import RegistrationFailure
 from avatar.files.library.attachments import AttachmentService
-from avatar.profiles.profile_fields import public_profile, FIXED_PUBLIC_FIELDS
-from avatar.profiles.profile_dates import next_modified_at
+from avatar.contracts.profile_fields import public_profile, FIXED_PUBLIC_FIELDS
+from avatar.core.revisions import next_modified_at
 from avatar.models.model_settings import ModelSettingsService
 from avatar.profiles.identity import save_identity
 
@@ -23,11 +23,11 @@ class AvatarService:
     # 职责：保存服务所需的数据库、注册器和密钥管理器。
     # 输入：database 为存储接口，provider 为注册适配器，vault 为 SecretVault。
     # 结果与约束：仅组合依赖，不触发注册或模型调用。
-    def __init__(self, database, provider, vault):
+    def __init__(self, database, provider, vault, model_changed):
         self.database, self.provider = database, provider
         self.vault = vault
         self.attachments = AttachmentService(database)
-        self.models = ModelSettingsService(database,vault)
+        self.models = ModelSettingsService(database,vault,model_changed)
 
     # 职责：判断个人 ACS 是否采用本体继承的正式模式。
     # 输入：user_id 可指定既有正式分身账户。

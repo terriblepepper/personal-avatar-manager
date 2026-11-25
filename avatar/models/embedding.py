@@ -7,11 +7,11 @@ from fastapi import HTTPException
 from avatar.models.diagnostics import contextual, transport_failure
 from pydantic import BaseModel,ConfigDict,Field,SecretStr,field_validator
 from typing import Literal
-from avatar.core.schemas import ModelConfigInput
+from avatar.models.schemas import ModelConfigInput
 from avatar.core.db import dump,event,now
 from avatar.models.capabilities import automatic
 from avatar.models.model_config import provider_base_url
-from avatar.profiles.profile_dates import next_modified_at
+from avatar.core.revisions import next_modified_at
 
 
 class EmbeddingInput(BaseModel):
@@ -51,9 +51,8 @@ class EmbeddingSettings:
     def get(self,user_id):
         with self.database.connect() as db:
             row=db.execute('SELECT config,updated_at FROM embedding_settings WHERE user_id=?',(user_id,)).fetchone()
-            updating=bool(db.execute("SELECT 1 FROM file_rag_documents WHERE user_id=? AND status IN ('queued','running')",(user_id,)).fetchone())
-        with self.database.connect() as db:config=automatic(db,user_id,json.loads(row[0]),embedding=True) if row else {}
-        return {'config':{k:v for k,v in config.items() if k not in ('encrypted_key','input_modalities')}|{'key_configured':bool(config.get('encrypted_key'))},'updated_at':row[1] if row else None,'index_updating':updating}
+            config=automatic(db,user_id,json.loads(row[0]),embedding=True) if row else {}
+        return {'config':{k:v for k,v in config.items() if k not in ('encrypted_key','input_modalities')}|{'key_configured':bool(config.get('encrypted_key'))},'updated_at':row[1] if row else None}
 
     def resolve(self,db,user,body):
         old=self.current(db,user['id'])
@@ -75,19 +74,14 @@ class EmbeddingSettings:
         return automatic(db,user['id'],config,embedding=True)
 
     def save(self,user,body,*,validated=None):
-        with self.database.connect(write=True) as db:
+        with self.database.connect(write=True, account_scope=user['id']) as db:
             previous=db.execute('SELECT config,updated_at FROM embedding_settings WHERE user_id=?',(user['id'],)).fetchone()
             if body.updated_at!=(previous[1] if previous else None):raise HTTPException(409,'嵌入配置已变化，请刷新后保存')
             config=validated if validated is not None else self.resolve(db,user,body)
             stamp=next_modified_at(previous[1] if previous else '')
             db.execute('INSERT INTO embedding_settings VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET config=excluded.config,updated_at=excluded.updated_at',(user['id'],dump(config),stamp))
-            from avatar.rag.invalidation import invalidate
-            old_config=json.loads(previous[0]) if previous else {}
-            if not previous or body.api_key or any(config.get(key)!=old_config.get(key) for key in config if key!='encrypted_key'):
-                invalidate(db,user['id'],force=bool(old_config.get('multimodal_enabled'))!=bool(config.get('multimodal_enabled')))
-            if index_identity(old_config)!=index_identity(config):
-                from avatar.knowledge.model_refresh import schedule
-                schedule(db,user['id'],embedding=True)
+            self.models.on_change(db, user['id'], json.loads(previous[0]) if previous else {}, config,
+                                  embedding=True, embedding_key_changed=bool(body.api_key) or previous is None)
             event(db,user['id'],user['username'],'保存嵌入模型配置',actor_id=user['id'])
         return self.get(user['id'])
 
