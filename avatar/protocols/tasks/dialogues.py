@@ -47,22 +47,12 @@ class PeerDialogueTasks:
                 'status':{'state':state,'stateChangedAt':now()},'products':[{'id':uuid.uuid4().hex,'dataItems':([{'type':'text','text':text}] if text else [])+[{'type':'data','data':{'usage':usage,**({'peerTaskAction':task_action} if task_action else {})}}]}] if text or task_action else []}
 
     def validate_delivery(self, db, task, owner):
-        receipt = json.loads(task.get('pending_file_delivery') or '{}')
-        if receipt.get('authority') and receipt.get('revision')==task['revision'] and receipt.get('speaker')==owner:
+        if task.get('pending_file_delivery'):
             try:
-                style=PeerTurn.resolve_style(self.dialogues,db,task,owner,receipt['workspace'],receipt)
-                authorized=receipt['authority']==PeerTurn.source_version(self.dialogues,db,task,owner,receipt['workspace'],style=style)
-            except HTTPException:
-                authorized=False
-            if not authorized:
-                raise ManagementTaskError(-32009,'原任务资料或工具授权已变化')
-            if proofs:=receipt.get('session_file_reads'):
-                try:
-                    self.dialogues.resources.validate_file_receipts(db,task,owner,receipt['workspace'],proofs,lock=False)
-                except HTTPException:
-                    raise ManagementTaskError(-32009,'原任务的会话文件或读取授权已变化') from None
-            return True
-        return False
+                return self.dialogues.executor.verified_delivery(db, task, owner)
+            except HTTPException as error:
+                raise ManagementTaskError(-32009, str(error.detail)) from None
+        return None
 
     @staticmethod
     def latest(db, scope):

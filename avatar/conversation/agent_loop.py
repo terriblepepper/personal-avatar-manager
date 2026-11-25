@@ -254,6 +254,8 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             rag.chat.model_client, (settings, key, system, history), question, state, draft,
             allowed=allowed, disabled=disabled, choices=choices, planned_arguments=planned_arguments,
             changed=changed, proposed=route.get('disclosure'), trace=trace, validate=validate, account=account,
+            allow_reply=(not required and not html_needed and not changed and not observations and not receipts_log
+                         and not draft.active and not state.get('parked_drafts')),
         )
     except PlanUnavailable as error:
         raise pause(str(error)) from None
@@ -265,6 +267,15 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
     if tools_plan.blocked:
         return tool_required(tools_plan.blocked)
     plan, pending, selected = tools_plan.plan, tools_plan.pending, tools_plan.selected
+    if tools_plan.reply:
+        await check_execution_async(validate)
+        response = completion_reply(tools_plan.reply, config, delivery, html_receipts)
+        if response is not None:
+            text, attachments = response
+            result = ModelResult(text.strip(), usage, finish_reason='stop', material_delivery=attachments)
+            await journal.answer(result)
+            return result
+        observations.append('候选答复含无效文件引用。只使用真实附件回执或纯文本。')
 
     if html_needed and not any(step['tool']=='create_html' for step in pending):
         index = next((i for i,step in enumerate(pending) if step['tool'] in ARGUMENTS), len(pending))
