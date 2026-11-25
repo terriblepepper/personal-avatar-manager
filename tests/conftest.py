@@ -1,3 +1,4 @@
+from avatar.runtime.schema import install_schema
 """所有 pytest 临时数据库和文件位于 data/test，每个用例及整次运行结束后清理。"""
 import sys
 sys.dont_write_bytecode=True
@@ -58,7 +59,7 @@ def postgres_url(postgres_schema):
 def pg_database(tmp_path, postgres_url):
     from contextlib import closing
     from avatar.core.db import Database
-    with closing(Database(tmp_path, postgres_url)) as database:
+    with closing(Database(tmp_path, postgres_url, schema=install_schema)) as database:
         database.initialize()
         yield database
 
@@ -68,12 +69,12 @@ def protect_runtime_database(monkeypatch):
     from avatar.core.db import Database
     from tests.support import OWNED
     original=Database.__init__
-    def isolated_init(self,data_dir,database_url=''):
+    def isolated_init(self,data_dir,database_url='',**kwargs):
         if not Path(data_dir).resolve().is_relative_to(TEST_ROOT.resolve()):
             raise RuntimeError('测试数据库只能位于 data/test')
         if database_url and database_url not in OWNED:
             raise RuntimeError('测试只允许使用本进程分配的 PostgreSQL schema')
-        original(self, Path(data_dir), database_url)
+        original(self, Path(data_dir), database_url, **kwargs)
     monkeypatch.setattr(Database,'__init__',isolated_init)
 
 

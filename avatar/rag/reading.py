@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import subprocess
 from fastapi import HTTPException
-from avatar.core.execution import AgentSteps
+from avatar.models.agent_trace import AgentSteps
 from pydantic import BaseModel,ConfigDict,Field,model_validator
 from typing import Literal
 from avatar.core.execution import AgentNeedsInput, call_with_retry, recoverable

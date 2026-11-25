@@ -212,7 +212,7 @@ def parse_response(fmt, data, *, config=None, request_id=None, api_key=''):
 def response_limit(config,streaming=False):
     wire_allowance = min(64*1024*1024,max(8*1024*1024,config['max_tokens']*2048))
     if config.get('_call_purpose') == 'html_generation' or any(tool.get('name') == 'create_html' for tool in config.get('_tools') or ()):
-        from avatar.files.artifact_limits import MAX_ENVELOPE_BYTES
+        from avatar.core.artifact_limits import MAX_ENVELOPE_BYTES
         # HTML is nested inside JSON tool arguments. Escapes and streaming headers do not count toward file size.
         return MAX_ENVELOPE_BYTES + (wire_allowance if streaming else 0)
     if streaming:

@@ -7,7 +7,7 @@ import logging
 import time
 from contextlib import aclosing
 from fastapi import HTTPException
-from avatar.core.schemas import ChatRequest
+from avatar.conversation.schemas import ChatRequest
 from avatar.models.client import collected_model_status
 from avatar.core.execution import run_blocking
 from avatar.conversation.jobs.store import LEASE_SECONDS, GenerationStore, run_key

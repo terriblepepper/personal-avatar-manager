@@ -3,7 +3,7 @@ import json
 
 from fastapi import HTTPException
 
-from avatar.core.schemas import PlatformSettings
+from avatar.core.platform_settings import PlatformSettings
 from avatar.profiles.pending_reviews import pending_count
 from avatar.protocols.registration.entity import staged_entity_metadata
 from avatar.protocols.transport.endpoints import entity_port_pool, preview_entity_urls

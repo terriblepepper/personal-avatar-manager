@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from fastapi import HTTPException
 from avatar.core.text_budget import fits_text_budget
 from avatar.core.db import dump, now
-from avatar.core.schemas import ChatRequest
+from avatar.conversation.schemas import ChatRequest
 from avatar.core.execution import AgentNeedsInput, execution_guard, run_blocking
 from avatar.conversation.loop.runtime import resume_safe
 from avatar.conversation.tools.reply_artifacts import reply_with_artifacts, without_source_footer

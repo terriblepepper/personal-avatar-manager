@@ -3,7 +3,7 @@ import json
 import re
 from contextlib import nullcontext
 from collections.abc import Mapping
-from avatar.profiles.profile_fields import public_profile
+from avatar.contracts.profile_fields import public_profile
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 SKILLS = frozenset({'avatar.manager.profile', 'avatar.manager.discovery', 'avatar.manager.account-link', 'avatar.manager.settings'})

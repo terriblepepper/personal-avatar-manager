@@ -3,7 +3,7 @@ from typing import Literal
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 from avatar.core.db import event
-from avatar.profiles.profile_dates import ModifiedAt
+from avatar.core.revisions import ModifiedAt
 from avatar.files.library.folders import validate_path, MaterialFolders
 
 

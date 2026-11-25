@@ -6,7 +6,7 @@ import unicodedata
 import uuid
 
 from pydantic import BaseModel, ConfigDict, Field
-from avatar.profiles.profile_fields import public_profile
+from avatar.contracts.profile_fields import public_profile
 from avatar.core.db import now, dump
 
 

@@ -10,9 +10,10 @@ import psycopg
 import pytest
 
 from avatar.core.db import Database
-from avatar.core.postgres_schema import install_schema
+from avatar.runtime.schema import install_schema
 from avatar.protocols.tasks.management import SystemManagementService
-from avatar.protocols.tasks.store import ManagementTaskError, SystemTaskStore, import_system_tasks
+from avatar.protocols.tasks.store import ManagementTaskError, SystemTaskStore
+from scripts.migrations.system_tasks import import_system_tasks
 from scripts.migrate_sqlite_to_postgres import (
     create_snapshot,
     dependency_order,
@@ -207,7 +208,7 @@ def test_postgres_http_registration_and_login(tmp_path, postgres_url):
         assert client.get('/api/chat/pending', params={'conversation_id': cid}).status_code == 200
         from avatar.conversation.jobs.store import GenerationStore
         from avatar.conversation.jobs.pipeline import generation_scope
-        from avatar.core.schemas import ChatRequest
+        from avatar.conversation.schemas import ChatRequest
         user = client.get('/api/auth/me').json()['user']
         store = GenerationStore(app.state.database)
         job = store.claim()[0]

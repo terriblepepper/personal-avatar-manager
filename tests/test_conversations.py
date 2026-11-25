@@ -1,3 +1,4 @@
+from avatar.runtime.schema import install_schema
 """聊天任务、跨分身协作与技能执行。"""
 import asyncio
 import json
@@ -15,7 +16,7 @@ import pytest
 from fastapi import HTTPException
 
 from avatar.core.db import now
-from avatar.core.schemas import ChatRequest
+from avatar.conversation.schemas import ChatRequest
 from avatar.models.client import ModelClient
 from avatar.protocols.tasks.dialogues import PeerDialogueTasks
 from avatar.protocols.tasks.store import ManagementTaskError
@@ -167,7 +168,7 @@ def test_legacy_snapshot_migration_is_idempotent_and_unlocks(legacy_sqlite,postg
     import sqlite3
     from avatar.conversation.jobs.store import GenerationStore
     from avatar.core.db import Database
-    from avatar.core.migrations.chat_generations import restore_legacy_generations
+    from scripts.migrations.chat_generations import restore_legacy_generations
     from scripts.migrate_sqlite_to_postgres import migrate
 
     snapshot='invalid JSON' if corrupt else json.dumps({'request_id':'legacy','done':False,'stage':'accepted','error':''})
@@ -182,7 +183,7 @@ def test_legacy_snapshot_migration_is_idempotent_and_unlocks(legacy_sqlite,postg
         source.execute("INSERT INTO chat_pending VALUES('chat','old',?,1)", (snapshot,))
     migrate(legacy_sqlite,tmp_path/'snapshot.sqlite3',postgres_url)
     expected = 'failed' if corrupt else 'indeterminate'
-    with closing(Database(tmp_path/'target',postgres_url)) as database:
+    with closing(Database(tmp_path/'target',postgres_url, schema=install_schema)) as database:
         with database.connect(write=True) as db:
             states = db.execute("SELECT state FROM chat_generation_jobs WHERE conversation_id='chat'").fetchall()
             assert [row[0] for row in states] == [expected]
@@ -1038,7 +1039,7 @@ def test_offline_command_with_legacy_ready_and_no_python_wrapper(tmp_path, monke
 
 
 def test_http_model_addresses_allow_changing_ips_without_allowlist(monkeypatch):
-    from avatar.core.schemas import ModelConfigInput
+    from avatar.models.schemas import ModelConfigInput
     endpoint='http://10.0.0.21:5000/v1'
     assert ModelConfigInput(provider='custom',api_format='openai',base_url=endpoint,model='qwen3.8',api_key='local').base_url==endpoint
     async def check():
@@ -1060,7 +1061,7 @@ def test_http_model_addresses_allow_changing_ips_without_allowlist(monkeypatch):
 def test_chat_generation_survives_refresh_and_bounded_queue(context,disconnect):
     from avatar.api.streaming import chat_response
     from avatar.conversation.jobs.runner import GenerationRunner
-    from avatar.core.schemas import ChatRequest
+    from avatar.conversation.schemas import ChatRequest
     app,client,_=context
     actor=client.get('/api/auth/me').json()['user']
     cid=client.post('/api/conversations',json={'channel':'assistant'}).json()['id']
@@ -1193,11 +1194,11 @@ def test_unknown_capabilities_allow_correction_but_metadata_locks(context):
         assert corrected['vision_enabled'] and corrected['capability_status']=='unknown'
         assert automatic(db,uid,corrected)['vision_enabled']
         assert automatic(db,uid,{**config,'multimodal_enabled':True},embedding=True)['multimodal_enabled']
-    remember(app.state.database,uid,config,[{'id':'custom-vision','vision':False,'audio':False,'input_modalities':['text'],'source':'api','category':'text','chat_compatible':True}])
+    remember(app.state.database,uid,config,[{'id':'custom-vision','vision':False,'audio':False,'input_modalities':['text'],'source':'api','category':'text','chat_compatible':True}],on_change=app.state.service.models.on_change)
     with app.state.database.connect() as db:
         locked=automatic(db,uid,config)
         assert not locked['vision_enabled'] and locked['capability_status']=='confirmed'
-    remember(app.state.database,uid,config,[{'id':'custom-vision','vision':True,'audio':False,'input_modalities':['text','image'],'source':'api','category':'multimodal','chat_compatible':True}])
+    remember(app.state.database,uid,config,[{'id':'custom-vision','vision':True,'audio':False,'input_modalities':['text','image'],'source':'api','category':'multimodal','chat_compatible':True}],on_change=app.state.service.models.on_change)
     with app.state.database.connect() as db:assert automatic(db,uid,{**config,'vision_enabled':False})['vision_enabled']
     response=user.put('/api/me/model-settings',json={'model_config_input':{'provider':'custom','base_url':'https://gateway.example/v1','model':'manual-only','api_key':'local','vision_enabled':True}})
     assert response.status_code==200,response.text

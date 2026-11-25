@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from fastapi import HTTPException
 from wit import WitAgent
 from wit.agents import BaseAgentEntryComponent, InvocationEvent, InvocationRequest, InvocationResult
-from avatar.core.schemas import ChatRequest
+from avatar.conversation.schemas import ChatRequest
 from avatar.runtime.wit_components import AVATAR_CHAT, ApplicationServices, AvatarBusinessComponent, InfrastructureComponent, ProvisioningComponent
 
 

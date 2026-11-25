@@ -2,7 +2,7 @@
 import json
 from fastapi import HTTPException
 from pydantic import BaseModel,ConfigDict,Field,StrictBool
-from avatar.profiles.profile_dates import ModifiedAt
+from avatar.core.revisions import ModifiedAt
 from avatar.core.db import event
 
 

@@ -13,13 +13,7 @@ from avatar.core.execution import AgentNeedsInput
 from avatar.protocols.transport.endpoints import entity_oidc_identity
 
 
-class PeerEndpointUnavailable(HTTPException):
-    """仅发送前检查可抛出；尚未调用对端，允许等待入口恢复。"""
-    def __init__(self,detail):super().__init__(503,detail)
-
-
-def current_protocol(own_aic,target_aic,*,ready=False):
-    return 'acps' if ready or all(not aic.startswith('DEMO-') for aic in (own_aic,target_aic)) else 'internal'
+from avatar.conversation.collaboration.transport import PeerEndpointUnavailable, current_protocol
 
 
 # endpoint 只来自已启动、核验 ACS 的运行时，不接受模型或用户指定地址。

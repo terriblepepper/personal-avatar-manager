@@ -8,9 +8,9 @@ from fastapi import HTTPException
 from langgraph.graph import StateGraph, START, END
 from langsmith import tracing_context
 from avatar.core.db import dump, now
-from avatar.core.execution import AgentSteps
+from avatar.models.agent_trace import AgentSteps
 from avatar.core.execution import AgentNeedsInput, check_execution, run_blocking, sandbox_checkpoint
-from avatar.conversation.loop.effects import SandboxEffects, file_versions, https_versions
+from avatar.skills.effects import SandboxEffects, file_versions, https_versions
 from avatar.models.limits import check_context
 from avatar.models.context_budget import json_text_view, fit_turn, fit_working_set
 from avatar.core.tokens import estimate

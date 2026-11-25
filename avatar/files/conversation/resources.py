@@ -8,7 +8,7 @@ import uuid
 from fastapi import HTTPException
 from avatar.core.db import now
 from avatar.files.library.attachments import TYPES, chat_file_limit
-from avatar.files.artifact_limits import MAX_SOURCE_BYTES
+from avatar.core.artifact_limits import MAX_SOURCE_BYTES
 from avatar.files.uploads.buffer import upload_buffer, upload_work
 from avatar.files.word_pdfs import WORD_SUFFIXES, link_word_pdf, prepare_word_pdf
 

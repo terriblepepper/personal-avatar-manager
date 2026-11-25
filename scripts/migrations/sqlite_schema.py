@@ -1,0 +1,678 @@
+"""SQLite snapshot schema for the offline migration tests."""
+SOURCE_SCHEMA = {'agent_wire_receipts': 'CREATE TABLE agent_wire_receipts (\n      local_aic TEXT NOT NULL, peer_aic TEXT NOT NULL, command_id TEXT NOT NULL,\n      fingerprint TEXT NOT NULL, document TEXT, PRIMARY KEY(local_aic,peer_aic,command_id))',
+ 'agent_request_receipts': 'CREATE TABLE agent_request_receipts (\n      user_id TEXT NOT NULL REFERENCES users(id), scope TEXT NOT NULL, request_id TEXT NOT NULL,\n      fingerprint TEXT NOT NULL, task_id TEXT NOT NULL REFERENCES agent_dialogues(id) ON DELETE CASCADE,\n      PRIMARY KEY(user_id,scope,request_id))',
+ 'account_reviews': 'CREATE TABLE account_reviews (\n'
+                    '              id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT REFERENCES users(id), '
+                    'reviewer TEXT REFERENCES users(id),\n'
+                    '              approved INTEGER NOT NULL, reason TEXT NOT NULL, created_at TEXT NOT '
+                    'NULL)',
+ 'active_soul_owner_insert': 'CREATE TRIGGER active_soul_owner_insert BEFORE INSERT ON active_souls\n'
+                             '          WHEN NOT EXISTS(SELECT 1 FROM soul_builds b WHERE b.id=NEW.build_id '
+                             'AND b.user_id=NEW.user_id)\n'
+                             "          BEGIN SELECT RAISE(ABORT,'soul owner mismatch'); END",
+ 'active_soul_owner_update': 'CREATE TRIGGER active_soul_owner_update BEFORE UPDATE ON active_souls\n'
+                             '          WHEN NOT EXISTS(SELECT 1 FROM soul_builds b WHERE b.id=NEW.build_id '
+                             'AND b.user_id=NEW.user_id)\n'
+                             "          BEGIN SELECT RAISE(ABORT,'soul owner mismatch'); END",
+ 'active_souls': 'CREATE TABLE active_souls (\n'
+                 '      user_id TEXT PRIMARY KEY REFERENCES users(id),build_id TEXT NOT NULL REFERENCES '
+                 'soul_builds(id))',
+ 'agent_activity_cursors': 'CREATE TABLE agent_activity_cursors (\n'
+                           '      user_id TEXT PRIMARY KEY REFERENCES users(id), last_event INTEGER NOT NULL '
+                           'DEFAULT 0,\n'
+                           '      admin INTEGER NOT NULL DEFAULT 0)',
+ 'agent_dialogue_controls': 'CREATE TABLE agent_dialogue_controls (\n'
+                            '      dialogue_id TEXT NOT NULL REFERENCES agent_dialogues(id) ON DELETE '
+                            'CASCADE,\n'
+                            '      user_id TEXT NOT NULL REFERENCES users(id), request_id TEXT NOT NULL,\n'
+                            '      PRIMARY KEY(dialogue_id,user_id,request_id))',
+ 'agent_dialogue_messages': 'CREATE TABLE agent_dialogue_messages (\n'
+                            '      id INTEGER PRIMARY KEY AUTOINCREMENT, dialogue_id TEXT NOT NULL '
+                            'REFERENCES agent_dialogues(id) ON DELETE CASCADE,\n'
+                            '      turn INTEGER NOT NULL, speaker_aic TEXT NOT NULL, speaker_name TEXT NOT '
+                            'NULL, content TEXT NOT NULL,\n'
+                            '      usage TEXT NOT NULL, created_at TEXT NOT NULL, speaker_role TEXT NOT NULL '
+                            "DEFAULT 'agent', transport_mode TEXT NOT NULL DEFAULT '', task_action TEXT NOT "
+                            "NULL DEFAULT '', speaker_user_id TEXT REFERENCES users(id), state TEXT NOT NULL "
+                            "DEFAULT '', state_detail TEXT NOT NULL DEFAULT '', tool_activity TEXT NOT NULL "
+                            "DEFAULT '[]', UNIQUE(dialogue_id,turn))",
+ 'agent_dialogue_preferences': 'CREATE TABLE agent_dialogue_preferences (\n'
+                               '      user_id TEXT PRIMARY KEY REFERENCES users(id), max_rounds INTEGER NOT '
+                               'NULL DEFAULT 10 CHECK(max_rounds BETWEEN 1 AND 1000))',
+ 'agent_dialogues': 'CREATE TABLE agent_dialogues (\n'
+                    '      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), own_aic TEXT NOT '
+                    'NULL,\n'
+                    '      target_user_id TEXT NOT NULL REFERENCES users(id), target_aic TEXT NOT NULL, '
+                    'objective TEXT NOT NULL,\n'
+                    "      status TEXT NOT NULL DEFAULT 'queued', active_speaker TEXT NOT NULL DEFAULT '',\n"
+                    "      error TEXT NOT NULL DEFAULT '', initiator_confirmed INTEGER NOT NULL DEFAULT 0,\n"
+                    '      target_confirmed INTEGER NOT NULL DEFAULT 0, request_id TEXT NOT NULL,\n'
+                    '      created_at TEXT NOT NULL, updated_at TEXT NOT NULL, revision INTEGER NOT NULL '
+                    "DEFAULT 0, summary TEXT NOT NULL DEFAULT '', summary_through INTEGER NOT NULL DEFAULT "
+                    '0, next_speaker INTEGER NOT NULL DEFAULT 0, initiator_deleted INTEGER NOT NULL DEFAULT '
+                    '0, target_deleted INTEGER NOT NULL DEFAULT 0, initiator_done INTEGER NOT NULL DEFAULT '
+                    '0, target_done INTEGER NOT NULL DEFAULT 0, ended_at TEXT, expires_at TEXT, end_reason '
+                    "TEXT NOT NULL DEFAULT '', initiator_skills TEXT NOT NULL DEFAULT '', target_skills TEXT "
+                    "NOT NULL DEFAULT '', source_conversation_id TEXT REFERENCES chat_conversations(id) ON "
+                    'DELETE SET NULL, retry_until REAL NOT NULL DEFAULT 0, session_id TEXT REFERENCES '
+                    'agent_peer_sessions(id), round_limit INTEGER NOT NULL DEFAULT 10, rounds_done INTEGER '
+                    "NOT NULL DEFAULT 0, task_kind TEXT NOT NULL DEFAULT 'chat', shared_content TEXT NOT "
+                    "NULL DEFAULT '', initiator_excluded_skills TEXT NOT NULL DEFAULT '[]', "
+                    "target_excluded_skills TEXT NOT NULL DEFAULT '[]', delivery_mode TEXT NOT NULL DEFAULT "
+                    "'negotiation', transport_mode TEXT NOT NULL DEFAULT '', waiting_reason TEXT NOT NULL "
+                    "DEFAULT '', tool_activity TEXT NOT NULL DEFAULT '[]', accepted INTEGER NOT NULL DEFAULT "
+                    '0, confirmation_required INTEGER NOT NULL DEFAULT 0, confirmation_acknowledged INTEGER '
+                    'NOT NULL DEFAULT 0, UNIQUE(user_id,request_id))',
+ 'agent_dialogues_expiry': 'CREATE INDEX agent_dialogues_expiry ON agent_dialogues(expires_at)',
+ 'agent_dialogues_incoming': 'CREATE INDEX agent_dialogues_incoming ON '
+                             'agent_dialogues(target_user_id,created_at)',
+ 'agent_dialogues_participants': 'CREATE INDEX agent_dialogues_participants ON '
+                                 'agent_dialogues(user_id,target_user_id,created_at)',
+ 'agent_dialogues_queue': 'CREATE INDEX agent_dialogues_queue ON agent_dialogues(status,created_at,id)',
+ 'agent_dialogues_session': 'CREATE INDEX agent_dialogues_session ON '
+                            'agent_dialogues(session_id,created_at,id)',
+ 'agent_intents': 'CREATE TABLE agent_intents (\n'
+                  '      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), conversation_id '
+                  'TEXT NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE,\n'
+                  '      document TEXT NOT NULL, created_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT '
+                  "'pending', task_id TEXT, message_id INTEGER REFERENCES chat_messages(id) ON DELETE SET "
+                  'NULL)',
+ 'agent_notifications': 'CREATE TABLE agent_notifications (\n'
+                        '      id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL REFERENCES '
+                        'users(id), kind TEXT NOT NULL,\n'
+                        '      session_id TEXT, task_id TEXT, title TEXT NOT NULL, content TEXT NOT NULL, '
+                        'created_at TEXT NOT NULL,\n'
+                        '      read_at TEXT, deleted_at TEXT, dedupe_key TEXT NOT NULL, category TEXT NOT '
+                        "NULL DEFAULT 'chat', target_page TEXT NOT NULL DEFAULT '', admin_only INTEGER NOT "
+                        'NULL DEFAULT 0, UNIQUE(user_id,dedupe_key))',
+ 'agent_notifications_inbox': 'CREATE INDEX agent_notifications_inbox ON '
+                              'agent_notifications(user_id,deleted_at,read_at,id)',
+ 'agent_peer_sessions': 'CREATE TABLE agent_peer_sessions (\n'
+                        '      id TEXT PRIMARY KEY, left_user_id TEXT NOT NULL REFERENCES users(id),\n'
+                        '      right_user_id TEXT NOT NULL REFERENCES users(id), creator_id TEXT NOT NULL '
+                        'REFERENCES users(id),\n'
+                        '      accepted INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at '
+                        'TEXT NOT NULL,\n'
+                        '      UNIQUE(left_user_id,right_user_id), CHECK(left_user_id<right_user_id))',
+ 'agent_pending_inputs': 'CREATE TABLE agent_pending_inputs (\n'
+                         '      id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL REFERENCES '
+                         'agent_dialogues(id) ON DELETE CASCADE,\n'
+                         '      user_id TEXT NOT NULL REFERENCES users(id), request_id TEXT NOT NULL, '
+                         'message TEXT NOT NULL,\n'
+                         "      applied INTEGER NOT NULL DEFAULT 0, skill_commands TEXT NOT NULL DEFAULT '', "
+                         "removed_skills TEXT NOT NULL DEFAULT '[]', UNIQUE(task_id,user_id,request_id))",
+ 'agent_protocol_controls': 'CREATE TABLE agent_protocol_controls (\n'
+                            '      task_id TEXT PRIMARY KEY REFERENCES agent_dialogues(id) ON DELETE '
+                            'CASCADE, action TEXT NOT NULL,\n'
+                            "      status TEXT NOT NULL DEFAULT 'queued', next_attempt REAL NOT NULL DEFAULT "
+                            "0, error TEXT NOT NULL DEFAULT '')",
+ 'agent_session_member_immutable': 'CREATE TRIGGER agent_session_member_immutable BEFORE UPDATE OF '
+                                   'session_id,user_id ON agent_session_members\n'
+                                   "      BEGIN SELECT RAISE(ABORT,'session member immutable'); END",
+ 'agent_session_member_insert': 'CREATE TRIGGER agent_session_member_insert BEFORE INSERT ON '
+                                'agent_session_members\n'
+                                '      WHEN NOT EXISTS(SELECT 1 FROM agent_peer_sessions WHERE '
+                                'id=NEW.session_id AND NEW.user_id IN (left_user_id,right_user_id))\n'
+                                "      BEGIN SELECT RAISE(ABORT,'session member mismatch'); END",
+ 'agent_session_members': 'CREATE TABLE agent_session_members (\n'
+                          '      session_id TEXT NOT NULL REFERENCES agent_peer_sessions(id) ON DELETE '
+                          'CASCADE,\n'
+                          '      user_id TEXT NOT NULL REFERENCES users(id), hidden INTEGER NOT NULL DEFAULT '
+                          '0,\n'
+                          '      cleared_through INTEGER NOT NULL DEFAULT 0, summary TEXT NOT NULL DEFAULT '
+                          "'',\n"
+                          '      summary_through INTEGER NOT NULL DEFAULT 0, source_conversation_id TEXT '
+                          'REFERENCES chat_conversations(id) ON DELETE SET NULL, cleared_at TEXT NOT NULL '
+                          "DEFAULT '', resource_conversation_id TEXT REFERENCES chat_conversations(id) ON "
+                          'DELETE SET NULL,\n'
+                          '      PRIMARY KEY(session_id,user_id))',
+ 'agent_skill_collections': 'CREATE TABLE agent_skill_collections (\n'
+                            '      user_id TEXT PRIMARY KEY REFERENCES users(id), updated_at TEXT NOT NULL)',
+ 'agent_skills': 'CREATE TABLE agent_skills (\n'
+                 '      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), name TEXT NOT '
+                 'NULL,\n'
+                 '      description TEXT NOT NULL, instructions TEXT NOT NULL, manifest TEXT NOT NULL,\n'
+                 '      enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)), created_at TEXT NOT '
+                 'NULL,\n'
+                 '      updated_at TEXT NOT NULL, UNIQUE(user_id,name))',
+ 'agent_task_files': 'CREATE TABLE agent_task_files (\n'
+                     '      task_id TEXT NOT NULL REFERENCES agent_dialogues(id) ON DELETE CASCADE,\n'
+                     '      file_id TEXT NOT NULL REFERENCES chat_files(id) ON DELETE CASCADE,\n'
+                     '      source_user_id TEXT NOT NULL REFERENCES users(id), message_id INTEGER REFERENCES '
+                     'agent_dialogue_messages(id) ON DELETE SET NULL,\n'
+                     '      PRIMARY KEY(task_id,file_id))',
+ 'agent_task_member_scope': 'CREATE TRIGGER agent_task_member_scope BEFORE INSERT ON agent_task_members\n'
+                            '      WHEN NOT EXISTS(SELECT 1 FROM agent_dialogues WHERE id=NEW.task_id AND '
+                            'NEW.user_id IN (user_id,target_user_id))\n'
+                            "      BEGIN SELECT RAISE(ABORT,'task member mismatch'); END",
+ 'agent_task_members': 'CREATE TABLE agent_task_members (\n'
+                       '      task_id TEXT NOT NULL REFERENCES agent_dialogues(id) ON DELETE CASCADE,\n'
+                       '      user_id TEXT NOT NULL REFERENCES users(id), hidden INTEGER NOT NULL DEFAULT '
+                       '0,\n'
+                       "      summary TEXT NOT NULL DEFAULT '', summary_through INTEGER NOT NULL DEFAULT 0, "
+                       'resource_conversation_id TEXT REFERENCES chat_conversations(id) ON DELETE SET NULL,\n'
+                       '      PRIMARY KEY(task_id,user_id))',
+ 'agent_task_memories': 'CREATE TABLE agent_task_memories (\n'
+                        '      user_id TEXT NOT NULL REFERENCES users(id), session_id TEXT NOT NULL '
+                        'REFERENCES agent_peer_sessions(id) ON DELETE CASCADE,\n'
+                        '      task_id TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL, '
+                        'source_message_id INTEGER REFERENCES chat_messages(id) ON DELETE SET NULL, PRIMARY '
+                        'KEY(user_id,task_id))',
+ 'agent_wire_results': 'CREATE TABLE agent_wire_results (\n'
+                       '      command_id TEXT NOT NULL, local_aic TEXT NOT NULL, peer_aic TEXT NOT NULL,\n'
+                       '      session_id TEXT NOT NULL, task_id TEXT NOT NULL, state TEXT NOT NULL, document '
+                       'TEXT NOT NULL,\n'
+                       '      PRIMARY KEY(local_aic,peer_aic,command_id))',
+ 'attachment_collections': 'CREATE TABLE attachment_collections (\n'
+                           '              user_id TEXT PRIMARY KEY REFERENCES users(id),updated_at TEXT NOT '
+                           'NULL)',
+ 'attachment_owner_immutable': 'CREATE TRIGGER attachment_owner_immutable\n'
+                               '                  BEFORE UPDATE OF user_id ON attachments WHEN NEW.user_id '
+                               'IS NOT OLD.user_id\n'
+                               "                  BEGIN SELECT RAISE(ABORT, 'owner is immutable'); END",
+ 'attachments': 'CREATE TABLE attachments (\n'
+                '              id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), filename '
+                'TEXT NOT NULL,\n'
+                '              content_type TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL,\n'
+                "              extracted_text TEXT NOT NULL DEFAULT '', extraction_status TEXT NOT NULL, "
+                "created_at TEXT NOT NULL, caption TEXT NOT NULL DEFAULT '', saved_at TEXT, visibility TEXT "
+                "NOT NULL DEFAULT 'private', updated_at TEXT NOT NULL DEFAULT '', relative_path TEXT NOT "
+                "NULL DEFAULT '', visibility_override INTEGER NOT NULL DEFAULT 0, extraction_version INTEGER "
+                'NOT NULL DEFAULT 0)',
+ 'attachments_owner': 'CREATE INDEX attachments_owner ON attachments(user_id)',
+ 'attachments_parse_cache_delete': 'CREATE TRIGGER attachments_parse_cache_delete AFTER DELETE ON '
+                                   'attachments BEGIN\n'
+                                   '          DELETE FROM model_artifact_cache WHERE user_id=OLD.user_id AND '
+                                   "kind='parse' AND source_hash=OLD.sha256\n"
+                                   '          AND NOT EXISTS(SELECT 1 FROM attachments WHERE '
+                                   'user_id=OLD.user_id AND sha256=OLD.sha256)\n'
+                                   '          AND NOT EXISTS(SELECT 1 FROM chat_files WHERE '
+                                   'user_id=OLD.user_id AND sha256=OLD.sha256); END',
+ 'audit_actor_time': 'CREATE INDEX audit_actor_time ON audit_events(actor_id,id)',
+ 'audit_events': 'CREATE TABLE audit_events (\n'
+                 '              id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT REFERENCES users(id),\n'
+                 '              actor TEXT NOT NULL, action TEXT NOT NULL, detail TEXT NOT NULL, created_at '
+                 'TEXT NOT NULL, actor_id TEXT REFERENCES users(id) ON DELETE SET NULL)',
+ 'avatar_aip_task_commands': 'CREATE TABLE avatar_aip_task_commands (\n'
+                             '      local_aic TEXT NOT NULL, peer_aic TEXT NOT NULL, group_id TEXT NOT '
+                             'NULL,\n'
+                             '      session_id TEXT NOT NULL, task_id TEXT NOT NULL, command_id TEXT NOT '
+                             'NULL,\n'
+                             '      PRIMARY KEY(local_aic,peer_aic,group_id,session_id,command_id),\n'
+                             '      FOREIGN KEY(local_aic,peer_aic,group_id,session_id,task_id)\n'
+                             '        REFERENCES '
+                             'avatar_aip_tasks(local_aic,peer_aic,group_id,session_id,task_id) ON DELETE '
+                             'CASCADE)',
+ 'avatar_aip_tasks': 'CREATE TABLE avatar_aip_tasks (\n'
+                     '      local_aic TEXT NOT NULL, peer_aic TEXT NOT NULL, group_id TEXT NOT NULL,\n'
+                     '      session_id TEXT NOT NULL, task_id TEXT NOT NULL, command_id TEXT NOT NULL,\n'
+                     '      document TEXT NOT NULL, deadline REAL,\n'
+                     '      PRIMARY KEY(local_aic,peer_aic,group_id,session_id,task_id),\n'
+                     '      UNIQUE(local_aic,peer_aic,group_id,session_id,command_id))',
+ 'avatar_entity_ports': 'CREATE TABLE avatar_entity_ports (\n'
+                        '      user_id TEXT PRIMARY KEY REFERENCES users(id), port INTEGER NOT NULL UNIQUE,\n'
+                        '      CHECK(port BETWEEN 1024 AND 65535))',
+ 'avatar_identity_changes': 'CREATE TABLE avatar_identity_changes (\n'
+                            '      old_aic TEXT PRIMARY KEY, new_aic TEXT NOT NULL UNIQUE,\n'
+                            '      user_id TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL)',
+ 'avatar_identity_job_busy': 'CREATE UNIQUE INDEX avatar_identity_job_busy ON avatar_identity_jobs(user_id)\n'
+                             "      WHERE status IN ('queued','running','waiting')",
+ 'avatar_identity_jobs': 'CREATE TABLE avatar_identity_jobs (\n'
+                         '      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id),\n'
+                         '      actor TEXT NOT NULL, action TEXT NOT NULL, expected_aic TEXT NOT NULL,\n'
+                         "      status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', attempts INTEGER NOT "
+                         'NULL DEFAULT 0,\n'
+                         '      next_attempt_at REAL NOT NULL DEFAULT 0, created_at TEXT NOT NULL, '
+                         "updated_at TEXT NOT NULL, remote_aic TEXT NOT NULL DEFAULT '')",
+ 'avatar_owner_immutable': 'CREATE TRIGGER avatar_owner_immutable\n'
+                           '                  BEFORE UPDATE OF user_id ON avatar_records WHEN NEW.user_id IS '
+                           'NOT OLD.user_id\n'
+                           "                  BEGIN SELECT RAISE(ABORT, 'owner is immutable'); END",
+ 'avatar_records': 'CREATE TABLE avatar_records (\n'
+                   '              user_id TEXT PRIMARY KEY REFERENCES users(id), aic TEXT UNIQUE NOT NULL,\n'
+                   '              certificate TEXT NOT NULL, profile TEXT NOT NULL, last_modified_at TEXT '
+                   'NOT NULL,\n'
+                   '              created_at TEXT NOT NULL, updated_at TEXT NOT NULL, acs_input TEXT NOT '
+                   "NULL DEFAULT '{}', acs_document TEXT NOT NULL DEFAULT '{}', identity_status TEXT NOT "
+                   "NULL DEFAULT 'active')",
+ 'chat_conversations': 'CREATE TABLE chat_conversations (\n'
+                       '              id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id),\n'
+                       '              channel TEXT NOT NULL, target_aic TEXT NOT NULL, caller_id TEXT NOT '
+                       'NULL,\n'
+                       '              platform TEXT NOT NULL, title TEXT NOT NULL, created_at TEXT NOT '
+                       'NULL,\n'
+                       "              updated_at TEXT NOT NULL, summary TEXT NOT NULL DEFAULT '',\n"
+                       "              summary_profile_modified_at TEXT NOT NULL DEFAULT '', summary_through "
+                       'INTEGER NOT NULL DEFAULT 0,\n'
+                       '              compression_count INTEGER NOT NULL DEFAULT 0, lease_until REAL NOT '
+                       'NULL DEFAULT 0, parent_id TEXT, selected_aic TEXT, title_source TEXT NOT NULL '
+                       "DEFAULT 'pending', tools_config TEXT NOT NULL DEFAULT '{}', tools_updated_at TEXT "
+                       "NOT NULL DEFAULT '', skills_updated_at TEXT NOT NULL DEFAULT '')",
+ 'chat_conversations_parent': 'CREATE INDEX chat_conversations_parent ON chat_conversations(parent_id)',
+ 'chat_file_content': 'CREATE INDEX chat_file_content ON chat_files(conversation_id,sha256,md5)',
+ 'chat_file_owner_insert': 'CREATE TRIGGER chat_file_owner_insert BEFORE INSERT ON chat_files\n'
+                           '      WHEN NOT EXISTS (SELECT 1 FROM chat_conversations c WHERE '
+                           'c.id=NEW.conversation_id AND c.user_id=NEW.user_id AND c.parent_id IS NULL AND '
+                           "c.platform='web')\n"
+                           "      BEGIN SELECT RAISE(ABORT,'chat file owner mismatch'); END",
+ 'chat_file_owner_update': 'CREATE TRIGGER chat_file_owner_update BEFORE UPDATE OF user_id,conversation_id '
+                           'ON chat_files\n'
+                           "      BEGIN SELECT RAISE(ABORT,'chat file owner is immutable'); END",
+ 'chat_file_promoted_owner': 'CREATE TRIGGER chat_file_promoted_owner BEFORE UPDATE OF promoted_id ON '
+                             'chat_files\n'
+                             '      WHEN NEW.promoted_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM '
+                             'attachments a WHERE a.id=NEW.promoted_id AND a.user_id=NEW.user_id)\n'
+                             "      BEGIN SELECT RAISE(ABORT,'chat file promoted owner mismatch'); END",
+ 'chat_file_usage_owner': 'CREATE TRIGGER chat_file_usage_owner BEFORE INSERT ON chat_file_usages\n'
+                          '      WHEN NOT EXISTS (SELECT 1 FROM chat_files f JOIN chat_messages m ON '
+                          'm.id=NEW.message_id\n'
+                          '        JOIN chat_conversations c ON c.id=m.conversation_id WHERE '
+                          'f.id=NEW.file_id AND f.user_id=m.user_id\n'
+                          '        AND (f.conversation_id=c.id OR f.conversation_id=c.parent_id) AND '
+                          "m.role='user')\n"
+                          "      BEGIN SELECT RAISE(ABORT,'chat file usage mismatch'); END",
+ 'chat_file_usages': 'CREATE TABLE chat_file_usages (\n'
+                     '      message_id INTEGER NOT NULL REFERENCES chat_messages(id) ON DELETE CASCADE,\n'
+                     '      file_id TEXT NOT NULL REFERENCES chat_files(id) ON DELETE CASCADE,\n'
+                     '      PRIMARY KEY(message_id,file_id))',
+ 'chat_file_usages_file': 'CREATE INDEX chat_file_usages_file ON chat_file_usages(file_id,message_id)',
+ 'chat_files': 'CREATE TABLE chat_files (\n'
+               '      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id),\n'
+               '      conversation_id TEXT NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE,\n'
+               '      filename TEXT NOT NULL, content_type TEXT NOT NULL, size INTEGER NOT NULL,\n'
+               "      extracted_text TEXT NOT NULL DEFAULT '', extraction_status TEXT NOT NULL,\n"
+               '      created_at TEXT NOT NULL,\n'
+               '      promoted_id TEXT REFERENCES attachments(id) ON DELETE SET NULL, origin TEXT NOT NULL '
+               "DEFAULT 'upload', generated_message_id INTEGER REFERENCES chat_messages(id) ON DELETE SET "
+               'NULL, referenced INTEGER NOT NULL DEFAULT 1 CHECK(referenced IN (0,1)), source_label TEXT '
+               "NOT NULL DEFAULT '', description TEXT NOT NULL DEFAULT '', parse_checked INTEGER NOT NULL "
+               "DEFAULT 0, extraction_version INTEGER NOT NULL DEFAULT 0, sha256 TEXT NOT NULL DEFAULT '', "
+               "md5 TEXT NOT NULL DEFAULT '', expires_at TEXT)",
+ 'chat_files_conversation': 'CREATE INDEX chat_files_conversation ON chat_files(conversation_id,created_at)',
+ 'chat_files_expiry': 'CREATE INDEX chat_files_expiry ON chat_files(expires_at)',
+ 'chat_files_output_message': 'CREATE INDEX chat_files_output_message ON chat_files(generated_message_id)',
+ 'chat_files_parse_cache_delete': 'CREATE TRIGGER chat_files_parse_cache_delete AFTER DELETE ON chat_files '
+                                  'BEGIN\n'
+                                  '          DELETE FROM model_artifact_cache WHERE user_id=OLD.user_id AND '
+                                  "kind='parse' AND source_hash=OLD.sha256\n"
+                                  '          AND NOT EXISTS(SELECT 1 FROM attachments WHERE '
+                                  'user_id=OLD.user_id AND sha256=OLD.sha256)\n'
+                                  '          AND NOT EXISTS(SELECT 1 FROM chat_files WHERE '
+                                  'user_id=OLD.user_id AND sha256=OLD.sha256); END',
+ 'chat_files_user': 'CREATE INDEX chat_files_user ON chat_files(user_id)',
+ 'chat_generation_active': 'CREATE UNIQUE INDEX chat_generation_active\n'
+                           '      ON chat_generation_jobs(conversation_id) WHERE state IN '
+                           "('queued','running')",
+ 'chat_generation_forget': 'CREATE TRIGGER chat_generation_forget BEFORE DELETE ON chat_conversations\n'
+                           '    BEGIN\n'
+                           "      UPDATE chat_generation_jobs SET payload='{}',authorization='{}',\n"
+                           '        '
+                           'state=\'cancelled\',snapshot=\'{"done":false,"error":"会话已删除","state":"cancelled"}\'\n'
+                           '        WHERE conversation_id=OLD.id;\n'
+                           '    END',
+ 'chat_generation_jobs': 'CREATE TABLE chat_generation_jobs (\n'
+                         '      task_id TEXT PRIMARY KEY,\n'
+                         '      user_id TEXT NOT NULL REFERENCES users(id),\n'
+                         '      request_id TEXT NOT NULL,\n'
+                         '      conversation_id TEXT REFERENCES chat_conversations(id) ON DELETE SET NULL,\n'
+                         '      fingerprint TEXT NOT NULL,\n'
+                         '      payload TEXT NOT NULL,\n'
+                         "      authorization TEXT NOT NULL DEFAULT '{}',\n"
+                         '      state TEXT NOT NULL CHECK(state IN '
+                         "('queued','running','succeeded','failed','cancelled','indeterminate')),\n"
+                         '      snapshot TEXT NOT NULL,\n'
+                         '      created_at REAL NOT NULL, updated_at REAL NOT NULL,\n'
+                         '      UNIQUE(user_id,request_id))',
+ 'chat_generation_queue': 'CREATE INDEX chat_generation_queue ON chat_generation_jobs(state,created_at)',
+ 'chat_messages': 'CREATE TABLE chat_messages (\n'
+                  '              id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT REFERENCES users(id),\n'
+                  '              channel TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, '
+                  "created_at TEXT NOT NULL, profile_modified_at TEXT NOT NULL DEFAULT '', conversation_id "
+                  'TEXT REFERENCES chat_conversations(id), responder_aic TEXT, responder_name TEXT, '
+                  "tool_events TEXT NOT NULL DEFAULT '[]', used_skills TEXT NOT NULL DEFAULT '[]', "
+                  "task_event TEXT NOT NULL DEFAULT '{}')",
+ 'chat_messages_conversation': 'CREATE INDEX chat_messages_conversation ON '
+                               'chat_messages(conversation_id,profile_modified_at,id)',
+ 'chat_output_owner': 'CREATE TRIGGER chat_output_owner BEFORE UPDATE OF generated_message_id ON chat_files\n'
+                      '      WHEN NEW.generated_message_id IS NOT NULL AND NOT EXISTS (\n'
+                      '        SELECT 1 FROM chat_messages m JOIN chat_conversations c ON '
+                      'c.id=m.conversation_id\n'
+                      '        WHERE m.id=NEW.generated_message_id AND m.user_id=NEW.user_id AND '
+                      "m.role='assistant'\n"
+                      '          AND (c.id=NEW.conversation_id OR c.parent_id=NEW.conversation_id))\n'
+                      "      BEGIN SELECT RAISE(ABORT,'generated file owner mismatch'); END",
+ 'chat_pending': 'CREATE TABLE chat_pending (\n'
+                 '              conversation_id TEXT PRIMARY KEY REFERENCES chat_conversations(id) ON DELETE '
+                 'CASCADE,\n'
+                 '              user_id TEXT NOT NULL REFERENCES users(id), snapshot TEXT NOT NULL, '
+                 'updated_at REAL NOT NULL)',
+ 'chat_session_skills': 'CREATE TABLE chat_session_skills (\n'
+                        '      conversation_id TEXT NOT NULL REFERENCES chat_conversations(id) ON DELETE '
+                        'CASCADE,\n'
+                        '      skill_id TEXT NOT NULL REFERENCES agent_skills(id) ON DELETE CASCADE,\n'
+                        '      enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),last_used_at TEXT '
+                        "NOT NULL DEFAULT '', authorized INTEGER NOT NULL DEFAULT 0,\n"
+                        '      PRIMARY KEY(conversation_id,skill_id))',
+ 'conversation_diagrams': 'CREATE TABLE conversation_diagrams (\n'
+                          '      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id),\n'
+                          '      conversation_id TEXT NOT NULL REFERENCES chat_conversations(id) ON DELETE '
+                          'CASCADE,\n'
+                          '      cache_key TEXT NOT NULL, source TEXT NOT NULL, svg TEXT NOT NULL, png BLOB '
+                          'NOT NULL,\n'
+                          '      blocked INTEGER NOT NULL DEFAULT 0, height INTEGER NOT NULL,\n'
+                          '      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,\n'
+                          '      promoted_id TEXT REFERENCES attachments(id) ON DELETE SET NULL, expires_at '
+                          'TEXT,\n'
+                          '      UNIQUE(user_id,conversation_id,cache_key))',
+ 'data_migrations': 'CREATE TABLE data_migrations(name TEXT PRIMARY KEY,applied_at TEXT NOT NULL)',
+ 'diagram_conversation': 'CREATE INDEX diagram_conversation ON conversation_diagrams(conversation_id)',
+ 'diagram_owner_insert': 'CREATE TRIGGER diagram_owner_insert BEFORE INSERT ON conversation_diagrams\n'
+                         '      WHEN NOT EXISTS (SELECT 1 FROM chat_conversations WHERE '
+                         "id=NEW.conversation_id AND user_id=NEW.user_id AND platform='web' AND parent_id IS "
+                         'NULL)\n'
+                         "      BEGIN SELECT RAISE(ABORT,'diagram owner mismatch'); END",
+ 'diagram_owner_update': 'CREATE TRIGGER diagram_owner_update BEFORE UPDATE ON conversation_diagrams\n'
+                         '      WHEN NEW.user_id!=OLD.user_id OR NEW.conversation_id!=OLD.conversation_id\n'
+                         '        OR (NEW.promoted_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM attachments '
+                         'WHERE id=NEW.promoted_id AND user_id=NEW.user_id))\n'
+                         "      BEGIN SELECT RAISE(ABORT,'diagram owner mismatch'); END",
+ 'dialogue_participants_immutable': 'CREATE TRIGGER dialogue_participants_immutable BEFORE UPDATE OF '
+                                    'user_id,own_aic,target_user_id,target_aic ON agent_dialogues\n'
+                                    '      WHEN NEW.user_id IS NOT OLD.user_id OR NEW.target_user_id IS NOT '
+                                    'OLD.target_user_id\n'
+                                    '        OR (NEW.own_aic IS NOT OLD.own_aic AND NOT EXISTS(SELECT 1 FROM '
+                                    'avatar_records WHERE user_id=NEW.user_id AND aic=NEW.own_aic))\n'
+                                    '        OR (NEW.target_aic IS NOT OLD.target_aic AND NOT EXISTS(SELECT '
+                                    '1 FROM avatar_records WHERE user_id=NEW.target_user_id AND '
+                                    'aic=NEW.target_aic))\n'
+                                    "      BEGIN SELECT RAISE(ABORT,'participants are immutable'); END",
+ 'embedding_settings': 'CREATE TABLE embedding_settings (\n'
+                       '      user_id TEXT PRIMARY KEY REFERENCES users(id),config TEXT NOT NULL,updated_at '
+                       'TEXT NOT NULL)',
+ 'file_rag_documents': 'CREATE TABLE file_rag_documents(\n'
+                       "      source TEXT NOT NULL CHECK(source IN ('profile','chat')),file_id TEXT NOT "
+                       'NULL,\n'
+                       '      user_id TEXT NOT NULL REFERENCES users(id),status TEXT NOT NULL DEFAULT '
+                       "'queued',\n"
+                       "      revision TEXT NOT NULL DEFAULT '',signature TEXT NOT NULL DEFAULT '',coverage "
+                       "TEXT NOT NULL DEFAULT '',\n"
+                       "      error TEXT NOT NULL DEFAULT '',updated_at TEXT NOT NULL DEFAULT '', "
+                       'lease_until REAL NOT NULL DEFAULT 0, next_attempt_at REAL NOT NULL DEFAULT 0, '
+                       "generation INTEGER NOT NULL DEFAULT 0, cache_epoch TEXT NOT NULL DEFAULT '', "
+                       "force_rebuild INTEGER NOT NULL DEFAULT 0, collection TEXT NOT NULL DEFAULT '', "
+                       "active_publication TEXT NOT NULL DEFAULT '', legacy_backfill INTEGER NOT NULL "
+                       'DEFAULT 0,PRIMARY KEY(source,file_id))',
+ 'file_rag_epochs': 'CREATE TABLE file_rag_epochs(user_id TEXT PRIMARY KEY REFERENCES users(id),epoch TEXT '
+                    'NOT NULL)',
+ 'file_rag_gc': 'CREATE TABLE file_rag_gc(\n'
+                '      user_id TEXT NOT NULL REFERENCES users(id),source TEXT NOT NULL,file_id TEXT NOT '
+                'NULL,\n'
+                '      collection TEXT NOT NULL,record_id TEXT NOT NULL,delete_after REAL NOT NULL,\n'
+                '      PRIMARY KEY(user_id,collection,record_id))',
+ 'file_rag_nodes': 'CREATE TABLE file_rag_nodes(\n'
+                   '      source TEXT NOT NULL,file_id TEXT NOT NULL,user_id TEXT NOT NULL REFERENCES '
+                   'users(id),\n'
+                   '      ordinal INTEGER NOT NULL,collection TEXT NOT NULL,record_id TEXT NOT NULL,\n'
+                   '      PRIMARY KEY(source,file_id,ordinal),\n'
+                   '      FOREIGN KEY(source,file_id) REFERENCES file_rag_documents(source,file_id) ON '
+                   'DELETE CASCADE)',
+ 'identity_migration_previews': 'CREATE TABLE identity_migration_previews (\n'
+                                '              token_hash TEXT PRIMARY KEY, actor_id TEXT NOT NULL '
+                                'REFERENCES users(id),\n'
+                                '              user_id TEXT NOT NULL REFERENCES users(id),subject TEXT NOT '
+                                'NULL,\n'
+                                '              allow_empty_transfer INTEGER NOT NULL,issuer TEXT NOT NULL,\n'
+                                '              fingerprint TEXT NOT NULL,expires REAL NOT NULL)',
+ 'knowledge_asset_updates': 'CREATE TABLE knowledge_asset_updates(user_id TEXT PRIMARY KEY REFERENCES '
+                            "users(id),revision TEXT NOT NULL,error TEXT NOT NULL DEFAULT '',updated_at TEXT "
+                            'NOT NULL)',
+ 'knowledge_assets': 'CREATE TABLE knowledge_assets (\n'
+                     '      id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),filename TEXT NOT '
+                     'NULL,\n'
+                     '      mime TEXT NOT NULL,size INTEGER NOT NULL,sha256 TEXT NOT NULL,kind TEXT NOT '
+                     'NULL,\n'
+                     "      caption TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL, source_attachment_id "
+                     "TEXT NOT NULL DEFAULT '', relative_path TEXT NOT NULL DEFAULT "
+                     "'',UNIQUE(user_id,sha256))",
+ 'knowledge_assets_owner_immutable': 'CREATE TRIGGER knowledge_assets_owner_immutable BEFORE UPDATE OF '
+                                     'user_id ON knowledge_assets\n'
+                                     '                       WHEN NEW.user_id IS NOT OLD.user_id BEGIN '
+                                     "SELECT RAISE(ABORT,'owner is immutable'); END",
+ 'knowledge_collections': 'CREATE TABLE knowledge_collections(user_id TEXT PRIMARY KEY REFERENCES '
+                          'users(id),updated_at TEXT NOT NULL)',
+ 'knowledge_folders': 'CREATE TABLE knowledge_folders(user_id TEXT NOT NULL REFERENCES users(id),path TEXT '
+                      "NOT NULL,caption TEXT NOT NULL DEFAULT '',PRIMARY KEY(user_id,path))",
+ 'login_devices': 'CREATE TABLE login_devices (\n'
+                  '              user_id TEXT NOT NULL REFERENCES users(id),device_hash TEXT NOT NULL,\n'
+                  '              os TEXT NOT NULL,browser TEXT NOT NULL,webview TEXT NOT NULL,ip TEXT NOT '
+                  'NULL,\n'
+                  '              first_seen TEXT NOT NULL,last_seen TEXT NOT NULL,PRIMARY '
+                  'KEY(user_id,device_hash))',
+ 'login_limits': 'CREATE TABLE login_limits (\n'
+                 '              key TEXT PRIMARY KEY, attempts INTEGER NOT NULL, reset_at REAL NOT NULL)',
+ 'material_folders': 'CREATE TABLE material_folders (\n'
+                     '              user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,path TEXT '
+                     "NOT NULL, caption TEXT NOT NULL DEFAULT '', visibility TEXT,\n"
+                     '              PRIMARY KEY(user_id,path))',
+ 'model_artifact_cache': 'CREATE TABLE model_artifact_cache(\n'
+                         '      user_id TEXT NOT NULL REFERENCES users(id),kind TEXT NOT NULL,signature TEXT '
+                         'NOT NULL,digest TEXT NOT NULL,\n'
+                         "      source_hash TEXT NOT NULL DEFAULT '',value BLOB NOT NULL,updated_at TEXT NOT "
+                         'NULL,\n'
+                         '      PRIMARY KEY(user_id,kind,signature,digest))',
+ 'model_calls': 'CREATE TABLE model_calls (\n'
+                '              id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT REFERENCES users(id),\n'
+                '              provider TEXT NOT NULL, model TEXT NOT NULL, usage TEXT NOT NULL,\n'
+                "              created_at TEXT NOT NULL, purpose TEXT NOT NULL DEFAULT 'answer', caller_id "
+                'TEXT, conversation_id TEXT)',
+ 'model_settings': 'CREATE TABLE model_settings (\n'
+                   '              user_id TEXT PRIMARY KEY REFERENCES users(id),model_config TEXT NOT NULL '
+                   "DEFAULT '{}',updated_at TEXT NOT NULL)",
+ 'oidc_identities': 'CREATE TABLE oidc_identities (\n'
+                    '              issuer TEXT NOT NULL, subject TEXT NOT NULL,\n'
+                    '              user_id TEXT NOT NULL UNIQUE REFERENCES users(id),\n'
+                    "              phone TEXT UNIQUE, verified_at TEXT, username TEXT NOT NULL DEFAULT '',\n"
+                    '              PRIMARY KEY(issuer,subject))',
+ 'oidc_identity_links': 'CREATE TABLE oidc_identity_links (\n'
+                        '              issuer TEXT NOT NULL, subject TEXT NOT NULL,\n'
+                        '              user_id TEXT NOT NULL REFERENCES users(id), username TEXT NOT NULL '
+                        "DEFAULT '',\n"
+                        '              town_principal_id TEXT, evidence TEXT NOT NULL, verified_at TEXT,\n'
+                        '              PRIMARY KEY(issuer,subject), UNIQUE(user_id,issuer))',
+ 'oidc_login_states': 'CREATE TABLE oidc_login_states (\n'
+                      '              state_hash TEXT PRIMARY KEY, browser_hash TEXT NOT NULL,\n'
+                      '              verifier TEXT NOT NULL, nonce TEXT NOT NULL,\n'
+                      '              person_type TEXT NOT NULL, return_to TEXT NOT NULL,\n'
+                      '              platform_token TEXT, expires REAL NOT NULL)',
+ 'peer_diagram_expiry': 'CREATE TRIGGER peer_diagram_expiry AFTER INSERT ON conversation_diagrams\n'
+                        '      WHEN EXISTS(SELECT 1 FROM chat_conversations WHERE id=NEW.conversation_id AND '
+                        "channel='peer')\n"
+                        "      BEGIN UPDATE conversation_diagrams SET expires_at=datetime('now','+7 days') "
+                        'WHERE id=NEW.id; END',
+ 'peer_file_expiry': 'CREATE TRIGGER peer_file_expiry AFTER INSERT ON chat_files\n'
+                     '      WHEN EXISTS(SELECT 1 FROM chat_conversations WHERE id=NEW.conversation_id AND '
+                     "channel='peer')\n"
+                     "      BEGIN UPDATE chat_files SET expires_at=datetime('now','+7 days') WHERE "
+                     'id=NEW.id; END',
+ 'peer_file_scope': 'CREATE TRIGGER peer_file_scope BEFORE INSERT ON agent_task_files\n'
+                    '      WHEN NOT EXISTS(SELECT 1 FROM agent_dialogues d JOIN agent_session_members m ON '
+                    'm.session_id=d.session_id\n'
+                    '        JOIN agent_task_members t ON t.task_id=d.id AND t.user_id=m.user_id\n'
+                    "        JOIN chat_files f ON f.conversation_id=CASE WHEN d.delivery_mode='message' THEN "
+                    'm.resource_conversation_id ELSE t.resource_conversation_id END AND f.user_id=m.user_id\n'
+                    '        WHERE d.id=NEW.task_id AND f.id=NEW.file_id\n'
+                    '        AND NEW.source_user_id IN (d.user_id,d.target_user_id))\n'
+                    "      BEGIN SELECT RAISE(ABORT,'peer file scope mismatch'); END",
+ 'platform_bindings': 'CREATE TABLE platform_bindings (\n'
+                      '              platform TEXT NOT NULL, account_id TEXT NOT NULL,\n'
+                      '              user_id TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL,\n'
+                      '              PRIMARY KEY(platform,account_id), UNIQUE(platform,user_id))',
+ 'platform_entry_tokens': 'CREATE TABLE platform_entry_tokens (\n'
+                          '              token_hash TEXT PRIMARY KEY, platform TEXT NOT NULL, account_id '
+                          'TEXT NOT NULL,\n'
+                          '              issued_for_user_id TEXT REFERENCES users(id), expires REAL NOT '
+                          'NULL, used_at TEXT)',
+ 'profile_records': 'CREATE TABLE profile_records (\n'
+                    '              user_id TEXT PRIMARY KEY REFERENCES users(id), draft TEXT NOT NULL '
+                    "DEFAULT '{}',\n"
+                    "              last_modified_at TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT "
+                    "'draft',\n"
+                    "              reason TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, acs_input TEXT "
+                    "NOT NULL DEFAULT '{}', acs_document TEXT NOT NULL DEFAULT '{}')",
+ 'profile_submissions': 'CREATE TABLE profile_submissions (\n'
+                        '              id TEXT PRIMARY KEY, user_id TEXT REFERENCES users(id), '
+                        'last_modified_at TEXT NOT NULL,\n'
+                        '              snapshot TEXT NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL '
+                        "DEFAULT '',\n"
+                        '              reviewer TEXT REFERENCES users(id), submitted_at TEXT NOT NULL, '
+                        "reviewed_at TEXT, acs_input TEXT NOT NULL DEFAULT '{}', acs_document TEXT NOT NULL "
+                        "DEFAULT '{}')",
+ 'protocol_message_versions': 'CREATE TABLE protocol_message_versions(kind TEXT PRIMARY KEY,version INTEGER '
+                              'NOT NULL)',
+ 'provision_jobs': 'CREATE TABLE provision_jobs (\n'
+                   '              id TEXT PRIMARY KEY, submission_id TEXT UNIQUE REFERENCES '
+                   'profile_submissions(id),\n'
+                   '              status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,\n'
+                   "              error TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, next_attempt_at "
+                   "REAL NOT NULL DEFAULT 0, registration_phase TEXT NOT NULL DEFAULT 'queued')",
+ 'rag_chat_delete': 'CREATE TRIGGER rag_chat_delete AFTER DELETE ON chat_files BEGIN\n'
+                    "          DELETE FROM file_rag_documents WHERE source='chat' AND file_id=OLD.id; END",
+ 'rag_chat_insert': 'CREATE TRIGGER rag_chat_insert AFTER INSERT ON chat_files BEGIN\n'
+                    '          INSERT INTO file_rag_documents(source,file_id,user_id,cache_epoch) '
+                    "VALUES('chat',NEW.id,NEW.user_id,coalesce((SELECT epoch FROM file_rag_epochs WHERE "
+                    "user_id=NEW.user_id),'')); END",
+ 'rag_chat_update': 'CREATE TRIGGER rag_chat_update AFTER UPDATE OF description,sha256,referenced ON '
+                    'chat_files WHEN NEW.description!=OLD.description OR NEW.sha256!=OLD.sha256 OR '
+                    'NEW.referenced!=OLD.referenced BEGIN\n'
+                    '          UPDATE file_rag_documents SET '
+                    "status='queued',error='',generation=generation+1 WHERE source='chat' AND "
+                    'file_id=NEW.id; END',
+ 'rag_document_delete': 'CREATE TRIGGER rag_document_delete BEFORE DELETE ON file_rag_documents BEGIN\n'
+                        '      INSERT OR REPLACE INTO '
+                        'file_rag_gc(user_id,source,file_id,collection,record_id,delete_after)\n'
+                        '        SELECT user_id,source,file_id,collection,record_id,0 FROM file_rag_nodes '
+                        'WHERE source=OLD.source AND file_id=OLD.file_id;\n'
+                        '      UPDATE file_rag_gc SET delete_after=0 WHERE user_id=OLD.user_id AND '
+                        'source=OLD.source AND file_id=OLD.file_id;\n'
+                        '    END',
+ 'rag_gc_due': 'CREATE INDEX rag_gc_due ON file_rag_gc(delete_after)',
+ 'rag_nodes_record': 'CREATE INDEX rag_nodes_record ON file_rag_nodes(user_id,collection,record_id)',
+ 'rag_owner_state': 'CREATE INDEX rag_owner_state ON file_rag_documents(user_id,status)',
+ 'rag_profile_delete': 'CREATE TRIGGER rag_profile_delete AFTER DELETE ON attachments BEGIN\n'
+                       "          DELETE FROM file_rag_documents WHERE source='profile' AND file_id=OLD.id; "
+                       'END',
+ 'rag_profile_insert': 'CREATE TRIGGER rag_profile_insert AFTER INSERT ON attachments BEGIN\n'
+                       '          INSERT INTO file_rag_documents(source,file_id,user_id,cache_epoch) '
+                       "VALUES('profile',NEW.id,NEW.user_id,coalesce((SELECT epoch FROM file_rag_epochs "
+                       "WHERE user_id=NEW.user_id),'')); END",
+ 'rag_profile_update': 'CREATE TRIGGER rag_profile_update AFTER UPDATE OF '
+                       'caption,sha256,filename,relative_path ON attachments WHEN NEW.caption!=OLD.caption '
+                       'OR NEW.sha256!=OLD.sha256 OR NEW.filename!=OLD.filename OR '
+                       'NEW.relative_path!=OLD.relative_path BEGIN\n'
+                       '          UPDATE file_rag_documents SET '
+                       "status='queued',error='',generation=generation+1 WHERE source='profile' AND "
+                       'file_id=NEW.id; END',
+ 'rag_publication_owner': 'CREATE INDEX rag_publication_owner ON rag_publications(user_id,collection)',
+ 'rag_publications': 'CREATE TABLE rag_publications(\n'
+                     '      id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),source TEXT NOT '
+                     'NULL,file_id TEXT NOT NULL,\n'
+                     '      revision TEXT NOT NULL,signature TEXT NOT NULL,collection TEXT NOT NULL,coverage '
+                     'TEXT NOT NULL,\n'
+                     '      record_ids TEXT NOT NULL,manifest TEXT NOT NULL,lexical_ready INTEGER NOT NULL '
+                     'DEFAULT 0,\n'
+                     '      legacy INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,\n'
+                     '      FOREIGN KEY(source,file_id) REFERENCES file_rag_documents(source,file_id) ON '
+                     'DELETE CASCADE)',
+ 'rag_schedule_users': 'CREATE TABLE rag_schedule_users(user_id TEXT PRIMARY KEY REFERENCES users(id) ON '
+                       'DELETE CASCADE,last_served REAL NOT NULL DEFAULT 0)',
+ 'record_dismissals': 'CREATE TABLE record_dismissals (\n'
+                      '      user_id TEXT NOT NULL REFERENCES users(id), collection TEXT NOT NULL,\n'
+                      '      record_id TEXT NOT NULL, created_at TEXT NOT NULL,\n'
+                      '      PRIMARY KEY(user_id,collection,record_id))',
+ 'recovery_limits': 'CREATE TABLE recovery_limits (key TEXT PRIMARY KEY, attempts INTEGER NOT NULL, reset_at '
+                    'REAL NOT NULL)',
+ 'session_skill_immutable': 'CREATE TRIGGER session_skill_immutable BEFORE UPDATE OF '
+                            'conversation_id,skill_id ON chat_session_skills\n'
+                            '      WHEN NEW.conversation_id IS NOT OLD.conversation_id OR NEW.skill_id IS '
+                            'NOT OLD.skill_id\n'
+                            "      BEGIN SELECT RAISE(ABORT,'session skill association is immutable'); END",
+ 'session_skill_owner': 'CREATE TRIGGER session_skill_owner BEFORE INSERT ON chat_session_skills\n'
+                        '      WHEN NOT EXISTS(SELECT 1 FROM chat_conversations c JOIN agent_skills s ON '
+                        's.user_id=c.user_id\n'
+                        '                      WHERE c.id=NEW.conversation_id AND s.id=NEW.skill_id AND '
+                        "c.platform='web' AND c.parent_id IS NULL)\n"
+                        "      BEGIN SELECT RAISE(ABORT,'session skill owner mismatch'); END",
+ 'sessions': 'CREATE TABLE sessions (\n'
+             '              token TEXT PRIMARY KEY, user_id TEXT REFERENCES users(id),\n'
+             '              csrf TEXT NOT NULL, expires REAL NOT NULL, auth_method TEXT NOT NULL DEFAULT '
+             "'local', access_scope TEXT NOT NULL DEFAULT 'full')",
+ 'settings': 'CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)',
+ 'single_root_account': 'CREATE UNIQUE INDEX single_root_account ON users(is_root) WHERE is_root=1',
+ 'skill_owner_immutable': 'CREATE TRIGGER skill_owner_immutable BEFORE UPDATE OF user_id ON agent_skills\n'
+                          "      WHEN NEW.user_id IS NOT OLD.user_id BEGIN SELECT RAISE(ABORT,'owner is "
+                          "immutable'); END",
+ 'soul_builds': 'CREATE TABLE soul_builds (\n'
+                '      id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),prompt TEXT NOT NULL,\n'
+                '      asset_ids TEXT NOT NULL,profile_snapshot TEXT NOT NULL,profile_revision TEXT NOT '
+                'NULL,\n'
+                '      status TEXT NOT NULL,progress INTEGER NOT NULL DEFAULT 0,stage TEXT NOT NULL,\n'
+                "      notes TEXT NOT NULL DEFAULT '[]',document TEXT NOT NULL DEFAULT '{}',error TEXT NOT "
+                "NULL DEFAULT '',\n"
+                "      reviewer TEXT REFERENCES users(id),reason TEXT NOT NULL DEFAULT '',created_at TEXT "
+                'NOT NULL,\n'
+                '      updated_at TEXT NOT NULL,reviewed_at TEXT, interview_rounds INTEGER NOT NULL DEFAULT '
+                "0, interview TEXT NOT NULL DEFAULT '[]', observations TEXT NOT NULL DEFAULT '[]', phase "
+                "TEXT NOT NULL DEFAULT 'analysis', asset_captions TEXT NOT NULL DEFAULT '{}', question_plan "
+                "TEXT NOT NULL DEFAULT '[]', interview_observations TEXT NOT NULL DEFAULT '[]', "
+                "analyzed_answers INTEGER NOT NULL DEFAULT 0, bank_answers TEXT NOT NULL DEFAULT '{}', "
+                "followup_rounds INTEGER NOT NULL DEFAULT 0, parent_build TEXT NOT NULL DEFAULT '', origin "
+                "TEXT NOT NULL DEFAULT 'build', memory_context TEXT NOT NULL DEFAULT '{}', "
+                "memory_fingerprint TEXT NOT NULL DEFAULT '', memory_tree TEXT NOT NULL DEFAULT '{}', "
+                "chat_samples TEXT NOT NULL DEFAULT '[]', rebuild INTEGER NOT NULL DEFAULT 0)",
+ 'soul_builds_owner': 'CREATE INDEX soul_builds_owner ON soul_builds(user_id,created_at)',
+ 'soul_builds_owner_immutable': 'CREATE TRIGGER soul_builds_owner_immutable BEFORE UPDATE OF user_id ON '
+                                'soul_builds\n'
+                                '                       WHEN NEW.user_id IS NOT OLD.user_id BEGIN SELECT '
+                                "RAISE(ABORT,'owner is immutable'); END",
+ 'soul_builds_queue': 'CREATE INDEX soul_builds_queue ON soul_builds(status,created_at)',
+ 'soul_question_categories': 'CREATE TABLE soul_question_categories (\n'
+                             '      id TEXT PRIMARY KEY,name TEXT NOT NULL UNIQUE,active INTEGER NOT NULL '
+                             'DEFAULT 0,\n'
+                             '      created_at TEXT NOT NULL,updated_at TEXT NOT NULL)',
+ 'soul_questions': 'CREATE TABLE soul_questions (\n'
+                   '      id TEXT PRIMARY KEY,category_id TEXT NOT NULL REFERENCES '
+                   'soul_question_categories(id),\n'
+                   '      prompt TEXT NOT NULL,fingerprint TEXT NOT NULL UNIQUE,source TEXT NOT NULL,\n'
+                   '      active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL,updated_at TEXT NOT '
+                   'NULL)',
+ 'soul_questions_category': 'CREATE INDEX soul_questions_category ON soul_questions(category_id,active)',
+ 'style_learning_daily': 'CREATE UNIQUE INDEX style_learning_daily ON style_learning_runs(user_id,day) WHERE '
+                         "mode='auto'",
+ 'style_learning_memory': 'CREATE TABLE style_learning_memory (\n'
+                          '      user_id TEXT PRIMARY KEY REFERENCES users(id),document TEXT NOT '
+                          'NULL,updated_at TEXT NOT NULL)',
+ 'style_learning_runs': 'CREATE TABLE style_learning_runs (\n'
+                        '      build_id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),mode '
+                        'TEXT NOT NULL,\n'
+                        '      day TEXT NOT NULL,sources TEXT NOT NULL,samples TEXT NOT NULL,created_at TEXT '
+                        'NOT NULL)',
+ 'style_learning_settings': 'CREATE TABLE style_learning_settings (\n'
+                            '      conversation_id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES '
+                            'users(id),\n'
+                            '      enabled INTEGER NOT NULL DEFAULT 0,last_message_id INTEGER NOT NULL '
+                            'DEFAULT 0,updated_at TEXT NOT NULL)',
+ 'submission_owner_time': 'CREATE INDEX submission_owner_time ON profile_submissions(user_id,submitted_at)',
+ 'town_visitor_quota': 'CREATE INDEX town_visitor_quota ON '
+                       'town_visitor_requests(owner_id,created_at,visitor_id)',
+ 'town_visitor_requests': 'CREATE TABLE town_visitor_requests (\n'
+                          '              owner_id TEXT NOT NULL REFERENCES users(id), visitor_id TEXT NOT '
+                          'NULL,\n'
+                          '              created_at TEXT NOT NULL)',
+ 'unique_account_email': 'CREATE UNIQUE INDEX unique_account_email ON users(email) WHERE email IS NOT NULL',
+ 'unique_account_phone': 'CREATE UNIQUE INDEX unique_account_phone ON users(phone) WHERE phone IS NOT NULL',
+ 'users': 'CREATE TABLE users (\n'
+          '              id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL,\n'
+          '              password TEXT NOT NULL, role TEXT NOT NULL, created_at TEXT NOT NULL, is_root '
+          "INTEGER NOT NULL DEFAULT 0, person_type TEXT NOT NULL DEFAULT 'student', student_id TEXT, "
+          "teacher_id TEXT, account_status TEXT NOT NULL DEFAULT 'active', account_reason TEXT NOT NULL "
+          "DEFAULT '', email TEXT, phone TEXT)"}

@@ -3,7 +3,12 @@
 
 import os
 import sqlite3
+import sys
 from pathlib import Path
+
+
+if __package__ in ('', None):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 def create_snapshot(source, destination):
@@ -106,7 +111,7 @@ def _schema_metadata(db):
 
 
 def validate_schema(db):
-    from avatar.core.postgres_schema_manifest import EXPECTED
+    from scripts.migrations.sqlite_manifest import EXPECTED
     tables, others = _schema_metadata(db)
     expected_tables, expected_others = EXPECTED
     present = set(tables)
@@ -139,7 +144,7 @@ def migrate(source, backup, target_url, *, dry_run=False):
     import sqlite3
     import psycopg
     from psycopg import sql
-    from avatar.core.migrations.chat_generations import restore_legacy_generations
+    from scripts.migrations.chat_generations import restore_legacy_generations
     from avatar.core.migrations.soul import restore_asset_sources
     from avatar.core.postgres import Connection, SCHEMA_LOCK, lock_schema_transaction
     from avatar.core.postgres_helpers import STATEMENTS as HELPER_STATEMENTS

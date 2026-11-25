@@ -13,10 +13,10 @@ from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 from avatar.accounts.roles import ADMIN_ROLES
 from avatar.core.db import now, dump, event
-from avatar.files.artifact_limits import MAX_SOURCE_BYTES
+from avatar.core.artifact_limits import MAX_SOURCE_BYTES
 from avatar.files.parsing.media_types import MEDIA,validate_media
-from avatar.profiles.profile_dates import next_modified_at
-from avatar.profiles.profile_dates import ModifiedAt
+from avatar.core.revisions import next_modified_at
+from avatar.core.revisions import ModifiedAt
 
 # Model and sandbox outputs retain a separate per-file processing bound.
 MAX_FILE = 10 * 1024 * 1024

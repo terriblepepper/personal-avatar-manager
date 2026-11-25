@@ -3,7 +3,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from avatar.files.artifact_limits import MAX_SOURCE_BYTES
+from avatar.core.artifact_limits import MAX_SOURCE_BYTES
 
 
 class SourceEdit(BaseModel):

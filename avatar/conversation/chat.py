@@ -6,10 +6,10 @@ import logging
 from fastapi import HTTPException
 from avatar.conversation.tools.registry import ConversationTools
 from avatar.models.effort import with_chat_effort
-from avatar.core.schemas import ChatRequest
+from avatar.conversation.schemas import ChatRequest
 from avatar.core.db import now, dump
 from avatar.models.model_config import require_complete
-from avatar.profiles.profile_fields import public_profile
+from avatar.contracts.profile_fields import public_profile
 from avatar.skills.service import UserSkills
 from avatar.skills.policy import SKILLS_PAUSED, PAUSE_NOTICE
 from avatar.conversation.memory import ConversationMemory

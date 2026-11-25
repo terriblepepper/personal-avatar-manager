@@ -21,9 +21,6 @@ from avatar.api.oidc_routes import router as oidc_router
 from avatar.api.system_routes import router as system_router
 from avatar.runtime.system_aip import SystemAipRuntime
 from avatar.runtime.system_registration import SystemRegistrationRuntime
-from avatar.runtime.avatar_ontology_registration import (
-    AvatarOntologyRegistrationRuntime,
-)
 from avatar.profiles.entity_lifecycle import EntityLifecycleService
 from avatar.runtime.personal_aip import PersonalAipRuntime
 from avatar.api.entity_routes import router as entity_router
@@ -55,7 +52,6 @@ def create_app(settings=None, provider=None, run_worker=True, model_client=None)
     resources.profiles.knowledge = knowledge
     system_aip = SystemAipRuntime(settings, resources.database)
     system_registration = SystemRegistrationRuntime(settings, system_aip)
-    avatar_registration = AvatarOntologyRegistrationRuntime(settings)
     from avatar.runtime.platform_certificate import PlatformCertificate
     platform_certificate = PlatformCertificate(resources.database, settings)
     entity_lifecycle = EntityLifecycleService(resources.database, settings)
@@ -95,7 +91,6 @@ def create_app(settings=None, provider=None, run_worker=True, model_client=None)
                 await system_registration.start()
             else:
                 await system_aip.start()
-            await avatar_registration.start()
             if rag_resources.policy.enforce_systemd:
                 from avatar.core.resource_limits import ServiceLimits
                 try:rag_resources.enforcement=await asyncio.to_thread(ServiceLimits().apply,rag_resources.policy,rag_resources.sampler())
@@ -118,6 +113,7 @@ def create_app(settings=None, provider=None, run_worker=True, model_client=None)
                             resources.database,
                             resources.chat.model_client,
                             resources.profiles.vault,
+                            on_change=resources.profiles.models.on_change,
                         ),
                         name="avatar-model-capabilities",
                     )
@@ -152,7 +148,6 @@ def create_app(settings=None, provider=None, run_worker=True, model_client=None)
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-            await avatar_registration.stop()
             await system_registration.stop()
             await system_aip.stop()
             await runtime.stop()
@@ -200,7 +195,6 @@ def create_app(settings=None, provider=None, run_worker=True, model_client=None)
     app.state.system_aip = system_aip
     app.state.platform_certificate = platform_certificate
     app.state.system_registration = system_registration
-    app.state.avatar_registration = avatar_registration
     app.state.entity_lifecycle, app.state.personal_aip = entity_lifecycle, personal_aip
     app.state.knowledge = knowledge
     app.state.dialogues = dialogues
@@ -276,7 +270,7 @@ def create_app(settings=None, provider=None, run_worker=True, model_client=None)
             if re.fullmatch(r"/api/conversations/[^/]+/diagrams/promote", request.url.path):
                 limit = 7 * 1024 * 1024
             if re.fullmatch(r"/api/(?:chat/(?:stream|generations)|agent-dialogues(?:/[^/]+/(?:resume|confirm|accept))?|"
-                            r"agent-sessions/[^/]+/(?:messages|accept|task-draft)|agent-intents/[^/]+/confirm|"
+                            r"agent-sessions/[^/]+/(?:messages|task-draft)|agent-intents/[^/]+/confirm|"
                             r"town/avatars/[^/]+/tasks)", request.url.path):
                 # A JSON escape can take six wire bytes for one byte of decoded text.
                 limit = 7 * TEXT_BYTES

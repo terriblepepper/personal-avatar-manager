@@ -2,12 +2,14 @@ import asyncio
 from fastapi import APIRouter,Depends,Request
 from avatar.api.knowledge_routes import owner
 from avatar.models.embedding import EmbeddingInput,EmbeddingSettings
+from avatar.rag.invalidation import index_status
 
 router=APIRouter(prefix='/api/me/embedding-settings',tags=['嵌入模型'])
 
 @router.get('')
 def get(request:Request,user=Depends(owner)):
-    return EmbeddingSettings(request.app.state.service.models).get(user['id'])
+    service = EmbeddingSettings(request.app.state.service.models)
+    return index_status(service.database, user['id'], service.get(user['id']))
 
 @router.put('')
 async def save(body:EmbeddingInput,request:Request,user=Depends(owner)):
@@ -25,8 +27,8 @@ async def save(body:EmbeddingInput,request:Request,user=Depends(owner)):
     await verify_api(request.app.state.chat.model_client,config,service.vault,embedding=True)
     saved=await asyncio.to_thread(service.save,user,body,validated=config)
     from avatar.models.capabilities import detect
-    asyncio.create_task(detect(service.database,user['id'],config,request.app.state.chat.model_client,service.vault),name='avatar-embedding-capability-detect')
-    return saved
+    asyncio.create_task(detect(service.database,user['id'],config,request.app.state.chat.model_client,service.vault,on_change=service.models.on_change),name='avatar-embedding-capability-detect')
+    return await asyncio.to_thread(index_status, service.database, user['id'], saved)
 
 @router.post('/options')
 async def options(body:EmbeddingInput,request:Request,user=Depends(owner)):
@@ -37,6 +39,6 @@ async def options(body:EmbeddingInput,request:Request,user=Depends(owner)):
     config=await asyncio.to_thread(prepare)
     result=await discover(request.app.state.chat.model_client,config,service.vault.decrypt(config['encrypted_key']))
     from avatar.models.capabilities import remember
-    await asyncio.to_thread(remember,service.database,user['id'],config,result['models'])
+    await asyncio.to_thread(remember,service.database,user['id'],config,result['models'],on_change=service.models.on_change)
     result['models']=[item for item in result['models'] if item['category'] in ('embedding','unknown')]
     return result

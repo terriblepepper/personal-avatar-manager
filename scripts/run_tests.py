@@ -107,7 +107,7 @@ def main():
         finally:
             signal.signal(signal.SIGTERM, old)
         return 0
-    env={**os.environ,'PYTHONDONTWRITEBYTECODE':'1','AVATAR_SYSTEM_ATR_ENABLED':'0','AVATAR_SYSTEM_AIP_ENABLED':'0','AVATAR_PERSONAL_ATR_ENABLED':'0','AVATAR_ENTITY_AIP_ENABLED':'0','WIT_REGISTRY_USERNAME':'','WIT_REGISTRY_PASSWORD':''}
+    env={**os.environ,'PYTHONDONTWRITEBYTECODE':'1','AVATAR_SYSTEM_ATR_ENABLED':'0','AVATAR_SYSTEM_AIP_ENABLED':'0','AVATAR_ENTITY_AIP_ENABLED':'0','WIT_REGISTRY_USERNAME':'','WIT_REGISTRY_PASSWORD':''}
     command=[sys.executable,'-m','pytest']
     if args.jobs>1 and '--collect-only' not in extra:command+=['-n',str(args.jobs),'--dist','worksteal']
     command+=extra or ['-q']

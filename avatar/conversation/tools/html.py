@@ -5,7 +5,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from avatar.files.conversation.resources import validate_output
-from avatar.files.artifact_limits import MAX_SOURCE_BYTES
+from avatar.core.artifact_limits import MAX_SOURCE_BYTES
 from avatar.models.tools import load_model_json
 
 
