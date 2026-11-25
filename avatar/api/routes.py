@@ -608,26 +608,6 @@ def own_attachment(attachment_id: str, request: Request, user=Depends(auth.curre
     return FileResponse(path, media_type=row['content_type'], filename=row['filename'], headers={'Content-Security-Policy': "sandbox; default-src 'none'"})
 
 
-@router.get('/me/attachments/{attachment_id}/preview-text')
-async def own_word_preview(attachment_id: str, request: Request, user=Depends(auth.current_user)):
-    import subprocess
-    from avatar.files.uploads.buffer import upload_work
-    from avatar.rag.indexing.service import native_text
-    files=request.app.state.service.attachments
-    async with files.parsing:
-        path,row=await asyncio.to_thread(files.file_for,user,attachment_id)
-        if not row['filename'].lower().endswith('.docx'):
-            raise HTTPException(415,'此文件不支持 Word 正文预览')
-        try:
-            result=await upload_work(native_text,path,'.docx')
-        except (ValueError,OSError,subprocess.SubprocessError):
-            raise HTTPException(422,'无法解析 Word 正文，请下载原件查看') from None
-        await asyncio.to_thread(files.file_for,user,attachment_id)
-    text=result['text']
-    if len(text)>240000:text=text[:240000]+'\n…正文预览已截断，完整内容请下载原件。'
-    return Response(text or '文档没有可预览的文字。',media_type='text/plain',headers={'Cache-Control':'private, no-store'})
-
-
 # 职责：让管理员读取审核所需附件原件。
 # 输入：attachment_id 为快照引用文件，user 必须通过 admin 依赖。
 # 结果与约束：管理员可核验私密材料，普通账户及临时资料会话不能访问管理路径。

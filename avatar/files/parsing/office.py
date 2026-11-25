@@ -10,6 +10,11 @@ import sys
 def main():
     if sys.platform!='linux':
         raise RuntimeError('Word 转换的网络隔离目前需要 Linux/libseccomp')
+    import resource
+    resource.setrlimit(resource.RLIMIT_AS, (4 * 1024**3, 4 * 1024**3))
+    resource.setrlimit(resource.RLIMIT_CPU, (60, 60))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024**2, 64 * 1024**2))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
     library=ctypes.util.find_library('seccomp')
     if not library:raise RuntimeError('Word 转换需要 libseccomp2 网络隔离支持')
     seccomp=ctypes.CDLL(library)

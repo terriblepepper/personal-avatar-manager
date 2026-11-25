@@ -26,7 +26,6 @@ dependencies = [
     "unstructured>=0.27.36,<0.28",
     "rank-bm25==0.2.2",
     "psutil>=6,<8",
-    "mammoth>=1.13,<2",
     "everos==1.5.1",
     "redis>=5,<8",
     "confluent-kafka>=2.12,<3",

@@ -1,19 +1,5 @@
-"""离线结构化分片；DOCX 先转 HTML，Unstructured 保留标题、表格及父子上下文。"""
+"""离线结构化分片，按页和标题保留父子上下文。"""
 import re
-
-
-def html_elements(html):
-    from bs4 import BeautifulSoup
-    from unstructured.documents.elements import Title,NarrativeText,Table,ElementMetadata
-    soup=BeautifulSoup(html,'html.parser');elements=[]
-    for node in soup(['script','style','iframe','object']):node.decompose()
-    for node in soup.find_all(['h1','h2','h3','h4','h5','h6','p','li','table']):
-        if node.find_parent(['table','li']):continue
-        text=node.get_text(' ',strip=True)
-        if not text:continue
-        kind=Title if node.name.startswith('h') else Table if node.name=='table' else NarrativeText
-        elements.append(kind(text,metadata=ElementMetadata(text_as_html=str(node) if node.name=='table' else None)))
-    return elements
 
 
 def text_elements(text,page=None):
@@ -60,8 +46,7 @@ def partition(extracted,window):
     from unstructured.chunking.title import chunk_by_title
     from unstructured.chunking.basic import chunk_elements
     from unstructured.documents.elements import Title
-    if extracted.get('html'):elements=html_elements(extracted['html'])
-    elif extracted.get('format')=='.md':elements=markdown_elements(extracted['text'])
+    if extracted.get('format')=='.md':elements=markdown_elements(extracted['text'])
     else:
         parts=re.split(r'\[第 (\d+) 页\]\n',extracted['text'])
         pages=[(int(parts[i]),parts[i+1]) for i in range(1,len(parts)-1,2)] if len(parts)>1 else [(None,extracted['text'])]
