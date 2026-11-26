@@ -5,6 +5,7 @@ import uuid
 from fastapi import HTTPException
 
 from avatar.conversation.jobs.pipeline import validate_authorization
+from avatar.conversation.loop.runtime import prepare_checkpoint, resume_safe
 from avatar.conversation.loop.store import RunStore
 from avatar.knowledge.learning import auto_style_advance
 from avatar.skills.policy import SKILLS_PAUSED, require_skills_enabled
@@ -131,6 +132,9 @@ def attach(chat, user, original, parent, session, overview, context, job, held, 
     model = owner.get('model_config') or context[0]
     binding.update(provider=model.get('provider'),model=model.get('model'))
     sources = overview['_run_sources']
+    automatic = bool(job and json.loads(job['authorization']).get('resume_run'))
+    if previous and not resume_safe(previous, initial=True, automatic=automatic):
+        raise HTTPException(409,'上次操作结果未确认，请核对已有结果后结束任务')
     prior = None
     if held and held.get('sources'):
         if any(held[key]!=binding[key] for key in ('owner','aic','session_id')):
@@ -140,8 +144,6 @@ def attach(chat, user, original, parent, session, overview, context, job, held, 
         old = previous['binding']
         if any(old[key]!=binding[key] for key in ('owner','aic','session_id')):
             raise HTTPException(409,'原任务发言人或会话已改变')
-        if previous.get('phase') in ('effect_unknown','external_handoff') or previous.get('sandbox',{}).get('in_flight'):
-            raise HTTPException(409,'上次操作结果未确认，请核对已有结果后结束任务')
         prior = previous['sources']
     if prior:
         with chat.service.database.connect() as db:
@@ -170,8 +172,8 @@ def attach(chat, user, original, parent, session, overview, context, job, held, 
             check(db)
     store = RunStore(chat.service.database,user['id'],'chat',parent['id'],run_id,uuid.uuid4().hex,validate)
     state = store.acquire(expected=previous)
+    state = prepare_checkpoint(store, state, fields={'binding':binding,'sources':sources}, automatic=automatic)
     config = dict(context[0])
-    store.merge({'binding':binding,'sources':sources})
     config.update(_run_store=store,_run_input_id=(job or {}).get('task_id') or original.request_id or original.agent_pause_id or run_id,
                   _run_supplement=original.message.strip() if original.agent_control=='continue' else '',
                   _resume_sandbox=bool(state.get('sandbox')))

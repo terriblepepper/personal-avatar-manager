@@ -18,6 +18,7 @@ from avatar.models.context_budget import input_budget
 
 
 log = logging.getLogger(__name__)
+_MEDIA_LIMITS = {'images':5, 'audio':1}
 _CONTINUE = '上一步因单次输出上限截断。请紧接已完成正文续写，不重复前文。若有未完成的工具调用，请根据回执继续。'
 
 
@@ -33,8 +34,7 @@ class ReActEngine:
         self.usage = self.state.get('usage')
         self.step = self.state.get('step', 0)
         self.seen = dict(self.state.get('seen_calls', {}))
-        self.media_calls = set(self.state.get('media_calls', ()))
-        for identity in self.media_calls:
+        for identity in self.state.get('media_calls', ()):
             self.seen.pop(identity, None)
         self.prefix = self.state.get('text_prefix', '')
         self.gen_media = {}
@@ -42,7 +42,7 @@ class ReActEngine:
 
     def fields(self, **fields):
         return {'step':self.step, 'trajectory':self.trajectory, 'usage':self.usage,
-                'seen_calls':self.seen, 'media_calls':sorted(self.media_calls), 'text_prefix':self.prefix,
+                'seen_calls':self.seen, 'media_calls':[], 'text_prefix':self.prefix,
                 'history_summary':self.context.summary, 'phase':'running',
                 'receipt_refs':self.context.receipt_refs,
                 'material':self.delivery.prepared if self.delivery else [],
@@ -90,13 +90,30 @@ class ReActEngine:
         if not self.delivery or not self.delivery.prepared:
             self.emit(text)
 
+    def invalidate_seen(self, prefix):
+        self.seen = {key:step for key,step in self.seen.items() if not key.startswith(prefix + ':')}
+
+    def consume_projection(self):
+        if omitted := self.context.omitted_count:
+            del self.trajectory[:omitted]
+            self.invalidate_seen('read_step_receipt')
+
+    def media(self, kind):
+        values = []
+        setting = '_image_inputs' if kind=='images' else '_audio_inputs'
+        for item in (*self.config.get(setting, ()),
+                     *self.gen_media.get(kind, ())):
+            if item not in values:
+                values.append(item)
+        return values
+
     async def complete_batch(self, batch, *, pending=None, capture=False, replay=False):
         frame, receipts = batch['assistant'], dict(batch.get('receipts', {}))
         calls = frame['tool_calls']
         controls = [call for call in calls if (spec := self.registry.tools.get(call['name'])) and spec.control]
         if pending and 'ref' in pending:
             receipts.update(pending.get('receipts', {}))
-        action, duplicates = None, 0
+        action, duplicates, advanced, interrupted = None, 0, False, None
         order = [call for call in calls if call not in controls] + controls
         for call in order:
             identifier = call['id']
@@ -104,12 +121,19 @@ class ReActEngine:
                 continue
             if capture or len(controls)>1:
                 await check_execution_async(self.registry.validate)
-            if len(controls)>1:
+            if interrupted:
+                outcome = ToolOutcome.error('上一项操作的结果尚未确认，本项未执行。')
+            elif len(controls)>1:
                 outcome = ToolOutcome.error('同一批含多个相互冲突的控制动作。请在下一轮只选择一个。')
             elif capture:
                 try:
-                    value = await self.drafts.capture(batch['partials'][identifier]) if call['name'] in self.registry.tools else None
+                    call_scope = current_tool_call.set((self.step, identifier, replay))
+                    try:
+                        value = await self.drafts.capture(batch['partials'][identifier])
+                    finally:
+                        current_tool_call.reset(call_scope)
                     outcome = ToolOutcome(value) if value else ToolOutcome.error('工具参数因输出上限截断，请分步重新提交。')
+                    advanced |= bool(value and value['status'] in ('truncated_draft_saved','draft_appended'))
                 except RunCapacity:
                     raise
                 except (ValueError, HTTPException) as error:
@@ -120,30 +144,40 @@ class ReActEngine:
                 call_scope = current_tool_call.set((self.step, identifier, replay))
                 try:
                     outcome, identity = await self.registry.dispatch(call, self.seen, self.step)
+                except AgentNeedsInput as error:
+                    interrupted = error
+                    outcome, identity = ToolOutcome.error(str(error)), None
                 finally:
                     current_tool_call.reset(call_scope)
                 if identity and identity in self.seen:
                     duplicates += 1
                 elif identity and not outcome.is_error:
                     self.seen[identity] = self.step
+                    if self.registry.tools[call['name']].checkpoint:
+                        self.invalidate_seen('session_directory')
                 if media := self.config.pop('_entry_native_media', None):
                     if identity:
-                        self.media_calls.add(identity)
-                    skipped = False
-                    for kind, limit in (('images', 5), ('audio', 1)):
+                        self.seen.pop(identity, None)
+                    overflow = False
+                    for kind, limit in _MEDIA_LIMITS.items():
+                        incoming = media.get(kind, ())
+                        if not incoming:
+                            continue
+                        current = self.media(kind)
                         values = self.gen_media.setdefault(kind, [])
-                        incoming = media.get(kind, [])
-                        room = max(0, limit-len(values))
-                        values.extend(incoming[:room])
-                        skipped |= len(incoming)>room
-                    if skipped:
+                        for item in incoming:
+                            if item not in current:
+                                if len(current)>=limit:
+                                    overflow = True
+                                else:
+                                    current.append(item)
+                                    values.append(item)
+                    if overflow:
                         outcome = ToolOutcome({'result':outcome.value,
-                                               'notice':'本批媒体超过可附加数量。请将该原件分开调用。'}, True)
-                        if identity:
-                            self.seen.pop(identity, None)
+                                               'notice':'已保留本轮附件和可附加的工具媒体，其余超出单次请求数量。'}, True)
             action = outcome.action or action
             receipts[identifier] = await self.observation(call, outcome)
-            if pending is not None and not outcome.action:
+            if pending is not None and not outcome.action and not interrupted:
                 pending = {**pending, 'receipts':receipts}
                 await self.journal.save(**self.fields(pending_batch=pending))
         rows = [receipts[c['id']] for c in calls]
@@ -153,19 +187,24 @@ class ReActEngine:
                                     json.dumps(observation, ensure_ascii=False)})
         else:
             self.trajectory.extend([frame, *rows])
-        return action, bool(rows) and all(row['is_error'] for row in rows), duplicates
+        if interrupted:
+            self.account(interrupted.usage)
+            interrupted.usage = self.usage
+            await self.journal.save(**self.fields(phase='paused', user_question=interrupted.user_question, pending_batch=None))
+            await self.release_batch(pending)
+            raise interrupted
+        return action, bool(rows) and all(row['is_error'] for row in rows), duplicates, advanced
 
     async def request(self, settings, *, recovering=False):
         prompt = self.prompt
         await check_execution_async(self.registry.validate)
         history = await self.context.project(settings, prompt, self.trajectory, recovering=recovering,
                                              summarize=self.summarize)
-        del self.trajectory[:self.context.omitted_count]
-        settings = {**settings, '_image_inputs':self.config.get('_image_inputs', ()),
-                    '_audio_inputs':self.config.get('_audio_inputs', ())}
+        self.consume_projection()
+        settings = {**settings, '_image_inputs':self.media('images')[:_MEDIA_LIMITS['images']],
+                    '_audio_inputs':self.media('audio')[:_MEDIA_LIMITS['audio']]}
         if self.gen_media:
             history.append({'role':'user','content':'此处为上一批工具读取的授权原件媒体。请结合对应文件回执使用。'})
-            settings.update(_image_inputs=self.gen_media.get('images', ()), _audio_inputs=self.gen_media.get('audio', ()))
         headroom = check_context(settings, prompt, history, None)
         self.config['_session_page_bytes'] = max(4, (headroom*3-512)//2)
         await check_execution_async(self.registry.validate)
@@ -228,14 +267,14 @@ class ReActEngine:
             await run_blocking(self.journal.store.discard, pending['ref'])
 
     async def run(self):
-        errors = repeats = continuations = corrections = 0
-        recovering = False
+        errors = repeats = stalled_continuations = corrections = 0
+        recovering = prefer_visible = False
         settings = {**self.config, '_tools':self.registry.schemas(), '_batch_tools':True,
                     '_optional_tools':True, '_react_tool_calls':True, '_retain_turn_fragments':True,
                     '_call_purpose':'react'}
         if pending := self.state.get('pending_batch'):
             batch = json.loads(await run_blocking(self.journal.store.read, pending['ref'])) if 'ref' in pending else pending
-            action, _, _ = await self.complete_batch(batch, pending=pending, capture=bool(batch.get('partials')), replay=True)
+            action, _, _, _ = await self.complete_batch(batch, pending=pending, capture=bool(batch.get('partials')), replay=True)
             if action:
                 answer = await self.control(action, pending)
                 await self.release_batch(pending)
@@ -249,6 +288,9 @@ class ReActEngine:
             if force_finish and (self.policy.require_terminal_tool or self.gate.html_missing or self.drafts.active):
                 await self.pause('任务尚缺必要回执，进度已保存，可重试当前步骤。', retry=True)
             current = {**settings, '_tools':[]} if force_finish else settings
+            if prefer_visible:
+                current = visible_output_config(current)
+                prefer_visible = False
             try:
                 result = await self.request(current, recovering=recovering)
             except HTTPException as error:
@@ -271,28 +313,32 @@ class ReActEngine:
             self.account(result.usage)
             recovering = False
             if result.stop_reason=='output_limit':
-                continuations += 1
-                self.prefix += result.text
-                self.preview_prefix = bool(self.prefix)
-                if not result.text:
-                    settings = visible_output_config(settings)
+                fragments = (*result.tool_calls, *result.partial_tool_calls)
                 declared = {schema['name'] for schema in current['_tools']}
-                calls = [call for call in (*result.tool_calls, *result.partial_tool_calls) if call['name'] in declared]
-                pending = None
+                calls = [call for call in fragments if call['name'] in declared]
+                pending, advanced = None, False
                 if calls:
                     self.reset()
+                    self.prefix = ''
                     minimal = [{k:call[k] for k in ('id','name')} | {'arguments':{}} for call in calls]
                     batch = {'assistant':{'role':'assistant','content':'','tool_calls':minimal},
                              'partials':{call['id']:call for call in calls}}
                     pending = await self.save_batch(batch)
-                    await self.complete_batch(batch, pending=pending, capture=True)
-                if result.text:
-                    self.trajectory.append({'role':'assistant','content':result.text})
-                self.trajectory.append({'role':'user','content':_CONTINUE})
+                    _, _, _, advanced = await self.complete_batch(batch, pending=pending, capture=True)
+                else:
+                    if result.text:
+                        self.prefix += result.text
+                        self.preview_prefix = True
+                        self.trajectory.append({'role':'assistant','content':result.text})
+                        advanced = True
+                    prefer_visible = not result.text and not fragments
+                    self.trajectory.append({'role':'user','content':_CONTINUE})
+                stalled_continuations = 0 if advanced else stalled_continuations+1
                 await self.clear_batch(pending)
-                if continuations>=self.policy.max_continuations or remaining==0:
-                    await self.pause('本轮输出多次达到模型上限，已保留可接续的内容。', retry=True)
+                if stalled_continuations>=self.policy.max_continuations or remaining==0:
+                    await self.pause('本轮输出截断，已保留可接续的内容。', retry=True)
                 continue
+            stalled_continuations = 0
             if result.tool_calls:
                 self.reset()
                 self.prefix = ''
@@ -304,10 +350,10 @@ class ReActEngine:
                 durable = any((spec := self.registry.tools.get(call['name'])) and spec.checkpoint for call in result.tool_calls)
                 batch = {'assistant':frame}
                 pending = await self.save_batch(batch) if durable else None
-                action, failed, duplicate = await self.complete_batch(batch, pending=pending)
+                action, failed, duplicate, _ = await self.complete_batch(batch, pending=pending)
                 if history_row_tokens(frame) > input_budget(current):
                     await self.context.project(current, self.prompt, self.trajectory)
-                    del self.trajectory[:self.context.omitted_count]
+                    self.consume_projection()
                 if action:
                     answer = await self.control(action, pending)
                     await self.release_batch(pending)

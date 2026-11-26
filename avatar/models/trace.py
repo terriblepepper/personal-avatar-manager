@@ -117,7 +117,7 @@ class ModelExchange:
             inputs['tools'] = names
         if self.scope[1] and parts is not None and rows[-1]['role']=='user':
             # Only text from the actual last user-role message. System, history, media and headers stay private.
-            message = parts if isinstance(parts,str) else next((p['text'] for p in parts if isinstance(p.get('text'),str)), '')
+            message = parts if isinstance(parts,str) else next((p['text'] for p in reversed(parts) if isinstance(p.get('text'),str)), '')
             if message:
                 inputs.update(message=preview(message,self.secret),message_chars=len(message))
         self.event = {'type':'tool','group':'model_io','id':uuid4().hex,'name':self.name,'purpose':self.purpose,'input':inputs}

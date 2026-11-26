@@ -82,7 +82,11 @@ class AtomicPython:
                 self.outputs.append(item)
 
     async def restore(self):
-        if self.store is None or self.journal is not None:
+        if self.store is None:
+            return
+        if self.journal is not None:
+            if (self.journal.state or {}).get('in_flight'):
+                raise AgentNeedsInput.from_context('上次沙箱操作结果未确认，已暂停等待核对', self.config)
             return
         checkpoint = sandbox_checkpoint(self.config.get('_agent_checkpoint'))
         self.journal = await run_blocking(SandboxEffects, self.store, self.scope, checkpoint)
@@ -146,7 +150,7 @@ class AtomicPython:
         if token in prior:
             raise ValueError('相同 Python 操作已有回执，请复用已有结果或修改参数')
         if len(prior) >= 16:
-            raise AgentNeedsInput.from_context('此任务已累计尝试十六次沙箱操作，已保存进度', self.config)
+            raise ValueError('此任务已累计尝试十六次沙箱操作。请复用已有结果或改用其他工具。')
         sources = await run_blocking(prepare)
         if self.journal:
             await run_blocking(self.journal.claim, token, sources, invocation=invocation)
@@ -172,7 +176,7 @@ class AtomicPython:
             result = {'status': 'error', 'error': str(exc)[:2000]}
         except (RuntimeError, OSError) as exc:
             if self.journal:
-                raise AgentNeedsInput.from_context('沙箱操作未返回可确认的结果，已暂停等待核对', self.config) from None
+                raise AgentNeedsInput.from_context('沙箱操作未返回可确认的结果，已暂停等待核对', self.config) from exc
             result = {'status': 'error', 'error': str(exc)[:2000]}
         await run_blocking(authorize)
         files = result.get('files', ()) if result['status'] == 'success' else ()
@@ -191,8 +195,10 @@ class AtomicPython:
         if self.journal:
             try:
                 await run_blocking(self.journal.confirm, token, record, files, None)
-            except ValueError:
-                raise AgentNeedsInput.from_context('沙箱回执未保存，已暂停等待核对', self.config) from None
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise AgentNeedsInput.from_context('沙箱回执未能确认，已暂停等待核对', self.config) from exc
         else:
             self.local_receipts.append({'token': token, 'sources': sources, 'record': record,
                                         'sizes': [len(item['data']) for item in files]})

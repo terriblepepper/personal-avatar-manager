@@ -28,6 +28,10 @@ async def stream_final(source, emit, validate, progress=None):
                         continue
                 elif event['type'] == 'usage':
                     final = event
+                elif event['type'] == 'status':
+                    if progress:
+                        progress(event)
+                    continue
                 else:
                     continue
                 await check_execution_async(validate)

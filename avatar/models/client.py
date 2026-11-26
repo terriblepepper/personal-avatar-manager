@@ -218,10 +218,15 @@ def parse_response(fmt, data, *, config=None, request_id=None, api_key=''):
     return ModelResult(visible, model_usage, calls, reason, replay=replay)
 
 
+def _generates_html(config):
+    return config.get('_call_purpose') == 'html_generation' or any(
+        tool['name'] in ('create_html', 'append_html_draft', 'edit_html') for tool in config.get('_tools') or ())
+
+
 # 按 token 预算分别限制有效内容和 SSE 传输；每个 token 可能单独携带完整的 JSON 事件头。
 def response_limit(config,streaming=False):
     wire_allowance = min(64*1024*1024,max(8*1024*1024,config['max_tokens']*2048))
-    if config.get('_call_purpose') == 'html_generation' or any(tool.get('name') == 'create_html' for tool in config.get('_tools') or ()):
+    if _generates_html(config):
         from avatar.core.artifact_limits import MAX_ENVELOPE_BYTES
         # HTML is nested inside JSON tool arguments. Escapes and streaming headers do not count toward file size.
         return MAX_ENVELOPE_BYTES + (wire_allowance if streaming else 0)
@@ -231,11 +236,11 @@ def response_limit(config,streaming=False):
 
 
 def generation_deadline(config):
-    return 600 if config.get('_call_purpose') == 'html_generation' else 180
+    return 600 if _generates_html(config) else 180
 
 
 def generation_http_timeout(config):
-    read = generation_deadline(config) if config.get('_call_purpose') == 'html_generation' else 120
+    read = 600 if _generates_html(config) else 120
     return httpx.Timeout(120, connect=10, read=read)
 
 
@@ -350,13 +355,22 @@ class ModelClient:
         conversation = wire_messages(fmt, transcript)
         images=config.get('_image_inputs',[])
         audio=config.get('_audio_inputs',[])
-        last_input = next((row for row in reversed(conversation)
-                           if row['role']=='user' and (isinstance(row.get('content'),str) or
-                               row.get('parts') and 'text' in row['parts'][0])), None) if images or audio else None
+        parts_key = 'parts' if fmt == 'gemini' else 'content'
+        last_input = None
+        if images or audio:
+            for row in reversed(conversation):
+                if row['role'] != 'user':
+                    continue
+                parts = row[parts_key]
+                if isinstance(parts, str) or any('text' in part for part in parts):
+                    last_input = row
+                    break
         if audio and (not config.get('audio_enabled') or fmt not in ('openai','gemini')):
             raise HTTPException(422, '当前模型配置或接口不支持音频输入')
         if (images or audio) and last_input and fmt in ('openai','anthropic'):
-            parts=[{'type':'text','text':last_input['content']}]
+            parts = last_input['content']
+            if isinstance(parts, str):
+                parts = [{'type':'text','text':parts}]
             for image in images:
                 if fmt=='openai':parts.append({'type':'image_url','image_url':{'url':'data:'+image['mime_type']+';base64,'+image['data']}})
                 else:parts.append({'type':'image','source':{'type':'base64','media_type':image['mime_type'],'data':image['data']}})

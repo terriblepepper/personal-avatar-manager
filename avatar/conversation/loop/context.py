@@ -159,7 +159,7 @@ class ReActContextManager:
         costs = [_cost(group) for group in groups]
         used = _cost(rows) + sum(costs)
         if used <= soft and not recovering:
-            return [*background, *rows, user, *trajectory]
+            return [*rows, user, *background, *trajectory]
         if recovering:
             soft = min(soft, used // 2)
         summary_room = max(0, min(1024, soft // 4))
@@ -185,6 +185,6 @@ class ReActContextManager:
                 row = {'role': 'user', 'content': summary}
                 background.append(row)
                 room -= history_row_tokens(row)
-        if summary := await self._older_history(rows[:kept], room, summarize):
-            background.append({'role': 'user', 'content': summary})
-        return [*background, *rows[kept:], user, *(row for group in groups[start:] for row in group)]
+        summary = await self._older_history(rows[:kept], room, summarize)
+        earlier = [{'role': 'user', 'content': summary}] if summary else []
+        return [*earlier, *rows[kept:], user, *background, *(row for group in groups[start:] for row in group)]

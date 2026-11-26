@@ -174,6 +174,57 @@ def test_native_tool_history_budget_counts_arguments_and_replay():
     assert check_context(config, 'system', [{'role':'user','content':'plain'}], 'follow-up') > 0
 
 
+
+@pytest.mark.parametrize('fmt', ['anthropic', 'gemini'])
+def test_native_tool_replies_merge_adjacent_user_blocks_and_keep_media(fmt):
+    expected_tools = ['first', 'second']
+    history = [{'role':'user','content':'earlier'}, {'role':'user','content':'objective'},
+               {'role':'assistant','content':'','tool_calls':[
+                   {'name':'lookup','id':call_id,'wire_id':call_id,'arguments':{}} for call_id in expected_tools]},
+               {'role':'user','content':'before receipts'},
+               {'role':'tool','tool_call_id':'first','name':'lookup','content':'found'},
+               {'role':'user','content':'between receipts'},
+               {'role':'tool','tool_call_id':'second','name':'lookup','content':'failure','is_error':True}]
+    config = {'api_format':fmt, 'provider':'custom', 'model':'mock', 'base_url':'https://example.test',
+              'max_tokens':512, '_react_tool_calls':True, '_image_inputs':[{'mime_type':'image/png','data':'YQ=='}]}
+    if fmt == 'gemini':
+        config.update(audio_enabled=True, _audio_inputs=[{'mime_type':'audio/wav','data':'Yg=='}])
+    *_, body = ModelClient().build_request(config, 'key', 'system', history, 'latest text')
+    if fmt == 'anthropic':
+        request, _, merged = body['messages']
+        assert [part['text'] for part in request['content']] == ['earlier','objective']
+        blocks = merged['content']
+        assert [r['tool_use_id'] for r in blocks[:2]] == expected_tools
+        assert blocks[1]['is_error']
+        assert blocks[-1]['source']['data'] == 'YQ=='
+        text = blocks[2:-1]
+    else:
+        request, _, merged = body['contents']
+        assert [part['text'] for part in request['parts']] == ['earlier','objective']
+        blocks = merged['parts']
+        assert [r['functionResponse']['id'] for r in blocks[:2]] == expected_tools
+        assert blocks[1]['functionResponse']['response'] == {'error':'failure'}
+        assert [p['inline_data']['data'] for p in blocks[-2:]] == ['YQ==','Yg==']
+        text = blocks[2:-2]
+    assert [part['text'] for part in text] == ['before receipts','between receipts','latest text']
+
+
+def test_native_tool_html_response_and_idle_budgets_use_the_same_policy():
+    from avatar.core.artifact_limits import MAX_ENVELOPE_BYTES
+    from avatar.models.client import generation_deadline, generation_http_timeout, response_limit
+
+    base = {'max_tokens':512, '_call_purpose':'react'}
+    assert generation_deadline(base) == 180 and generation_http_timeout(base).read == 120
+    for overrides in (
+        {'_call_purpose':'html_generation'},
+        *({'_tools':[{'name':name}]} for name in ('create_html','append_html_draft','edit_html')),
+    ):
+        config = {**base, **overrides}
+        assert response_limit(config) == MAX_ENVELOPE_BYTES
+        assert response_limit(config, streaming=True) > MAX_ENVELOPE_BYTES
+        assert generation_deadline(config) == generation_http_timeout(config).read == 600
+
+
 # Persistent generation identity and lifecycle; no external model requests
 
 @pytest.fixture
@@ -537,6 +588,122 @@ def test_react_executes_native_batches_and_returns_each_receipt(scenario):
         assert [item['filename'] for item in config['_generated_files']] == ['updated.html']
 
 
+def _react_probe_definition(name):
+    return {'name':name, 'description':name, 'parameters':{'type':'object'}}
+
+
+def _react_probe_call(identifier, name, args):
+    return {'id':identifier,'name':name,'arguments':args}
+
+
+def _react_probe_receipt(*calls, reason='tool_calls', partial=False):
+    return {'type':'usage','usage':{'input_tokens':2,'output_tokens':1,'total_tokens':3},
+            'finish_reason':reason,'partial_tool_calls' if partial else 'tool_calls':list(calls)}
+
+
+async def _run_react_probe(stream, config, **kwargs):
+    from avatar.conversation.agent_loop import run_agent
+
+    rag=SimpleNamespace(chat=SimpleNamespace(model_client=SimpleNamespace(stream=stream)),validate=lambda _:None)
+    return await run_agent(rag,(config,'fixture-key','测试',[]),'请完成操作',**kwargs)
+
+
+def test_unknown_sandbox_preserves_context_and_usage():
+    from avatar.conversation.loop.store import MemoryRunStore
+
+    store=MemoryRunStore()
+    config={'_run_store':store,'_entry_tools':[_react_probe_definition('run_python')],'context_tokens':32768}
+    attempts = []
+
+    async def tool(name, args):
+        attempts.append(name)
+        store.merge({'sandbox':{'in_flight':'unconfirmed'}})
+        raise AgentNeedsInput.from_context('沙箱结果未确认',config)
+
+    async def stream(*args):
+        yield _react_probe_receipt(_react_probe_call('clock','get_current_time',{}),_react_probe_call('python','run_python',{'code':'print(1)'}),
+                      _react_probe_call('skipped','get_current_time',{}))
+
+    config['_execute_entry_tool']=tool
+    with pytest.raises(AgentNeedsInput) as paused:
+        asyncio.run(_run_react_probe(stream,config))
+    state=store.load()
+    assert state['phase']=='paused' and state['pending_batch'] is None
+    assert paused.value.usage==state['usage'] and state['usage']['total_tokens']==3
+    assert state['sandbox']['in_flight']=='unconfirmed'
+    rows=[r for r in state['trajectory'] if r['role']=='tool']
+    assert [r['tool_call_id'] for r in rows]==['clock','python','skipped']
+    assert [r['is_error'] for r in rows]==[False,True,True]
+    assert attempts==['run_python']
+
+
+def test_draft_continues_after_four_productive_truncations_without_phantom_text():
+    from avatar.conversation.loop.store import MemoryRunStore
+
+    store=MemoryRunStore()
+    config={'_run_store':store,'_html_enabled':True,'context_tokens':32768,'reasoning_effort':'high'}
+    rounds=[]
+    visible=[]
+    progress=[]
+
+    async def stream(settings,*args):
+        rounds.append(settings)
+        n=len(rounds)
+        if n==1:
+            yield {'type':'status','stage':'waiting','message':'等待'}
+            yield {'type':'delta','text':'请撤回的候选'}
+            yield _react_probe_receipt(_react_probe_call('initial','create_html',{'filename':'demo.html','html':'<!doctype html><main>'}),
+                          reason='length',partial=True)
+        elif n<=6:
+            identifier,draft=next(iter(store.load()['drafts'].items()))
+            yield _react_probe_receipt(_react_probe_call(str(n),'append_html_draft',{'draft_id':identifier,'offset':draft['offset'],'chunk':'有效字节'}),
+                          reason='length',partial=True)
+        elif n==7:
+            identifier,draft=next(iter(store.load()['drafts'].items()))
+            yield _react_probe_receipt(_react_probe_call('finish-draft','append_html_draft',
+                               {'draft_id':identifier,'offset':draft['offset'],'chunk':'</main>','done':True}))
+        else:
+            yield {'type':'delta','text':'成品已就绪。'}
+            yield _react_probe_receipt(reason='stop')
+
+    result=asyncio.run(_run_react_probe(stream,config,progress=progress.append,on_delta=visible.append))
+    assert result.text=='成品已就绪。'
+    assert rounds[-1]['reasoning_effort']=='high'
+    assert any(event.get('stage')=='waiting' for event in progress)
+    assert b'</main>' in config['_generated_files'][0]['data']
+
+
+def test_media_and_refreshed_directory_survive_native_steps():
+    image={'mime_type':'image/png','data':'attached'}
+    extra={'mime_type':'image/png','data':'tool-read'}
+    audio={'mime_type':'audio/wav','data':'tool-audio'}
+    config={'_entry_tools':list(map(_react_probe_definition,('read_session_file','read_material','run_python'))),
+            'context_tokens':32768,'_image_inputs':[image],'audio_enabled':True}
+    executed=[]
+    calls=iter([('read_session_file',{'query':''}),('read_material',{'file_id':'a'}),('run_python',{'code':'print(1)'}),
+                ('read_session_file',{'query':''}),('read_material',{'file_id':'a'})])
+    received=[]
+
+    async def tool(name,args):
+        executed.append(name)
+        if name=='read_material':
+            config['_entry_native_media']={'images':[image,extra],'audio':[audio]}
+        return {'status':'success'}
+
+    async def stream(settings,*args):
+        received.append((settings['_image_inputs'],settings['_audio_inputs']))
+        if selection:=next(calls,None):
+            yield _react_probe_receipt(_react_probe_call(str(len(received)),*selection))
+        else:
+            yield {'type':'delta','text':'完成'}
+            yield _react_probe_receipt(reason='stop')
+
+    config['_execute_entry_tool']=tool
+    assert asyncio.run(_run_react_probe(stream,config)).text=='完成'
+    assert executed==['read_session_file','read_material','run_python','read_session_file','read_material']
+    assert received[2] == received[-1] == ([image,extra],[audio])
+
+
 def test_peer_transport_polls_accepted_task_without_resending(context):
     import asyncio
     from types import SimpleNamespace
@@ -725,13 +892,15 @@ def test_peer_public_material_staging_reuses_verified_receipt(context, supplemen
     def bind():
         run = PeerTurn(service.executor, task, owner)
         store, state = run.open()
+        assert state['schema_version'] == 2
         config = {}
         bind_public_material_tools(app.state.chat, config, library, owner, store, state,
                                    workspace=run.workspace, task_id=task_id)
         return store, config
 
     store, _ = bind()
-    store.merge({
+    legacy = {key:value for key,value in store.load().items() if key != 'schema_version'}
+    store.save({**legacy,
         'phase':'external_handoff',
         'handoff':{'name':'send_public_material'},
         'peer_export':{'exports':[{'id':'legacy'}], 'receipts':[{'prepared_originals':[]}]},
@@ -1424,10 +1593,51 @@ def test_distinct_actions_stop_at_task_attempt_cap():
     async def run():
         for index in range(16):
             await tool.execute(PythonArguments(code=f'print({index})'))
-        with pytest.raises(AgentNeedsInput,match='十六次'):
+        with pytest.raises(ValueError,match='十六次'):
             await tool.execute(PythonArguments(code='print(16)'))
     asyncio.run(run())
     assert len(calls)==16
+
+
+
+@pytest.mark.parametrize('interrupted', ['execution', 'confirmation'])
+def test_unknown_sandbox_operation_preserves_intent(interrupted):
+    from avatar.conversation.loop.store import MemoryRunStore
+
+    class Store(MemoryRunStore):
+        def merge(self, patch, *, expected=None):
+            if interrupted=='confirmation' and not patch['sandbox']['in_flight']:
+                raise OSError('receipt write interrupted')
+            super().merge(patch, expected=expected)
+
+    store = Store()
+    config = {'_run_store':store}
+    runs = []
+
+    async def execute(owner, resources, script, args, **kwargs):
+        runs.append(resources[script])
+        if interrupted=='execution':
+            raise RuntimeError('sandbox result lost')
+        return {'status':'success','stdout':'ok','files':[]}
+
+    def sandbox(config):
+        return AtomicPython(SimpleNamespace(execute=execute),config,owner='owner',conversation='c1',inputs=dict)
+
+    async def run():
+        args = PythonArguments(code='print(1)')
+        active = sandbox(config)
+        with pytest.raises(AgentNeedsInput) as interrupted_operation:
+            await active.execute(args)
+        assert interrupted_operation.value.checkpoint['sandbox_attempted']
+        assert store.load()['sandbox']['in_flight']
+        assert not store.load()['sandbox']['receipts']
+        with pytest.raises(AgentNeedsInput,match='上次沙箱操作结果未确认'):
+            await active.execute(PythonArguments(code='print(2)'))
+        with pytest.raises(AgentNeedsInput,match='上次沙箱操作结果未确认'):
+            await sandbox({'_run_store':store}).execute(args)
+
+    asyncio.run(run())
+    assert runs==[b'print(1)']
 
 
 # Keep the offline Deno command and permissions stable across Python dependency updates
@@ -1709,8 +1919,10 @@ def test_native_html_draft_survives_truncation_and_writer_change(pg_database):
     from hashlib import sha256
 
     from avatar.conversation.loop.drafts import HtmlDrafts
+    from avatar.conversation.loop.runtime import restore_files
     from avatar.conversation.loop.store import RunConflict, RunStore
     from avatar.conversation.tools.html import CREATE_HTML
+    from avatar.core.execution import current_tool_call
     from tests.support import fake_dns
 
     stamp = now()
@@ -1732,6 +1944,13 @@ def test_native_html_draft_survives_truncation_and_writer_change(pg_database):
     config = {'api_format':'openai','provider':'custom','model':'mock','base_url':'https://example.test',
               'max_tokens':512,'_tools':[CREATE_HTML],'_react_tool_calls':True,'_optional_tools':True}
 
+    async def invoke(scope, execute, arguments):
+        token = current_tool_call.set(scope)
+        try:
+            return await execute(arguments)
+        finally:
+            current_tool_call.reset(token)
+
     async def exercise():
         run = ('draft-owner', 'chat', 'draft-chat', 'draft-run')
         origin = RunStore(pg_database, *run, 'writer-1')
@@ -1742,8 +1961,16 @@ def test_native_html_draft_survives_truncation_and_writer_change(pg_database):
         events = [event async for event in model.stream(config, 'key', 'system', [], 'create HTML')]
         clipped, = events[-1]['partial_tool_calls']
         outputs = [{'id':'python-result','filename':'result.txt','data':b'result'}]
-        draft = await HtmlDrafts(origin, state, outputs).capture(clipped)
+        drafts = HtmlDrafts(origin, state, outputs)
+        draft = await drafts.capture(clipped)
+        assert draft['status'] == 'truncated_draft_saved'
         assert draft['offset'] == len(source.encode()) and draft['tail_preview'] == source[-300:]
+        revision = origin._revision
+        for repeated in (clipped,
+                         {**clipped, 'id':'new-id', 'arguments':'{"filename":"timeline.html","html":"different'},
+                         {**clipped, 'id':'filename-only', 'arguments':'{"filename":"timeline.html","html":'}):
+            assert await drafts.capture(repeated) == {**draft, 'status':'draft_exists'}
+        assert origin._revision == revision
 
         new = RunStore(pg_database, *run, 'writer-2')
         restored = new.acquire()
@@ -1758,7 +1985,15 @@ def test_native_html_draft_survives_truncation_and_writer_change(pg_database):
             await drafts.capture({'name':'append_html_draft','id':'stale',
                                   'arguments':{**arguments,'offset':0}})
         next_prefix = json.dumps(arguments, ensure_ascii=False)[:-1] + ',"do'
-        appended = await drafts.capture({'name':'append_html_draft','id':'next','arguments':next_prefix})
+        call = {'name':'append_html_draft', 'id':'next', 'arguments':next_prefix}
+        appended = await invoke((2,'next',False), drafts.capture, call)
+        new = RunStore(pg_database, *run, 'writer-3')
+        drafts = HtmlDrafts(new, new.acquire(), outputs)
+        revision = new._revision
+        assert await invoke((2,'next',True), drafts.capture, call) == appended
+        with pytest.raises(ValueError, match=str(appended['offset'])):
+            await invoke((2,'another',True), drafts.capture, {**call, 'id':'another'})
+        assert new._revision == revision
         typed_prefix = [
             {'args':{'draft_id':resume['draft_id']}},
             {'partialArgs':[{'jsonPath':'$.chunk','stringValue':'终点','willContinue':True}]},
@@ -1767,7 +2002,18 @@ def test_native_html_draft_survives_truncation_and_writer_change(pg_database):
         ]
         typed = await drafts.capture({'name':'append_html_draft','id':'gemini',
             'argument_format':'gemini_partial_args','arguments':{'chunks':typed_prefix}})
-        page = await drafts.append({**arguments, 'offset':typed['offset'], 'chunk':'</main>', 'done':True})
+        final = {**arguments, 'offset':typed['offset'], 'chunk':'</main>', 'done':True}
+        page = await invoke((3,'finish',False), drafts.append, final)
+        new = RunStore(pg_database, *run, 'writer-4')
+        restored = new.acquire()
+        outputs = outputs[:1]
+        await restore_files(new, restored, {'_generated_files':outputs})
+        drafts = HtmlDrafts(new, restored, outputs)
+        revision = new._revision
+        assert await invoke((3,'finish',True), drafts.append, final) == page
+        with pytest.raises(ValueError, match='草稿不存在或已交付'):
+            await invoke((4,'finish',True), drafts.append, final)
+        assert new._revision == revision
         [receipt] = new.load()['files']
         assert [item['id'] for item in outputs] == ['python-result', page['id']]
         data = (source + '下一段终点</main>').encode()
@@ -1857,13 +2103,22 @@ def test_react_context_preserves_call_result_pairs_when_compacting():
     from avatar.conversation.loop.context import ReActContextManager
 
     async def run():
-        manager = ReActContextManager([], '分析此文件')
+        past = {'role':'assistant','content':'上一轮答复'}
+        config = {'context_tokens':5000, 'max_tokens':1000}
+        manager = ReActContextManager([past], '分析此文件',
+                                      checkpoint={'legacy_summary':'旧执行结果'})
         trajectory = []
         for index in range(8):
             call = {'id':f'call_{index}', 'name':'find_material', 'arguments':{'page':index}}
             observation = {'role':'tool', 'name':call['name'], 'tool_call_id':call['id'], 'content':f'页{index}' + '条目' * 400}
             trajectory.extend([{'role':'assistant', 'content':'', 'tool_calls':[call]}, observation])
-        request = await manager.project({'context_tokens':5000, 'max_tokens':1000}, '系统', trajectory)
+        quick = await manager.project(config, '系统', trajectory[:2])
+        assert [row['content'] for row in quick[:2]] == ['上一轮答复', '分析此文件']
+        assert '旧执行结果' in quick[2]['content']
+        request = await manager.project(config, '系统', trajectory)
+        goal = next(index for index,row in enumerate(request) if row['content'] == '分析此文件')
+        assert '旧执行结果' in request[goal+1]['content']
+        assert '较早工具步骤' in request[goal+2]['content']
         calls = [call['id'] for row in request for call in row.get('tool_calls', ())]
         observations = [row['tool_call_id'] for row in request if row['role'] == 'tool']
         assert calls == observations and calls[-1] == 'call_7' and len(calls) < 8
@@ -1913,3 +2168,68 @@ def test_react_recovery_republishes_held_question_without_model_call():
         assert '旧任务回执' in checkpoint['legacy_summary']
 
     asyncio.run(run())
+
+
+
+def test_react_entry_checkpoints_keep_proofs_written_before_model(context, supplemented_task, monkeypatch):
+    import time
+    from avatar.conversation.loop import personal
+    from avatar.conversation.loop.peer import PeerTurn
+    from avatar.conversation.loop.runtime import load_checkpoint
+    from avatar.core.db import dump
+    from avatar.protocols.tasks import personal_turns
+    from avatar.protocols.tasks.personal import PersonalTaskService
+
+    app, _, _ = context
+    service, users, task_id = supplemented_task
+    owner = users[1]
+    chat = app.state.chat
+    session = chat.session(owner['id'], 'avatar')
+    lease = chat.memory.acquire(session['id'])
+    proof = {'session_file_reads':{'image':{'sha256':'kept'}}, 'session_image_ids':['image'],
+             'entry_material':{'sources':[{'file_id':'source'}],'revisions':[[['profile','source'],'version']]}}
+
+    async def assert_new(store):
+        assert store.load()['schema_version'] == 2
+        store.merge(proof)
+        state = await load_checkpoint(store)
+        assert {key:state[key] for key in proof} == proof
+
+    try:
+        with service.database.connect() as db:
+            sources = personal.source_snapshot(db, owner['id'], session['id'], owner['id'], 'peer-1')
+        overview = {'agent':{'user_id':owner['id'],'aic':'peer-1'}, '_run_sources':sources}
+        request = ChatRequest(channel='avatar', message='读取附件')
+        model = ({'provider':'custom','model':'test'},'key','system',[])
+        config,*_ = personal.attach(chat, owner, request, session, session, overview, model, None, None,
+                                    'entry-proof-test', lease, None)
+        asyncio.run(assert_new(config['_run_store']))
+    finally:
+        chat.memory.release(session['id'], lease)
+
+    with service.database.connect(write=True) as db:
+        db.execute("UPDATE agent_dialogues SET status='running',next_speaker=1 WHERE id=?", (task_id,))
+        task = dict(service.session_store.owned(db, owner, task_id))
+    store, _ = PeerTurn(service.executor, task, owner['id']).open()
+    asyncio.run(assert_new(store))
+
+    task_service = PersonalTaskService(chat, app.state.settings)
+    scope = ('peer-1','town#public:visitor','','entry-town-session','entry-town-task')
+    result = {'id':'entry-writer','taskId':scope[4],'sessionId':scope[3]}
+    with service.database.connect(write=True) as db:
+        run = {'owner':owner['id'],'run_id':'entry-town-run','automatic':False,'skills':{},
+               'sources':personal_turns.source_revision(db, owner['id'], 'peer-1')}
+        document = {**result,'status':{'state':'working'},'_agent_resume':run}
+        db.execute('INSERT INTO avatar_aip_tasks VALUES(?,?,?,?,?,?,?,?)',(*scope,'start',dump(document),time.time()+60))
+        rowid = task_service.task_row(db, scope)['rowid']
+
+    async def bind(*args, store, **kwargs):
+        await assert_new(store)
+        raise AgentNeedsInput('保留测试证明')
+
+    monkeypatch.setattr(task_service,'target',lambda *_:owner)
+    monkeypatch.setattr(task_service,'approved_skills',lambda *_:[])
+    monkeypatch.setattr(task_service,'answer',bind)
+    progress = SimpleNamespace(deadline=lambda:time.time()+60, update=None, stream_state=None)
+    outcome = asyncio.run(task_service.generate(scope,rowid,result,None,None,run,progress))
+    assert outcome['status']['state'] == 'awaiting-input'

@@ -291,6 +291,13 @@ def wire_messages(fmt, history):
             rows.append(wire)
             continue
         key = 'parts' if fmt == 'gemini' else 'content'
+        text_tag = {'type':'text'} if fmt == 'anthropic' else {}
+        if role == 'assistant':
+            gemini_ids = {c['id']: c['wire_id'] for c in calls if c.get('wire_id')}
+            wire_role = 'model' if fmt == 'gemini' else 'assistant'
+            value = _wire_assistant_parts(fmt, row) if fmt == 'gemini' or calls or row.get('replay') else content
+            rows.append({'role': wire_role, key: value})
+            continue
         if role == 'tool':
             call_id = row['tool_call_id']
             if fmt == 'gemini':
@@ -302,17 +309,21 @@ def wire_messages(fmt, history):
                 part = {'type': 'tool_result', 'tool_use_id': call_id, 'content': content}
                 if row.get('is_error'):
                     part['is_error'] = True
-            if rows and rows[-1]['role'] == 'user' and isinstance(rows[-1][key], list):
-                rows[-1][key].append(part)
-            else:
-                rows.append({'role': 'user', key: [part]})
-        elif role == 'assistant' and (calls or row.get('replay')):
-            gemini_ids = {c['id']: c['wire_id'] for c in calls if c.get('wire_id')}
-            rows.append({'role': 'model' if fmt == 'gemini' else 'assistant', key: _wire_assistant_parts(fmt, row)})
-        elif fmt == 'gemini':
-            rows.append({'role': 'model' if role == 'assistant' else 'user', 'parts': [{'text': content}]})
         else:
-            rows.append({'role': role, 'content': content})
+            part = {**text_tag, 'text': content}
+        if not rows or rows[-1]['role'] != 'user':
+            value = content if fmt == 'anthropic' and role == 'user' else [part]
+            rows.append({'role': 'user', key: value})
+            continue
+        parts = rows[-1][key]
+        if isinstance(parts, str):
+            parts = rows[-1][key] = [{**text_tag, 'text':parts}]
+        if role == 'tool':
+            # Keep the corresponding result blocks directly after the assistant's tool calls.
+            first_text = next((index for index, block in enumerate(parts) if 'text' in block), len(parts))
+            parts.insert(first_text, part)
+        else:
+            parts.append(part)
 
     return rows
 

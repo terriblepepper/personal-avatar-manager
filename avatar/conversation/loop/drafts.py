@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from avatar.conversation.loop.store import RunConflict
 from avatar.conversation.tools.html import HtmlFile, checked_args, create_html
 from avatar.core.artifact_limits import MAX_SOURCE_BYTES
-from avatar.core.execution import run_blocking
+from avatar.core.execution import current_tool_call, run_blocking
 from avatar.files.conversation.resources import validate_output
 
 
@@ -166,10 +166,8 @@ class HtmlDrafts:
                 values = _json_prefix(raw, fields, content) if isinstance(raw, str) else raw
             if not isinstance(values, dict) or set(values) - fields:
                 return None
-            text = values[content]
-            if not isinstance(text, str) or not text or '\x00' in text:
-                return None
-            size = len(text.encode('utf-8'))
+            text = values.get(content)
+            size = len(text.encode('utf-8')) if isinstance(text, str) and '\x00' not in text else 0
             if is_create:
                 filename = checked_args(HtmlFile, {'filename':values.get('filename')}).filename
                 validate_output(filename, b'')
@@ -179,14 +177,15 @@ class HtmlDrafts:
             return None
 
         if not is_create:
-            return self._append(request)
+            return self._append(request) if size else None
+        drafts = self.state.get('drafts', {})
+        for name, draft in drafts.items():
+            if draft['filename'] == filename:
+                return self._draft_receipt(name, draft, 'draft_exists')
+        if not size:
+            return None
         key = f"{self.state.get('step', 0)}\0{call['id']}\0{filename}"
         name = 'draft-' + sha256(key.encode()).hexdigest()[:32]
-        drafts = self.state.get('drafts', {})
-        if name in drafts:
-            return self._draft_receipt(name, drafts[name], 'truncated_draft_saved')
-        if any(draft['filename'] == filename for draft in drafts.values()):
-            return None
         draft = {'name':name, 'filename':filename, 'offset':size}
         patch = {'drafts':{**drafts, name:draft}}
         self._check_quota(self.outputs, patch['drafts'])
@@ -194,6 +193,16 @@ class HtmlDrafts:
         return self._draft_receipt(name, draft, 'truncated_draft_saved')
 
     def _append(self, request):
+        invocation = current_tool_call.get()
+        call = list(invocation[:2]) if invocation else None
+        committed = self.state.get('html_append', {})
+        if invocation and invocation[2] and committed.get('call') == call:
+            if receipt := committed.get('artifact'):
+                self.store.check()
+                return receipt
+            draft = committed['draft']
+            return self._draft_receipt(draft['name'], draft, 'draft_appended')
+
         name = request.draft_id
         drafts = self.state.get('drafts', {})
         draft = drafts.get(name)
@@ -207,11 +216,14 @@ class HtmlDrafts:
             source = self.store.read(draft['name'])
             if len(source.encode('utf-8')) != draft['offset']:
                 raise RunConflict('草稿正文与已确认游标不一致')
-            return self._publish({'filename':draft['filename'], 'html':source + request.chunk}, request=request)
+            return self._publish({'filename':draft['filename'], 'html':source + request.chunk},
+                                 request=request, append_call=call)
         if not request.chunk:
             raise ValueError('请提交非空的源码片段')
         updated = {**draft, 'offset':request.offset + len(request.chunk.encode('utf-8'))}
         patch = {'drafts':{**drafts, name:updated}}
+        if call:
+            patch['html_append'] = {'call':call, 'draft':updated}
         self._check_quota(self.outputs, patch['drafts'])
         self._write_text(draft['name'], request.offset, request.chunk, patch)
         return self._draft_receipt(name, updated, 'draft_appended')
@@ -222,7 +234,7 @@ class HtmlDrafts:
         if sum(sizes.values()) + sum(draft['offset'] for draft in drafts.values()) > MAX_SOURCE_BYTES:
             raise HTTPException(413, '本轮作品和草稿合计超过 100 MiB')
 
-    def _publish(self, arguments, *, request=None):
+    def _publish(self, arguments, *, request=None, append_call=None):
         candidates = list(self.outputs)
         try:
             item = create_html(arguments, candidates)
@@ -235,7 +247,10 @@ class HtmlDrafts:
         active = self.state.get('drafts', {})
         drafts = {name:draft for name,draft in active.items() if draft['filename'] != item['filename']}
         self._check_quota(candidates, drafts)
+        outcome = {key:item[key] for key in ('id','filename')}
         patch = {'drafts':drafts}
+        if append_call:
+            patch['html_append'] = {'call':append_call, 'artifact':outcome}
         reused = len(candidates) == len(self.outputs)
         if not reused:
             name = active[request.draft_id]['name'] if request else 'artifact-' + item['id']
@@ -252,7 +267,7 @@ class HtmlDrafts:
         for key in active.keys() - drafts.keys():
             if reused or not request or key != request.draft_id:
                 self.store.discard(active[key]['name'])
-        return {key:item[key] for key in ('id','filename')}
+        return outcome
 
     def _write_text(self, name, offset, text, patch):
         if text:
