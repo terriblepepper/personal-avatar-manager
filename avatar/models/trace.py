@@ -89,7 +89,7 @@ class ModelExchange:
         self.secret = secret
         self.attempt = attempt
         purpose = config.get('_call_purpose', 'answer')
-        self.kind = 'artifact' if purpose in ('segmented_writing','html_generation') else 'text'
+        self.kind = 'artifact' if purpose == 'html_generation' else 'text'
         self.name = PURPOSES.get(purpose, '模型调用')
         self.purpose = purpose if purpose in PURPOSES else 'answer'
         self.event = None
@@ -104,21 +104,22 @@ class ModelExchange:
             return
         if fmt == 'gemini':
             rows = body['contents']
-            parts = rows[-1]['parts']
+            parts = rows[-1]['parts'] if rows else None
             tools = [t for group in body.get('tools',()) for t in group.get('functionDeclarations',())]
         else:
             rows = body['messages']
-            parts = rows[-1]['content']
+            parts = rows[-1]['content'] if rows else None
             tools = [t.get('function',t) for t in body.get('tools',())]
         names = [t['name'] for t in tools if _TOOL_NAME.fullmatch(t.get('name',''))]
         self.available = set(names)
         inputs = {'history_turns':sum(r['role']!='system' for r in rows[:-1]), 'tool_count':len(names), 'attempt':self.attempt}
         if self.scope[1]:
             inputs['tools'] = names
-        if self.scope[1] and rows[-1]['role']=='user':
+        if self.scope[1] and parts is not None and rows[-1]['role']=='user':
             # Only text from the actual last user-role message. System, history, media and headers stay private.
             message = parts if isinstance(parts,str) else next((p['text'] for p in parts if isinstance(p.get('text'),str)), '')
-            inputs.update(message=preview(message,self.secret),message_chars=len(message))
+            if message:
+                inputs.update(message=preview(message,self.secret),message_chars=len(message))
         self.event = {'type':'tool','group':'model_io','id':uuid4().hex,'name':self.name,'purpose':self.purpose,'input':inputs}
         self.send('running', {'kind':self.kind})
 

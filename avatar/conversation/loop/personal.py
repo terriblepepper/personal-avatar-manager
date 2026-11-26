@@ -127,8 +127,7 @@ def restore(chat, user, request, parent, state):
 
 def attach(chat, user, original, parent, session, overview, context, job, held, run_id, lease, previous):
     owner = overview['agent']
-    binding = {'session_id':session['id'],'owner':owner['user_id'],'aic':owner['aic'],
-               'answer_route':context[0].get('_answer_route'),'material_delivery':context[0].get('_material_delivery')}
+    binding = {'session_id':session['id'],'owner':owner['user_id'],'aic':owner['aic']}
     model = owner.get('model_config') or context[0]
     binding.update(provider=model.get('provider'),model=model.get('model'))
     sources = overview['_run_sources']
@@ -172,13 +171,6 @@ def attach(chat, user, original, parent, session, overview, context, job, held, 
     store = RunStore(chat.service.database,user['id'],'chat',parent['id'],run_id,uuid.uuid4().hex,validate)
     state = store.acquire(expected=previous)
     config = dict(context[0])
-    if state.get('binding'):
-        for key in ('answer_route','material_delivery'):
-            if original.agent_control=='continue' and original.message.strip():
-                continue
-            if not config.get('_'+key) and state['binding'].get(key):
-                binding[key] = state['binding'][key]
-                config['_'+key] = binding[key]
     store.merge({'binding':binding,'sources':sources})
     config.update(_run_store=store,_run_input_id=(job or {}).get('task_id') or original.request_id or original.agent_pause_id or run_id,
                   _run_supplement=original.message.strip() if original.agent_control=='continue' else '',

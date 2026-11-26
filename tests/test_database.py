@@ -360,10 +360,6 @@ def test_rag_catalog_reads_are_bounded_and_recheck_permissions(pg_database, monk
             if not final_event:
                 yield {'type':'delta', 'text':'revoked'}
 
-        async def answer_context(context, message):
-            return context, message
-
-        monkeypatch.setattr(rag, 'answer_context', answer_context)
         rag.chat = SimpleNamespace(model_client=SimpleNamespace(stream=model_stream))
         proof['revisions'] = [((r['source'], r['id']), revision(r)) for r in rows]
         config = {'_rag_access':proof, '_material_sources':[{'filename':'chat.txt','type':'RAG'}]}

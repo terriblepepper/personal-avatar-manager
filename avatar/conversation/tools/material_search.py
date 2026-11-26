@@ -95,7 +95,7 @@ class MaterialDiscovery:
             name_hits=sum(word in name for word in words)
             hits[row['id']]=[exact,named,0,overlap,fuzzy,'',name_hits]
         if query and documents and not any(hit[0] for hit in hits.values()):
-            evidence,_=await self.retrieve(documents,question,published_only=True)
+            evidence,_=await self.retrieve(documents,question)
             for rank,doc in enumerate(evidence):
                 hit=hits.get(doc.metadata.get('file_id'))
                 if hit is not None and not hit[2]:

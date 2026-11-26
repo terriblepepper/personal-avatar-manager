@@ -30,6 +30,7 @@ class ModelResult:
     material_delivery: tuple | None = None
     contact_draft: dict | None = None
     partial_tool_calls: tuple = field(default=(), repr=False)
+    replay: dict | None = field(default=None, repr=False)
 
     @property
     def stop_reason(self):
@@ -110,7 +111,8 @@ def tokens(value):
 # 结果与约束：返回 ModelResult，过滤 Gemini 思考片段；空回答报错，用量优先采用上游总数，无总数时仅在输入输出齐全后求和。
 def parse_response(fmt, data, *, config=None, request_id=None, api_key=''):
     config = config or {}
-    retain = config.get('_retain_turn_fragments', False)
+    native = config.get('_react_tool_calls', False)
+    retain = native or config.get('_retain_turn_fragments', False)
     separator = '' if retain else '\n'
     if data.get('error'):
         from avatar.models.diagnostics import provider_error,contextual
@@ -135,14 +137,20 @@ def parse_response(fmt, data, *, config=None, request_id=None, api_key=''):
     total = reported_total if reported_total is not None else incoming+outgoing if incoming is not None and outgoing is not None else None
     model_usage = {"input_tokens": incoming, "output_tokens": outgoing, "total_tokens": total}
     reason=((data.get('choices') or [{}])[0].get('finish_reason') if fmt=='openai' else
-            data.get('stop_reason') if fmt=='anthropic' else (data.get('candidates') or [{}])[0].get('finishReason'))
+            data.get('stop_reason') if fmt=='anthropic' else
+            (data.get('candidates') or [{}])[0].get('finishReason') or (data.get('promptFeedback') or {}).get('blockReason'))
     calls=()
     terminal = stop_reason(reason)
-    check_terminal(reason, model_usage)
+    check_terminal(reason, model_usage, native=native)
     if terminal == 'output_limit':
-        from avatar.models.tools import raw_tool_calls
+        from avatar.models.tools import identify_calls, raw_tool_calls
         try:
-            fragments = tuple(raw_tool_calls(fmt, data))
+            fragments = raw_tool_calls(fmt, data)
+            if native:
+                fragments = identify_calls(fragments)
+            else:
+                fragments = [{k: v for k, v in call.items() if k != 'id'} for call in fragments]
+            fragments = tuple(fragments)
             if (text is not None and not isinstance(text,str) or len(fragments) > 8 or
                     any(type(f['index']) is not int or f['index'] < 0 or not isinstance(f['name'],str)
                         or not isinstance(f['arguments'], (str,dict)) for f in fragments)):
@@ -153,14 +161,8 @@ def parse_response(fmt, data, *, config=None, request_id=None, api_key=''):
             error.output_limited = True
             error.model_usage = model_usage
             raise error from None
-        legacy_draft = config.get('_avatar_agent') and config.get('_call_purpose') in ('goal_decision','html_generation','task_planning')
         if retain:
             return ModelResult(text or '', model_usage, finish_reason=reason, partial_tool_calls=fragments)
-        if legacy_draft:
-            allowed = {tool['name'] for tool in config.get('_tools', ())}
-            selected = tuple(call for call in fragments if call['name'] in allowed)
-            if text or selected:
-                return ModelResult(text or '', model_usage, finish_reason=reason, partial_tool_calls=selected)
         if fragments and config.get('_tools'):
             error = HTTPException(502,'模型工具调用达到单次输出上限，本批工具未执行')
             error.stop_reason = terminal
@@ -169,11 +171,17 @@ def parse_response(fmt, data, *, config=None, request_id=None, api_key=''):
             raise error
     # Distinguish a missing action after private reasoning from a malformed proposed action.
     tools = config.get('_tools') or ()
+    replay = None
     if tools or retain:
-        from avatar.models.tools import parse_tools
+        from avatar.models.tools import invalid_tool_call, parse_native_calls, parse_tools
         try:
-            calls=tuple(parse_tools(fmt,data,tools,required=bool(tools and text and str(text).strip())
-                                    and not config.get('_optional_tools'),batch=bool(config.get('_batch_tools'))))
+            if native:
+                calls, replay = parse_native_calls(fmt, data)
+                if terminal == 'tool' and not calls:
+                    raise invalid_tool_call('上游结束了工具调用，但未返回可执行参数', 0)
+            else:
+                calls=tuple(parse_tools(fmt,data,tools,required=bool(tools and text and str(text).strip())
+                                        and not config.get('_optional_tools'),batch=bool(config.get('_batch_tools'))))
         except HTTPException as error:
             error.model_usage=model_usage
             if terminal == 'output_limit':
@@ -207,7 +215,7 @@ def parse_response(fmt, data, *, config=None, request_id=None, api_key=''):
         raise empty_response(fmt,reason=reason,thinking=thinking and not action,refusal=refusal,usage=usage,request_id=request_id,config=config)
     # 分身可能在下一次完整响应续写，保留两段交界处的空格、换行与代码缩进。
     visible = (text or '') if retain or config.get('_avatar_agent') else (text or '').strip()
-    return ModelResult(visible, model_usage, calls, reason)
+    return ModelResult(visible, model_usage, calls, reason, replay=replay)
 
 
 # 按 token 预算分别限制有效内容和 SSE 传输；每个 token 可能单独携带完整的 JSON 事件头。
@@ -337,19 +345,23 @@ class ModelClient:
         from avatar.models.limits import check_context
         check_context(config,system,history,message)
         fmt = config["api_format"]
-        conversation = [{"role": m["role"], "content": m["content"]} for m in history]
-        conversation.append({"role": "user", "content": message})
+        from avatar.models.tools import wire_messages
+        transcript = history if message is None else [*history, {"role": "user", "content": message}]
+        conversation = wire_messages(fmt, transcript)
         images=config.get('_image_inputs',[])
         audio=config.get('_audio_inputs',[])
+        last_input = next((row for row in reversed(conversation)
+                           if row['role']=='user' and (isinstance(row.get('content'),str) or
+                               row.get('parts') and 'text' in row['parts'][0])), None) if images or audio else None
         if audio and (not config.get('audio_enabled') or fmt not in ('openai','gemini')):
             raise HTTPException(422, '当前模型配置或接口不支持音频输入')
-        if (images or audio) and fmt in ('openai','anthropic'):
-            parts=[{'type':'text','text':message}]
+        if (images or audio) and last_input and fmt in ('openai','anthropic'):
+            parts=[{'type':'text','text':last_input['content']}]
             for image in images:
                 if fmt=='openai':parts.append({'type':'image_url','image_url':{'url':'data:'+image['mime_type']+';base64,'+image['data']}})
                 else:parts.append({'type':'image','source':{'type':'base64','media_type':image['mime_type'],'data':image['data']}})
             parts.extend({'type':'input_audio','input_audio':{'data':item['data'],'format':'wav'}} for item in audio)
-            conversation[-1]['content']=parts
+            last_input['content']=parts
         base = config["base_url"].rstrip("/")
         if fmt == "openai":
             endpoint = base + "/chat/completions"
@@ -357,7 +369,7 @@ class ModelClient:
             limit_field = "max_completion_tokens" if config["provider"] == "openai" else "max_tokens"
             body = {"model": config["model"], "messages": [{"role": "system", "content": system}]+conversation,
                     limit_field: config["max_tokens"], "stream": streaming}
-            if (config.get('_recover_thinking') or config.get('_brief_visual_parse') or config.get('_call_purpose') in ('skill_execution','task_planning','material_selection','agent_intent','delivery_review')
+            if (config.get('_recover_thinking') or config.get('_brief_visual_parse') or config.get('_call_purpose') == 'agent_intent'
                     or (config.get('_tools') and config.get('_call_purpose') in ('file_read','rag_query_construction'))) and not config.get('reasoning_effort') and config['provider']=='custom' and config['model'].split('/')[-1].lower().startswith('qwen'):
                 body['enable_thinking']=False
                 body['chat_template_kwargs']={'enable_thinking':False}
@@ -377,10 +389,10 @@ class ModelClient:
             endpoint = base + "/models/" + quote(model, safe="") + (":streamGenerateContent?alt=sse" if streaming else ":generateContent")
             headers = {"x-goog-api-key": api_key}
             body = {"systemInstruction": {"parts": [{"text": system}]},
-                    "contents": [{"role": "model" if m["role"] == "assistant" else "user", "parts": [{"text": m["content"]}]} for m in conversation],
+                    "contents": conversation,
                     "generationConfig": {"maxOutputTokens": config["max_tokens"]}}
-            if images:body["contents"][-1]["parts"].extend({"inline_data":{"mime_type":image["mime_type"],"data":image["data"]}} for image in images)
-            if audio:body["contents"][-1]["parts"].extend({"inline_data":{"mime_type":item["mime_type"],"data":item["data"]}} for item in audio)
+            if images and last_input:last_input["parts"].extend({"inline_data":{"mime_type":image["mime_type"],"data":image["data"]}} for image in images)
+            if audio and last_input:last_input["parts"].extend({"inline_data":{"mime_type":item["mime_type"],"data":item["data"]}} for item in audio)
         else:
             raise HTTPException(422, "不支持的模型接口格式")
         apply_effort(config, body)
@@ -388,7 +400,8 @@ class ModelClient:
             body["stream_options"] = {"include_usage": True}
         if config.get('_tools'):
             from avatar.models.tools import configure_tools
-            configure_tools(fmt,body,config['_tools'],required=not config.get('_optional_tools'),batch=bool(config.get('_batch_tools')))
+            configure_tools(fmt,body,config['_tools'],required=not config.get('_optional_tools'),
+                            batch=bool(config.get('_batch_tools')),native=bool(config.get('_react_tool_calls')))
         return fmt, endpoint, headers, body
 
     # 职责：在总超时内转发统一格式的上游流式事件。

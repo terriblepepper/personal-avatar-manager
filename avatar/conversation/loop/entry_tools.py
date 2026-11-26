@@ -8,16 +8,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from avatar.core.text_budget import AgentText
 from avatar.core.execution import check_execution_async, run_blocking
-from avatar.rag.reading import ReadingNeedsInput
-
-
-class ToolQuestion(BaseModel):
-    model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
-    query: AgentText = Field(min_length=1)
-
-
-class SearchQuestion(ToolQuestion):
-    folder: str = Field(default='', max_length=512)
+from avatar.rag.reading import ReadRequest
+from avatar.rag.service import SearchMaterialRequest
 
 
 class SessionFileRequest(BaseModel):
@@ -32,10 +24,6 @@ class SessionFileRequest(BaseModel):
         if (self.file_id is None) == (self.query is None) or self.query is not None and self.page!=1:
             raise ValueError('给出 file_id 读取原件，或给出 query 查目录；目录分页用 offset')
         return self
-
-
-def background(system):
-    return json.JSONDecoder().raw_decode(system.split('\n', 1)[1])[0]
 
 
 @dataclass(frozen=True)
@@ -63,15 +51,15 @@ async def bind_entry_tools(chat, context, entry, *, sandbox=None, status=None, d
     scope = (owner, aic, session, files, include_private)
     store = config.get('_run_store')
     state = await run_blocking(store.load) if store else {}
+    current_schema = state.get('schema_version') == 2
     saved = state.get('entry_material', {})
-    sources = list(saved.get('sources', ()))
+    sources = list(saved.get('sources', ())) if current_schema else []
     revisions = {tuple(identity): revision for identity, revision in saved.get('revisions', ())}
     if revisions:
         config.update(_rag_access={'originals':True,'scope':scope,'revisions':list(revisions.items())}, _material_sources=sources)
         await run_blocking(chat.rag.validate, context)
     outputs = config.setdefault('_generated_files', [])
-    tools = []
-    lookup_types = {}
+    tools = list(config.get('_entry_tools', ()))
     session_files = temporary_files
     read_images = {}
     other_images = list(config.get('_image_inputs', ()))
@@ -92,14 +80,18 @@ async def bind_entry_tools(chat, context, entry, *, sandbox=None, status=None, d
         return len(explicit_images)+len(read_images)
 
     previous_reads = state.get('session_file_reads', state.get('generated_reads', {}))
+    source_checks = state.get('session_source_checks', {})
+    if not current_schema:
+        source_checks = {**source_checks, **previous_reads}
+        previous_reads = {}
     if session_access is not None:
         from avatar.files.conversation.session_files import SessionFiles
         session_files = SessionFiles(chat.chat_files, session_access.owner or owner, session_access.conversation, previous_reads,
                                     grants=session_access.grants, sandbox_ids=[f['id'] for f in (*files,*config.get('_agent_saved_files',()))], outputs=outputs,
-                                    staged_reads=state.get('staged_html_reads'))
+                                    staged_reads=state.get('staged_html_reads') if current_schema else None,
+                                    source_checks=source_checks)
         config.update(_session_file_scope=session_access.conversation, _load_session_source=session_files.html,
-                      _session_read_proofs=session_files.proofs, _has_html_source=session_files.has_html_source,
-                      _session_sandbox_inputs=session_files.sandbox_inputs,
+                      _session_read_proofs=session_files.proofs,
                       _validate_session_files_in=session_files.validate_in)
         await run_blocking(session_files.validate)
         if files:
@@ -111,7 +103,7 @@ async def bind_entry_tools(chat, context, entry, *, sandbox=None, status=None, d
                 config['_image_inputs'] = (images+list(config.get('_image_inputs',())))[:5]
             if store:
                 await run_blocking(store.merge,{'session_file_reads':dict(session_files.proofs)})
-        if config.get('vision_enabled'):
+        if current_schema and config.get('vision_enabled'):
             for identifier in state.get('session_image_ids', ()):
                 if identifier not in session_files.proofs:
                     raise HTTPException(409,'此前的视觉原件授权已改变')
@@ -119,51 +111,35 @@ async def bind_entry_tools(chat, context, entry, *, sandbox=None, status=None, d
                 if binary := image.pop('image_input',None):
                     attach_image(identifier,binary)
     elif temporary_files is not None:
-        config.update(_load_session_source=session_files.html,_has_html_source=session_files.has_html_source)
-    elif previous_reads:
+        config['_load_session_source'] = session_files.html
+    elif previous_reads or source_checks:
         raise HTTPException(409, '此前读取的原件已失去会话授权')
 
-    def tool(name, description, schema=ToolQuestion, *, prefill=False):
+    def tool(name, description, schema):
         tools.append({'name':name, 'description':description, 'parameters':schema.model_json_schema()})
-        if prefill:
-            lookup_types[name]=schema
 
-    tool('search_materials', '混合检索已授权资料的正文片段，可指定目录。', SearchQuestion, prefill=True)
-    tool('read_material', '按文件名、说明或问题定位授权资料并读取原文。', prefill=True)
+    tool('search_materials', '按查询和可选目录、文件或页码过滤检索授权资料，返回片段和文件 ID。', SearchMaterialRequest)
+    tool('read_material', '按 file_id 读取授权原件的正文、图片或音视频片段。按 next 续读，search 定位正文。', ReadRequest)
     if session_files:
-        tool('read_session_file', '查找或读取本会话授权文件，也可复查本轮生成的 HTML。query 查目录，file_id 读原件。按返回游标续读。', SessionFileRequest, prefill=True)
+        tool('read_session_file', '查找或读取本会话授权文件，也可复查本轮生成的 HTML。query 查目录，file_id 读原件。按返回游标续读。', SessionFileRequest)
     if directory_reply:
-        from avatar.conversation.avatar_assistant import CatalogArguments, LIST_AVATARS
+        from avatar.conversation.avatar_assistant import LIST_AVATARS
         tools.append(LIST_AVATARS)
-        lookup_types['list_avatars']=CatalogArguments
     if status:
         tools.append({'name':'application_status','description':'查看本人的分身申请与审核状态。',
                       'parameters':{'type':'object','properties':{},'additionalProperties':False}})
+    python = None
     if sandbox:
-        tool('python', '运行获准的沙箱计算或技能脚本；query 说明需验证的计算、输入和期望产物。')
-
-    async def run_python(query, *, restoring=False):
-        if sandbox is None:
-            raise HTTPException(403,'当前身份或会话未授权执行沙箱')
-        cfg, _, enriched, _ = await sandbox(({**config, '_restore_only':restoring}, key, system, history), query)
-        for name in ('_validate_sandbox','_sandbox_succeeded','_sandbox_delivered','_agent_checkpoint','_workflow_notices'):
-            if name in cfg:
-                config[name] = cfg[name]
-        known = {item['id'] for item in outputs}
-        outputs.extend(item for item in cfg.get('_generated_files', ()) if item['id'] not in known)
-        records = background(enriched).get('skill_execution_results', [])
-        if not restoring and not records:
-            raise ValueError('沙箱未执行，缺少实际计算回执')
-        if not restoring and records[-1].get('status')!='success':
-            last = records[-1]
-            raise ValueError('沙箱执行失败：'+str(last.get('error') or last.get('stderr') or '没有成功回执')[:500])
-        return json.dumps({'results':records}, ensure_ascii=False)
+        from avatar.skills.python_tool import PythonArguments
+        python = sandbox(session_files.sandbox_inputs if session_files else dict)
+        tools.append({'name':'run_python', 'parameters':python.arguments_schema(),
+                      'description':'在隔离环境执行 Python 源码并返回回执。用已授权文件 ID 提供输入，生成文件写入 outputs/。支持 NumPy、pandas、Matplotlib、Pillow 和 pypdf。'})
 
     # Recover files and recheck source grants even when the next model step only writes the final answer.
     if state.get('sandbox') or config.get('_agent_checkpoint',{}).get('sandbox_attempted'):
-        if not sandbox:
+        if python is None:
             raise HTTPException(409, '此前沙箱权限已撤回，未恢复其结果')
-        await run_python('', restoring=True)
+        await python.restore()
 
     def validate():
         if session_files:
@@ -210,60 +186,36 @@ async def bind_entry_tools(chat, context, entry, *, sandbox=None, status=None, d
             if args:
                 raise ValueError('申请状态工具无需参数')
             return await run_blocking(status)
-        if name=='python':
-            return await run_python(ToolQuestion.model_validate(args).query)
-        if name not in ('search_materials','read_material'):
+        if name=='run_python':
+            if python is None:
+                raise HTTPException(403,'当前身份或会话未授权执行沙箱')
+            return await python.execute(PythonArguments.model_validate(args))
+        if name == 'search_materials':
+            observation = await chat.rag.search_tool(scope, args)
+        elif name == 'read_material':
+            observation = await chat.rag.read_tool(
+                scope, args, vision=bool(config.get('vision_enabled')),
+                audio=bool(config.get('audio_enabled')) and config.get('api_format') in ('openai', 'gemini'))
+        else:
             raise ValueError('当前会话未提供此工具')
-        request = (SearchQuestion if name=='search_materials' else ToolQuestion).model_validate(args)
-        route = {'mode':'search' if name=='search_materials' else 'read', **request.model_dump()}
-        # A new lookup must not inherit proof or excerpts from an earlier successful lookup.
-        lookup={k:v for k,v in config.items() if k not in ('_rag_access','_material_sources','_image_inputs','_workflow_notices')}
-        data=background(system)
-        for field in ('file_evidence','file_catalog','material_readings'):
-            data.pop(field,None)
-        lookup_system=system.split('\n',1)[0]+'\n'+json.dumps(data,ensure_ascii=False)
-        selected = await chat.rag.enrich(owner,aic,session,files,({**lookup,'_answer_route':route},key,lookup_system,history),
-                                         request.query,include_private=include_private,progress=progress)
-        try:
-            resolved, message = await chat.rag.answer_context(selected, request.query, progress=progress)
-        except ReadingNeedsInput as missing:
-            await check_execution_async(validate)
-            return json.dumps({'query':request.query,'has_evidence':False,'matches':[],
-                               'sources':[],'notices':[str(missing)]},ensure_ascii=False)
-        cfg = resolved[0]
-        data = background(resolved[2])
-        evidence = data.get('file_evidence', [])
-        reading = message[len(request.query):].strip()
-        # Older protected observations stay bound to their original revisions across compaction and restart.
+
         await check_execution_async(validate)
-        proof = cfg.get('_rag_access', {})
-        visible_ids = {item['file_id'] for item in cfg.get('_material_sources', ())}
-        visible_ids.update(item['file_id'] for item in evidence if item.get('file_id'))
-        for identity, revision in proof.get('revisions', ()):
-            if identity[1] not in visible_ids:
-                continue
-            identity = tuple(identity)
+        for identity, revision in observation.revisions:
             if identity in revisions and revisions[identity] != revision:
-                raise HTTPException(409,'资料或权限已变化，请重新提问')
+                raise HTTPException(409, '资料或权限已变化，请重新提问')
             revisions[identity] = revision
-        for source in cfg.get('_material_sources', ()):
+        for source in observation.sources:
             if source not in sources:
                 sources.append(source)
-        config.update(_rag_access={'originals':True,'scope':scope,'revisions':list(revisions.items())}, _material_sources=sources)
-        if cfg.get('_image_inputs'):
-            other_images[:] = cfg['_image_inputs']
-            config['_image_inputs'] = (list(config.get('_explicit_image_inputs',()))+list(read_images.values())+other_images)[:5]
-        if store:
-            await run_blocking(store.merge, {'entry_material':{'sources':sources,'revisions':list(revisions.items())}})
+        proof = {'originals':True, 'scope':scope, 'revisions':list(revisions.items())}
+        config.update(_rag_access=proof, _material_sources=sources)
         await check_execution_async(validate)
-        proven_ids={identity[1] for identity,_ in proof.get('revisions',())}
-        original=any(item.get('file_id') in proven_ids and item.get('type')=='源文件'
-                     for item in cfg.get('_material_sources',()))
-        matched=any(item.get('file_id') in proven_ids and str(item.get('text') or '').strip() for item in evidence)
-        return json.dumps({'query':request.query,'has_evidence':original or (name=='search_materials' and matched),
-                           'matches':evidence,'reading':reading,
-                           'sources':cfg.get('_material_sources',[]),'notices':cfg.get('_workflow_notices',[])},ensure_ascii=False)
+        if store:
+            await run_blocking(store.merge, {'entry_material':{'sources':sources, 'revisions':proof['revisions']}})
+        if observation.images or observation.audio:
+            config['_entry_native_media'] = {'images':observation.images, 'audio':observation.audio}
+        return json.dumps({**observation.content, 'sources':observation.sources}, ensure_ascii=False)
 
-    config.update(_entry_tools=tools,_entry_lookup_types=lookup_types,
+    config.update(_entry_tools=tools,
                   _execute_entry_tool=execute,_validate_entry_results=validate)
     return context

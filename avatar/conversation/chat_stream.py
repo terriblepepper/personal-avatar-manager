@@ -119,7 +119,7 @@ async def stream_chat(chat, user, request):
                             continue
                         elif event['type'] == 'delta':
                             text.append(event['text'])
-                            if (overview.get('_material_delivery') or '_material_outputs' in overview
+                            if ('_material_outputs' in overview
                                     or any(is_html_output(item) for item in overview.get('_generated_files', ()))
                                     or any(item.get('group') == 'sandbox' for item in overview.get('_tool_events', ()))):
                                 continue  # Delivery text and its file cards become visible together after commit.
@@ -162,7 +162,6 @@ async def stream_chat(chat, user, request):
                 paused=AgentNeedsInput.from_context(exc.detail,pause_context[0] if pause_context else {})
                 paused.stream_retryable=True
                 paused.retry_dispatch=retry_dispatch or bool(held and held.get('retry_dispatch') and prepared is None)
-                paused.answer_route=pause_context[0].get('_answer_route') if pause_context else None
                 try:
                     result=await run_blocking(pauses.pause,chat,user,original,request,parent,session or parent,overview,paused,held)
                 except HTTPException as error:

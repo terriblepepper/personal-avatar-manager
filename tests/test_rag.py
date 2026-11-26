@@ -293,9 +293,7 @@ def prepared_index(context,monkeypatch):
     return rag,uid,fid,store
 
 
-def test_search_materials_passes_planned_query_evidence_and_notices(context, monkeypatch):
-    import json
-    from types import SimpleNamespace
+def test_search_materials_returns_exact_query_evidence_and_notices(context, monkeypatch):
     from unittest.mock import Mock
     from tests.support import saved_file
 
@@ -304,39 +302,32 @@ def test_search_materials_passes_planned_query_evidence_and_notices(context, mon
     owner = client.get('/api/auth/me').json()['user']['id']
     good = saved_file(client, 'retry.txt', b'Retry after a timeout.')
     failed = saved_file(client, 'unavailable.txt', b'Unavailable content.')
+    excluded = saved_file(client, 'other.txt', b'Retry after a timeout.')
     with rag.database.connect(write=True) as db:
         db.execute("""INSERT INTO avatar_records(user_id,aic,certificate,profile,last_modified_at,created_at,updated_at)
                       VALUES(?,'fixture-aic','{}','{}','1','1','1')""", (owner,))
-        db.execute("UPDATE attachments SET relative_path='notes/' || filename WHERE user_id=?", (owner,))
+        db.execute("UPDATE attachments SET relative_path='notes/' || filename WHERE id IN (?,?)", (good, failed))
         db.execute("UPDATE file_rag_documents SET status='failed',error='parse failed' WHERE file_id=?", (failed,))
 
-    question = 'How should the client recover?'
-    requested = 'retry after timeout'
-    async def generate(config, key, system, history, message):
-        tool = config['_tools'][0]['name']
-        if tool == 'search_materials':
-            assert json.loads(message)['question'] == question
-            arguments = {'query': '  ' + requested + '  '}
-        else:
-            assert tool == 'construct_file_query'
-            assert json.loads(message)['question'] == requested
-            arguments = {'query': 'timeout recovery', 'folder': 'notes'}
-        return SimpleNamespace(usage={}, tool_calls=[{'name': tool, 'arguments': arguments}])
+    asyncio.run(rag.index('profile', good, owner))
+
+    async def generate(*args, **kwargs):
+        pytest.fail('material search called a generative model')
 
     monkeypatch.setattr(rag.chat.model_client, 'generate', generate)
     search = Mock(wraps=rag.store.search)
     monkeypatch.setattr(rag.store, 'search', search)
-    config = {'provider':'deepseek', 'model':'test-model', 'max_tokens':128, '_workflow_notices':['prior notice']}
-    enriched, _, system, _ = asyncio.run(rag.enrich(
-        owner, 'fixture-aic', {'id':'session'}, [], (config, '', 'system\n{}', []), question, include_private=True))
-    assert search.call_args.args[3] == [requested, 'timeout recovery']
-    background = json.loads(system.split('\n', 1)[1])
-    assert background['file_query_scope']['folder'] == 'notes'
-    assert {(row['file_id'], row['relative_path']) for row in background['file_evidence']} == {(good, 'notes/retry.txt')}
-    assert any('Retry after a timeout.' in row['text'] for row in background['file_evidence'])
-    notices = background['workflow_notices']
-    assert notices == enriched['_workflow_notices'] and notices[0] == 'prior notice'
-    assert any('parse failed' in notice and 'unavailable.txt' in notice for notice in notices)
+    scope = (owner, 'fixture-aic', {'id':'session'}, [], True)
+    result = asyncio.run(rag.search_tool(scope, {'query':' retry after timeout ', 'folder':'notes'}))
+
+    assert search.call_args.args[3] == ['retry after timeout']
+    assert {(row['file_id'], row['relative_path']) for row in result.content['evidence']} == {(good, 'notes/retry.txt')}
+    assert any('Retry after a timeout.' in row['text'] for row in result.content['evidence'])
+    assert {row['file_id'] for row in result.content['catalog']} == {good, failed}
+    assert any('parse failed' in notice and 'unavailable.txt' in notice for notice in result.content['notices'])
+    assert {(source, uid) for (source, uid), _ in result.revisions} == {('profile', good), ('profile', failed)}
+    assert result.sources == [{'file_id':good, 'filename':'retry.txt', 'type':'RAG'}]
+    assert excluded not in str(result.content)
 
 
 def test_index_does_not_publish_when_vector_write_is_incomplete(context,monkeypatch):
@@ -733,25 +724,16 @@ def test_model_configuration_probe_failure_preserves_settings_and_index(context,
     assert snapshot()==before
 
 
-def test_answer_sources_use_evidence_and_successful_original_reads(monkeypatch):
-    import json
+def test_source_footer_uses_observed_sources_and_honors_omission():
     from avatar.rag.service import MaterialRag
-    rag=object.__new__(MaterialRag)
-    async def unchanged(context,message):return context
-    monkeypatch.setattr(rag,'reading_context',unchanged)
-    monkeypatch.setattr(rag,'validate',lambda context:None)
-    payload={'file_catalog':[{'file_id':'unused','filename':'not-read.pdf'}],
-             'file_evidence':[{'file_id':'pdf','filename':'paper.pdf','text':'excerpt'}]*2,
-             'material_readings':[{'file_id':'pdf','filename':'paper.pdf','pages':[{'page':1,'text':'original'}]},
-                                  {'file_id':'failed','filename':'failed.pdf','error':'unreadable'}]}
-    config={'_rag_access':True,'context_tokens':128000,'max_tokens':1024}
-    context,message=asyncio.run(rag.answer_context((config,'key','context\n'+json.dumps(payload),[]),'explain'))
-    footer=rag.source_footer(context)
-    assert footer.count('paper.pdf · RAG')==1
-    assert footer.count('paper.pdf · 源文件')==1
-    assert 'not-read.pdf' not in footer and 'failed.pdf' not in footer
-    assert 'original' in message
-    assert rag.source_footer(({},'', '',[]))==''
+
+    sources = [{'file_id':'pdf', 'filename':'report_[final].pdf', 'type':'RAG'},
+               {'file_id':'pdf', 'filename':'report_[final].pdf', 'type':'源文件'}]
+    config = {'_material_sources':sources}
+    footer = MaterialRag.source_footer((config, '', '', []))
+    assert footer.count('report\\_\\[final\\].pdf') == 2
+    assert '· RAG' in footer and '· 源文件' in footer
+    assert MaterialRag.source_footer(({**config, '_omit_source_citations':True}, '', '', [])) == ''
 
 
 def test_embedding_retries_only_transient_failures(monkeypatch):
@@ -775,33 +757,53 @@ def test_embedding_retries_only_transient_failures(monkeypatch):
     assert delays==[2,5,10]
 
 
-def test_named_private_file_can_be_read_without_embedding(provisioned_context, monkeypatch):
-    import json
-    from avatar.models.client import ModelResult
+def test_atomic_original_read_preserves_cursor_and_checks_private_access(provisioned_context, monkeypatch):
+    from fastapi import HTTPException
+    from tests.support import saved_file
 
     app, user, _ = provisioned_context
-    item = upload(user, 'private-notes.txt')
+    content = 'Native text. ' * 1500
+    identifier = saved_file(user, 'private-notes.txt', content.encode())
     uid = user.get('/api/auth/me').json()['user']['id']
     with app.state.database.connect(write=True) as db:
-        aic = db.execute('SELECT aic FROM avatar_records WHERE user_id=?',(uid,)).fetchone()[0]
-        db.execute('DELETE FROM embedding_settings WHERE user_id=?',(uid,))
-    calls = iter((('read_material', {'file_id': item['id']}), ('finish_reading', {})))
+        aic = db.execute('SELECT aic FROM avatar_records WHERE user_id=?', (uid,)).fetchone()[0]
+        db.execute("UPDATE attachments SET visibility='private' WHERE id=?", (identifier,))
 
-    async def model(config, key, system, history, message):
-        assert {tool['name'] for tool in config['_tools']} == {'read_material','finish_reading'}
-        assert any(row['file_id'] == item['id'] for row in json.loads(message)['catalog'])
-        name, arguments = next(calls)
-        return ModelResult('', {}, ({'name': name, 'arguments': arguments},))
+    async def generate(*args, **kwargs):
+        pytest.fail('original read called a generative model')
 
-    monkeypatch.setattr(app.state.chat.model_client, 'generate', model)
-    config = {'_avatar_agent': True, 'provider': 'deepseek', 'model': 'test-model'}
-    previous = [{'role': 'user', 'content': '解释 private-notes.txt 内容'}]
-    question = '展开解释，给我详细信息'
     rag = app.state.chat.rag
-    context = asyncio.run(rag.enrich(uid, aic, {'id':'named-read'}, [],
-                          (config,'local','context\n{}',previous), question, include_private=True))
-    answered, message = asyncio.run(rag.answer_context(context, question))
-    readings = json.loads(message.rsplit('：\n',1)[1])['material_readings']
-    assert readings[0]['pages'][0]['text'] == 'private-notes.txt'
-    original, = answered[0]['_material_sources']
-    assert original == {'file_id': item['id'], 'filename': 'private-notes.txt', 'type': '源文件'}
+    monkeypatch.setattr(rag.chat.model_client, 'generate', generate)
+    scope = (uid, aic, {'id':'named-read'}, [], True)
+    first = asyncio.run(rag.read_tool(scope, {'file_id':identifier}))
+    assert not first.content['complete']
+    second = asyncio.run(rag.read_tool(scope, {'file_id':identifier, **first.content['next']}))
+    assert first.content['pages'][0]['text'] + second.content['pages'][0]['text'] == content
+    assert second.content['complete']
+    assert first.sources == [{'file_id':identifier, 'filename':'private-notes.txt', 'type':'源文件'}]
+    assert first.revisions == second.revisions
+    with pytest.raises(HTTPException) as denied:
+        asyncio.run(rag.read_tool((*scope[:-1], False), {'file_id':identifier}))
+    assert denied.value.status_code == 404
+
+
+def test_atomic_pdf_read_keeps_a_cursor_through_blank_pages(tmp_path):
+    from pypdf import PdfWriter
+    from avatar.rag.reading import ReadRequest, read_original_tool
+
+    path = tmp_path / 'blank.pdf'
+    writer = PdfWriter()
+    for _ in range(17):
+        writer.add_blank_page(width=100, height=100)
+    writer.write(path)
+
+    request = ReadRequest(file_id='pdf', mode='full')
+    first, images, audio = asyncio.run(read_original_tool(path, path.name, 'application/pdf',
+                                                         request, vision=False, audio=False))
+    assert len(first['pages']) == 16 and not first['complete']
+    assert first['next'] == {'start':17, 'offset':0}
+    assert not (images or audio)
+    second, _, _ = asyncio.run(read_original_tool(path, path.name, 'application/pdf',
+                                                 ReadRequest(file_id='pdf', **first['next']),
+                                                 vision=False, audio=False))
+    assert second['complete'] and second['empty_pages'] == [17]

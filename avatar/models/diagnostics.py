@@ -5,7 +5,10 @@ import ssl
 import httpx
 from fastapi import HTTPException
 
-PURPOSES={'segmented_writing':'接续未完成的输出','agent_intent':'会话意图分析','task_planning':'拆分目标并选择所需工具','goal_decision':'目标核对与工具选择','delivery_review':'交付回执核验','html_generation':'HTML 作品生成','material_selection':'资料原件筛选','skill_execution':'技能脚本规划','memory':'记忆压缩','file_embedding':'向量嵌入','file_search':'资料判断/检索','file_read':'资料原文读取','answer':'回答生成'}
+PURPOSES={'react':'分身模型调用','agent_intent':'会话意图分析','html_generation':'HTML 作品生成',
+          'memory':'记忆压缩','file_embedding':'向量嵌入','file_search':'资料判断/检索',
+          'file_read':'资料原文读取','answer':'回答生成'}
+_REFUSALS = {'content_filter','safety','recitation','blocklist','prohibited_content','spii','refusal'}
 
 
 def stop_reason(reason, tool_calls=()):
@@ -26,15 +29,25 @@ def stop_reason(reason, tool_calls=()):
     return 'error'
 
 
-def check_terminal(reason, usage):
+def check_terminal(reason, usage, *, native=False):
     terminal = stop_reason(reason)
     detail = {'context_overflow':'输入超过上游模型的上下文窗口', 'cancelled':'上游已取消模型响应',
-              'interrupted':'上游中断了模型响应'}
-    if terminal in detail:
-        error = HTTPException(499 if terminal == 'cancelled' else 502, detail[terminal])
-        error.stop_reason = terminal
-        error.model_usage = usage
-        raise error
+              'interrupted':'上游中断了模型响应'}.get(terminal)
+    if native and terminal == 'error':
+        tag = identifier(reason) or '未知'
+        if tag.lower() in ('malformed_function_call','unexpected_tool_call'):
+            from avatar.models.tools import invalid_tool_call
+            error = invalid_tool_call('上游未生成可执行的工具调用（'+tag+'）', None)
+        else:
+            cause = '上游模型拒绝或拦截了本次响应' if tag.lower() in _REFUSALS else '上游模型未正常完成响应'
+            error = HTTPException(502, cause+'（终止原因='+tag+'）')
+    elif detail:
+        error = HTTPException(499 if terminal == 'cancelled' else 502, detail)
+    else:
+        return
+    error.stop_reason = terminal
+    error.model_usage = usage
+    raise error
 
 
 def connection_error(error,service='模型平台'):
@@ -61,7 +74,7 @@ def empty_response(fmt,*,reason=None,thinking=False,refusal=False,usage=None,req
     terminal = stop_reason(tag)
     if terminal == 'output_limit':
         cause='达到本次生成的 Token 上限，未生成可见正文；这是单次输出预算限制，不代表账户余额不足'
-    elif refusal or tag.lower() in ('content_filter','safety','recitation','blocklist','prohibited_content','spii','refusal'):
+    elif refusal or tag.lower() in _REFUSALS:
         cause='上游返回内容拦截或拒绝，未提供可见正文'
     elif thinking:
         cause='上游只返回了思考内容，没有返回可见正文；未展示思考原文，不能据此认定余额不足'

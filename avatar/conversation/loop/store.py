@@ -1,6 +1,7 @@
 """Owner-scoped PostgreSQL checkpoints and append-only UTF-8 fragments."""
 import json
 from contextlib import contextmanager
+from copy import deepcopy
 from threading import RLock
 
 from avatar.core.artifact_limits import MAX_ENVELOPE_BYTES, MAX_SOURCE_BYTES
@@ -21,14 +22,14 @@ _SCOPE_ACCESS = {
                    WHERE t._rowid=?::bigint AND a.user_id=?''',
 }
 _UNSEEN = object()
-RAW_ARGUMENT_PREFIX = 'draft-arguments-'
+BATCH_PREFIX = 'react-batch-'
 # Provider fragments, assembled arguments and a repaired base may coexist with visible text and a finished artifact.
 OWNER_STORAGE_BYTES = 4 * MAX_ENVELOPE_BYTES + 2 * MAX_SOURCE_BYTES
 _CHUNK_OVERHEAD = 256
 
 
 def draft_byte_limit(name, binary=False):
-    return MAX_ENVELOPE_BYTES if not binary and name.startswith(RAW_ARGUMENT_PREFIX) else MAX_SOURCE_BYTES
+    return MAX_ENVELOPE_BYTES if not binary and name.startswith(BATCH_PREFIX) else MAX_SOURCE_BYTES
 
 
 class RunStore:
@@ -158,6 +159,14 @@ class RunStore:
         with self._write() as db:
             db.execute('UPDATE agent_loop_runs SET state=?::jsonb WHERE id=?', (self._json(state), self._id))
 
+    def migrate(self, state, keep):
+        with self._write() as db:
+            db.execute('''WITH removed AS (DELETE FROM agent_loop_chunks WHERE run=? AND NOT (draft=ANY(?::text[]))
+                    RETURNING octet_length(content)+octet_length(draft)+? AS charge)
+                UPDATE agent_loop_runs SET state=?::jsonb,
+                    storage_bytes=storage_bytes-(SELECT coalesce(sum(charge),0) FROM removed) WHERE id=?''',
+                       (self._id, sorted(keep), _CHUNK_OVERHEAD, self._json(state), self._id))
+
     def _patch(self, db, patch):
         if patch is not None:
             db.execute('UPDATE agent_loop_runs SET state=state || ?::jsonb WHERE id=?', (self._json(patch), self._id))
@@ -206,17 +215,40 @@ class RunStore:
             if not data and not binary:
                 return size
             if size + len(data) > draft_byte_limit(name, binary):
-                raise RunCapacity('工具参数封装过大' if not binary and name.startswith(RAW_ARGUMENT_PREFIX) else '单份草稿超过 100 MiB')
-            charge = len(data) + len(name.encode()) + _CHUNK_OVERHEAD
-            used = db.execute('SELECT COALESCE(sum(storage_bytes),0) FROM agent_loop_runs WHERE owner=?',
-                              (self.owner,)).fetchone()[0]
-            if used + charge > OWNER_STORAGE_BYTES:
-                raise RunCapacity('账户临时草稿存储空间不足')
-            db.execute('INSERT INTO agent_loop_chunks(run,draft,start_byte,content,is_binary) VALUES(?,?,?,?,?::int::boolean)',
-                       (self._id, name, offset, data, int(binary)))
-            db.execute('UPDATE agent_loop_runs SET storage_bytes=storage_bytes+? WHERE id=?', (charge, self._id))
+                raise RunCapacity('工具参数封装过大' if not binary and name.startswith(BATCH_PREFIX) else '单份草稿超过 100 MiB')
+            self._write_chunks(db, name, [(offset, data)], binary)
             self._patch(db, patch)
             return size + len(data)
+
+    def _write_chunks(self, db, name, chunks, binary):
+        charge = sum(len(data) + len(name.encode()) + _CHUNK_OVERHEAD for _, data in chunks)
+        used = db.execute('SELECT COALESCE(sum(storage_bytes),0) FROM agent_loop_runs WHERE owner=?',
+                          (self.owner,)).fetchone()[0]
+        if used + charge > OWNER_STORAGE_BYTES:
+            raise RunCapacity('账户临时草稿存储空间不足')
+        db.executemany('INSERT INTO agent_loop_chunks(run,draft,start_byte,content,is_binary) VALUES(?,?,?,?,?::int::boolean)',
+                       ((self._id, name, offset, data, int(binary)) for offset, data in chunks))
+        db.execute('UPDATE agent_loop_runs SET storage_bytes=storage_bytes+? WHERE id=?', (charge, self._id))
+
+    def archive(self, name, data, *, patch):
+        if len(data) > draft_byte_limit(self._draft(name)):
+            raise RunCapacity('单份回执超过 100 MiB')
+        # The reference and its independently pageable rows commit under the same writer fence.
+        chunks = []
+        start = 0
+        while start < len(data):
+            end = min(start + 256 * 1024, len(data))
+            while end < len(data) and data[end] & 0xc0 == 0x80:
+                end -= 1
+            chunks.append((start, data[start:end]))
+            start = end
+        with self._write() as db:
+            last = self._last(db, name)
+            if not last and chunks:
+                self._write_chunks(db, name, chunks, False)
+            elif last and (last[0] != len(data) or last[1]):
+                raise RunConflict('已归档回执的内容不一致')
+            self._patch(db, patch)
 
     def append(self, draft_id, offset, text, *, patch=None):
         return self._append(draft_id, offset, text.encode('utf-8'), False, patch)
@@ -281,3 +313,66 @@ class RunStore:
         with self._gate, self.database.connect(write=True, account_scope=self.owner) as db:
             self.check_in(db)
             self.clear_in(db, *self._key)
+
+
+class MemoryRunStore:
+    """Run-local storage for entries without a durable checkpoint."""
+    def __init__(self):
+        self.state = {}
+        self.chunks = {}
+        self.storage_bytes = 0
+
+    def check(self):
+        pass
+
+    def load(self):
+        return deepcopy(self.state)
+
+    def save(self, state):
+        self.state = deepcopy(state)
+
+    def migrate(self, state, keep):
+        for name in self.chunks.keys() - keep:
+            self.discard(name)
+        self.save(state)
+
+    def merge(self, patch, *, expected=None):
+        if expected and any(self.state.get(key) != value for key, value in expected.items()):
+            raise RunConflict('任务步骤已由其他执行者更新')
+        self.state.update(deepcopy(patch))
+
+    def append(self, name, offset, text, *, patch=None):
+        return self._append(name, offset, text.encode('utf-8'), patch)
+
+    def _append(self, name, offset, data, patch):
+        current = self.chunks.get(name, {})
+        size = sum(map(len, current.values()))
+        if offset != size:
+            if current.get(offset) == data:
+                return size
+            raise RunConflict('草稿字节游标已改变')
+        if size + len(data) > draft_byte_limit(name):
+            raise RunCapacity('单份草稿超过存储上限')
+        if data:
+            charge = len(data) + len(name.encode()) + _CHUNK_OVERHEAD
+            if self.storage_bytes + charge > OWNER_STORAGE_BYTES:
+                raise RunCapacity('临时草稿存储空间不足')
+            self.chunks.setdefault(name, {})[offset] = data
+            self.storage_bytes += charge
+        if patch:
+            self.merge(patch)
+        return size + len(data)
+
+    def archive(self, name, data, *, patch):
+        self._append(name, 0, data, None)
+        self.merge(patch)
+
+    def read_range(self, name, start, limit):
+        return b''.join(self.chunks.get(name, {}).values())[start:start + limit]
+
+    def read(self, name):
+        return b''.join(self.chunks.get(name, {}).values()).decode('utf-8')
+
+    def discard(self, name):
+        chunks = self.chunks.pop(name, {})
+        self.storage_bytes -= sum(len(data) + len(name.encode()) + _CHUNK_OVERHEAD for data in chunks.values())

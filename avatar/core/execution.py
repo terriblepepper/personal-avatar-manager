@@ -62,6 +62,7 @@ async def finish_on_cancel(coroutine):
 
 # The same context follows generation work through model, sandbox and RAG boundaries.
 current_generation = ContextVar('current_generation', default=None)
+current_tool_call: ContextVar[tuple[int, str, bool] | None] = ContextVar('current_tool_call', default=None)
 
 
 def authorization():

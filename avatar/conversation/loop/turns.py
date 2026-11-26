@@ -45,4 +45,4 @@ async def stream_final(source, emit, validate, progress=None):
         raise
     return ModelResult(''.join(chunks), final['usage'], tool_calls=tuple(final.get('tool_calls', ())),
                        finish_reason=final.get('finish_reason'),
-                       partial_tool_calls=tuple(final.get('partial_tool_calls', ())))
+                       partial_tool_calls=tuple(final.get('partial_tool_calls', ())), replay=final.get('replay'))

@@ -86,12 +86,14 @@ def word_vectors(path, extension):
     return vector
 
 
-def pdf_visual_pages(reader, *, vector=True):
+def pdf_visual_pages(reader, *, vector=True, pages=None):
     paints = {b'Do', b'INLINE IMAGE'}
     if vector:
         paints.update((b'sh', b'S', b's', b'f', b'f*', b'F', b'B', b'B*', b'b', b'b*'))
-    for index, page in enumerate(reader.pages, 1):
-        content = page.get_contents()
+    for index in range(1, len(reader.pages)+1) if pages is None else sorted(pages):
+        if not 1 <= index <= len(reader.pages):
+            continue
+        content = reader.pages[index-1].get_contents()
         if content is not None and any(operator in paints for _, operator in content.operations):
             yield index
 
@@ -102,9 +104,7 @@ def pdf_images(path, pages=None, *, vector=True):
     reader = PdfReader(path, strict=False)
     if reader.is_encrypted:
         raise ValueError('PDF 已加密，无法解析图片')
-    for number in pdf_visual_pages(reader, vector=vector):
-        if pages is not None and number not in pages:
-            continue
+    for number in pdf_visual_pages(reader, vector=vector, pages=pages):
         # Render the page as well: vector plots, masks and nested forms are visual evidence too.
         with tempfile.TemporaryDirectory(prefix='avatar-document-page-') as directory:
             target = Path(directory) / 'page'

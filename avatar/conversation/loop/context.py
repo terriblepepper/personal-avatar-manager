@@ -1,269 +1,190 @@
-"""Project the durable transcript and the current tool turn into the next model request."""
-import asyncio
+"""Project the durable turn into a budgeted native tool-calling transcript."""
 import hashlib
 import json
-from itertools import islice
 
-from avatar.conversation.loop.store import RunCapacity, draft_byte_limit
-from avatar.models.context_budget import bounded_excerpt, compression_budget, excerpt, fit_working_set, input_budget, retained_budget
+from avatar.conversation.loop.store import MemoryRunStore, RunConflict
 from avatar.core.execution import run_blocking
 from avatar.core.tokens import estimate
+from avatar.models.context_budget import bounded_excerpt, compression_budget, input_budget
+from avatar.models.limits import history_row_tokens
 
 
 READ_STEP_RECEIPT = {
-    'name':'read_step_receipt',
-    'description':'在本任务内分页读取已压缩的真实工具回执。receipt=0 列目录，其他编号按 UTF-8 字节 offset 读取。',
-    'parameters':{'type':'object','properties':{
-        'receipt':{'type':'integer','minimum':0},'offset':{'type':'integer','minimum':0}},
-        'required':['receipt'],'additionalProperties':False},
+    'name': 'read_step_receipt',
+    'description': '按编号和字节偏移读取工具回执。编号 0 列目录。',
+    'parameters': {'type': 'object', 'properties': {
+        'receipt': {'type': 'integer', 'minimum': 0}, 'offset': {'type': 'integer', 'minimum': 0}},
+        'required': ['receipt'], 'additionalProperties': False},
 }
 _PAGE = 4096
+_RECEIPT_BYTES = 12 * 1024
 
 
-class TurnContext:
-    def __init__(self, history, question, revision, summary=None, *, store=None, checkpoint=None):
-        self.history = [dict(row) for row in history]
-        self.question = question
-        self.revision = revision
-        self.summary = dict(summary or {})
-        self.store = store
+def _json(value):
+    return json.dumps(value, ensure_ascii=False, separators=(',', ':'))
+
+
+def _groups(trajectory):
+    index = 0
+    groups = []
+    while index < len(trajectory):
+        message = trajectory[index]
+        calls = message.get('tool_calls', ())
+        end = index + 1 + len(calls)
+        group = trajectory[index:end]
+        if (message['role'] == 'tool' or calls and message['role'] != 'assistant'
+                or [call['id'] for call in calls] != [row.get('tool_call_id') for row in group[1:]]
+                or any(row['role'] != 'tool' for row in group[1:])):
+            raise RunConflict('分身任务的工具调用与回执不匹配')
+        groups.append(group)
+        index = end
+    return groups
+
+
+def _cost(rows):
+    return sum(map(history_row_tokens, rows))
+
+
+class ReActContextManager:
+    def __init__(self, history, question, *, store=None, checkpoint=None):
         checkpoint = checkpoint or {}
-        self.base = checkpoint.get('observation_base', 0)
-        self.refs = dict(checkpoint.get('observation_refs', {}))
-        self.scanned = 0
-        self.pages = dict(checkpoint.get('observation_pages', {}))
-        self._page_views = {}
-        self._visible_pages = set()
-        self._retire_through = self.base
-        self._hydrated = set()
-        self._key = None
-        self._attempted = set()
+        self.history = list(history)
+        self.question = question
+        self.store = store if store is not None else MemoryRunStore()
+        self.receipt_refs = dict(checkpoint.get('receipt_refs', {}))
+        self.summary = dict(checkpoint.get('history_summary') or {})
+        self.legacy_summary = checkpoint.get('legacy_summary', '')
+        self.omitted_count = 0
 
-    def _prefix_key(self):
-        if self._key is None:
-            digest = hashlib.sha256()
-            for item in (self.revision, self.question, *self.history[:-2]):
-                digest.update(json.dumps(item, ensure_ascii=False, separators=(',', ':'), sort_keys=True).encode())
-                digest.update(b'\0')
-            self._key = digest.hexdigest()
-        return self._key
-
-    def _archive(self, number, note):
-        data = note.encode('utf-8')
+    async def archive(self, content, *, force=False):
+        data = content.encode('utf-8')
+        if not force and len(data) <= _RECEIPT_BYTES:
+            return content, None
         name = 'step-receipt-' + hashlib.sha256(data).hexdigest()
-        if len(data) > draft_byte_limit(name):
-            raise RunCapacity('单份回执超过 100 MiB')
-        # Limit each database row so reading one page never decompresses a giant TOAST value.
-        offset = self.store.size(name)
-        while offset < len(data):
-            end = min(offset + 256 * 1024, len(data))
-            while end < len(data) and data[end] & 0xc0 == 0x80:
-                end -= 1
-            offset = self.store.append(name, offset, data[offset:end].decode('utf-8'))
-        self.refs[str(number)] = {'name':name, 'size':len(data),'label':note.strip()[:48]}
-
-    async def checkpoint_observations(self, notes):
-        """Preserve originals before checkpoint pruning; content addresses make a replay idempotent."""
-        end = len(notes)
-        cut = min(end, max(0, self._retire_through-self.base))
-        def capture():
-            for start, stop, force in ((0, cut, True), (max(cut, self.scanned), end, False)):
-                for index in range(start, stop):
-                    n = str(self.base + index + 1)
-                    if n not in self.pages and n not in self.refs and (force or len(notes[index]) > 1600):
-                        self._archive(n, notes[index])
-        if self.store and (end > self.scanned or cut):
-            await run_blocking(capture)
-        if cut:
-            del notes[:cut]
-            self.base += cut
-            self._hydrated = {n for n in self._hydrated if int(n)>self.base}
-            self.pages = {k:v for k,v in self.pages.items() if int(k) > self.base}
-            self._page_views = {k:v for k,v in self._page_views.items() if k in self.pages}
-        self.scanned = len(notes)
-        return {'observation_base':self.base, 'observation_refs':self.refs, 'observation_pages':self.pages,
-                'observations':[excerpt(note, 1600) for note in notes]}
-
-    def remember_page(self, observations, args, page):
-        n = str(self.base + len(observations) + 1)
-        source = args['receipt']
-        offset = args.get('offset',0)
-        self.pages[n] = {'receipt':source,'offset':offset}
-        self._page_views[n] = json.dumps(page,ensure_ascii=False)
-        observations.append(f'已读取本任务回执 {source}，偏移 {offset}。')
-
-    def page_visible(self, args):
-        return (args['receipt'],args.get('offset',0)) in self._visible_pages
+        number = next((int(key) for key, ref in self.receipt_refs.items() if ref['name'] == name), None)
+        if number is None:
+            number = max(map(int, self.receipt_refs), default=0) + 1
+            refs = {**self.receipt_refs, str(number): {'name': name, 'size': len(data), 'label': content[:48]}}
+            await run_blocking(self.store.archive, name, data, patch={'receipt_refs': refs})
+            self.receipt_refs.update(refs)
+        return _json({'receipt': number, 'bytes': len(data), 'preview': bounded_excerpt(content, 512),
+                      'hint': '可用 read_step_receipt 分页读取完整回执。'}), number
 
     async def read_receipt(self, args):
-        number, offset = args.get('receipt'), args.get('offset',0)
-        if (set(args) - {'receipt','offset'} or type(number) is not int or type(offset) is not int
+        number, offset = args.get('receipt'), args.get('offset', 0)
+        if (set(args) - {'receipt', 'offset'} or type(number) is not int or type(offset) is not int
                 or number < 0 or offset < 0):
             raise ValueError('无效的回执编号或偏移')
         if number == 0:
-            check = getattr(self.store,'check',None)
-            if check:
-                await asyncio.to_thread(check)
-            keys = sorted(self.refs,key=int)[offset:offset+16]
-            rows = [(n,self.refs[n]) for n in keys]
-            return {'items':[{'receipt':int(n),'bytes':ref['size'],'label':ref['label']} for n,ref in rows],
-                    'next_offset':offset+len(rows) if offset+len(rows)<len(self.refs) else None}
-        ref = self.refs.get(str(number))
-        if not ref or not self.store or offset > ref['size']:
+            await run_blocking(self.store.check)
+            keys = sorted(self.receipt_refs, key=int)[offset:offset + 16]
+            return {'items': [{'receipt': int(n), 'bytes': self.receipt_refs[n]['size'],
+                               'label': self.receipt_refs[n]['label']} for n in keys],
+                    'next_offset': offset + len(keys) if offset + len(keys) < len(self.receipt_refs) else None}
+        ref = self.receipt_refs.get(str(number))
+        if not ref or offset > ref['size']:
             raise ValueError('本任务没有此回执或游标')
-        data = await asyncio.to_thread(self.store.read_range,ref['name'],offset,_PAGE)
+        data = await run_blocking(self.store.read_range, ref['name'], offset, _PAGE)
         if (offset < ref['size'] and not data) or (data and data[0] & 0xc0 == 0x80):
             raise ValueError('回执偏移须位于有效 UTF-8 字符边界')
-        text = data.decode('utf-8','ignore')
+        text = data.decode('utf-8', 'ignore')
         end = offset + len(text.encode('utf-8'))
-        return {'receipt':number, 'offset':offset, 'text':text, 'next_offset':end if end < ref['size'] else None}
+        return {'receipt': number, 'offset': offset, 'text': text, 'next_offset': end if end < ref['size'] else None}
 
-    def _catalog(self):
-        if not self.refs:
+    async def _fold_trajectory(self, groups, summarize):
+        prior = self.summary.get('trajectory', '')
+        rows = [{'role': 'user', 'content': prior}] if prior else []
+        for group in groups:
+            for row in group:
+                if row['role'] != 'tool':
+                    if row['content']:
+                        rows.append({'role': row['role'], 'content': row['content']})
+                    continue
+                ref = row.get('receipt_ref')
+                text = row['content']
+                if not ref:
+                    text, ref = await self.archive(text, force=True)
+                rows.append({'role': 'user', 'content': f'{row["name"]} 回执 {ref}（数据）：{text}'})
+        raw = '\n'.join(row['role'] + '：' + row['content'] for row in rows)
+        summary = await summarize(rows) if summarize and estimate(raw) > 4096 else None
+        self.summary['trajectory'] = bounded_excerpt(summary or raw, 1024)
+        self.omitted_count = sum(map(len, groups))
+
+    async def _older_history(self, rows, room, summarize):
+        if not rows or room <= 16:
             return ''
-        latest = list(islice(reversed(self.refs),3))
-        return '\n已归档回执可用 read_step_receipt 按编号及字节偏移重读；编号 0 列目录。近期编号：'+', '.join(reversed(latest))+'。'
+        raw = '\n'.join(row['role'] + '：' + row['content'] for row in rows)
+        digest = hashlib.sha256(raw.encode()).hexdigest()
+        previous = self.summary.get('history', {})
+        if previous.get('digest') != digest and summarize and estimate(raw) > 4096:
+            previous = {'digest': digest, 'text': await summarize(rows)}
+            self.summary['history'] = previous
+        summary = (previous.get('text') if previous.get('digest') == digest else '') or raw
+        return bounded_excerpt('较早会话（历史数据）：\n' + summary, room - 16)
 
-    def _restore_note(self, ref, budget):
-        # Checkpoints keep previews. Reopen the original through the same scoped store on resume.
-        size = ref['size']
-        limit = max(0, budget)*3
-        if size <= limit:
-            return self.store.read(ref['name'])
-        if limit < 2:
+    def _trajectory_view(self, room):
+        if room <= 16 or not self.summary.get('trajectory'):
             return ''
-        half = limit//2
-        start = self.store.read_range(ref['name'],0,half).decode('utf-8','ignore')
-        end = self.store.read_range(ref['name'],size-half,half).decode('utf-8','ignore') if half else ''
-        return start+'\n[…已节选，可按回执编号读取…]\n'+end
+        return bounded_excerpt('较早工具步骤（历史数据）：\n' + self.summary['trajectory'], room - 16)
 
-    async def _turn_notes(self, config, prompt, objective, observations, summarize, recovering):
-        catalog = self._catalog()
-        saved = self.summary.get('turn') or {}
-        through = saved.get('through', self.base) if saved.get('revision') == self.revision else self.base
-        start = max(0, through - self.base)
-        previous = saved.get('text','') if saved.get('revision') == self.revision else ''
-        digest = '\n本轮此前工具结果的摘要（数据）：' + previous if previous else ''
-        covered = [digest] if digest else []
-        budget = compression_budget(config)
-        rest = list(observations[start:])
-        for i in range(len(rest)):
-            n = str(self.base + start + i + 1)
-            if n in self.pages:
-                if n not in self._page_views:
-                    page = await self.read_receipt(self.pages[n])
-                    self._page_views[n] = json.dumps(page,ensure_ascii=False)
-                rest[i] += self._page_views[n]
-            elif n in self.refs:
-                ref = self.refs[n]
-                if self.store and n not in self._hydrated and len(rest[i].encode()) < ref['size']:
-                    rest[i] = await run_blocking(self._restore_note,ref,input_budget(config))
-                    observations[start+i] = rest[i]
-                self._hydrated.add(n)
-                rest[i] = f'\n回执 {n}（数据，可分页重读）：'+rest[i]
-        overhead = estimate(prompt)+estimate(objective)+estimate(catalog)
-        room = max(0,budget-overhead) or max(0,input_budget(config)-overhead)
-        size = sum(map(estimate,rest))
-        history_cost = sum(estimate(row['content'])+16 for row in self.history)
-        if size+estimate(digest)+history_cost >= room:
-            room = max(room//2,room-history_cost)
-        # Even old short receipts can cross the active window before reaching the token threshold.
-        prior_end = saved.get('through',0) if saved.get('revision') == self.revision else 0
-        archive_due = self.base > prior_end
-        if archive_due:
-            older = [f'回执 {n}：{ref["label"]}' for n,ref in self.refs.items() if prior_end < int(n) <= self.base]
-            if older:
-                digest += '\n已归档较早回执的索引（数据）：'+bounded_excerpt('\n'.join(older),512)
-                covered = [digest]
-        if summarize and rest and (size + estimate(digest) >= room or recovering):
-            # Protect the latest result; when that result alone fills a turn, summarize its prefix too.
-            split_latest = estimate(rest[-1]) > max(240,room//2)
-            count = len(rest) if split_latest else len(rest)-1
-            end = self.base + start + count
-            key = ('turn',end)
-            if count and key not in self._attempted:
-                self._attempted = {k for k in self._attempted if not isinstance(k,tuple) or k[0] != 'turn'}
-                self._attempted.add(key)
-                rows = [{'role':'user','content':digest}] if digest else []
-                for i,note in enumerate(rest[:count]):
-                    n = self.base + start + i + 1
-                    value = note[:-256] if split_latest and i == count-1 and len(note)>256 else note
-                    rows.append({'role':'user','content':f'工具回执 {n}（数据）：'+value})
-                text = await summarize(rows)
-                if text:
-                    tail = rest[-1][-256:] if split_latest else ''
-                    self.summary = {**self.summary, 'turn':{'revision':self.revision,'through':end,'text':text,'tail':tail}}
-                    covered = ['\n本轮此前工具结果的摘要（数据）：'+text]
-                    self._retire_through = end
-                    rest = rest[count:]
-                    if tail:
-                        covered.append('\n最近工具回执结尾（数据）：'+tail)
-        if previous and saved.get('tail') and through == self.summary.get('turn',{}).get('through'):
-            covered.append('\n最近工具回执结尾（数据）：'+saved['tail'])
-        if self.store and size > room:
-            # Even when summarization is unavailable, retire only evidence beyond the actual window.
-            keep = 0
-            for i in range(len(rest)-1,-1,-1):
-                keep += estimate(rest[i])
-                if keep>room and i<len(rest)-1:
-                    self._retire_through = max(self._retire_through,self.base+len(observations)-len(rest)+i+1)
-                    break
-        covered.extend(rest)
-        return ([catalog] if catalog else []) + covered
-
-    async def project_goal(self, config, prompt, goal, reserved, *, recovering, writing, summarize):
-        # Delivery conditions and the continuation cursor stay intact when the user turn alone overflows.
-        overhead = estimate(prompt)+estimate(reserved)
-        hard = max(0,input_budget(config)-overhead)
-        room = min(hard,max(0,compression_budget(config)-overhead))
-        if recovering:
-            hard //= 2
-            room = min(room,hard)
-        if estimate(goal) <= room:
-            return goal
-        key = hashlib.sha256(goal.encode()).hexdigest()
-        entry = self.summary.get('objective') or {}
-        if entry.get('key') != key and summarize and room >= 128 and ('goal',key) not in self._attempted:
-            self._attempted.add(('goal',key))
-            text = await summarize([{'role':'user','content':goal}])
-            if text:
-                entry = {'key':key,'text':text}
-                self.summary = {**self.summary,'objective':entry}
-        if entry.get('key') != key or not room:
-            return bounded_excerpt(goal,hard)
-        digest = '本轮用户要求摘要：' + entry['text']
-        remainder = room - estimate(digest) - 16
-        return (digest + '\n用户原文节选：' + bounded_excerpt(goal,remainder)
-                if remainder >= 32 else bounded_excerpt(digest,room))
-
-    async def project(self, config, prompt, objective, observations, *, recovering=False, summarize=None, writing=False):
-        notes = await self._turn_notes(config,prompt,objective,observations,summarize,recovering)
+    async def project(self, config, prompt, trajectory, *, recovering=False, summarize=None):
+        self.omitted_count = 0
+        groups = _groups(trajectory)
+        boundary = estimate(prompt)
+        hard = max(0, input_budget(config) - boundary)
+        soft = max(0, compression_budget(config) - boundary)
+        legacy = ''
+        if self.legacy_summary:
+            legacy = bounded_excerpt('本任务旧执行记录（只读数据）：\n' + self.legacy_summary, min(800, hard // 8))
+        prior = self._trajectory_view(min(1024, hard // 8))
+        background = [{'role': 'user', 'content': text} for text in (legacy, prior) if text]
+        background_cost = _cost(background)
+        objective = self.question
+        if history_row_tokens({'content': objective}) + background_cost > hard:
+            goal_limit = max(0, hard - background_cost - 64)
+            objective = bounded_excerpt(objective, goal_limit)
+            if summarize and goal_limit >= 128:
+                digest = hashlib.sha256(self.question.encode()).hexdigest()
+                previous = self.summary.get('objective', {})
+                if previous.get('digest') != digest:
+                    previous = {'digest': digest, 'text': await summarize([{'role': 'user', 'content': self.question}])}
+                    self.summary['objective'] = previous
+                if previous.get('text'):
+                    objective = bounded_excerpt('当前用户要求摘要：\n' + previous['text'], goal_limit)
+        user = {'role': 'user', 'content': objective}
+        base_cost = background_cost + history_row_tokens(user)
+        hard -= base_cost
+        soft -= base_cost
         rows = self.history
-        fitted, views = fit_working_set(config,prompt,rows,objective,notes,force=recovering)
-        if len(rows) > 2 and (recovering or fitted != rows or views!=notes) and summarize:
-            key = self._prefix_key()
-            if self.summary.get('key') != key and key not in self._attempted:
-                self._attempted.add(key)
-                text = await summarize(rows[:-2])
-                if text:
-                    self.summary = {**self.summary,'key':key,'text':text,'turns':len(rows)-2}
-            if self.summary.get('key') == key:
-                digest = {'role':'user','content':'此前执行摘要（仅作历史数据）：\n'+self.summary['text']}
-                recent = rows[-2:]
-                ceiling = compression_budget(config) - estimate(prompt) - estimate(objective)
-                target = min(ceiling, retained_budget(config,prompt,objective))
-                used = sum(map(estimate,views)) + sum(estimate(row['content'])+16 for row in (digest,*recent))
-                start = len(rows)-2
-                while not recovering and used < target and start:
-                    cost = estimate(rows[start-1]['content'])+16
-                    if used+cost>ceiling:
-                        break
-                    start -= 1
-                    used += cost
-                fitted, views = fit_working_set(config,prompt,[digest,*rows[start:]],objective,notes,force=recovering)
-        # A page might have been clipped again after summarization or budget fitting.
-        delivered = set(views)
-        self._visible_pages = {(page['receipt'],page['offset']) for n,page in self.pages.items()
-                               if n in self._page_views and
-                               observations[int(n)-self.base-1] + self._page_views[n] in delivered}
-        return fitted, views
+        costs = [_cost(group) for group in groups]
+        used = _cost(rows) + sum(costs)
+        if used <= soft and not recovering:
+            return [*background, *rows, user, *trajectory]
+        if recovering:
+            soft = min(soft, used // 2)
+        summary_room = max(0, min(1024, soft // 4))
+        room = max(0, soft - summary_room)
+        start = len(groups)
+        while start and costs[start - 1] <= room:
+            start -= 1
+            room -= costs[start]
+        if not recovering and groups and start == len(groups) and costs[-1] <= hard:
+            start -= 1
+            room = 0
+            summary_room = min(summary_room, hard - costs[-1])
+        kept = len(rows)
+        while kept and history_row_tokens(rows[kept - 1]) <= room:
+            kept -= 1
+            room -= history_row_tokens(rows[kept])
+        room += summary_room
+        if start:
+            await self._fold_trajectory(groups[:start], summarize)
+            if prior:
+                room += history_row_tokens(background.pop())
+            if summary := self._trajectory_view(room if not kept else room // 2):
+                row = {'role': 'user', 'content': summary}
+                background.append(row)
+                room -= history_row_tokens(row)
+        if summary := await self._older_history(rows[:kept], room, summarize):
+            background.append({'role': 'user', 'content': summary})
+        return [*background, *rows[kept:], user, *(row for group in groups[start:] for row in group)]

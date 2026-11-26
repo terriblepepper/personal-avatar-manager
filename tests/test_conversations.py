@@ -21,8 +21,157 @@ from avatar.models.client import ModelClient
 from avatar.protocols.tasks.dialogues import PeerDialogueTasks
 from avatar.protocols.tasks.store import ManagementTaskError
 from avatar.protocols.transport.peer import PeerAcpsTransport
-from avatar.skills.execution import SkillExecution, SkillEnrichRequest
+from avatar.core.execution import AgentNeedsInput
+from avatar.skills.python_tool import AtomicPython, PythonArguments
 from tests.support import legacy_sqlite
+
+
+
+@pytest.mark.parametrize('fmt', ['openai', 'anthropic', 'gemini'])
+def test_native_tool_protocol_replays_calls_and_results(fmt):
+    from avatar.models.client import parse_response
+    tool = {'name': 'lookup', 'description': 'lookup', 'parameters': {'type':'object'}}
+    config = {'api_format':fmt, 'provider':'custom', 'model':'mock', 'base_url':'https://example.test',
+              'max_tokens':512, '_tools':[tool], '_react_tool_calls':True, '_optional_tools':True, '_batch_tools':True}
+    if fmt == 'openai':
+        payload = {'choices':[{'finish_reason':'tool_calls','message':{'reasoning_content':'private',
+            'tool_calls':[{'id':'actual','function':{'name':'lookup','arguments':'{"q":"one"}'}},
+                          {'id':'other','function':{'name':'hidden','arguments':'{'}}]}}]}
+    elif fmt == 'anthropic':
+        payload = {'stop_reason':'tool_use','content':[{'type':'thinking','thinking':'private','signature':'opaque'},
+            {'type':'tool_use','id':'actual','name':'lookup','input':{'q':'one'}},
+            {'type':'tool_use','id':'other','name':'hidden','input':'{'}]}
+    else:
+        payload = {'candidates':[{'finishReason':'STOP','content':{'parts':[
+            {'text':'private','thought':True,'thoughtSignature':'first'},
+            {'functionCall':{'id':'actual','name':'lookup','args':{'q':'one'}},'thoughtSignature':'opaque'},
+            {'functionCall':{'name':'hidden','args':['bad']}}]}}]}
+    result = parse_response(fmt, payload, config=config)
+    first, second = result.tool_calls
+    assert first['id'] == 'actual' and first['arguments'] == {'q':'one'}
+    assert second['name'] == 'hidden' and second['argument_error'] and second['arguments'] == {}
+    assert result.stop_reason == 'tool'
+    assert 'private' not in repr(result)
+    history = [{'role':'user','content':'look it up'},
+               {'role':'assistant','content':result.text,'tool_calls':result.tool_calls,'replay':result.replay},
+               {'role':'tool','tool_call_id':first['id'],'name':'lookup','content':'found'},
+               {'role':'tool','tool_call_id':second['id'],'name':'hidden','content':'invalid','is_error':True}]
+    *_, body = ModelClient().build_request(config, 'key', 'system', history, None)
+    if fmt == 'openai':
+        assistant, receipt, error = body['messages'][-3:]
+        assert assistant['reasoning_content'] == 'private'
+        assert [c['id'] for c in assistant['tool_calls']] == ['actual','other']
+        assert receipt == {'role':'tool','tool_call_id':'actual','content':'found'}
+        assert error['tool_call_id'] == 'other'
+    elif fmt == 'anthropic':
+        assistant, reply = body['messages'][-2:]
+        assert assistant['content'][0] == payload['content'][0]
+        assert [(r['tool_use_id'],r.get('is_error')) for r in reply['content']] == [('actual',None),('other',True)]
+    else:
+        assistant, reply = body['contents'][-2:]
+        declaration, = body['tools'][0]['functionDeclarations']
+        assert declaration == {'name':'lookup','description':'lookup','parametersJsonSchema':tool['parameters']}
+        assert assistant['parts'][0] == payload['candidates'][0]['content']['parts'][0]
+        assert assistant['parts'][1]['thoughtSignature'] == 'opaque'
+        assert assistant['parts'][1]['functionCall']['id'] == reply['parts'][0]['functionResponse']['id'] == 'actual'
+        assert 'id' not in reply['parts'][1]['functionResponse']
+        assert reply['parts'][1]['functionResponse']['response'] == {'error':'invalid'}
+
+
+
+@pytest.mark.parametrize('fmt', ['openai', 'anthropic', 'gemini'])
+def test_native_tool_stream_preserves_replay_and_call_ids(fmt):
+    from avatar.models.trace import model_io_scope
+    tool = {'name': 'lookup', 'description': 'lookup', 'parameters': {'type':'object'}}
+    config = {'api_format':fmt, 'provider':'custom', 'model':'mock', 'base_url':'https://example.test',
+              'max_tokens':512, '_tools':[tool], '_react_tool_calls':True, '_optional_tools':True, '_batch_tools':True}
+    if fmt == 'openai':
+        frames = [
+            {'choices':[{'delta':{'reasoning_content':'private_'},'finish_reason':None}]},
+            {'choices':[{'delta':{'reasoning_content':'opaque','tool_calls':[
+                {'index':0,'id':'first','function':{'name':'lookup','arguments':'{"q"'}}]},'finish_reason':None}]},
+            {'choices':[{'delta':{'tool_calls':[{'index':0,'function':{'arguments':':"one"}'}}]},
+                         'finish_reason':'tool_calls'}]},
+        ]
+    elif fmt == 'anthropic':
+        frames = [
+            {'type':'content_block_start','index':0,'content_block':{'type':'thinking','thinking':''}},
+            {'type':'content_block_delta','index':0,'delta':{'type':'thinking_delta','thinking':'private_opaque'}},
+            {'type':'content_block_delta','index':0,'delta':{'type':'signature_delta','signature':'signed'}},
+            {'type':'content_block_stop','index':0},
+            {'type':'content_block_start','index':1,'content_block':{'type':'tool_use','id':'first','name':'lookup','input':{}}},
+            {'type':'content_block_delta','index':1,'delta':{'type':'input_json_delta','partial_json':'{"q":"one"}'}},
+            {'type':'content_block_stop','index':1},
+            {'type':'message_delta','delta':{'stop_reason':'tool_use'}},
+            {'type':'message_stop'},
+        ]
+    else:
+        frames = [
+            {'candidates':[{'content':{'parts':[
+                {'text':'private_opaque','thought':True,'thoughtSignature':'signed'},
+                {'functionCall':{'id':'first','name':'lookup','willContinue':True,'partialArgs':[
+                    {'jsonPath':'$.q','stringValue':'o','willContinue':True}]},'thoughtSignature':'opaque'},
+            ]}}]},
+            {'candidates':[{'content':{'parts':[{'functionCall':{'willContinue':True,
+               'partialArgs':[{'jsonPath':'$.q','stringValue':'ne','willContinue':True}]}}]}}]},
+            {'candidates':[{'content':{'parts':[{'functionCall':{'partialArgs':[{'jsonPath':'$.q'}]}}]},
+                            'finishReason':'STOP'}]},
+        ]
+    stream = ''.join('data: '+json.dumps(frame)+'\n\n' for frame in frames)
+    async def resolver(host, port):
+        return '203.0.113.9'
+    model = ModelClient(httpx.MockTransport(lambda _: httpx.Response(
+        200, headers={'content-type':'text/event-stream'}, text=stream)), resolver=resolver)
+
+    async def exercise():
+        events = []
+        with model_io_scope(events.append, private=True):
+            reply = [event async for event in model.stream(config, 'key', 'system', [], 'find')]
+        assert reply[-1]['type'] == 'usage'
+        call, = reply[-1]['tool_calls']
+        assert call['id'] == 'first' and call['arguments'] == {'q':'one'}
+        assert 'private_opaque' in json.dumps(reply[-1]['replay'])
+        assert 'private_opaque' not in json.dumps(events)
+        assert not any(event['type']=='delta' for event in reply)
+        *_, plain = model.build_request(config, 'key', 'system',
+                                        [{'role':'assistant','content':'earlier'}], 'new')
+        if fmt == 'gemini':
+            assert plain['contents'] == [{'role':'model','parts':[{'text':'earlier'}]},
+                                         {'role':'user','parts':[{'text':'new'}]}]
+        else:
+            assert plain['messages'][-2:] == [{'role':'assistant','content':'earlier'},
+                                              {'role':'user','content':'new'}]
+    asyncio.run(exercise())
+
+
+
+@pytest.mark.parametrize(('fmt', 'payload'), [
+    ('openai', {'choices':[{'finish_reason':'content_filter','message':{'content':'unfinished'}}],
+                'usage':{'prompt_tokens':4,'completion_tokens':2}}),
+    ('anthropic', {'stop_reason':'refusal','content':[{'type':'text','text':'unfinished'}],
+                   'usage':{'input_tokens':4,'output_tokens':2}}),
+    ('gemini', {'candidates':[{'finishReason':'MALFORMED_FUNCTION_CALL','content':{'parts':[{'text':'unfinished'}]}}],
+                'usageMetadata':{'promptTokenCount':4,'candidatesTokenCount':2}}),
+])
+def test_native_tool_rejected_terminal_is_not_a_final_answer(fmt, payload):
+    from avatar.models.client import parse_response
+
+    with pytest.raises(HTTPException) as failure:
+        parse_response(fmt, payload, config={'_react_tool_calls':True})
+    assert failure.value.stop_reason == 'error'
+    assert failure.value.model_usage['total_tokens'] == 6
+    assert 'unfinished' not in failure.value.detail
+
+
+def test_native_tool_history_budget_counts_arguments_and_replay():
+    from avatar.models.limits import check_context
+    config = {'api_format':'openai', 'max_tokens':128, 'context_tokens':1200}
+    history = [{'role':'assistant','content':'','tool_calls':[{'id':'one','name':'lookup','arguments':{'q':'x'*1200}}],
+                'replay':{'reasoning_content':'x'*1200}}]
+    with pytest.raises(HTTPException) as failure:
+        check_context(config, 'system', history, None)
+    assert failure.value.stop_reason == 'context_overflow'
+    assert check_context(config, 'system', [{'role':'user','content':'plain'}], 'follow-up') > 0
 
 
 # Persistent generation identity and lifecycle; no external model requests
@@ -266,103 +415,125 @@ def test_peer_protocol_accepts_before_generation_and_deduplicates(context):
     asyncio.run(check())
 
 
-def test_agent_disclosure_can_finish_plain_answer():
+def test_react_single_streaming_answer():
     from avatar.conversation.agent_loop import run_agent
-    from avatar.models.client import ModelResult
 
-    purposes = []
+    calls, deltas = [], []
 
-    async def generate(config, *args):
-        purposes.append(config['_call_purpose'])
-        if config['_call_purpose'] == 'task_planning':
-            schema = config['_tools'][0]['parameters']['properties']
-            arguments = {'steps': []}
-            if 'reply' in schema:
-                arguments['reply'] = 'TCP 提供可靠且有序的传输。'
-            return ModelResult('', {'total_tokens': 20}, ({'name':'plan_task','arguments':arguments},), 'tool_calls')
-        return ModelResult('TCP 提供可靠且有序的传输。', {'total_tokens': 20}, finish_reason='stop')
+    async def stream(config, key, system, history, message):
+        calls.append(config)
+        yield {'type':'delta','text':'TCP 提供可靠且有序的传输。'}
+        yield {'type':'usage','usage':{'total_tokens':20},'finish_reason':'stop'}
 
-    rag = SimpleNamespace(chat=SimpleNamespace(model_client=SimpleNamespace(generate=generate)), validate=lambda _: None)
+    rag = SimpleNamespace(chat=SimpleNamespace(model_client=SimpleNamespace(stream=stream)), validate=lambda _: None)
     config = {'provider':'custom','model':'test','api_format':'openai','context_tokens':32768,'max_tokens':1024}
-    result = asyncio.run(run_agent(rag, (config,'key','测试分身',[]), '用一句话介绍 TCP。'))
+    result = asyncio.run(run_agent(rag, (config,'key','测试分身',[]), '用一句话介绍 TCP。',
+                                   progress=lambda event:None,on_delta=deltas.append))
     assert result.text == 'TCP 提供可靠且有序的传输。'
+    assert deltas == [result.text]
     assert result.usage['total_tokens'] == 20
-    assert purposes == ['task_planning']
+    assert len(calls)==1
+    assert {'ask_user','get_current_time'} <= {tool['name'] for tool in calls[0]['_tools']}
 
 
-@pytest.mark.parametrize('scenario', ['authorized', 'unavailable', 'read_then_create', 'partial_read'])
-def test_agent_disclosure_recovers_against_actual_provider_response(scenario):
+def test_react_ask_user_resumes_by_id_and_continues_truncated_reply():
+    from avatar.conversation.agent_loop import run_agent
+    from avatar.conversation.loop.store import MemoryRunStore
+    from avatar.core.execution import AgentNeedsInput
+
+    store, requests = MemoryRunStore(), []
+
+    async def stream(config, key, system, history, message):
+        requests.append(history)
+        if len(requests)==1:
+            yield {'type':'usage','usage':None,'finish_reason':'tool_calls','tool_calls':[
+                {'id':'call_ask','name':'ask_user','arguments':{'question':'几点开始？','options':['八点','九点']}}]}
+        else:
+            assert any(row['role']=='tool' and row['tool_call_id']=='call_ask' for row in history)
+            assert any('九点' in row['content'] for row in history if row['role']=='user')
+            text, reason = ('课程从','length') if len(requests)==2 else ('九点开始。','stop')
+            yield {'type':'delta','text':text}
+            yield {'type':'usage','usage':None,'finish_reason':reason}
+
+    async def run():
+        rag = SimpleNamespace(chat=SimpleNamespace(model_client=SimpleNamespace(stream=stream)), validate=lambda _:None)
+        config = {'context_tokens':32768,'max_tokens':1024,'_run_store':store}
+        context = (config,'key','测试分身',[])
+        with pytest.raises(AgentNeedsInput) as first:
+            await run_agent(rag,context,'安排课程。')
+        question = first.value.user_question
+        state = store.load()
+        assert state['schema_version']==2 and state['phase']=='paused' and state['pending_batch'] is None
+        config['_auto_recover'] = True
+        with pytest.raises(AgentNeedsInput) as recovered:
+            await run_agent(rag,context,'安排课程。')
+        assert recovered.value.user_question==question and len(requests)==1
+        config.pop('_auto_recover')
+        config['_answered_question'] = {**question,'answer':'九点'}
+        deltas=[]
+        answer = await run_agent(rag,context,'安排课程。',progress=lambda _:None,on_delta=deltas.append)
+        assert answer.text==''.join(deltas)=='课程从九点开始。'
+        assert (await run_agent(rag,context,'安排课程。')).text==answer.text and len(requests)==3
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('scenario', ['batch', 'unavailable', 'read_then_create', 'duplicate'])
+def test_react_executes_native_batches_and_returns_each_receipt(scenario):
     from avatar.conversation.agent_loop import run_agent
     from avatar.conversation.loop.entry_tools import SessionFileRequest
     from tests.support import fake_dns
 
     text = '<!DOCTYPE html><html><body><main>测试页面</main></body></html>'
-    name = 'read_session_file' if scenario != 'unavailable' else 'unknown_tool'
     definition = {'name':'read_session_file','description':'读取当前会话原件',
                   'parameters':SessionFileRequest.model_json_schema()}
-    planned_creation = scenario in ('read_then_create', 'partial_read')
-    actual_tools = []
-    executed = []
-    def tool(name, arguments):
-        return {'tool_calls':[{'type':'function','function':{'name':name,'arguments':json.dumps(arguments)}}]}
+    requests, executed = [], []
+    name = 'unknown_tool' if scenario=='unavailable' else 'read_session_file'
+
+    def tool(id, name, arguments):
+        return {'id':id,'type':'function','function':{'name':name,'arguments':json.dumps(arguments)}}
+
     def upstream(request):
         body = json.loads(request.content)
-        declared = {t['function']['name'] for t in body.get('tools', [])}
-        actual_tools.append(declared)
-        step = len(actual_tools)
+        declared = {t['function']['name'] for t in body['tools']}
+        assert 'read_session_file' in declared
+        assert not {'plan_task','update_task','request_tools'} & declared
+        requests.append(body)
+        step = len(requests)
         if step == 1:
-            plan = []
-            if planned_creation:
-                plan = [{'goal':'读取原件','tool':'read_session_file','criterion':'得到完整源码',
-                         'file_access':'content','lookup':{'file_id':'original'}},
-                        {'goal':'生成更新后的页面','tool':'create_html'}]
-            answer = tool('plan_task', {'steps':plan})
-        elif scenario == 'partial_read' and step in (2, 3, 4):
-            assert 'create_html' not in declared
-            if step == 2:
-                answer = tool('create_html', {'filename':'updated.html','html':text})
-            elif step == 3:
-                assert '前置' in body['messages'][-1]['content'] or '必要回执' in body['messages'][-1]['content']
-                answer = tool('read_session_file', {'file_id':'original','offset':10})
-            else:
-                assert 'update_task' in declared
-                answer = tool('update_task', {'goal_no':1,'result':'已读取原件','receipts':[1,2]})
-        elif planned_creation and step == (5 if scenario == 'partial_read' else 2):
-            assert executed == ['read_session_file'] * (2 if scenario == 'partial_read' else 1)
-            assert 'create_html' in declared
-            answer = tool('create_html', {'filename':'updated.html','html':text})
-        elif step == 2:
-            assert name not in declared
-            answer = tool(name, {'file_id':'original'})
-        elif step == 3 and scenario == 'authorized':
-            assert name in declared and executed == []
-            answer = tool(name, {'file_id':'original'})
+            calls = [tool('call_read',name,{'file_id':'original'})]
+            if scenario == 'batch':
+                calls.append(tool('call_time','get_current_time',{}))
+        elif step == 2 and scenario in ('read_then_create','duplicate'):
+            assert body['messages'][-1]['tool_call_id']=='call_read'
+            calls = [tool('call_follow','create_html',{'filename':'updated.html','html':text})] if scenario=='read_then_create' else [tool('call_follow',name,{'file_id':'original'})]
         else:
-            assert scenario != 'unavailable' or name not in declared
-            answer = {'content':'已处理。'}
-        return httpx.Response(200,json={'choices':[{'message':answer,
-            'finish_reason':'tool_calls' if 'tool_calls' in answer else 'stop'}]})
+            messages = [m for m in body['messages'] if m['role']=='tool']
+            assert [m['tool_call_id'] for m in messages] == ['call_read'] + (
+                ['call_time'] if scenario=='batch' else ['call_follow'] if scenario in ('duplicate','read_then_create') else [])
+            if scenario in ('unavailable','duplicate'):
+                assert json.loads(messages[-1]['content'])['error']
+            calls = []
+        deltas = [{'delta':{'tool_calls':[{**c,'index':i} for i,c in enumerate(calls)]},'finish_reason':None}] if calls else [{'delta':{'content':'已处理。'},'finish_reason':None}]
+        deltas.append({'delta':{},'finish_reason':'tool_calls' if calls else 'stop'})
+        events = ''.join('data: '+json.dumps({'choices':[delta]})+'\n\n' for delta in deltas)
+        return httpx.Response(200,content=(events+'data: [DONE]\n\n').encode(),
+                              headers={'content-type':'text/event-stream'})
 
     async def execute(tool_name, args):
         assert args['file_id'] == 'original'
         executed.append(tool_name)
-        offset = args.get('offset', 0)
-        next_offset = 10 if scenario == 'partial_read' and offset == 0 else None
-        content = text[offset:next_offset]
-        return json.dumps({'kind':'file','has_content':True,'text':content,'offset':offset,'next_offset':next_offset})
+        return json.dumps({'kind':'file','has_content':True,'text':text})
 
     model = ModelClient(httpx.MockTransport(upstream),resolver=fake_dns)
     rag = SimpleNamespace(chat=SimpleNamespace(model_client=model),validate=lambda _:None)
     config = {'provider':'custom','model':'test','api_format':'openai','base_url':'https://model.example/v1',
               'context_tokens':32768,'max_tokens':1024,'_entry_tools':[definition],
-              '_entry_lookup_types':{'read_session_file':SessionFileRequest},'_execute_entry_tool':execute,
-              '_html_enabled':planned_creation}
+              '_execute_entry_tool':execute,
+              '_html_enabled':scenario=='read_then_create'}
     result = asyncio.run(run_agent(rag,(config,'key','测试分身',[]),'处理本轮请求。'))
     assert result.text == '已处理。'
-    read_count = {'unavailable':0, 'partial_read':2}.get(scenario, 1)
-    assert executed == ['read_session_file'] * read_count
-    assert all('request_tools' not in declared for declared in actual_tools)
-    if planned_creation:
+    assert executed == ([] if scenario=='unavailable' else ['read_session_file'])
+    if scenario=='read_then_create':
         assert [item['filename'] for item in config['_generated_files']] == ['updated.html']
 
 
@@ -490,29 +661,29 @@ def test_sandbox_inputs_cannot_expand_after_submission(context,jobs,monkeypatch)
     captured={}
     async def memory(session,modified,context,*args,**kwargs):return context
     async def skills(uid,context,*args,**kwargs):return context
-    async def rag(uid,aic,session,files,context,*args,**kwargs):return context
-    async def execute(context, enrichment, model, **kwargs):
-        captured.update(enrichment.inputs)
-        prefix, data = context[2].split('\n',1)
-        evidence = {**json.loads(data), 'skill_execution_results':[{'status':'success'}]}
-        return context[0],context[1],prefix+'\n'+json.dumps(evidence),context[3]
+    async def execute(owner,resources,script,args,**kwargs):
+        kwargs['authorize']()
+        captured.update(resources)
+        return {'status':'success','stdout':'original','files':[]}
     monkeypatch.setattr(chat.memory,'prepare',memory)
     monkeypatch.setattr(chat.memory,'needs_compression',lambda *args:False)
     monkeypatch.setattr(chat.skills,'load_context',skills)
-    monkeypatch.setattr(chat.rag,'enrich',rag)
-    monkeypatch.setattr(chat.skill_execution,'enrich',execute)
+    monkeypatch.setattr(chat.sandbox,'execute',execute)
     overview={'agent':{'user_id':user['id'],'aic':'aic','last_modified_at':''},'_private_context':True}
     session={'id':cid,'parent_id':None}
     context=({'context_tokens':32768,'max_tokens':16},'key','system\n'+json.dumps({'available_skills':[]}),[])
     async def use_sandbox():
         prepared=await chat.prepare(user,request(cid,'inputs'),overview,context,session)
+        tool=prepared[0]['_execute_entry_tool']
+        with pytest.raises(ValueError,match='未授权文件'):
+            await tool('run_python',{'code':'print(1)','input_file_ids':[late]})
         assert not captured
-        await prepared[0]['_execute_entry_tool']('python',{'query':'读取可用输入'})
+        receipt=await tool('run_python',{'code':'print(1)','input_file_ids':[original]})
+        assert receipt['status']=='success'
+        assert captured['inputs/'+original+'/original.txt']==b'original'
+        with store.database.connect(write=True) as db:db.execute('DELETE FROM attachments WHERE id=?',(original,))
+        with pytest.raises(HTTPException):prepared[0]['_validate_sandbox']()
     with generation_scope(job):asyncio.run(use_sandbox())
-    assert original in captured and late not in captured
-    assert captured[original]['read']()==b'original'
-    with store.database.connect(write=True) as db:db.execute('DELETE FROM attachments WHERE id=?',(original,))
-    with pytest.raises(HTTPException):captured[original]['read']()
 
 
 @pytest.fixture
@@ -529,6 +700,137 @@ def supplemented_task(context,monkeypatch):
     async def no_controls(*args):pass
     monkeypatch.setattr(service.recovery,'flush_controls',no_controls)
     return service,users,identifier
+
+
+def test_peer_public_material_staging_reuses_verified_receipt(context, supplemented_task):
+    from avatar.conversation.loop.peer import PeerTurn
+    from avatar.conversation.loop.runtime import load_checkpoint
+    from avatar.conversation.loop.public_materials import bind_public_material_tools
+    from avatar.files.library.delivery import SavedMaterials
+    from avatar.files.library.public import PublicMaterials
+    from tests.support import saved_file
+
+    app, _, receiver = context
+    service, users, task_id = supplemented_task
+    owner = users[1]['id']
+    public = saved_file(receiver, '公开原件.txt', b'public')
+    private = saved_file(receiver, '私有资料.txt', b'private')
+    with service.database.connect(write=True) as db:
+        db.execute("UPDATE attachments SET visibility='public' WHERE id=?", (public,))
+        db.execute("UPDATE agent_dialogues SET status='running',next_speaker=1 WHERE id=?", (task_id,))
+        task = dict(service.session_store.owned(db, users[1], task_id))
+
+    library = SavedMaterials(app.state.chat.service.attachments, owner)
+
+    def bind():
+        run = PeerTurn(service.executor, task, owner)
+        store, state = run.open()
+        config = {}
+        bind_public_material_tools(app.state.chat, config, library, owner, store, state,
+                                   workspace=run.workspace, task_id=task_id)
+        return store, config
+
+    store, _ = bind()
+    store.merge({
+        'phase':'external_handoff',
+        'handoff':{'name':'send_public_material'},
+        'peer_export':{'exports':[{'id':'legacy'}], 'receipts':[{'prepared_originals':[]}]},
+        'history_summary':{'text':'核对旧附件'},
+    })
+    store, config = bind()
+    migrated = asyncio.run(load_checkpoint(store))
+    assert migrated['schema_version'] == 2 and migrated['trajectory'] == []
+    assert migrated['legacy_summary'] == '核对旧附件' and not migrated.get('peer_export')
+    tools = config['_react_handlers']
+    send = tools['send_public_material']
+    with pytest.raises(ValueError, match='可见'):
+        asyncio.run(send({'file_ids':[public]}))
+    found = asyncio.run(tools['find_public_material']({}))
+    assert [row['file_id'] for row in found['items']] == [public]
+    with pytest.raises(ValueError, match='可见'):
+        asyncio.run(send({'file_ids':[private]}))
+    receipt = asyncio.run(send({'file_ids':[public,public]}))
+
+    store, config = bind()
+    repeated = asyncio.run(config['_react_handlers']['send_public_material']({'file_ids':[public]}))
+    assert receipt == repeated
+    output, = store.load()['public_files']
+    assert output['id'] == receipt['files'][0]['id']
+    with service.database.connect() as db:
+        assert PublicMaterials.validate(db, owner, output)['id'] == public
+        assert not db.execute('SELECT 1 FROM chat_files WHERE id=?', (output['id'],)).fetchone()
+
+
+def test_town_public_material_stages_with_marker_and_releases_outputs_on_completion(context, supplemented_task, monkeypatch):
+    import time
+    from uuid import uuid4
+    from avatar.conversation.loop.store import RunStore
+    from avatar.conversation.loop.town import bind_town_tools
+    from avatar.core.db import dump
+    from avatar.protocols.tasks.personal import PersonalTaskService
+    from tests.support import saved_file
+
+    app, _, receiver = context
+    service, users, _ = supplemented_task
+    owner = users[1]['id']
+    public = saved_file(receiver, '公开原件.txt', b'public')
+    scope = ('peer-1','town#public:visitor','','town-session','town-task')
+    with service.database.connect(write=True) as db:
+        db.execute("UPDATE attachments SET visibility='public' WHERE id=?", (public,))
+        db.execute('INSERT INTO avatar_aip_tasks VALUES(?,?,?,?,?,?,?,?)',
+                   (*scope,'start',dump({'status':{'state':'working'}}),time.time()+60))
+        rowid = PersonalTaskService.task_row(db, scope)['rowid']
+
+    chat = app.state.chat
+    task_service = PersonalTaskService(chat, app.state.settings)
+    files = task_service.files
+
+    async def principal(_):
+        return {'visitor_id':'visitor','anonymous':False}
+
+    monkeypatch.setattr(task_service.public_authorization, 'authorize', principal)
+    wire = SimpleNamespace(peer_aic='town',group_id='',headers={'x-avatar-access':'public'})
+    command = {'taskId':'town-task','sessionId':'town-session'}
+    store = RunStore(service.database, owner, 'protocol', str(rowid), 'run', uuid4().hex)
+    store.acquire()
+    store.merge({'schema_version':2, 'phase':'running'})
+    async def run():
+        async with files.workspace() as slot:
+            config = {'_run_store':store}
+            await bind_town_tools(chat, (config,'key','test\n{}',[]), {'id':owner,'aic':'peer-1'}, 'town',
+                                  {'id':'town-session'}, slot, store, None, {})
+            assert {'find_public_material', 'send_public_material'} <= {tool['name'] for tool in config['_entry_tools']}
+            handlers = config['_react_handlers']
+            assert [row['file_id'] for row in (await handlers['find_public_material']({}))['items']] == [public]
+            receipt = await handlers['send_public_material']({'file_ids':[public]})
+            original, = config['_react_public_files']
+            assert receipt['files'][0]['marker'] == '[[attachment:'+original['id']+']]'
+            assert not config['_generated_files']
+            html = {'id':str(uuid4()), 'filename':'town.html', 'data':b'<!doctype html><html>town</html>'}
+            (slot/'draft').write_text('working')
+            async with files.prepare(rowid, [html], [original]) as staging:
+                with service.database.connect(write=True) as db:
+                    delivery, products = files.publish(db, rowid, owner, staging)
+                    document = {**command,'status':{'state':'awaiting-completion'},'_file_deliveries':[delivery],
+                                'products':[{'dataItems':[{'type':'text','text':'town'},*products]}]}
+                    db.execute('UPDATE avatar_aip_tasks SET document=? WHERE rowid=?', (dump(document), rowid))
+                result = await task_service.handle({**command,'id':'get','command':'get'}, wire, owner, 'peer-1')
+                text = result['products'][0]['dataItems'][0]['text']
+                assert html['data'].decode() in text
+                stream, _ = files.download(rowid, delivery['token'], original['id'])
+                with stream:
+                    assert stream.read() == b'public'
+        assert list(slot.iterdir()) == []
+        result = await task_service.handle({**command,'id':'complete','command':'complete'}, wire, owner, 'peer-1')
+        assert result['status']['state'] == 'completed'
+        assert result['products'][0]['dataItems'] == [{'type':'text','text':'town'}]
+        assert not files.folder(rowid, delivery['token']).exists()
+        with pytest.raises(HTTPException) as failure:
+            files.download(rowid, delivery['token'], original['id'])
+        assert failure.value.status_code == 404
+        assert chat.service.attachments.directory.available(owner, public, len(b'public'))
+
+    asyncio.run(run())
 
 
 def test_acps_get_revalidates_saved_peer_reply(supplemented_task):
@@ -687,36 +989,47 @@ def peers(context, monkeypatch):
     return app, actor, peer
 
 
-def test_contact_graph_requires_confirmation_and_rejects_foreign_files(peers, monkeypatch):
-    import asyncio
-    from fastapi import HTTPException
-    from avatar.models.client import ModelResult
-    from tests.support import MODEL
-    from tests.support import saved_file
+def test_contact_tool_requires_confirmation_and_rejects_foreign_files(peers, monkeypatch):
+    from tests.support import MODEL, saved_file
 
     app, actor, peer = peers
     assert actor.put('/api/me/model-settings', json={'model_config_input': MODEL}).status_code == 200
     user = actor.get('/api/auth/me').json()['user']
-    parent = actor.post('/api/conversations', json={'channel':'assistant'}).json()
+    parent = actor.post('/api/conversations', json={'channel': 'assistant'}).json()
     own_file = saved_file(actor, 'mine.txt', b'my notes')
     other_file = saved_file(peer, 'other.txt', b'private notes')
+    ticks = []
 
-    def contact(file_id):
-        return ModelResult('', {}, ({'name':'contact_avatar', 'arguments':{
-            'target_query':'admin', 'content':'review notes', 'file_ids':[file_id]}},))
+    async def stream(config, key, system, history, message):
+        ticks.append(config.get('_call_purpose'))
+        observed = [row for row in history if row['role'] == 'tool' and row.get('name') == 'contact_avatar']
+        if observed:
+            assert observed[-1]['tool_call_id'] == 'contact'
+            assert observed[-1]['is_error'] and '不可用的文件' in observed[-1]['content']
+            yield {'type': 'delta', 'text': '指定附件不可用。'}
+            yield {'type': 'usage', 'usage': {}, 'finish_reason': 'stop'}
+            return
+        assert 'contact_avatar' in {tool['name'] for tool in config['_tools']}
+        prompt = message or next(row['content'] for row in reversed(history) if row['role'] == 'user')
+        called = {'id': 'contact', 'name': 'contact_avatar', 'arguments': {
+            'target_query': 'admin', 'content': 'review notes',
+            'file_ids': [other_file if 'other' in prompt else own_file],
+        }}
+        yield {'type': 'usage', 'usage': {}, 'tool_calls': (called,), 'finish_reason': 'tool_calls'}
 
-    intent = app.state.dialogues.intent
-    run_graph = AsyncMock(wraps=intent.graph.ainvoke)
-    monkeypatch.setattr(intent.graph, 'ainvoke', run_graph)
-    monkeypatch.setattr(app.state.chat.model_client, 'generate',
-                        AsyncMock(side_effect=[contact(own_file), contact(other_file)]))
-    draft = asyncio.run(intent.propose(user, 'Share my notes for review', parent))['intent']
+    async def run(message):
+        body = ChatRequest(conversation_id=parent['id'], message=message, personal=True)
+        events = [event async for event in app.state.chat.stream(user, body)]
+        assert events[-1]['type'] == 'done', events[-1]
+        return events[-1]
+
+    monkeypatch.setattr(app.state.chat.model_client, 'stream', stream)
+    draft = asyncio.run(run('Share my notes for review'))['intent']
     assert draft['status'] == 'pending' and draft['conversation_id'] == parent['id']
-    assert draft['requested_files'] == [{'source':'profile', 'id':own_file}]
-    with pytest.raises(HTTPException, match='不可用的文件') as denied:
-        asyncio.run(intent.propose(user, 'Share notes', parent))
-    assert denied.value.status_code == 502
-    assert run_graph.await_count == 2
+    assert draft['requested_files'] == [{'source': 'profile', 'id': own_file}]
+    denied = asyncio.run(run('Share the other notes'))
+    assert denied['intent'] is None and denied['reply'] == '指定附件不可用。'
+    assert 'agent_intent' not in ticks
     with app.state.database.connect() as db:
         intents = db.execute('SELECT id,status,task_id FROM agent_intents WHERE user_id=?', (user['id'],)).fetchall()
         assert [tuple(row) for row in intents] == [(draft['id'], 'pending', None)]
@@ -1056,80 +1369,65 @@ def test_exchange_replays_first_command_without_changing_operation(context):
     assert sent[0][0] == 'start' and sent[2][0] == 'continue'
 
 
-# skill execution
+def test_repeated_python_action_keeps_result():
+    from avatar.core.execution import current_tool_call
 
-# 模块说明：技能执行图回归测试；重复动作必须立即终止循环，不能空转到 LangGraph 递归上限（GraphRecursionError 会让沙箱结果丢失且无最终回答）。
+    calls=[]
+    checkpoint={}
+    files={'original':b'original'}
+    async def execute(owner,resources,script,args,**kwargs):
+        calls.append(resources[script])
+        return {'status':'success','stdout':['1986569672'],'files':[]}
+    def merge(patch, *, expected):
+        assert checkpoint.get('sandbox')==expected['sandbox']
+        checkpoint.update(patch)
+    store=SimpleNamespace(load=lambda: checkpoint,merge=merge)
+    runtime=SimpleNamespace(execute=execute)
+    def inputs():
+        return {'original':{'path':'inputs/original/file.txt','read':lambda: files['original']}}
+    def new_tool(config):
+        return AtomicPython(runtime,config,owner='owner',conversation='c1',inputs=inputs)
+    args=PythonArguments(code='print(17348 * 114514)',input_file_ids=['original'])
 
+    async def invoke(tool, step, call_id, replay=False):
+        token=current_tool_call.set((step,call_id,replay))
+        try:
+            return await tool.execute(args)
+        finally:
+            current_tool_call.reset(token)
 
-class FakeResponse:
-    def __init__(self,text):
-        self.text=text
-        self.usage={'input_tokens':10,'output_tokens':5}
-
-
-class FakeModel:
-    # 职责：按脚本返回规划 JSON；列表耗尽后重复最后一项，模拟模型执行成功后仍复读同一动作。
-    def __init__(self,actions):
-        self.actions=list(actions)
-        self.calls=0
-    async def generate(self,*args,**kwargs):
-        action=self.actions[min(self.calls,len(self.actions)-1)]
-        self.calls+=1
-        return FakeResponse(json.dumps(action,ensure_ascii=False))
-
-
-def build_context():
-    background={'installed_skills':[]}
-    system='PREFIX\n'+json.dumps(background,ensure_ascii=False)+'\nSUFFIX'
-    config={'provider':'deepseek','model':'deepseek-v4-flash','max_tokens':1024}
-    return config,'test-key',system,[]
-
-
-def make_execution(context):
-    app,user,_=context
-    execution=SkillExecution(app.state.chat.skills)
-    async def fake_execute(user_id,resources,script,args,**kwargs):
-        return {'status':'success','stdout':['1986569672'],'stderr':[],'error':'','files':[]}
-    execution.sandbox.execute=fake_execute
-    return execution,user.get('/api/auth/me').json()['user']['id']
-
-
-def background_of(merged_system):
-    value,_=json.JSONDecoder().raw_decode(merged_system.split('\n',1)[1])
-    return value
-
-
-def test_repeated_python_action_terminates_and_keeps_result(context):
-    # 复现线上故障：模型两次返回同一 python 动作，第二次命中重复守卫后必须结束并保留已成功的沙箱结果。
-    execution,user_id=make_execution(context)
-    model=FakeModel([{'action':'python','code':'print(17348 * 114514)','input_ids':[]}])
-    config,key,system,history=build_context()
-    merged,_,merged_system,_=asyncio.run(execution.enrich((config,key,system,history),SkillEnrichRequest(user_id,'调用sandbox计算17348×114514','c1',allow_code=True),model))
-    assert model.calls==2
-    results=background_of(merged_system)['skill_execution_results']
-    assert len(results)==1 and results[0]['status']=='success'
-    assert results[0]['stdout']=='1986569672'
-    assert '不得只复述脚本代码' in background_of(merged_system)['skill_execution_rules']
-    assert merged['_generated_files']==[]
-    assert not any('未成功' in notice or '未完成' in notice for notice in merged['_workflow_notices'])
+    config={'_run_store':store}
+    async def run():
+        receipt=await invoke(new_tool(config),1,'provider-call')
+        assert receipt['stdout']=='1986569672'
+        resumed=new_tool({'_run_store':store})
+        assert await invoke(resumed,1,'provider-call',replay=True)==receipt
+        with pytest.raises(ValueError,match='已有回执'):
+            await invoke(resumed,1,'provider-call')
+        with pytest.raises(ValueError,match='已有回执'):
+            await invoke(resumed,2,'provider-call',replay=True)
+        files['original']=b'changed'
+        with pytest.raises(HTTPException) as rejected:
+            await invoke(resumed,1,'provider-call',replay=True)
+        assert rejected.value.status_code==409
+    asyncio.run(run())
+    assert calls==[args.code.encode()]
+    assert config['_sandbox_succeeded'] and config['_generated_files']==[]
 
 
-def test_distinct_actions_stop_at_four_run_cap(context):
-    execution,user_id=make_execution(context)
-    actions=[{'action':'python','code':'print('+str(n)+')','input_ids':[]} for n in range(6)]
-    model=FakeModel(actions)
-    config,key,system,history=build_context()
-    merged,_,_,_=asyncio.run(execution.enrich((config,key,system,history),SkillEnrichRequest(user_id,'多步计算','c1',allow_code=True),model))
-    assert model.calls==4
-    assert any('已运行四次' in notice for notice in merged['_workflow_notices'])
-
-
-def test_finish_action_never_executes(context):
-    execution,user_id=make_execution(context)
-    model=FakeModel([{'action':'finish'}])
-    config,key,system,history=build_context()
-    _,_,merged_system,_=asyncio.run(execution.enrich((config,key,system,history),SkillEnrichRequest(user_id,'普通聊天','c1',allow_code=True),model))
-    assert model.calls==1 and background_of(merged_system)['skill_execution_results']==[]
+def test_distinct_actions_stop_at_task_attempt_cap():
+    calls=[]
+    async def execute(owner,resources,script,args,**kwargs):
+        calls.append(resources[script])
+        return {'status':'success','stdout':'','files':[]}
+    tool=AtomicPython(SimpleNamespace(execute=execute),{},owner='owner',conversation='c1',inputs=dict)
+    async def run():
+        for index in range(16):
+            await tool.execute(PythonArguments(code=f'print({index})'))
+        with pytest.raises(AgentNeedsInput,match='十六次'):
+            await tool.execute(PythonArguments(code='print(16)'))
+    asyncio.run(run())
+    assert len(calls)==16
 
 
 # Keep the offline Deno command and permissions stable across Python dependency updates
@@ -1269,10 +1567,7 @@ def test_unified_html_and_animation_setting(context):
     updated = user.patch('/api/conversations/'+cid+'/tools', json={'tools': {'animation': True}})
     assert switches(updated) == {'python': True, 'animation': True}
     assert switches(user.get('/api/conversations/'+cid+'/tools')) == switches(updated)
-    from avatar.conversation.loop.planning import available_tools
-    tools = available_tools({'_html_enabled':True})
-    assert 'create_animation' not in tools
-    html = tools['create_html']
+    from avatar.conversation.tools.html import CREATE_HTML as html
     assert html['description'].startswith('工具用于生成基于html的网页、2d动画和3d动画')
     assert set(html['parameters']['properties'])==set(html['parameters']['required'])=={'filename','html'}
     assert user.patch('/api/conversations/'+cid+'/tools',json={'tools':{'mermaid':False}}).status_code==422
@@ -1408,3 +1703,213 @@ def test_peer_message_files_persist_within_session_but_not_tasks(pg_database):
         assert service.selected(db,'new','someone-else')==[]
         db.execute("UPDATE chat_files SET expires_at='2000-01-01' WHERE id='shared'")
         assert service.selected(db,'new','recipient')==[]
+
+
+def test_native_html_draft_survives_truncation_and_writer_change(pg_database):
+    from hashlib import sha256
+
+    from avatar.conversation.loop.drafts import HtmlDrafts
+    from avatar.conversation.loop.store import RunConflict, RunStore
+    from avatar.conversation.tools.html import CREATE_HTML
+    from tests.support import fake_dns
+
+    stamp = now()
+    with pg_database.connect(write=True) as db:
+        db.execute("INSERT INTO users(id,username,password,role,created_at) VALUES('draft-owner','draft-owner','x','user',?)", (stamp,))
+        db.execute("""INSERT INTO chat_conversations(id,user_id,channel,target_aic,caller_id,platform,title,created_at,updated_at)
+            VALUES('draft-chat','draft-owner','personal','avatar','draft-owner','web','drafts',?,?)""", (stamp, stamp))
+
+    source = '<main>起点' + '🕰️继续' * 80
+    prefix = '{"filename":"timeline.html","html":"' + source + r'\ud83d'
+    frames = [
+        {'choices':[{'delta':{'tool_calls':[{'index':0,'id':'html-start',
+            'function':{'name':'create_html','arguments':prefix}}]},'finish_reason':None}]},
+        {'choices':[{'delta':{},'finish_reason':'length'}]},
+    ]
+    stream = ''.join('data: ' + json.dumps(frame) + '\n\n' for frame in frames)
+    model = ModelClient(httpx.MockTransport(lambda _: httpx.Response(
+        200, headers={'content-type':'text/event-stream'}, text=stream)), resolver=fake_dns)
+    config = {'api_format':'openai','provider':'custom','model':'mock','base_url':'https://example.test',
+              'max_tokens':512,'_tools':[CREATE_HTML],'_react_tool_calls':True,'_optional_tools':True}
+
+    async def exercise():
+        run = ('draft-owner', 'chat', 'draft-chat', 'draft-run')
+        origin = RunStore(pg_database, *run, 'writer-1')
+        state = origin.acquire()
+        patch = {'schema_version':2, 'step':1, 'trajectory':[]}
+        origin.merge(patch)
+        state.update(patch)
+        events = [event async for event in model.stream(config, 'key', 'system', [], 'create HTML')]
+        clipped, = events[-1]['partial_tool_calls']
+        outputs = [{'id':'python-result','filename':'result.txt','data':b'result'}]
+        draft = await HtmlDrafts(origin, state, outputs).capture(clipped)
+        assert draft['offset'] == len(source.encode()) and draft['tail_preview'] == source[-300:]
+
+        new = RunStore(pg_database, *run, 'writer-2')
+        restored = new.acquire()
+        with pytest.raises(RunConflict):
+            origin.check()
+        assert restored['trajectory'] == []
+        drafts = HtmlDrafts(new, restored, outputs)
+        [resume] = await drafts.resume_receipts()
+        assert resume == {**draft, 'status':'draft_resumed'}
+        arguments = {'draft_id':resume['draft_id'], 'offset':resume['offset'], 'chunk':'下一段'}
+        with pytest.raises(ValueError, match=str(resume['offset'])):
+            await drafts.capture({'name':'append_html_draft','id':'stale',
+                                  'arguments':{**arguments,'offset':0}})
+        next_prefix = json.dumps(arguments, ensure_ascii=False)[:-1] + ',"do'
+        appended = await drafts.capture({'name':'append_html_draft','id':'next','arguments':next_prefix})
+        typed_prefix = [
+            {'args':{'draft_id':resume['draft_id']}},
+            {'partialArgs':[{'jsonPath':'$.chunk','stringValue':'终点','willContinue':True}]},
+            {'partialArgs':[{'jsonPath':'$.offset','numberValue':float(appended['offset'])},
+                            {'jsonPath':'$.chunk'}]},
+        ]
+        typed = await drafts.capture({'name':'append_html_draft','id':'gemini',
+            'argument_format':'gemini_partial_args','arguments':{'chunks':typed_prefix}})
+        page = await drafts.append({**arguments, 'offset':typed['offset'], 'chunk':'</main>', 'done':True})
+        [receipt] = new.load()['files']
+        assert [item['id'] for item in outputs] == ['python-result', page['id']]
+        data = (source + '下一段终点</main>').encode()
+        assert outputs[1]['data'] == data and new.read(receipt['draft']).encode() == data
+        assert receipt['sha256'] == sha256(data).hexdigest() and not drafts.active
+
+    asyncio.run(exercise())
+
+
+
+
+def test_react_checkpoint_rehydrates_legacy_artifacts_and_fences_receipt_writer(pg_database):
+    from hashlib import sha256
+
+    from avatar.conversation.loop.context import ReActContextManager
+    from avatar.conversation.loop.runtime import LoopState, load_checkpoint, restore_files, restore_materials, resume_safe
+    from avatar.conversation.loop.store import RunConflict, RunStore
+    from avatar.models.client import ModelResult
+
+    with pg_database.connect(write=True) as db:
+        stamp = now()
+        db.execute("INSERT INTO users(id,username,password,role,created_at) VALUES('receipt-owner','receipt-owner','unused','user',?)", (stamp,))
+        db.execute("""INSERT INTO chat_conversations(id,user_id,channel,target_aic,caller_id,platform,title,created_at,updated_at)
+            VALUES('receipt-chat','receipt-owner','personal','receipt-avatar','receipt-owner','web','test',?,?)""", (stamp, stamp))
+    key = (pg_database, 'receipt-owner', 'chat', 'receipt-chat', 'receipt-run')
+    first = RunStore(*key, 'old-writer')
+    first.acquire()
+    html = '<!doctype html><main>旧作品🙂</main>'
+    content = html.encode()
+    artifact = {'id':'old-artifact', 'filename':'old.html', 'html_mode':'html', 'draft':'artifact-old',
+                'size':len(content), 'sha256':sha256(content).hexdigest()}
+    proofs = {'sources':[{'file_id':'source-1'}], 'revisions':[[['profile','source-1'],'source-revision']]}
+    first.append('artifact-old', 0, html, patch={
+        'phase':'retry', 'files':[artifact], 'sources':{'revision':'v1'}, 'plan':{'steps':[]},
+        'observations':['已经制作旧作品'], 'public_visible':['former-candidate'], 'draft':{'name':'discard-me'},
+        'entry_material':proofs, 'session_file_reads':{'session-file':{'read_content':True}},
+        'session_image_ids':['session-file'], 'material':[{'id':'only-prepared'}],
+    })
+
+    first.append('incomplete-legacy-draft', 0, 'unused data')
+
+    async def run():
+        checkpoint = await load_checkpoint(first)
+        assert checkpoint['schema_version'] == 2 and checkpoint['trajectory'] == [] and checkpoint['step'] == 0
+        assert checkpoint['sources'] == {'revision':'v1'} and '已经制作旧作品' in checkpoint['legacy_summary']
+        assert not {'public_visible','draft','plan','observations','session_image_ids','material'} & checkpoint.keys()
+        assert checkpoint['entry_material'] == {'revisions':proofs['revisions']}
+        assert 'session-file' in checkpoint['session_source_checks'] and 'session_file_reads' not in checkpoint
+        assert first.size('incomplete-legacy-draft') == 0
+        assert resume_safe(checkpoint) and not resume_safe(checkpoint, automatic=True)
+        config = {}
+        await restore_files(first, checkpoint, config)
+        assert config['_generated_files'][0]['data'] == content
+
+        manager = ReActContextManager([], '继续', store=first, checkpoint=checkpoint)
+        evidence = '开头' + '👩测试' * 30000 + '结尾'
+        preview, number = await manager.archive(evidence)
+        assert '开头' in preview and '结尾' in preview
+
+        second = RunStore(*key, 'new-writer')
+        fresh = second.acquire()
+        with pytest.raises(RunConflict):
+            first.archive('stale', b'evidence', patch={})
+        manager = ReActContextManager([], '继续', store=second, checkpoint=fresh)
+        pieces = []
+        offset = 0
+        while offset is not None:
+            page = await manager.read_receipt({'receipt':number, 'offset':offset})
+            pieces.append(page['text'])
+            offset = page['next_offset']
+        assert ''.join(pieces) == evidence
+
+        result = ModelResult('', {'total_tokens':5}, ({'id':'finish','name':'end_task','arguments':{}},), 'tool_calls')
+        await LoopState(second, fresh).answer(result)
+        assert await LoopState(second, second.load()).restore_answer(None) == result
+        second.merge({'usage':None})
+        assert (await LoopState(second, second.load()).restore_answer(None)).usage is None
+        delivery = SimpleNamespace(visible_ids=set(), prepared=[], library=SimpleNamespace(prepare=lambda *_args,**_kwargs: {}))
+        with pytest.raises(HTTPException) as denied:
+            await restore_materials(delivery, [{'id':'forged','relative_path':'file.txt','version':[]}])
+        assert denied.value.status_code == 409 and not delivery.prepared
+
+    asyncio.run(run())
+
+
+def test_react_context_preserves_call_result_pairs_when_compacting():
+    from avatar.conversation.loop.context import ReActContextManager
+
+    async def run():
+        manager = ReActContextManager([], '分析此文件')
+        trajectory = []
+        for index in range(8):
+            call = {'id':f'call_{index}', 'name':'find_material', 'arguments':{'page':index}}
+            observation = {'role':'tool', 'name':call['name'], 'tool_call_id':call['id'], 'content':f'页{index}' + '条目' * 400}
+            trajectory.extend([{'role':'assistant', 'content':'', 'tool_calls':[call]}, observation])
+        request = await manager.project({'context_tokens':5000, 'max_tokens':1000}, '系统', trajectory)
+        calls = [call['id'] for row in request for call in row.get('tool_calls', ())]
+        observations = [row['tool_call_id'] for row in request if row['role'] == 'tool']
+        assert calls == observations and calls[-1] == 'call_7' and len(calls) < 8
+        catalog = await manager.read_receipt({'receipt':0})
+        assert catalog['items'][0]['label'].startswith('页0')
+        assert manager.omitted_count == 8 * 2 - len(calls) * 2
+        remaining = trajectory[manager.omitted_count:]
+        resumed = ReActContextManager([], '分析此文件', store=manager.store,
+                                      checkpoint={'history_summary':manager.summary, 'receipt_refs':manager.receipt_refs})
+        request = await resumed.project({'context_tokens':5000, 'max_tokens':1000}, '系统', remaining)
+        assert any('较早工具步骤' in row['content'] and '回执' in row['content'] for row in request)
+
+
+    asyncio.run(run())
+
+
+
+def test_react_recovery_republishes_held_question_without_model_call():
+    from avatar.conversation.agent_loop import run_agent
+    from avatar.conversation.loop.runtime import load_checkpoint, resume_safe
+    from avatar.conversation.loop.store import MemoryRunStore
+    from avatar.core.execution import AskUser
+
+    async def run():
+        store = MemoryRunStore()
+        question = AskUser(question='哪天上课？', options=['周一', '周二']).pending()
+        paused = {'schema_version':2,'phase':'paused','user_question':question}
+        assert resume_safe(paused, automatic=True)
+        assert not resume_safe(paused, automatic=True, allow_question=False)
+        assert not resume_safe({**paused,'user_question':{**question,'id':'invalid'}}, automatic=True)
+        assert not resume_safe({**paused,'user_question':None}, automatic=True)
+        store.save(paused)
+        config = {'_run_store':store, '_auto_recover':True}
+        model = SimpleNamespace(stream=AsyncMock(side_effect=AssertionError('paused job called the model')))
+        rag = SimpleNamespace(chat=SimpleNamespace(model_client=model), validate=lambda _: None)
+        with pytest.raises(AgentNeedsInput) as caught:
+            await run_agent(rag,(config,'key','system',[]),'查看课程')
+        assert caught.value.user_question == question
+        model.stream.assert_not_called()
+
+        legacy = {'phase':'paused','observations':['旧任务回执']}
+        store.save(legacy)
+        assert resume_safe(legacy) and not resume_safe(legacy, automatic=True)
+        assert await load_checkpoint(store, automatic=True) == legacy
+        checkpoint = await load_checkpoint(store)
+        assert checkpoint['phase'] == 'running' and checkpoint['trajectory'] == []
+        assert '旧任务回执' in checkpoint['legacy_summary']
+
+    asyncio.run(run())

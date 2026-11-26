@@ -85,7 +85,6 @@ class GenerationRunner:
                     config=context[0] if context else {'_agent_checkpoint':(previous or {}).get('checkpoint')}
                     error=AgentNeedsInput.from_context('任务已暂停。点击继续，或补充信息后继续。',config)
                     error.retry_dispatch=not binding and not state and bool((previous or {}).get('retry_dispatch', not previous))
-                    error.answer_route=config.get('_answer_route') or binding.get('answer_route')
                     pauses.pause(chat,actor,request,work,parent,session,overview,error,previous,db=db,job=row)
                     return self.store.view(
                         db.execute('SELECT * FROM chat_generation_jobs WHERE task_id=?',(row['task_id'],)).fetchone(),db)

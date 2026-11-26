@@ -18,7 +18,11 @@ RUNTIME = Path(os.environ.get('AVATAR_SANDBOX_RUNTIME') or Path(sys.prefix) / 's
 ANALYSIS_PACKAGES = {'numpy': 'numpy', 'pandas': 'pandas', 'matplotlib': 'matplotlib', 'PIL': 'pillow'}
 
 
-class SandboxUnavailable(RuntimeError):
+class SandboxExecutionError(RuntimeError):
+    """The sandbox stopped without publishing a result."""
+
+
+class SandboxUnavailable(SandboxExecutionError):
     def __init__(self):
         super().__init__('服务器的 Python 沙箱运行环境尚未就绪，请联系管理员准备运行环境后重试。')
 
@@ -65,7 +69,7 @@ class LocalPythonSandbox:
         if not isinstance(args,list) or len(args)>40 or any(not isinstance(a,str) or len(a)>2000 for a in args):
             raise ValueError('脚本参数必须为最多 40 个短字符串')
         if self.users.get(user_id,(None,0))[1]>=2 or sum(count for _,count in self.users.values())>=32:
-            raise RuntimeError('沙箱任务排队已满，请等待现有任务完成后再试')
+            raise SandboxExecutionError('沙箱任务排队已满，请等待现有任务完成后再试')
         # 空闲账户锁及时移除，避免长期运行累计账户对象；排队和执行均可取消。
         lock, count = self.users.get(user_id, (asyncio.Semaphore(1),0))
         self.users[user_id] = (lock,count+1)
@@ -170,7 +174,7 @@ class LocalPythonSandbox:
                 result=bytearray()
                 while block:=await stream.read(16384):
                     result.extend(block)
-                    if len(result)>30*1024*1024:raise RuntimeError('沙箱输出超过 30 MiB，执行已中止')
+                    if len(result)>30*1024*1024:raise SandboxExecutionError('沙箱输出超过 30 MiB，执行已中止')
                 return result.decode(errors='replace')
             # Deno/V8 会预留大块虚拟地址，按实际常驻内存限制，不能用 RLIMIT_AS 误杀启动。
             async def memory_watch():
@@ -178,7 +182,7 @@ class LocalPythonSandbox:
                     try:
                         status=Path(f'/proc/{process.pid}/status').read_text()
                         rss=int(next(line.split()[1] for line in status.splitlines() if line.startswith('VmRSS:')))
-                        if rss>512*1024:raise RuntimeError('沙箱内存超过 512 MiB，执行已中止')
+                        if rss>512*1024:raise SandboxExecutionError('沙箱内存超过 512 MiB，执行已中止')
                     except (FileNotFoundError,ProcessLookupError,StopIteration):pass
                     try:
                         await asyncio.wait_for(process.wait(), timeout=0.1)
@@ -190,7 +194,7 @@ class LocalPythonSandbox:
                     out,err,_=await asyncio.gather(*readers)
                     await process.wait()
                 return await asyncio.to_thread(self.decode_result,out,err,process.returncode)
-            except TimeoutError:raise RuntimeError(f'沙箱执行超过 {timeout} 秒，已终止') from None
+            except TimeoutError:raise SandboxExecutionError(f'沙箱执行超过 {timeout} 秒，已终止') from None
             finally:
                 if process.returncode is None:
                     try:os.killpg(process.pid,signal.SIGKILL)
@@ -203,20 +207,20 @@ class LocalPythonSandbox:
     @staticmethod
     def decode_result(out, err, exit_code):
         try:value=json.loads(out)
-        except ValueError:raise RuntimeError('沙箱运行失败（退出码 '+str(exit_code)+'）：'+err[-2000:]) from None
+        except ValueError:raise SandboxExecutionError('沙箱运行失败（退出码 '+str(exit_code)+'）：'+err[-2000:]) from None
         if not isinstance(value,dict) or not isinstance(value.get('success'),bool):
-            raise RuntimeError('沙箱运行结果格式无效')
+            raise SandboxExecutionError('沙箱运行结果格式无效')
         if len(json.dumps([value.get('stdout',[]),value.get('stderr',[])],ensure_ascii=False).encode())>1024*1024:
-            raise RuntimeError('沙箱文字输出超过 1 MiB，执行已中止')
+            raise SandboxExecutionError('沙箱文字输出超过 1 MiB，执行已中止')
         files=value.get('files',[]) if value['success'] else []
-        if not isinstance(files,list):raise RuntimeError('沙箱生成文件清单无效')
+        if not isinstance(files,list):raise SandboxExecutionError('沙箱生成文件清单无效')
         from avatar.files.conversation.resources import validate_output
         decoded=[]
         for item in files:
             if not isinstance(item,dict) or not isinstance(item.get('data'),str) or len(item['data'])>14*1024*1024:
-                raise RuntimeError('沙箱生成文件格式无效')
+                raise SandboxExecutionError('沙箱生成文件格式无效')
             body=base64.b64decode(item['data'],validate=True)
             validate_output(item.get('filename'),body)
             decoded.append({'filename':item['filename'],'data':body})
-        if sum(len(item['data']) for item in decoded)>20*1024*1024:raise RuntimeError('沙箱生成文件总量超限')
+        if sum(len(item['data']) for item in decoded)>20*1024*1024:raise SandboxExecutionError('沙箱生成文件总量超限')
         return {'status':'success' if value.get('success') else 'error','stdout':value.get('stdout',[]),'stderr':value.get('stderr',[]),'error':value.get('error',''),'files':decoded}
