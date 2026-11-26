@@ -13,7 +13,7 @@ from itertools import count
 from fastapi import HTTPException
 from pydantic import ValidationError
 
-from avatar.core.text_budget import fits_text_budget, model_text_budget
+from avatar.core.text_budget import model_text_budget
 from avatar.conversation.loop.continuation import DraftLimit, MemoryDraftStore, SegmentedDraft
 from avatar.conversation.loop.store import RunCapacity
 from avatar.conversation.loop.runtime import LoopState, restore_files, restore_materials, resume_safe
@@ -21,9 +21,9 @@ from avatar.conversation.loop.context import TurnContext
 from avatar.conversation.loop.model_turn import project_turn
 from avatar.conversation.loop.completion import completion_reply
 from avatar.conversation.loop.tool_call import entry_evidence, execute_entry_tool
-from avatar.conversation.loop.planning import (available_tools, disclosure_catalog, disclose_tools, prepare_plan, PlanUnavailable,
-                                               REQUEST_TOOLS, UPDATE_TASK, EVIDENCE_TOOLS, WRITING_CONTROLS, action_ready, needs_confirmation,
-                                               confirm_goal, revise_goals, lookup_types,
+from avatar.conversation.loop.planning import (available_tools, disclosure_catalog, prepare_plan, PlanUnavailable,
+                                               UPDATE_TASK, EVIDENCE_TOOLS, WRITING_CONTROLS, action_ready, needs_confirmation,
+                                               confirm_goal, lookup_types,
                                                read_goals_verified)
 from avatar.conversation.loop.turns import stream_final
 from avatar.models.context_budget import excerpt
@@ -285,8 +285,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         if 'create_html' not in selected:
             selected.append('create_html')
 
-    defaults = {REQUEST_TOOLS['name']: REQUEST_TOOLS}
-    defaults.update((name,allowed[name]) for name in ('ask_user','search_materials','get_current_time') if name in allowed)
+    defaults = {name:allowed[name] for name in ('ask_user','search_materials','get_current_time') if name in allowed}
     missing_information = ('缺少用户才能给出的信息时用 ask_user。' if 'ask_user' in allowed else
                            '缺少必要信息时，以最终答复说明已核实内容和信息缺口。')
     if required and 'end_task' in domain:
@@ -303,20 +302,18 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
     final_writing = bool(state.get('final_writing') and not changed and not pending and not required)
     settings = {**settings,'_tools':selected_definitions(final=final_writing),'_optional_tools':not required}
     if required:
-        prompt += '协议要求以会话动作收尾。若当前未披露合适的终态函数，先用 request_tools 描述所需的交接方式。'
+        prompt += '协议要求以会话动作收尾。'
     prompt += ('可直接回答时直接回答。工具可见不表示必须调用。'
-               '需要更多能力或调整后续目标时用 request_tools。'+missing_information+
+               +missing_information+
                '需要当前日期或时段时，按需用 get_current_time 获取准确北京时间。'
                '有依赖时先取实际回执，再创作或交付。复杂子目标使用 update_task 并引用当前目标回执。'
                '只有已取得实际回执的单项只读目标仍待核验时，可以直接提交最终正文。')
-    disclosure_misses = state.get('disclosure_no_progress',0) if not changed else 0
 
     queued = []
     receipt_ok = False
 
-    def received(name, mode=None):
-        nonlocal premature, invalid, receipt_ok, disclosure_misses, settings
-        disclosure_misses = 0
+    def received(name, mode=None, *, complete_read=False):
+        nonlocal premature, invalid, receipt_ok, settings
         receipt_ok = True
         invalid = 0
         premature = 0
@@ -325,7 +322,8 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         receipt = {'id':len(receipts_log)+1,'tool':name,'goal_no':matched['goal_no'] if matched else None,
                    'mode':mode, 'input_id':revision}
         receipts_log.append(receipt)
-        if matched and not needs_confirmation(matched):
+        if matched and (not needs_confirmation(matched) or (complete_read and matched['tool']==name
+                        and all(tool==name for tool in matched.get('tools',())))):
             pending.remove(matched)
         if required and not pending:
             settings = {**settings,'_tools':selected_definitions()}
@@ -347,6 +345,36 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         else:
             goal = '，仍缺少目标「' + pending[0]['goal'] + '」的回执' if pending else ''
             raise pause((detail or '修正后仍未收到有效的工具调用') + goal) from None
+
+    def recover_disclosure(names, declared, *, controls_only=False, restricted=False):
+        nonlocal settings, invalid
+        authorized = [name for name in dict.fromkeys(names) if name in allowed]
+        eligible = [name for name in authorized if name not in declared and not restricted and
+                    (not controls_only or name in WRITING_CONTROLS) and
+                    action_ready(name,pending,receipts_log,revision)]
+        if eligible:
+            selected.extend(name for name in eligible if name not in selected)
+            if current:
+                current['support'] = list(dict.fromkeys([*current.get('support',()),*eligible]))
+            settings = {**settings, '_tools':selected_definitions()}
+            invalid = 0
+            detail = '自动披露工具：'+json.dumps(eligible,ensure_ascii=False)+'。上一次调用未执行，请使用新声明重新提交。'
+            observations.append(detail)
+            log.info('agent disclosure run=%s iteration=%d tools=%s',run_id,iteration,eligible)
+            trace.point('check', {'iteration':iteration}, {'decision':'自动披露', 'tools':eligible})
+        elif authorized:
+            detail = '工具暂不可在本步执行：'+json.dumps(authorized,ensure_ascii=False)+'。'
+            if restricted:
+                detail += '请按当前步骤要求提交结构化输出。'
+            elif controls_only:
+                detail += '草稿接续请按游标边界的辅助动作格式提交。'
+            elif current:
+                detail += f"先取得目标 #{current['goal_no']} 的必要回执。"
+                if 'update_task' in declared:
+                    detail += '已有足够证据时调用 update_task，引用该目标的实际回执编号。'
+            repair_call(detail)
+        else:
+            repair_call('该工具不在当前授权目录，未执行。请使用已声明的工具或说明能力缺口。')
 
     html_repair = None
     premature=0
@@ -379,7 +407,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
 
     async def checkpoint(phase='decision', *, artifact=None):
         fields = dict(phase=phase, plan=plan, remaining=pending, disclosed_tools=selected,
-                           disclosure_no_progress=disclosure_misses, receipts=receipts_log, handoff=state.get('handoff'),
+                           receipts=receipts_log, handoff=state.get('handoff'),
                            **await turn_context.checkpoint_observations(observations),
                            material=delivery.prepared if delivery else [], files=state.get('files', []),
                            draft=state.get('draft'), parked_drafts=state.get('parked_drafts',[]),
@@ -455,7 +483,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             controls = {t['name']:t for t in step_settings['_tools'] if t['name'] in WRITING_CONTROLS}
             step_settings = {**settings, '_tools': [], '_call_purpose': 'segmented_writing'}
             step_prompt = system + '\n接续已经选择的输出。本步只返回请求的游标分片。'
-            step_prompt += '可在游标边界申请以下辅助动作。名称及参数字段：'+json.dumps({
+            step_prompt += '可在游标边界使用以下辅助动作。名称及参数字段：'+json.dumps({
                 n:list(t['parameters'].get('properties',{})) for n,t in controls.items()},ensure_ascii=False)
         elif repairing_html:
             step_settings = {**settings,'_tools':[],'_recover_thinking':True,'_call_purpose':'html_generation'}
@@ -480,7 +508,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         )
         if turn_context.summary is not previous_summary:
             await journal.save(history_summary=turn_context.summary, usage=usage)
-        working_history, message, notes = turn.history, turn.message, turn.notes
+        working_history, message = turn.history, turn.message
         current_receipts = [receipt for receipt in receipts_log if receipt.get('input_id') == revision]
         if progress and turn.compressed:
             progress({'type':'status','stage':'compressing','message':'已精简本步历史或工具回执，继续处理当前目标'})
@@ -563,12 +591,15 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                                 finish_reason=result.finish_reason, usage=result.usage)
         except HTTPException as error:
             diagnostic = model_failure(error)
+            missing = getattr(error,'undisclosed_tools',None)
             next_action = '暂停，等待接续' if getattr(error,'stream_exhausted',False) else '结束本次请求'
             if not diagnostic['delivery_unknown']:
                 if getattr(error, 'stop_reason', None) == 'context_overflow':
                     next_action = '输入精简后接续' if not context_retry else '输入超窗，暂停'
                 elif getattr(error,'output_limited',False):
                     next_action = '压缩并接续'
+                elif missing is not None:
+                    next_action = '核对授权和前置回执'
                 elif artifact_ready and lookup_tool in ARTIFACT_TOOLS and getattr(error,'invalid_tool_call',False) and invalid < 1:
                     next_action = '修复 HTML 参数'
                 elif getattr(error,'invalid_tool_call',False) and invalid < 1 and settings['_tools']:
@@ -604,6 +635,13 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 else:
                     await draft.start(result, tool=lookup_tool if artifact_ready else None, decision=bool(pending or required))
                 continue
+            if missing is not None:
+                if can_stream:
+                    account(getattr(error, 'model_usage', None))
+                declared = controls if writing else {tool['name'] for tool in step_settings['_tools']}
+                recover_disclosure(missing, declared, controls_only=writing,
+                                   restricted=repairing_html or structured)
+                continue
             if not settings['_tools'] or not (getattr(error,'invalid_tool_call',False) or
                                                ((structured or repairing_html) and getattr(error,'empty_model_output',False))):
                 raise
@@ -627,13 +665,13 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
             old_offset = state['draft']['offset']
             status, payload = completed or await draft.accept(result, limited)
             if state['draft']['offset'] > old_offset:
-                invalid = disclosure_misses = 0
+                invalid = 0
             if status == 'retry':
                 raise await no_progress()
             if status == 'more':
                 continue
             if status == 'control' and (not writing or payload['name'] not in controls):
-                repair_call('该辅助动作在本次分片中未获披露或不能执行，草稿仍在原游标')
+                recover_disclosure([payload['name']], controls if writing else (), controls_only=True, restricted=not writing)
                 continue
             if status in ('control','artifact'):
                 result = replace(result, text='', tool_calls=(payload,), finish_reason='tool_calls', partial_tool_calls=())
@@ -646,9 +684,9 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
         elif limited:
             declared = {t['name'] for t in step_settings['_tools']}
             partial_calls = result.partial_tool_calls or calls
-            if any(c.get('name') not in declared or not action_ready(c.get('name'),pending,receipts_log,revision)
-                   for c in partial_calls):
-                repair_call('截断的工具请求不在本步声明中，尚未开始作品。先完成当前目标或申请补充工具')
+            missing = [c['name'] for c in partial_calls if c['name'] not in declared]
+            if missing:
+                recover_disclosure(missing, declared, restricted=repairing_html or structured)
                 continue
             await draft.start(result, tool=repair_tool if repairing_html else (lookup_tool if artifact_ready else None),
                               filename=repair_filename if repairing_html else 'index.html', decision=bool(required or pending))
@@ -657,14 +695,11 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 progress({'type':'status','stage':'result_writing','message':'已保存本步进度，正在分段接续'})
             continue
         declared_now = {t['name'] for t in step_settings['_tools']}
-        if len(calls)>1 and any(c.get('name') not in declared_now for c in calls):
-            reads = [c for c in calls if c.get('name') in declared_now and c['name'] in EVIDENCE_TOOLS]
-            if not reads:
-                repair_call('模型选择了本轮未披露的工具')
+        if not (queued_call or planned_lookup is not None or continuing or repairing_html or structured):
+            missing = [call['name'] for call in calls if call['name'] not in declared_now]
+            if missing:
+                recover_disclosure(missing, declared_now)
                 continue
-            observations.append('本批仅执行已披露的查证操作。其他动作须在取得回执后重新决定。')
-            calls = tuple(reads)
-            result = replace(result,tool_calls=calls)
         if len(calls)>1:
             batch = []
             for call in calls:
@@ -778,42 +813,6 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 raise ValueError('当前子目标的前置证据尚未取得，已阻止提前交付')
             if name not in active_tools or not isinstance(args, dict):
                 raise ValueError('工具未披露，或参数不是 JSON 对象')
-            if name == 'request_tools':
-                need = args.get('need')
-                replace_goals = args.get('replace_goals', [])
-                if (not isinstance(replace_goals,list) or any(type(i) is not int or
-                        not any(s['goal_no']==i for s in pending) for i in replace_goals)):
-                    raise ValueError('待调整的子目标不存在')
-                if set(args)-{'need','replace_goals'} or not isinstance(need,str) or not need.strip() or not fits_text_budget(need):
-                    raise ValueError()
-                focus = {'request':question,'need':need,'goals':pending,'selected':selected,
-                         'recent_results':notes}
-                if disclosure_misses>=3:
-                    repair_call('连续三次未找到新的可用能力，请换用已披露工具或向用户说明缺口',tool=name)
-                    continue
-                with trace.step('reason', {'operation':'disclose_tools','need':need,'tools':list(choices)}) as out:
-                    addition,cost = await disclose_tools(rag.chat.model_client,settings,key,system,working_history,
-                        '只为当前证据缺口披露工具或新增目标。已有目标与交付无需重列。若核对已有作品，只规划核对；有明确缺陷后再决定是否修订。数据：'+
-                        json.dumps(focus,ensure_ascii=False),choices,validate,lookups=planned_arguments)
-                    account(cost)
-                    if addition is None:
-                        disclosure_misses += 1
-                        repair_call('未能确定满足需求的附加工具，请具体说明缺失的证据或改用已披露工具',tool=name)
-                        continue
-                    out.update(tools=addition['tools'],goals=[s['goal'] for s in addition['steps']])
-                for n in addition['tools']:
-                    if n in disabled:
-                        return tool_required(n)
-                gained = set(addition['tools']).intersection(allowed).difference(selected,defaults)
-                disclosure_misses = 0 if gained else disclosure_misses+1
-                if current:
-                    current['support'] = list(dict.fromkeys([*current.get('support',()),*addition['tools']]))
-                revised = revise_goals(plan,pending,selected,addition,replace_goals)
-                if not revised:
-                    observations.append('本次披露未找到新的能力。请依据已有回执完成，或明确指出仍需用户提供的资料。')
-                settings={**settings,'_tools':selected_definitions()}
-                observations.append('本步工具披露结果（数据）：'+json.dumps(addition,ensure_ascii=False))
-                continue
             if name == 'get_current_time':
                 if args:
                     raise ValueError('获取当前北京时间不接受参数')
@@ -823,7 +822,7 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 note = confirm_goal(args,pending,receipts_log,revision)
                 remember(note)
                 receipt_ok=True
-                invalid=premature=disclosure_misses=0
+                invalid=premature=0
                 settings={**settings,'_tools':selected_definitions(final=not (required or pending))}
                 continue
             if name in {t['name'] for t in config.get('_entry_tools',())}:
@@ -840,8 +839,8 @@ async def _run_agent(rag, context, question, progress, on_delta, trace, discard)
                 settings.update({k:v for k,v in config.items() if k.startswith('_') and k not in ('_tools','_optional_tools')})
                 await check_execution_async(validate)
                 seen.add(identity)
-                note, access, confirmed, hint = entry_evidence(name, note)
-                receipt = received(name, mode=access) if confirmed else None
+                access, confirmed, complete_read, hint = entry_evidence(name, note)
+                receipt = received(name, mode=access, complete_read=complete_read) if confirmed else None
                 remember(note, receipt if name=='read_session_file' else None)
                 if hint:
                     observations.append(hint)

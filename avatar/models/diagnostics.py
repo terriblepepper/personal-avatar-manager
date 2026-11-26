@@ -114,6 +114,7 @@ def contextual(error,config):
     result.invalid_tool_call=getattr(error,'invalid_tool_call',False)
     result.tool_issue=getattr(error,'tool_issue',None)
     result.tool_count=getattr(error,'tool_count',None)
+    result.undisclosed_tools=getattr(error,'undisclosed_tools',None)
     result.model_usage=getattr(error,'model_usage',None)
     return result
 

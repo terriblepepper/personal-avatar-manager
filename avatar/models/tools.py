@@ -86,14 +86,22 @@ def parse_tools(fmt, data, tools, *, required=True, batch=False):
             issue = '未提交所需工具调用' if not count else '单批超过八项工具调用' if batch else '此决策只接受一个工具调用'
             raise ValueError()
         allowed = {tool['name'] for tool in tools}
+        undisclosed = tuple(dict.fromkeys(
+            call['name'] for call in calls
+            if isinstance(call.get('name'), str) and call['name'] not in allowed
+        ))
+        if undisclosed:
+            error = invalid_tool_call('选择了本步未提供的工具',count)
+            error.undisclosed_tools = undisclosed
+            raise error
         parsed = []
         for call in calls:
             if call.get('argument_format') == 'gemini_partial_args':
                 issue = '工具参数尚未传输完整'
                 raise ValueError()
             name = call.get('name')
-            if not isinstance(name,str) or name not in allowed:
-                issue = '选择了本步未提供的工具'
+            if not isinstance(name,str):
+                issue = '工具名称格式无效'
                 raise ValueError()
             args = call.get('arguments', {})
             if isinstance(args,str):

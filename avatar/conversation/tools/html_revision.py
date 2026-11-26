@@ -29,7 +29,7 @@ def revision_tool(tool):
         return tool
     form = tool['parameters']
     properties = {**form['properties'], 'revision':{k:v for k,v in REVISION_SCHEMA.items() if k!='$defs'}}
-    return {**tool, 'description':tool['description']+' 局部修改使用已读取原件的 file_id、sha256 和准确片段，另存新文件。',
+    return {**tool, 'description':tool['description']+' 全文重写传 filename 和 html。局部修改只传 filename 和 revision，使用已读原件的 ID、SHA-256 和准确片段。两种参数不能混用。',
             'parameters':{**form,'properties':properties,'$defs':{**form.get('$defs',{}),**REVISION_SCHEMA['$defs']},'required':['filename']}}
 
 
