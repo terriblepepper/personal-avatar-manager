@@ -114,6 +114,9 @@ class ReActEngine:
         if pending and 'ref' in pending:
             receipts.update(pending.get('receipts', {}))
         action, duplicates, advanced, interrupted = None, 0, False, None
+        previous_media = self.gen_media
+        if not capture:
+            self.gen_media = {}
         order = [call for call in calls if call not in controls] + controls
         for call in order:
             identifier = call['id']
@@ -164,23 +167,25 @@ class ReActEngine:
                         if not incoming:
                             continue
                         current = self.media(kind)
-                        values = self.gen_media.setdefault(kind, [])
                         for item in incoming:
                             if item not in current:
                                 if len(current)>=limit:
                                     overflow = True
                                 else:
                                     current.append(item)
-                                    values.append(item)
+                                    self.gen_media.setdefault(kind, []).append(item)
                     if overflow:
-                        outcome = ToolOutcome({'result':outcome.value,
-                                               'notice':'已保留本轮附件和可附加的工具媒体，其余超出单次请求数量。'}, True)
+                        outcome = replace(outcome, value={'result':outcome.value,
+                            'notice':'超额工具媒体未附加。请依据实际附加的媒体和回执正文作答。'})
             action = outcome.action or action
             receipts[identifier] = await self.observation(call, outcome)
             if pending is not None and not outcome.action and not interrupted:
                 pending = {**pending, 'receipts':receipts}
                 await self.journal.save(**self.fields(pending_batch=pending))
         rows = [receipts[c['id']] for c in calls]
+        failed = all(row['is_error'] for row in rows)
+        if not capture and failed:
+            self.gen_media = previous_media
         if capture:
             observation = [{'name':r['name'],'content':r['content']} for r in rows]
             self.trajectory.append({'role':'user','content':'截断工具的恢复回执（数据）：'+
@@ -193,7 +198,7 @@ class ReActEngine:
             await self.journal.save(**self.fields(phase='paused', user_question=interrupted.user_question, pending_batch=None))
             await self.release_batch(pending)
             raise interrupted
-        return action, bool(rows) and all(row['is_error'] for row in rows), duplicates, advanced
+        return action, bool(rows) and failed, duplicates, advanced
 
     async def request(self, settings, *, recovering=False):
         prompt = self.prompt
@@ -204,7 +209,7 @@ class ReActEngine:
         settings = {**settings, '_image_inputs':self.media('images')[:_MEDIA_LIMITS['images']],
                     '_audio_inputs':self.media('audio')[:_MEDIA_LIMITS['audio']]}
         if self.gen_media:
-            history.append({'role':'user','content':'此处为上一批工具读取的授权原件媒体。请结合对应文件回执使用。'})
+            history.append({'role':'user','content':'此处为本轮工具读取的授权原件媒体。请结合对应文件回执使用。'})
         headroom = check_context(settings, prompt, history, None)
         self.config['_session_page_bytes'] = max(4, (headroom*3-512)//2)
         await check_execution_async(self.registry.validate)
@@ -225,7 +230,6 @@ class ReActEngine:
             result = await stream_final(source, self.emit_candidate, self.registry.validate, report)
             output.update(finish_reason=result.finish_reason, usage=result.usage,
                           tools=[call['name'] for call in result.tool_calls])
-        self.gen_media = {}
         return result
 
     def show_prefix(self):
@@ -331,8 +335,11 @@ class ReActEngine:
                         self.preview_prefix = True
                         self.trajectory.append({'role':'assistant','content':result.text})
                         advanced = True
-                    prefer_visible = not result.text and not fragments
-                    self.trajectory.append({'role':'user','content':_CONTINUE})
+                    prefer_visible = not result.text.strip()
+                    hint = _CONTINUE if not fragments or result.text.strip() else ''
+                    if fragments:
+                        hint = '上一轮截断的工具未声明。请使用本轮已声明的工具或直接回复。' + hint
+                    self.trajectory.append({'role':'user','content':hint})
                 stalled_continuations = 0 if advanced else stalled_continuations+1
                 await self.clear_batch(pending)
                 if stalled_continuations>=self.policy.max_continuations or remaining==0:
@@ -373,7 +380,9 @@ class ReActEngine:
                 if corrections>=self.policy.finish_corrections or remaining==0:
                     await self.pause(issue + ' 进度已保存，可重试。', retry=True)
                 corrections += 1
-                self.trajectory.extend([{'role':'assistant','content':result.text}, {'role':'user','content':issue}])
+                if result.text.strip():
+                    self.trajectory.append({'role':'assistant','content':result.text})
+                self.trajectory.append({'role':'user','content':issue})
                 self.prefix = ''
                 continue
             return await self.final(replace(result,text=text))

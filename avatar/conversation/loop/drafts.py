@@ -14,12 +14,15 @@ from avatar.core.execution import current_tool_call, run_blocking
 from avatar.files.conversation.resources import validate_output
 
 
+_APPEND_ORDER = '按 draft_id、offset、done、chunk 的顺序填写，源码 chunk 放最后。'
+
+
 class AppendHtmlDraft(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
-    draft_id: str = Field(pattern=r'^draft-[a-f0-9]{32}$')
-    offset: int = Field(ge=0, description='上一条草稿回执中的 UTF-8 字节游标。')
-    chunk: str = Field(max_length=MAX_SOURCE_BYTES, description='紧接草稿尾部的 HTML 源码。')
-    done: bool = Field(description='本段追加后是否可发布完整作品。')
+    draft_id: str = Field(pattern=r'^draft-[a-f0-9]{32}$', description='首先填写最近回执中的草稿 ID。')
+    offset: int = Field(ge=0, description='随后填写该草稿回执中的 UTF-8 字节游标。')
+    done: bool = Field(description='在 chunk 前填写。本段追加后是否发布完整作品。')
+    chunk: str = Field(max_length=MAX_SOURCE_BYTES, description='最后填写紧接草稿尾部的 HTML 源码。')
 
     @field_validator('offset', mode='before')
     @classmethod
@@ -30,7 +33,7 @@ class AppendHtmlDraft(BaseModel):
 
 APPEND_HTML_DRAFT = {
     'name': 'append_html_draft',
-    'description': '继续暂存的 HTML。使用最近回执的游标，完成后交付作品。',
+    'description': '继续暂存的 HTML。使用最近回执并在完成后交付作品。' + _APPEND_ORDER,
     'parameters': AppendHtmlDraft.model_json_schema(),
 }
 
@@ -115,7 +118,8 @@ def _gemini_prefix(chunks, fields, content):
                     values[field] = ''.join(parts)
                     parts.clear()
             elif more:
-                raise ValueError('草稿标识或游标未确认')
+                # Only complete identifying fields can authorize an append.
+                return values
             else:
                 kind = {'offset':'numberValue','done':'boolValue'}.get(field, 'stringValue')
                 values[field] = update[kind]
@@ -167,18 +171,27 @@ class HtmlDrafts:
             if not isinstance(values, dict) or set(values) - fields:
                 return None
             text = values.get(content)
-            size = len(text.encode('utf-8')) if isinstance(text, str) and '\x00' not in text else 0
             if is_create:
+                size = len(text.encode('utf-8')) if isinstance(text, str) and '\x00' not in text else 0
                 filename = checked_args(HtmlFile, {'filename':values.get('filename')}).filename
                 validate_output(filename, b'')
             else:
-                request = checked_args(AppendHtmlDraft, {**values, 'done':False})
+                request = (checked_args(AppendHtmlDraft, {**values, 'done':False})
+                           if {'draft_id','offset'} <= values.keys() else None)
         except (AttributeError, KeyError, TypeError, ValueError, RecursionError):
             return None
 
-        if not is_create:
-            return self._append(request) if size else None
         drafts = self.state.get('drafts', {})
+        if not is_create:
+            if request is not None:
+                return self._append(request) if request.chunk and '\x00' not in request.chunk else None
+            if len(drafts) == 1:
+                name, draft = next(iter(drafts.items()))
+                if values.get('draft_id', name) == name:
+                    receipt = self._draft_receipt(name, draft, 'draft_needs_cursor')
+                    receipt['hint'] = '本次截断片段未保存，请从回执游标重写。' + receipt['hint']
+                    return receipt
+            return None
         for name, draft in drafts.items():
             if draft['filename'] == filename:
                 return self._draft_receipt(name, draft, 'draft_exists')
@@ -285,4 +298,4 @@ class HtmlDrafts:
         tail = data.decode('utf-8', errors='ignore')[-300:]
         return {'status':status, 'draft_id':name, 'filename':draft['filename'],
                 'offset':draft['offset'], 'tail_preview':tail,
-                'hint':'使用 append_html_draft 和回执游标继续追加源码，最后一段设 done=true。'}
+                'hint':'使用 append_html_draft 继续追加，最后一段设 done=true。' + _APPEND_ORDER}

@@ -134,9 +134,11 @@ def test_native_tool_stream_preserves_replay_and_call_ids(fmt):
         assert 'private_opaque' not in json.dumps(events)
         assert not any(event['type']=='delta' for event in reply)
         *_, plain = model.build_request(config, 'key', 'system',
-                                        [{'role':'assistant','content':'earlier'}], 'new')
+                                        [{'role':'user','content':'question'},
+                                         {'role':'assistant','content':'earlier'}], 'new')
         if fmt == 'gemini':
-            assert plain['contents'] == [{'role':'model','parts':[{'text':'earlier'}]},
+            assert plain['contents'] == [{'role':'user','parts':[{'text':'question'}]},
+                                         {'role':'model','parts':[{'text':'earlier'}]},
                                          {'role':'user','parts':[{'text':'new'}]}]
         else:
             assert plain['messages'][-2:] == [{'role':'assistant','content':'earlier'},
@@ -207,6 +209,58 @@ def test_native_tool_replies_merge_adjacent_user_blocks_and_keep_media(fmt):
         assert [p['inline_data']['data'] for p in blocks[-2:]] == ['YQ==','Yg==']
         text = blocks[2:-2]
     assert [part['text'] for part in text] == ['before receipts','between receipts','latest text']
+
+
+
+@pytest.mark.parametrize('fmt', ['anthropic','gemini'])
+def test_native_tool_normalizes_orphan_and_adjacent_assistant_blocks(fmt):
+    from avatar.models.tools import wire_messages
+
+    private = ({'type':'thinking','thinking':'','signature':'opaque'} if fmt == 'anthropic'
+               else {'text':'','thoughtSignature':'opaque','thought':True})
+    call_layout = {'call':0}
+    if fmt == 'gemini':
+        call_layout['thoughtSignature'] = 'call-signature'
+    history = [
+        {'role':'user','content':' '},
+        {'role':'assistant','content':'older answer'},
+        {'role':'assistant','content':''},
+        {'role':'user','content':' '},
+        {'role':'assistant','content':'', 'replay':{'layout':[private, {'text_length':0}, call_layout]},
+         'tool_calls':[{'id':'native','wire_id':'native','name':'lookup','arguments':{}}]},
+        {'role':'assistant','content':'latest note'},
+        {'role':'tool','tool_call_id':'native','name':'lookup','content':'found'},
+        {'role':'user','content':'question'},
+        {'role':'user','content':''},
+    ]
+    anchor, reply, receipt = wire_messages(fmt, history)
+    assert anchor['role'] == receipt['role'] == 'user'
+    if fmt == 'anthropic':
+        assert anchor['content'].strip()
+        assert reply['role'] == 'assistant'
+        older, thought, call, newer = reply['content']
+        assert call['id'] == receipt['content'][0]['tool_use_id'] == 'native'
+        assert receipt['content'][1]['text'] == 'question'
+    else:
+        assert anchor['parts'][0]['text'].strip()
+        assert reply['role'] == 'model'
+        older, thought, call, newer = reply['parts']
+        assert call['thoughtSignature'] == 'call-signature'
+        assert call['functionCall']['id'] == receipt['parts'][0]['functionResponse']['id'] == 'native'
+        assert receipt['parts'][1]['text'] == 'question'
+    assert (older['text'], newer['text']) == ('older answer', 'latest note')
+    assert thought == private
+
+
+def test_native_tool_keeps_media_only_user_message():
+    config = {'api_format':'gemini','provider':'custom','model':'mock','base_url':'https://example.test',
+              'max_tokens':512,'_image_inputs':[{'mime_type':'image/png','data':'YQ=='}]}
+    *_, body = ModelClient().build_request(config, 'key', 'system', [], '')
+    user, = body['contents']
+    assert user['role'] == 'user'
+    assert user['parts'][-1]['inline_data']['data'] == 'YQ=='
+    assert all('text' not in part or part['text'].strip() for part in user['parts'])
+
 
 
 def test_native_tool_html_response_and_idle_budgets_use_the_same_policy():
@@ -702,6 +756,78 @@ def test_media_and_refreshed_directory_survive_native_steps():
     assert asyncio.run(_run_react_probe(stream,config)).text=='完成'
     assert executed==['read_session_file','read_material','run_python','read_session_file','read_material']
     assert received[2] == received[-1] == ([image,extra],[audio])
+
+
+def test_tool_media_survives_truncation_and_finish_gate_correction():
+    image={'mime_type':'image/png','data':'authorized-view-fixture'}
+    audio={'mime_type':'audio/wav','data':'authorized-audio-fixture'}
+    replacement={'mime_type':'image/png','data':'second-read-fixture'}
+    config={'context_tokens':32768,'audio_enabled':True,'reasoning_effort':'high',
+            'provider':'custom','api_format':'openai','model':'qwen-fixture',
+            '_entry_tools':[_react_probe_definition('read_material')]}
+    requests=[]
+
+    async def tool(name, args):
+        config['_entry_native_media']=({'images':[image],'audio':[audio]} if args['file_id']=='original'
+                                       else {'images':[replacement]})
+        return {'file_id':'original','text':'已提供画面及录音'}
+
+    async def stream(settings, key, system, history, message):
+        requests.append((settings,history))
+        n=len(requests)
+        if n==1:
+            yield _react_probe_receipt(_react_probe_call('read','read_material',{'file_id':'original'}))
+        elif n==2:
+            yield _react_probe_receipt(_react_probe_call('unavailable','unknown_tool',{}),reason='length',partial=True)
+        elif n==3:
+            yield _react_probe_receipt(_react_probe_call('bad','unknown_tool',{}))
+        elif n==4:
+            yield _react_probe_receipt(reason='stop')
+        elif n==5:
+            yield {'type':'delta','text':'[[attachment:unauthorized]]'}
+            yield _react_probe_receipt(reason='stop')
+        elif n==6:
+            yield _react_probe_receipt(_react_probe_call('second','read_material',{'file_id':'second'}))
+        else:
+            yield {'type':'delta','text':'已核对素材。'}
+            yield _react_probe_receipt(reason='stop')
+
+    config['_execute_entry_tool']=tool
+    assert asyncio.run(_run_react_probe(stream,config)).text=='已核对素材。'
+    assert all(settings['_image_inputs']==[image] and settings['_audio_inputs']==[audio] for settings,_ in requests[1:-1])
+    assert requests[-1][0]['_image_inputs']==[replacement] and not requests[-1][0]['_audio_inputs']
+    hint=[row['content'] for row in requests[2][1] if row['role']=='user']
+    assert any('未声明' in text for text in hint)
+    assert requests[2][0]['_recover_thinking'] is True
+    assert not requests[3][0].get('_recover_thinking')
+    assert not any(row['role']=='assistant' and not row['content'] and not row.get('tool_calls')
+                   for _,history in requests for row in history)
+
+
+def test_full_media_capacity_keeps_valid_tool_receipt():
+    attached=[{'mime_type':'image/png','data':str(index)} for index in range(5)]
+    config={'context_tokens':32768,'_image_inputs':attached,'_entry_tools':[_react_probe_definition('read_material')]}
+    requests=[]
+
+    async def tool(name, args):
+        config['_entry_native_media']={'images':[{'mime_type':'image/png','data':'excess'}]}
+        return {'text':'正文读取成功'}
+
+    async def stream(settings, key, system, history, message):
+        requests.append((settings,history))
+        if len(requests)<=4:
+            yield _react_probe_receipt(_react_probe_call(str(len(requests)),'read_material',{'file_id':str(len(requests))}))
+        else:
+            yield {'type':'delta','text':'已核对正文。'}
+            yield _react_probe_receipt(reason='stop')
+
+    config['_execute_entry_tool']=tool
+    assert asyncio.run(_run_react_probe(stream,config)).text=='已核对正文。'
+    final,history=requests[-1]
+    assert final['_image_inputs']==attached and final['_tools']
+    rows=[row for row in history if row['role']=='tool']
+    assert len(rows)==4 and all(not row['is_error'] for row in rows)
+    assert all(json.loads(row['content'])['result']['text']=='正文读取成功' for row in rows)
 
 
 def test_peer_transport_polls_accepted_task_without_resending(context):
@@ -1918,7 +2044,7 @@ def test_peer_message_files_persist_within_session_but_not_tasks(pg_database):
 def test_native_html_draft_survives_truncation_and_writer_change(pg_database):
     from hashlib import sha256
 
-    from avatar.conversation.loop.drafts import HtmlDrafts
+    from avatar.conversation.loop.drafts import APPEND_HTML_DRAFT, HtmlDrafts
     from avatar.conversation.loop.runtime import restore_files
     from avatar.conversation.loop.store import RunConflict, RunStore
     from avatar.conversation.tools.html import CREATE_HTML
@@ -1966,6 +2092,25 @@ def test_native_html_draft_survives_truncation_and_writer_change(pg_database):
         assert draft['status'] == 'truncated_draft_saved'
         assert draft['offset'] == len(source.encode()) and draft['tail_preview'] == source[-300:]
         revision = origin._revision
+        base_call = {'name':'append_html_draft','id':'missing-cursor'}
+        draft_id = json.dumps(draft['draft_id'])
+        incomplete = [
+            {'arguments':'{"chunk":"尚未保存'},
+            {'arguments':'{"draft_id":' + draft_id + ',"chunk":"尚未保存'},
+            {'arguments':'{"draft_id":' + draft_id + ',"chunk":"尚未保存","offset":10'},
+            {'argument_format':'gemini_partial_args','arguments':{'chunks':[
+                {'args':{'draft_id':draft['draft_id']},
+                 'partialArgs':[{'jsonPath':'$.offset','numberValue':10,'willContinue':True}]},
+            ]}},
+        ]
+        for fragment in incomplete:
+            reminder = await drafts.capture({**base_call, **fragment})
+            assert reminder is not None
+            assert reminder == {**draft, 'status':'draft_needs_cursor', 'hint':reminder['hint']}
+            assert '未保存' in reminder['hint'] and 'chunk' in reminder['hint']
+        assert await drafts.capture({**base_call, 'arguments':{'draft_id':'draft-'+'f'*32}}) is None
+        assert list(CREATE_HTML['parameters']['properties']) == ['filename','html']
+        assert list(APPEND_HTML_DRAFT['parameters']['properties']) == ['draft_id','offset','done','chunk']
         for repeated in (clipped,
                          {**clipped, 'id':'new-id', 'arguments':'{"filename":"timeline.html","html":"different'},
                          {**clipped, 'id':'filename-only', 'arguments':'{"filename":"timeline.html","html":'}):
@@ -2019,6 +2164,13 @@ def test_native_html_draft_survives_truncation_and_writer_change(pg_database):
         data = (source + '下一段终点</main>').encode()
         assert outputs[1]['data'] == data and new.read(receipt['draft']).encode() == data
         assert receipt['sha256'] == sha256(data).hexdigest() and not drafts.active
+        for filename in ('first.html', 'second.html'):
+            assert await drafts.capture({'name':'create_html', 'id':filename,
+                                         'arguments':{'filename':filename,'html':'<main>'}})
+        revision = new._revision
+        assert await drafts.capture({'name':'append_html_draft', 'id':'ambiguous',
+                                     'arguments':'{"chunk":"cannot locate'}) is None
+        assert new._revision == revision
 
     asyncio.run(exercise())
 
