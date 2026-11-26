@@ -35,8 +35,8 @@ class AvatarChat:
         self.session_skills=SessionSkills(service.database)
         self.dialogues = None
         self.skills = UserSkills(service.database)
-        from avatar.skills.execution import SkillExecution
-        self.skill_execution = SkillExecution(self.skills)
+        from avatar.skills.sandbox import LocalPythonSandbox
+        self.sandbox = LocalPythonSandbox()
         from avatar.files.conversation.attachments import ChatFiles
         self.chat_files = ChatFiles(service.database,service.attachments)
         self.tools=ConversationTools(self.chat_files)
@@ -359,18 +359,17 @@ class AvatarChat:
             entry = EntryToolContext(overview['agent']['user_id'], overview['agent']['aic'], session, files,
                                      include_private=bool(overview.get('_private_context')))
             workspace = SessionFileAccess(parent_id, user['id'], None if own_files else lambda db: explicit_grants) if own_files or files else None
-            async def sandbox(context, objective):
-                inputs={}
-                if enabled and overview.get('_private_context'):
-                    from avatar.conversation.jobs.pipeline import sandbox_inputs
-                    inputs=await asyncio.to_thread(sandbox_inputs,self,user['id'],parent_id,files,context[0].get('_agent_saved_files',()),request.agent_pause_id)
-                    if context[0].get('_session_sandbox_inputs'):
-                        inputs.update(context[0]['_session_sandbox_inputs']())
-                from avatar.skills.execution import SkillEnrichRequest
-                return await self.skill_execution.enrich(context, SkillEnrichRequest(
-                    overview['agent']['user_id'], objective, session['id'], caller_id=user['id'],
-                    parent_id=parent_id, inputs=inputs, enabled=enabled, allow_code=enabled,
-                ), self.model_client, progress=progress)
+            def sandbox(session_inputs):
+                from avatar.conversation.jobs.pipeline import sandbox_inputs
+                from avatar.skills.python_tool import AtomicPython
+                config = context[0]
+
+                def inputs():
+                    return {**sandbox_inputs(self,user['id'],parent_id,files,config.get('_agent_saved_files',()),
+                                             request.agent_pause_id), **session_inputs()}
+
+                return AtomicPython(self.sandbox, config, owner=entry.owner, conversation=session['id'],
+                                    caller=user['id'], parent=parent_id, inputs=inputs, progress=progress)
             context = await bind_entry_tools(self, context, entry,
                 sandbox=sandbox if enabled else None, session_access=workspace,
                 directory_reply=self.assistant_router.catalog_reply,

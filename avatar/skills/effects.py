@@ -58,10 +58,12 @@ class SandboxEffects:
     def receipts(self):
         return (self.state or {}).get('receipts', [])
 
-    def claim(self, token, sources):
+    def claim(self, token, sources, *, invocation=None):
         check_execution()
-        pending = {**(self.state or {}), 'scope': self.scope, 'receipts': self.receipts,
-                   'in_flight': {'token': token, 'sources': sources}}
+        effect = {'token': token, 'sources': sources}
+        if invocation is not None:
+            effect['invocation'] = invocation
+        pending = {**(self.state or {}), 'scope': self.scope, 'receipts': self.receipts, 'in_flight': effect}
         self.store.merge({'sandbox': pending}, expected={'sandbox': self.state})
         self.state = pending
 
@@ -92,13 +94,18 @@ class SandboxEffects:
             self.store.merge({'sandbox': confirmed}, expected={'sandbox': self.state})
         self.state = confirmed
 
+    @staticmethod
+    def read_record(receipt):
+        record = deepcopy(receipt['record'])
+        for key in receipt.get('escaped', ()):
+            record[key] = json.loads(record[key])
+        return record
+
     def restore(self, inputs, authorize, saved, persisted):
         results, outputs = [], []
         for receipt in self.receipts:
             authorize(receipt['sources'])
-            record = deepcopy(receipt['record'])
-            for key in receipt.get('escaped', ()):
-                record[key] = json.loads(record[key])
+            record = self.read_record(receipt)
             files = record.get('outputs', [])
             sizes = receipt['sizes']
             if len(sizes) != len(files):

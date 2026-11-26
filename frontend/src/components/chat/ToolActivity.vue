@@ -29,7 +29,7 @@ const actions: Record<string, string> = {
   list_avatars: '查询公开分身目录',
   contact_avatar: '准备分身联络草稿',
   require_conversation_tool: '检查所需工具是否开启',
-  python: '规划 Python 沙箱操作',
+  run_python: '运行 Python 沙箱',
   ask_user: '确认需要补充的信息',
   wait_for_user: '等待任务参与者补充信息',
   end_task: '提交任务结果',

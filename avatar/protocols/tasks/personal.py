@@ -32,7 +32,7 @@ PUBLIC_STAGES = {
     'intent_analysis': '判断任务目标', 'thinking': '分析任务和已有信息',
     'tool_selection': '判断所需工具', 'rag_retrieving': '检索相关资料',
     'material_reading': '读取相关资料', 'tool_catalog': '查询候选资料',
-    'tool_action': '执行已选择的操作', 'skill_execution': '运行 Python 沙箱',
+    'tool_action': '执行已选择的操作',
     'result_writing': '整理最终答复', 'model_stream': '模型响应流已连接',
 }
 

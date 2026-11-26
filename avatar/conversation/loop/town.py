@@ -14,6 +14,7 @@ from avatar.files.conversation.resources import validate_output
 from avatar.files.conversation.session_files import SessionFiles, usable_text
 from avatar.files.library.delivery import SavedMaterials
 from avatar.files.parsing import PLAIN_TEXT_EXTENSIONS
+from avatar.skills.python_tool import AtomicPython
 
 
 class TemporarySessionFiles(SessionFiles):
@@ -93,10 +94,6 @@ class TemporarySessionFiles(SessionFiles):
                                  else '原件超出沙箱输入上限。')
         return result
 
-    def has_html_source(self):
-        return super().has_html_source() or any(fid in self.staged_reads and row['mimeType']=='text/html'
-            and row['path'].is_file() for fid,row in self.previous.items())
-
     def html(self, identifier, sha256):
         if previous := self.previous.get(identifier):
             if (self.staged_reads.get(identifier)!=sha256 or previous['sha256']!=sha256
@@ -156,13 +153,9 @@ async def bind_town_tools(chat, model, actor, caller, conversation, path, store,
                     inputs[fid] = {'path':f"inputs/{fid}/{row['filename']}",'read':lambda fid=fid:public_input(fid)}
         return inputs
 
-    async def sandbox(context, objective):
-        inputs = await run_blocking(sandbox_catalog)
-        from avatar.skills.execution import SkillEnrichRequest
-        return await chat.skill_execution.enrich(context, SkillEnrichRequest(
-            owner, objective, conversation['id'], caller_id=caller, parent_id=conversation['id'],
-            inputs=inputs, allow_code=True,
-        ), chat.model_client, progress=progress)
+    def sandbox(_):
+        return AtomicPython(chat.sandbox, config, owner=owner, conversation=conversation['id'], caller=caller,
+                            parent=conversation['id'], inputs=sandbox_catalog, progress=progress)
 
     config.update(_html_enabled=True,_sandbox_https_enabled=False,_sandbox_workspace=path/'python')
     allowed = bind_public_material_tools(chat, config, materials, owner, store, state, allow_sources=True)

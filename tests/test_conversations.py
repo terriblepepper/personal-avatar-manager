@@ -22,7 +22,7 @@ from avatar.protocols.tasks.dialogues import PeerDialogueTasks
 from avatar.protocols.tasks.store import ManagementTaskError
 from avatar.protocols.transport.peer import PeerAcpsTransport
 from avatar.core.execution import AgentNeedsInput
-from avatar.skills.execution import SkillExecution, SkillEnrichRequest
+from avatar.skills.python_tool import AtomicPython, PythonArguments
 from tests.support import legacy_sqlite
 
 
@@ -661,29 +661,29 @@ def test_sandbox_inputs_cannot_expand_after_submission(context,jobs,monkeypatch)
     captured={}
     async def memory(session,modified,context,*args,**kwargs):return context
     async def skills(uid,context,*args,**kwargs):return context
-    async def rag(uid,aic,session,files,context,*args,**kwargs):return context
-    async def execute(context, enrichment, model, **kwargs):
-        captured.update(enrichment.inputs)
-        prefix, data = context[2].split('\n',1)
-        evidence = {**json.loads(data), 'skill_execution_results':[{'status':'success'}]}
-        return context[0],context[1],prefix+'\n'+json.dumps(evidence),context[3]
+    async def execute(owner,resources,script,args,**kwargs):
+        kwargs['authorize']()
+        captured.update(resources)
+        return {'status':'success','stdout':'original','files':[]}
     monkeypatch.setattr(chat.memory,'prepare',memory)
     monkeypatch.setattr(chat.memory,'needs_compression',lambda *args:False)
     monkeypatch.setattr(chat.skills,'load_context',skills)
-    monkeypatch.setattr(chat.rag,'enrich',rag)
-    monkeypatch.setattr(chat.skill_execution,'enrich',execute)
+    monkeypatch.setattr(chat.sandbox,'execute',execute)
     overview={'agent':{'user_id':user['id'],'aic':'aic','last_modified_at':''},'_private_context':True}
     session={'id':cid,'parent_id':None}
     context=({'context_tokens':32768,'max_tokens':16},'key','system\n'+json.dumps({'available_skills':[]}),[])
     async def use_sandbox():
         prepared=await chat.prepare(user,request(cid,'inputs'),overview,context,session)
+        tool=prepared[0]['_execute_entry_tool']
+        with pytest.raises(ValueError,match='未授权文件'):
+            await tool('run_python',{'code':'print(1)','input_file_ids':[late]})
         assert not captured
-        await prepared[0]['_execute_entry_tool']('python',{'query':'读取可用输入'})
+        receipt=await tool('run_python',{'code':'print(1)','input_file_ids':[original]})
+        assert receipt['status']=='success'
+        assert captured['inputs/'+original+'/original.txt']==b'original'
+        with store.database.connect(write=True) as db:db.execute('DELETE FROM attachments WHERE id=?',(original,))
+        with pytest.raises(HTTPException):prepared[0]['_validate_sandbox']()
     with generation_scope(job):asyncio.run(use_sandbox())
-    assert original in captured and late not in captured
-    assert captured[original]['read']()==b'original'
-    with store.database.connect(write=True) as db:db.execute('DELETE FROM attachments WHERE id=?',(original,))
-    with pytest.raises(HTTPException):captured[original]['read']()
 
 
 @pytest.fixture
@@ -1369,80 +1369,65 @@ def test_exchange_replays_first_command_without_changing_operation(context):
     assert sent[0][0] == 'start' and sent[2][0] == 'continue'
 
 
-# skill execution
+def test_repeated_python_action_keeps_result():
+    from avatar.core.execution import current_tool_call
 
-# 模块说明：技能执行图回归测试；重复动作必须立即终止循环，不能空转到 LangGraph 递归上限（GraphRecursionError 会让沙箱结果丢失且无最终回答）。
+    calls=[]
+    checkpoint={}
+    files={'original':b'original'}
+    async def execute(owner,resources,script,args,**kwargs):
+        calls.append(resources[script])
+        return {'status':'success','stdout':['1986569672'],'files':[]}
+    def merge(patch, *, expected):
+        assert checkpoint.get('sandbox')==expected['sandbox']
+        checkpoint.update(patch)
+    store=SimpleNamespace(load=lambda: checkpoint,merge=merge)
+    runtime=SimpleNamespace(execute=execute)
+    def inputs():
+        return {'original':{'path':'inputs/original/file.txt','read':lambda: files['original']}}
+    def new_tool(config):
+        return AtomicPython(runtime,config,owner='owner',conversation='c1',inputs=inputs)
+    args=PythonArguments(code='print(17348 * 114514)',input_file_ids=['original'])
 
+    async def invoke(tool, step, call_id, replay=False):
+        token=current_tool_call.set((step,call_id,replay))
+        try:
+            return await tool.execute(args)
+        finally:
+            current_tool_call.reset(token)
 
-class FakeResponse:
-    def __init__(self,text):
-        self.text=text
-        self.usage={'input_tokens':10,'output_tokens':5}
-
-
-class FakeModel:
-    # 职责：按脚本返回规划 JSON；列表耗尽后重复最后一项，模拟模型执行成功后仍复读同一动作。
-    def __init__(self,actions):
-        self.actions=list(actions)
-        self.calls=0
-    async def generate(self,*args,**kwargs):
-        action=self.actions[min(self.calls,len(self.actions)-1)]
-        self.calls+=1
-        return FakeResponse(json.dumps(action,ensure_ascii=False))
-
-
-def build_context():
-    background={'installed_skills':[]}
-    system='PREFIX\n'+json.dumps(background,ensure_ascii=False)+'\nSUFFIX'
-    config={'provider':'deepseek','model':'deepseek-v4-flash','max_tokens':1024}
-    return config,'test-key',system,[]
-
-
-def make_execution(context):
-    app,user,_=context
-    execution=SkillExecution(app.state.chat.skills)
-    async def fake_execute(user_id,resources,script,args,**kwargs):
-        return {'status':'success','stdout':['1986569672'],'stderr':[],'error':'','files':[]}
-    execution.sandbox.execute=fake_execute
-    return execution,user.get('/api/auth/me').json()['user']['id']
-
-
-def background_of(merged_system):
-    value,_=json.JSONDecoder().raw_decode(merged_system.split('\n',1)[1])
-    return value
-
-
-def test_repeated_python_action_terminates_and_keeps_result(context):
-    # 复现线上故障：模型两次返回同一 python 动作，第二次命中重复守卫后必须结束并保留已成功的沙箱结果。
-    execution,user_id=make_execution(context)
-    model=FakeModel([{'action':'python','code':'print(17348 * 114514)','input_ids':[]}])
-    config,key,system,history=build_context()
-    merged,_,merged_system,_=asyncio.run(execution.enrich((config,key,system,history),SkillEnrichRequest(user_id,'调用sandbox计算17348×114514','c1',allow_code=True),model))
-    assert model.calls==2
-    results=background_of(merged_system)['skill_execution_results']
-    assert len(results)==1 and results[0]['status']=='success'
-    assert results[0]['stdout']=='1986569672'
-    assert '不得只复述脚本代码' in background_of(merged_system)['skill_execution_rules']
-    assert merged['_generated_files']==[]
-    assert not any('未成功' in notice or '未完成' in notice for notice in merged['_workflow_notices'])
+    config={'_run_store':store}
+    async def run():
+        receipt=await invoke(new_tool(config),1,'provider-call')
+        assert receipt['stdout']=='1986569672'
+        resumed=new_tool({'_run_store':store})
+        assert await invoke(resumed,1,'provider-call',replay=True)==receipt
+        with pytest.raises(ValueError,match='已有回执'):
+            await invoke(resumed,1,'provider-call')
+        with pytest.raises(ValueError,match='已有回执'):
+            await invoke(resumed,2,'provider-call',replay=True)
+        files['original']=b'changed'
+        with pytest.raises(HTTPException) as rejected:
+            await invoke(resumed,1,'provider-call',replay=True)
+        assert rejected.value.status_code==409
+    asyncio.run(run())
+    assert calls==[args.code.encode()]
+    assert config['_sandbox_succeeded'] and config['_generated_files']==[]
 
 
-def test_distinct_actions_stop_at_four_run_cap(context):
-    execution,user_id=make_execution(context)
-    actions=[{'action':'python','code':'print('+str(n)+')','input_ids':[]} for n in range(6)]
-    model=FakeModel(actions)
-    config,key,system,history=build_context()
-    merged,_,_,_=asyncio.run(execution.enrich((config,key,system,history),SkillEnrichRequest(user_id,'多步计算','c1',allow_code=True),model))
-    assert model.calls==4
-    assert any('已运行四次' in notice for notice in merged['_workflow_notices'])
-
-
-def test_finish_action_never_executes(context):
-    execution,user_id=make_execution(context)
-    model=FakeModel([{'action':'finish'}])
-    config,key,system,history=build_context()
-    _,_,merged_system,_=asyncio.run(execution.enrich((config,key,system,history),SkillEnrichRequest(user_id,'普通聊天','c1',allow_code=True),model))
-    assert model.calls==1 and background_of(merged_system)['skill_execution_results']==[]
+def test_distinct_actions_stop_at_task_attempt_cap():
+    calls=[]
+    async def execute(owner,resources,script,args,**kwargs):
+        calls.append(resources[script])
+        return {'status':'success','stdout':'','files':[]}
+    tool=AtomicPython(SimpleNamespace(execute=execute),{},owner='owner',conversation='c1',inputs=dict)
+    async def run():
+        for index in range(16):
+            await tool.execute(PythonArguments(code=f'print({index})'))
+        with pytest.raises(AgentNeedsInput,match='十六次'):
+            await tool.execute(PythonArguments(code='print(16)'))
+    asyncio.run(run())
+    assert len(calls)==16
 
 
 # Keep the offline Deno command and permissions stable across Python dependency updates
@@ -1829,7 +1814,8 @@ def test_react_checkpoint_rehydrates_legacy_artifacts_and_fences_receipt_writer(
         assert checkpoint['schema_version'] == 2 and checkpoint['trajectory'] == [] and checkpoint['step'] == 0
         assert checkpoint['sources'] == {'revision':'v1'} and '已经制作旧作品' in checkpoint['legacy_summary']
         assert not {'public_visible','draft','plan','observations','session_image_ids','material'} & checkpoint.keys()
-        assert checkpoint['entry_material'] == proofs and 'session-file' in checkpoint['session_file_reads']
+        assert checkpoint['entry_material'] == {'revisions':proofs['revisions']}
+        assert 'session-file' in checkpoint['session_source_checks'] and 'session_file_reads' not in checkpoint
         assert first.size('incomplete-legacy-draft') == 0
         assert resume_safe(checkpoint) and not resume_safe(checkpoint, automatic=True)
         config = {}
@@ -1921,6 +1907,7 @@ def test_react_recovery_republishes_held_question_without_model_call():
         legacy = {'phase':'paused','observations':['旧任务回执']}
         store.save(legacy)
         assert resume_safe(legacy) and not resume_safe(legacy, automatic=True)
+        assert await load_checkpoint(store, automatic=True) == legacy
         checkpoint = await load_checkpoint(store)
         assert checkpoint['phase'] == 'running' and checkpoint['trajectory'] == []
         assert '旧任务回执' in checkpoint['legacy_summary']

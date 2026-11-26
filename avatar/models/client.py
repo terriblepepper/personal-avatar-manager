@@ -369,7 +369,7 @@ class ModelClient:
             limit_field = "max_completion_tokens" if config["provider"] == "openai" else "max_tokens"
             body = {"model": config["model"], "messages": [{"role": "system", "content": system}]+conversation,
                     limit_field: config["max_tokens"], "stream": streaming}
-            if (config.get('_recover_thinking') or config.get('_brief_visual_parse') or config.get('_call_purpose') in ('skill_execution','agent_intent')
+            if (config.get('_recover_thinking') or config.get('_brief_visual_parse') or config.get('_call_purpose') == 'agent_intent'
                     or (config.get('_tools') and config.get('_call_purpose') in ('file_read','rag_query_construction'))) and not config.get('reasoning_effort') and config['provider']=='custom' and config['model'].split('/')[-1].lower().startswith('qwen'):
                 body['enable_thinking']=False
                 body['chat_template_kwargs']={'enable_thinking':False}

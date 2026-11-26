@@ -6,7 +6,7 @@ import httpx
 from fastapi import HTTPException
 
 PURPOSES={'react':'分身模型调用','agent_intent':'会话意图分析','html_generation':'HTML 作品生成',
-          'skill_execution':'技能脚本规划','memory':'记忆压缩','file_embedding':'向量嵌入','file_search':'资料判断/检索',
+          'memory':'记忆压缩','file_embedding':'向量嵌入','file_search':'资料判断/检索',
           'file_read':'资料原文读取','answer':'回答生成'}
 _REFUSALS = {'content_filter','safety','recitation','blocklist','prohibited_content','spii','refusal'}
 

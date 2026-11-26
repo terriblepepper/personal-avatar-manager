@@ -44,7 +44,7 @@ def merged_work(request, task):
 _PUBLIC_ACTIONS = frozenset("""find_material send_material search_materials read_material
     find_public_material send_public_material create_html edit_html append_html_draft
     list_avatars contact_avatar read_session_file read_step_receipt require_conversation_tool
-    python ask_user get_current_time wait_for_user end_task send_message""".split())
+    run_python ask_user get_current_time wait_for_user end_task send_message""".split())
 
 
 def public_event(event):

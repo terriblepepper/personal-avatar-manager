@@ -50,9 +50,10 @@ async def run_agent(rag, context, question, *, progress=None, on_delta=None):
         store.check()
 
     await check_execution_async(validate)
-    state = await load_checkpoint(store)
-    if not resume_safe(state, initial=True, automatic=bool(config.get('_auto_recover')),
-                       allow_question=config.get('_allow_user_questions', True)):
+    automatic = bool(config.get('_auto_recover'))
+    allow_question = config.get('_allow_user_questions', True)
+    state = await load_checkpoint(store, automatic=automatic, allow_question=allow_question)
+    if not resume_safe(state, initial=True, automatic=automatic, allow_question=allow_question):
         raise AgentNeedsInput.from_context('此前操作尚未确认。请核对执行结果后继续。', config, state.get('usage'))
     await restore_files(store, state, config)
     journal = LoopState(store, state)

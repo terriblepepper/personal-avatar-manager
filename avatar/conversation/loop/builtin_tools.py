@@ -34,7 +34,7 @@ def bind_tools(chat, config, question, validate, trace, context, drafts, deliver
         if handler is None:
             async def handler(args, name=name):
                 return await config['_execute_entry_tool'](name, args)
-        registry.add(definition, handler, checkpoint=name in ('run_python','python','send_public_material'))
+        registry.add(definition, handler, checkpoint=name in ('run_python','send_public_material'))
 
     async def terminal(args, definition):
         name = definition['name']

@@ -16,7 +16,7 @@ from avatar.models.context_budget import bounded_excerpt
 _LEGACY_SAFE = {'planning', 'decision', 'writing', 'artifact_receipt'}
 _LEGACY_BINDINGS = (
     'binding', 'sources', 'files', 'sandbox', 'peer_source', 'peer_style', 'peer_workspace',
-    'objective', 'usage', 'entry_material', 'session_file_reads', 'staged_html_reads',
+    'objective', 'usage', 'session_source_checks',
 )
 
 
@@ -59,15 +59,19 @@ def _legacy_summary(state):
     return bounded_excerpt('\n'.join(filter(None, sections)), 1200)
 
 
-async def load_checkpoint(store):
+async def load_checkpoint(store, *, automatic=False, allow_question=True):
     state = await run_blocking(store.load) if store is not None else {}
-    if state.get('schema_version') == 2 or not resume_safe(state, initial=True):
+    if state.get('schema_version') == 2 or not resume_safe(
+            state, initial=True, automatic=automatic, allow_question=allow_question):
         return state
     fresh = {key: state[key] for key in _LEGACY_BINDINGS if key in state}
     fresh.update(schema_version=2, phase='retry' if state.get('phase') == 'retry' else 'running',
                  step=0, trajectory=[], drafts={}, receipt_refs={}, supplements=[], question_answers=[])
-    if 'session_file_reads' not in fresh and state.get('generated_reads'):
-        fresh['session_file_reads'] = state['generated_reads']
+    if material := (state.get('entry_material') or {}).get('revisions'):
+        fresh['entry_material'] = {'revisions':material}
+    historic = state.get('session_file_reads', state.get('generated_reads', {}))
+    if historic:
+        fresh['session_source_checks'] = {**fresh.get('session_source_checks', {}), **historic}
     if summary := _legacy_summary(state):
         fresh['legacy_summary'] = summary
     if store is not None:

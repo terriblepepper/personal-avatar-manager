@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import stat
+from itertools import chain
 import subprocess
 from pathlib import Path
 
@@ -22,10 +23,12 @@ def usable_text(text):
 
 
 class SessionFiles:
-    def __init__(self, files, owner, conversation, proofs, *, grants=None, sandbox_ids=(), outputs=(), staged_reads=None):
+    def __init__(self, files, owner, conversation, proofs, *, grants=None, sandbox_ids=(), outputs=(), staged_reads=None, source_checks=None):
         self.files, self.owner, self.conversation = files, owner, conversation
         self.grants, self.sandbox_ids = grants, set(sandbox_ids)
         self.proofs = {key:{'source':'chat', 'origin':'generated', **proof} for key,proof in proofs.items()}
+        self.source_checks = {key:{'source':'chat','origin':'generated', **proof}
+                              for key,proof in (source_checks or {}).items()}
         self.verified = {}
         self.outputs = outputs
         self.staged_reads = dict(staged_reads or {})
@@ -93,18 +96,20 @@ class SessionFiles:
             (storage_owner,self.conversation,*identifiers))}
 
     def validate(self):
-        if self.proofs:
+        if self.proofs or self.source_checks:
             with self.files.database.connect() as db:
                 self.validate_in(db)
 
     def validate_in(self, db, *, lock=False):
-        if not self.proofs:
+        identifiers = self.source_checks.keys() | self.proofs.keys()
+        if not identifiers:
             return
-        rows = self._rows(db, tuple(self.proofs), lock=lock)
-        explicit = {i for i,p in self.proofs.items() if p.get('explicit_reference')}
+        rows = self._rows(db, tuple(identifiers), lock=lock)
+        explicit = {i for i,p in chain(self.source_checks.items(), self.proofs.items())
+                    if p.get('explicit_reference')}
         if explicit and self._referenced(db,tuple(explicit))!=explicit:
             raise HTTPException(409,'本轮明确授权的文件引用已撤回')
-        for identifier, proof in self.proofs.items():
+        for identifier, proof in chain(self.source_checks.items(), self.proofs.items()):
             row = rows.get(identifier)
             if row is not None and proof.get('listed_only'):
                 if not self._available(row):
@@ -127,10 +132,6 @@ class SessionFiles:
         if cache is None or cache[0] is not data:
             cache = self.staged_digests[item['id']] = (data,hashlib.sha256(data).hexdigest())
         return cache[1]
-
-    def has_html_source(self):
-        return (any(self.staged_html(identifier) for identifier in self.staged_reads) or
-                any(row.get('content_type')=='text/html' and row.get('read_content') for row in self.proofs.values()))
 
     def discover(self, query, offset):
         result = self.files.discover(self.owner,self.conversation,query,offset,self.outputs,grants=self.grants)

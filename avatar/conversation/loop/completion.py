@@ -2,9 +2,6 @@
 from avatar.conversation.tools.material_delivery import valid_reply
 
 
-TERMINAL_TOOLS = frozenset(('send_message', 'end_task', 'wait_for_user'))
-
-
 class FinishGate:
     def __init__(self, config, policy, delivery, drafts):
         self.config, self.policy, self.delivery, self.drafts = config, policy, delivery, drafts

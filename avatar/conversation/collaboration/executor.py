@@ -15,6 +15,7 @@ from avatar.conversation.collaboration.inbox import notify
 from avatar.conversation.collaboration.tools import TASK_TOOLS, task_tool_result
 from avatar.conversation.tools.activity import without_false_tool_footer
 from avatar.skills.policy import SKILLS_PAUSED
+from avatar.skills.python_tool import AtomicPython
 from avatar.conversation.collaboration.results import confirmed_message
 
 
@@ -355,13 +356,14 @@ class PeerTurnExecutor:
                     raise HTTPException(409,'文件已取消引用')
                 with self.chat.chat_files.directory.path(row['user_id'],workspace,identifier+'.blob').open('rb') as stream:
                     return stream.read(8*1024*1024+1)
-        async def sandbox(context, objective):
-            inputs={file['id']:{'path':'inputs/'+file['id']+'/'+Path(file['filename']).name,'read':lambda identifier=file['id']:read_input(identifier)} for file in [*files,*saved]}
-            from avatar.skills.execution import SkillEnrichRequest
-            return await self.chat.skill_execution.enrich(context, SkillEnrichRequest(
-                speaker_id, objective, workspace, caller_id=job['user_id'], parent_id=workspace,
-                inputs=inputs, enabled=settings['python'], allow_code=settings['python'],
-            ), self.chat.model_client, progress=progress)
+        def sandbox(inputs):
+            def catalog():
+                return {**inputs(), **{
+                    file['id']:{'path':'inputs/'+file['id']+'/'+Path(file['filename']).name,
+                                'read':lambda identifier=file['id']:read_input(identifier)}
+                    for file in [*files,*saved]}}
+            return AtomicPython(self.chat.sandbox, context[0], owner=speaker_id, conversation=workspace,
+                                caller=job['user_id'], parent=workspace, inputs=catalog, progress=progress)
         if not ordinary:
             tools=TASK_TOOLS
             if response_owed and not may_stop:

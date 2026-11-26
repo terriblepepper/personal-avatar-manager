@@ -214,7 +214,7 @@ def test_streamed_upload_batch_completion_and_download(context):
 
 
 @pytest.mark.parametrize('cancel_early', [False, True])
-def test_rag_graph_stream_preserves_events_and_closes_the_model(cancel_early):
+def test_rag_stream_preserves_events_and_closes_the_model(cancel_early):
     from contextlib import aclosing
     from types import SimpleNamespace
     from avatar.rag.service import MaterialRag
@@ -234,19 +234,52 @@ def test_rag_graph_stream_preserves_events_and_closes_the_model(cancel_early):
             finally:
                 closed.set()
 
-        async def answer_context(context, message):
-            return context, message
-
         rag = object.__new__(MaterialRag)
         rag.chat = SimpleNamespace(model_client=SimpleNamespace(stream=model_stream))
-        rag.answer_context = answer_context
         config = {'_material_sources':[{'filename':'report.txt', 'type':'RAG'}]}
         async with aclosing(rag.stream((config, '', '', []), 'question')) as stream:
             assert await anext(stream) == messages[0]
             if not cancel_early:
                 assert [item async for item in stream] == [
                     *messages[1:], {'type':'delta','text':'\n\n> 引用来源：\n> report.txt · RAG  \n'}]
-        assert closed.is_set(), 'closing the graph stream must finish cleanup of the model iterator'
+        assert closed.is_set(), 'closing the stream must finish cleanup of the model iterator'
+
+    asyncio.run(asyncio.wait_for(exercise(), timeout=10))
+
+
+@pytest.mark.parametrize('cancel_early', [False, True])
+def test_agent_rag_stream_reconciles_preview_and_joins_generation(cancel_early):
+    from contextlib import aclosing
+    from avatar.models.client import ModelResult
+    from avatar.rag.service import MaterialRag
+
+    async def exercise():
+        released = asyncio.Event()
+        closed = asyncio.Event()
+
+        async def run(rag, context, message, *, progress, on_delta):
+            try:
+                on_delta('draft')
+                await released.wait()
+                progress({'type':'status', 'stage':'thinking', 'reset_reply':True})
+                on_delta('final')
+                return ModelResult('final text', {'input_tokens':7})
+            finally:
+                closed.set()
+
+        rag = object.__new__(MaterialRag)
+        rag.agent_answer = run
+        async with aclosing(rag.stream(({'_avatar_agent':True}, '', '', []), 'question')) as stream:
+            assert await anext(stream) == {'type':'delta', 'text':'draft'}
+            if not cancel_early:
+                released.set()
+                assert [event async for event in stream] == [
+                    {'type':'status', 'stage':'thinking', 'reset_reply':True},
+                    {'type':'delta', 'text':'final'},
+                    {'type':'delta', 'text':' text'},
+                    {'type':'usage', 'usage':{'input_tokens':7}},
+                ]
+        assert closed.is_set()
 
     asyncio.run(asyncio.wait_for(exercise(), timeout=10))
 

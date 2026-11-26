@@ -224,7 +224,12 @@ class HtmlDrafts:
 
     def _publish(self, arguments, *, request=None):
         candidates = list(self.outputs)
-        item = create_html(arguments, candidates)
+        try:
+            item = create_html(arguments, candidates)
+        except HTTPException as error:
+            if error.status_code != 409:
+                raise
+            raise ValueError(error.detail) from None
         if any(saved['filename'] == item['filename'] for saved in self.saved_files):
             raise ValueError('本轮已保存同名作品，请使用不同文件名')
         active = self.state.get('drafts', {})
