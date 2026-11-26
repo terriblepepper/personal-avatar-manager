@@ -10,7 +10,6 @@ from fastapi import HTTPException
 from avatar.conversation.collaboration.results import confirmed_message
 from avatar.conversation.collaboration.tools import task_tool_result
 from avatar.conversation.loop.peer import PeerTurn, speaker as turn_speaker, wire_id
-from avatar.conversation.loop.runtime import resume_safe
 from avatar.conversation.loop.store import RunStore
 from avatar.core.db import now,dump
 from avatar.core.execution import AgentNeedsInput
@@ -90,7 +89,7 @@ class PeerDialogueTasks:
         if not failed.get('products'):
             return False
         state=RunStore.inspect_in(db,owner,'dialogue',task['id'],'turn') or {}
-        return resume_safe(state,initial=not state)
+        return PeerTurn.resume_safe(state,initial=not state)
 
     # start/continue 生成一方发言；command id 去重使网络重试不会重复调用模型。
     async def handle(self,command,context,user_id):

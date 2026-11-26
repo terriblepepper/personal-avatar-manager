@@ -293,12 +293,6 @@ class AvatarChat:
             scope=authorization()
             if scope is not None:files=[file for file in files if file['id'] in scope.get('files',[])]
             overview['_attachment_ids']=[file['id'] for file in files]
-            if config.get('_material_delivery') and not files and not config.get('_resume_sandbox') and overview.get('_private_context') and overview['agent']['user_id']==user['id']:
-                recent = await asyncio.to_thread(self._deliveries,user['id'],session['id'])
-                overview['_material_delivery']=True
-                overview['_generated_files'] = outputs = []
-                return ({**config,'_material_owner':user['id'],'_generated_files':outputs,
-                         '_animation_request':request.message,'_material_history':recent},key,system,history)
             parent_id=session.get('parent_id') or session['id']
             config,key,system,history=context
             prefix,raw=system.split('\n',1);background=json.loads(raw)
@@ -313,12 +307,20 @@ class AvatarChat:
             config={**config,'_mermaid_enabled':True}
             overview['_mermaid_enabled']=True
             if overview['agent']['user_id']==user['id']:
-                def skill_state():
+                from avatar.conversation.tools.material_delivery import recent_deliveries
+
+                def owner_state():
                     with self.service.database.connect() as db:
+                        recent = recent_deliveries(db, user['id'], session['id'], self.service.attachments.directory)
                         return (self.session_skills.excluded(db,parent_id),
                                 self.session_skills.active(db,user['id'],parent_id),
-                                db.execute('SELECT skills_updated_at,tools_updated_at FROM chat_conversations WHERE id=?',(parent_id,)).fetchone())
-                excluded,background['_session_skill_ids'],parent = await asyncio.to_thread(skill_state)
+                                db.execute('SELECT skills_updated_at,tools_updated_at FROM chat_conversations WHERE id=?',(parent_id,)).fetchone(),
+                                recent)
+                excluded,background['_session_skill_ids'],parent,recent = await asyncio.to_thread(owner_state)
+                if overview.get('_private_context'):
+                    config['_material_owner'] = user['id']
+                    if recent:
+                        background['recent_material_deliveries'] = recent
                 background['available_skills']=[item for item in background.get('available_skills',[]) if item['id'] not in excluded]
                 revision=self.owner_memory_revision(overview,parent)
             else:revision=overview['agent']['last_modified_at']
@@ -338,18 +340,6 @@ class AvatarChat:
                 tools=[item for item in tools if item['id']=='animation']
             enabled=next((tool['enabled'] for tool in tools if tool['id']=='python'),False)
             context=({**context[0],'_conversation_tools':tools,'_animation_request':request.message},*context[1:])
-            async def sandbox(context, objective):
-                inputs={}
-                if enabled and overview.get('_private_context'):
-                    from avatar.conversation.jobs.pipeline import sandbox_inputs
-                    inputs=await asyncio.to_thread(sandbox_inputs,self,user['id'],parent_id,files,context[0].get('_agent_saved_files',()),request.agent_pause_id)
-                    if context[0].get('_session_sandbox_inputs'):
-                        inputs.update(context[0]['_session_sandbox_inputs']())
-                from avatar.skills.execution import SkillEnrichRequest
-                return await self.skill_execution.enrich(context, SkillEnrichRequest(
-                    overview['agent']['user_id'], objective, session['id'], caller_id=user['id'],
-                    parent_id=parent_id, inputs=inputs, enabled=enabled, allow_code=enabled,
-                ), self.model_client, progress=progress)
             overview['_generated_files'] = context[0].setdefault('_generated_files', [])
             # Enrichment can add evidence after memory.prepare. Fit this working copy without reloading the old turns.
             from avatar.models.context_budget import fit_turn
@@ -362,9 +352,6 @@ class AvatarChat:
             from avatar.models.limits import check_context
             if not context[0].get('_avatar_agent'):
                 check_context(context[0],context[2],context[3],request.message)
-            if overview.get('_private_context') and overview['agent']['user_id']==user['id']:
-                recent = await asyncio.to_thread(self._deliveries,user['id'],session['id'])
-                context=({**context[0],'_material_owner':user['id'],'_material_history':recent},*context[1:])
             from avatar.conversation.loop.entry_tools import bind_entry_tools, EntryToolContext, SessionFileAccess
             own_files = bool(overview.get('_private_context') and overview['agent']['user_id']==user['id']
                              and session.get('platform')=='web' and not session.get('parent_id'))
@@ -372,6 +359,18 @@ class AvatarChat:
             entry = EntryToolContext(overview['agent']['user_id'], overview['agent']['aic'], session, files,
                                      include_private=bool(overview.get('_private_context')))
             workspace = SessionFileAccess(parent_id, user['id'], None if own_files else lambda db: explicit_grants) if own_files or files else None
+            async def sandbox(context, objective):
+                inputs={}
+                if enabled and overview.get('_private_context'):
+                    from avatar.conversation.jobs.pipeline import sandbox_inputs
+                    inputs=await asyncio.to_thread(sandbox_inputs,self,user['id'],parent_id,files,context[0].get('_agent_saved_files',()),request.agent_pause_id)
+                    if context[0].get('_session_sandbox_inputs'):
+                        inputs.update(context[0]['_session_sandbox_inputs']())
+                from avatar.skills.execution import SkillEnrichRequest
+                return await self.skill_execution.enrich(context, SkillEnrichRequest(
+                    overview['agent']['user_id'], objective, session['id'], caller_id=user['id'],
+                    parent_id=parent_id, inputs=inputs, enabled=enabled, allow_code=enabled,
+                ), self.model_client, progress=progress)
             context = await bind_entry_tools(self, context, entry,
                 sandbox=sandbox if enabled else None, session_access=workspace,
                 directory_reply=self.assistant_router.catalog_reply,
@@ -382,11 +381,6 @@ class AvatarChat:
             return context
         if request.attachment_ids:raise HTTPException(422,'请先选择一个分身，再发送附件提问')
         return None
-
-    def _deliveries(self, user_id, conversation_id):
-        from avatar.conversation.collaboration.intent import delivery_history
-        with self.service.database.connect() as db:
-            return delivery_history(db,user_id,conversation_id,self.service.attachments.directory)
 
     # 职责：生成无需模型调用的申请引导和状态答复。
     # 输入：overview 为本人业务概览；调用工具已在上游确定，不从文本推断操作。
@@ -435,8 +429,6 @@ class AvatarChat:
                     for file_id in dict.fromkeys(overview.get('_attachment_ids',request.attachment_ids)):
                         db.execute('INSERT OR IGNORE INTO chat_file_usages(message_id,file_id) VALUES(?,?)',(cursor.lastrowid,file_id))
             outputs=overview.get('_generated_files',[])
-            if overview.get('_material_delivery') and '_material_outputs' not in overview:
-                raise HTTPException(502,'本轮缺少资料工具回执，未发送附件')
             materials=overview.get('_material_outputs',())
             if outputs:resources.enter_context(self.chat_files.storing_outputs(db,user['id'],overview.get('_parent_id',request.conversation_id),cursor.lastrowid,outputs))
             used=overview.get('_used_skills',[])
@@ -484,13 +476,9 @@ class AvatarChat:
         declared = json.loads(parent['tools_config']).get('animation') is True
         overview = await asyncio.to_thread(self.service.overview,user['id'])
         own = overview['agent']
-        # A personal chat already has its responder. Tool selection belongs to that responder's loop.
-        known_responder = request.personal and own and own.get('identity_status')=='active'
-        decision = (await self.dialogues.trigger(user,request.message,parent,request.personal or request.channel=='avatar')
-                    if self.dialogues and overview['embedding_configured'] and not known_responder else None)
-        if decision and decision.get('intent'):
-            overview=await asyncio.to_thread(self.service.overview,user['id']);overview['_intent']=decision['intent']
-            return overview,None,parent,decision['reply']
+        # Personal conversations already have a responder. Only explicit assistant navigation can switch it.
+        decision = (await self.dialogues.trigger(user, request.message, parent)
+                    if self.dialogues and not request.personal and not declared and overview['embedding_configured'] else None)
         action=(decision or {}).get('action');arguments=(decision or {}).get('arguments',{})
         observation=None
         if action in ('list_avatars','application_status'):
@@ -509,7 +497,7 @@ class AvatarChat:
                 overview=await asyncio.to_thread(self.service.overview,user['id'])
                 return overview,None,parent,'请明确目标分身的名称或 AIC。'+self.assistant_router.catalog_reply(arguments.get('query',''))
             target=matches[0]
-        elif action not in ('answer_self','deliver_material') and not request.personal and request.channel=='assistant' and parent.get('selected_aic'):
+        elif action != 'answer_self' and not request.personal and request.channel=='assistant' and parent.get('selected_aic'):
             target=next((t for t in self.assistant_router.catalog() if t['aic']==parent['selected_aic']),None)
         if target:
             overview,context=await asyncio.to_thread(self.context,user,request,target['row'],private_access=True,run_parent=parent['id'])
@@ -518,10 +506,6 @@ class AvatarChat:
             return overview,context,child,None
         if not own:return overview,None,parent,None
         overview,context=await asyncio.to_thread(self.context,user,request,own,private_access=True,run_parent=parent['id'])
-        if action=='deliver_material' and not declared:
-            context=({**context[0],'_material_delivery':arguments},*context[1:])
-        elif action=='continue_answer':
-            context=({**context[0],'_answer_route':{'mode':'answer',**arguments}},*context[1:])
         if observation is not None:
             config,key,system,history=context
             instruction,raw=system.split('\n',1)

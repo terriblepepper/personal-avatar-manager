@@ -3,7 +3,6 @@ import uuid
 from typing import Annotated
 from fastapi import HTTPException
 from pydantic import BaseModel,ConfigDict,Field
-from avatar.files.library.catalog import model_animation_metadata
 
 
 class PublicMaterialRequest(BaseModel):
@@ -17,24 +16,12 @@ SEND_PUBLIC_MATERIAL={'name':'send_public_material','description':'对方明确�
 class PublicMaterials:
     def __init__(self,chat):
         self.database=chat.service.database
+        self.chat_files=chat.chat_files
 
-    def catalog(self,owner_id,query=''):
-        with self.database.connect() as db:
-            rows=db.execute("""SELECT id AS file_id,filename,relative_path,content_type,substr(caption,1,300) AS description,
-                animation_metadata FROM attachments WHERE user_id=? AND visibility='public' AND saved_at IS NOT NULL
-                ORDER BY created_at DESC,id""",(owner_id,))
-            items=[]
-            for row in rows:
-                item=dict(row)
-                item.update(model_animation_metadata(item.pop('animation_metadata'),query))
-                items.append(item)
-            return items
-
-    def prepare(self,owner_id,arguments,workspace=None,task_id=None):
-        request=PublicMaterialRequest.model_validate(arguments)
+    def prepare(self,owner_id,request,workspace=None,task_id=None,*,reserved=()):
         outputs=[]
         with self.database.connect() as db:
-            storage_owner=self.chat.chat_files.session(db,owner_id,workspace)['user_id'] if workspace else owner_id
+            storage_owner=self.chat_files.session(db,owner_id,workspace)['user_id'] if workspace else owner_id
             for identifier in dict.fromkeys(request.file_ids):
                 row=db.execute("""SELECT id,filename,sha256,size FROM attachments
                     WHERE id=? AND user_id=? AND visibility='public' AND saved_at IS NOT NULL""",(identifier,owner_id)).fetchone()
@@ -44,7 +31,7 @@ class PublicMaterials:
                     AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now')) AND NOT EXISTS
                     (SELECT 1 FROM agent_task_files a WHERE a.task_id=? AND a.file_id=f.id)
                     ORDER BY f.created_at,f.id LIMIT 1""",(storage_owner,workspace,row['filename'],row['sha256'],task_id)).fetchone() if workspace else None
-                if existing and any(item['id']==existing['id'] for item in outputs):
+                if existing and (existing['id'] in reserved or any(item['id']==existing['id'] for item in outputs)):
                     existing=None
                 outputs.append({'id':existing['id'] if existing else str(uuid.uuid4()),'reuse':bool(existing),
                                 'public_material_id':row['id'],'filename':row['filename'],'sha256':row['sha256'],'size':row['size']})

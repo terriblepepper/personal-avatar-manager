@@ -451,7 +451,7 @@ class PersonalTaskService:
             await self.limit.acquire()
             try:
                 state = store.acquire()
-                if not resume_safe(state, initial=not run.get('claimed'), automatic=run['automatic']):
+                if not resume_safe(state, initial=not run.get('claimed'), automatic=run['automatic'], allow_question=False):
                     raise HTTPException(409,'上次操作尚无确定回执，请核对已有结果后重新发起任务')
                 if not state.get('phase'):
                     store.merge({'phase':'planning'})
@@ -566,7 +566,7 @@ class PersonalTaskService:
             if validate_sandbox:
                 validate_sandbox()
             outputs = model[0].get('_generated_files',())
-            originals = model[0].get('_town_exports',())
+            originals = model[0].get('_react_public_files',())
             reply = without_source_footer(result.text)
             if not config.get('_direct_chat'):
                 attempted = model[0].get('_agent_checkpoint',{}).get('sandbox_attempted')

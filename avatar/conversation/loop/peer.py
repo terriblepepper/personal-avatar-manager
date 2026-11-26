@@ -6,7 +6,6 @@ import uuid
 from fastapi import HTTPException
 
 from avatar.core.db import dump, now
-from avatar.models.client import accumulate_usage
 from avatar.conversation.loop.runtime import resume_safe
 from avatar.conversation.loop.store import RunStore
 from avatar.knowledge.learning import auto_style_advance
@@ -60,7 +59,7 @@ class PeerTurn:
         self.service, self.task, self.owner = service, task, owner
         self.writer = uuid.uuid4().hex
         self.active = None
-        self.charges = {}
+        self.billing = None
         self.validate_session_files = None
         with service.database.connect(write=True) as db:
             self.workspace = service.resources.workspace(db, owner, task['session_id'], task['id'])
@@ -119,16 +118,30 @@ class PeerTurn:
         with self.service.database.connect() as db:
             self.commit(db,files=False)
 
-    def open(self, run_id='turn'):
-        store = RunStore(self.service.database, self.owner, 'dialogue', self.task['id'], run_id, self.writer, self.validate)
+    @staticmethod
+    def _legacy_staged_public(state):
+        # The old export receipt was written after local preparation, before publishing the peer reply.
+        export = state.get('peer_export')
+        return (state.get('schema_version') != 2 and state.get('phase') == 'external_handoff'
+                and (state.get('handoff') or {}).get('name') == 'send_public_material'
+                and isinstance(export, dict) and isinstance(export.get('exports'), list)
+                and bool(export.get('receipts')) and not (state.get('sandbox') or {}).get('in_flight'))
+
+    @staticmethod
+    def resume_safe(state, *, automatic=False, initial=False):
+        return PeerTurn._legacy_staged_public(state) or resume_safe(state, automatic=automatic, initial=initial)
+
+    def open(self):
+        store = RunStore(self.service.database, self.owner, 'dialogue', self.task['id'], 'turn', self.writer, self.validate)
         state = store.acquire()
         if state and state.get('peer_source') != self.source:
             raise HTTPException(409, '分身资料或工具授权已改变，原草稿已停止使用')
-        exported = state.get('phase') == 'external_handoff' and state.get('peer_export') and not (state.get('sandbox') or {}).get('in_flight')
-        if not exported and not resume_safe(state, initial=not state):
+        if not self.resume_safe(state, initial=not state):
             raise HTTPException(409, '原操作结果尚未确认，请核对后结束任务')
         self.active = store
         fields = {'peer_source':self.source, 'peer_style':self.style, 'peer_workspace':self.workspace, 'phase':state.get('phase','planning')}
+        if self._legacy_staged_public(state):
+            fields.update(phase='decision', handoff=None, peer_export=None)
         if not state:
             fields['objective'] = self.task['objective']
         store.merge(fields)
@@ -136,22 +149,20 @@ class PeerTurn:
 
     def charge(self, config, usage):
         if usage is not None:
-            store = config['_run_store']
-            self.charges[store.run_id] = (store,config['provider'],config['model'],usage)
+            self.billing = (config['provider'], config['model'], usage)
 
     def settle(self, db):
-        total = None
-        for store,provider,model,usage in self.charges.values():
-            db.execute('INSERT INTO model_calls(user_id,provider,model,usage,created_at,purpose,caller_id) VALUES(?,?,?,?,?,?,?)',
-                       (self.owner,provider,model,dump(usage),now(),'agent_dialogue',self.task['user_id']))
-            store.mark_usage_recorded_in(db)
-            total = accumulate_usage(total,usage)
-        return total
+        if self.billing is None:
+            return None
+        provider, model, usage = self.billing
+        db.execute('INSERT INTO model_calls(user_id,provider,model,usage,created_at,purpose,caller_id) VALUES(?,?,?,?,?,?,?)',
+                   (self.owner,provider,model,dump(usage),now(),'agent_dialogue',self.task['user_id']))
+        self.active.mark_usage_recorded_in(db)
+        return usage
 
     @staticmethod
     def clear(db, task_id, owner):
-        for run_id in ('turn','public-reply'):
-            RunStore.clear_in(db, owner, 'dialogue', task_id, run_id)
+        RunStore.clear_scope_in(db, owner, 'dialogue', task_id)
 
     @staticmethod
     def recoverable(service, db, task):
@@ -171,9 +182,7 @@ class PeerTurn:
                 return False
             if (state and state.get('peer_source') != current) or (known and receipt.get('authority') != current):
                 return False
-        if state.get('peer_export') and not (state.get('sandbox') or {}).get('in_flight') and state.get('phase') != 'effect_unknown':
-            state = RunStore.inspect_in(db, owner, 'dialogue', task['id'], 'public-reply') or {'phase':'planning'}
-        safe = resume_safe(state, automatic=True)
+        safe = PeerTurn.resume_safe(state, automatic=True)
         if task['transport_mode'] == 'acps':
             command_id = wire_id(db, task, owner)
             wire = db.execute('SELECT state FROM agent_wire_results WHERE task_id=? AND session_id=? AND command_id=? '

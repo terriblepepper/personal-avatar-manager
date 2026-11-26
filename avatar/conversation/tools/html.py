@@ -6,7 +6,6 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from avatar.files.conversation.resources import validate_output
 from avatar.core.artifact_limits import MAX_SOURCE_BYTES
-from avatar.models.tools import load_model_json
 
 
 class HtmlFile(BaseModel):
@@ -23,39 +22,6 @@ CREATE_HTML = {
     'description':'工具用于生成基于html的网页、2d动画和3d动画。作品在隔离环境中运行，无联网或宿主文件访问权限，可使用内置 Three.js。',
     'parameters':WebPage.model_json_schema(),
 }
-ARTIFACT_TOOLS = ('create_html',)
-
-
-def html_repair_prompt():
-    return '输出修正后的 HTML 源码，预览无联网权限。'
-
-
-def _artifact_fields(pairs):
-    result = {}
-    for name,value in pairs:
-        if name in result and (type(result[name]) is not type(value) or result[name] != value):
-            raise ValueError('作品参数含有取值冲突的重复字段')
-        result[name] = value
-    return result
-
-
-def repaired_html_arguments(text, filename):
-    source = text.strip()
-    if source.startswith('```') and source.endswith('```'):
-        header, newline, body = source.partition('\n')
-        if newline and header.strip().lower() in ('```','```json','```html'):
-            source = body[:-3].strip()
-    if source.lstrip('﻿').startswith('<'):
-        try:
-            if validate_output(filename,b'') != 'text/html':
-                filename = 'index.html'
-        except ValueError:
-            filename = 'index.html'
-        return {'filename':filename,'html':source}
-    args = load_model_json(source,object_pairs_hook=_artifact_fields)
-    if not isinstance(args,dict):
-        raise ValueError('修复结果缺少参数对象')
-    return args
 
 
 def checked_args(schema, args):

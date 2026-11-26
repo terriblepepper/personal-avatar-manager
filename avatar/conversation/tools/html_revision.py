@@ -14,23 +14,19 @@ class SourceEdit(BaseModel):
     new: str
 
 
-class Revision(BaseModel):
+class EditHtml(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
+    filename: str = Field(min_length=5, max_length=200, pattern=r'(?i)[.]html?$')
     file_id: str = Field(min_length=1, max_length=80)
     sha256: str = Field(pattern='^[0-9a-f]{64}$')
     edits: list[SourceEdit] = Field(min_length=1, max_length=32)
 
 
-REVISION_SCHEMA = Revision.model_json_schema()
-
-
-def revision_tool(tool):
-    if tool['name']!='create_html':
-        return tool
-    form = tool['parameters']
-    properties = {**form['properties'], 'revision':{k:v for k,v in REVISION_SCHEMA.items() if k!='$defs'}}
-    return {**tool, 'description':tool['description']+' 全文重写传 filename 和 html。局部修改只传 filename 和 revision，使用已读原件的 ID、SHA-256 和准确片段。两种参数不能混用。',
-            'parameters':{**form,'properties':properties,'$defs':{**form.get('$defs',{}),**REVISION_SCHEMA['$defs']},'required':['filename']}}
+EDIT_HTML = {
+    'name':'edit_html',
+    'description':'局部修改已读取的 HTML 原件。填原文件 ID、SHA-256 和准确片段，另存为新作品。',
+    'parameters':EditHtml.model_json_schema(),
+}
 
 
 def apply_edits(text, edits):
@@ -66,10 +62,8 @@ def apply_edits(text, edits):
     return b''.join(parts).decode('utf-8')
 
 
-def expand_revision(args, load_source):
-    from avatar.conversation.tools.html import checked_args
-    if not load_source or set(args) - {'revision', 'filename'}:
-        raise ValueError('修订需使用已读取的当前会话原件，完整源码与局部修改不可混用')
-    change = checked_args(Revision, args['revision'])
+def expand_revision(change, load_source):
+    if load_source is None:
+        raise ValueError('请先读取当前会话授权的 HTML 原件')
     _, source, _ = load_source(change.file_id, change.sha256)
-    return {'filename': args.get('filename'), 'html': apply_edits(source, change.edits)}
+    return {'filename':change.filename, 'html':apply_edits(source, change.edits)}

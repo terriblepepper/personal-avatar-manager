@@ -70,7 +70,7 @@ async def bind_entry_tools(chat, context, entry, *, sandbox=None, status=None, d
         config.update(_rag_access={'originals':True,'scope':scope,'revisions':list(revisions.items())}, _material_sources=sources)
         await run_blocking(chat.rag.validate, context)
     outputs = config.setdefault('_generated_files', [])
-    tools = []
+    tools = list(config.get('_entry_tools', ()))
     lookup_types = {}
     session_files = temporary_files
     read_images = {}

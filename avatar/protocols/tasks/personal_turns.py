@@ -92,11 +92,11 @@ def interrupt_in(db, row, document):
     started = run.get('claimed', False)
     lease_release(db, run)
     saved = RunStore.inspect_in(db, run['owner'], 'protocol', str(row['rowid']), run['run_id']) if run.get('run_id') else None
-    if run.get('run_id') and resume_safe(saved or {}, automatic=True, initial=not started):
+    if run.get('run_id') and resume_safe(saved or {}, automatic=True, initial=not started, allow_question=False):
         run['restart'] = True
         document['_agent_resume'] = run
         state, message = 'awaiting-input', '已保存进度，原调用者查询后将继续'
-    elif saved and resume_safe(saved):
+    elif saved and resume_safe(saved, allow_question=False):
         document['_agent_resume'] = run
         state, message = 'awaiting-input', '上次请求的自动重试已用尽，请补充要求后继续'
     else:

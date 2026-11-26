@@ -15,18 +15,19 @@ const phase = (event: ToolEvent) => event.phase || oldPhases[event.name]
 const record = (value: unknown): Record<string, unknown> =>
   value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
 const actions: Record<string, string> = {
-  deliver_material: '准备交付资料原件',
   find_material: '检索授权原件目录',
-  select_materials: '核验所选原件',
   send_material: '准备所选原件',
   search_materials: '混合检索资料正文',
   read_material: '读取文件原文',
   find_public_material: '检索公开原件',
   send_public_material: '准备公开原件',
   create_html: '生成 HTML',
+  edit_html: '修订 HTML',
+  append_html_draft: '续写 HTML 草稿',
+  read_step_receipt: '读取工具回执',
+  get_current_time: '获取北京时间',
   list_avatars: '查询公开分身目录',
   contact_avatar: '准备分身联络草稿',
-  continue_answer: '确认由当前分身回答',
   require_conversation_tool: '检查所需工具是否开启',
   python: '规划 Python 沙箱操作',
   ask_user: '确认需要补充的信息',
@@ -46,7 +47,7 @@ function meaningfulLegacy(event: ToolEvent) {
   const input = record(event.input), output = record(event.output)
   return event.status === 'error' || phase(event) === 'final'
     || (phase(event) === 'act' && !!input.tool)
-    || (phase(event) === 'reason' && (!!input.stage || !!input.operation || !!input.tools || input.tool === 'python'))
+    || (phase(event) === 'reason' && (!!input.stage || !!input.operation || !!input.tools))
     || (phase(event) === 'check' && !!output.decision && output.decision !== '完成')
 }
 function modelName(event: ToolEvent) {
@@ -82,49 +83,18 @@ function activityName(event: ToolEvent) {
   const input = record(event.input), output = record(event.output)
   if (phase(event) === 'final') return '整理回答与附件'
   if (phase(event) === 'act') {
-    if (input.tool === 'find_material' && Array.isArray(input.queries)) return `检索 ${input.queries.length} 个资料目标`
-    if (input.tool === 'select_materials' && Array.isArray(output.files)) return `核验 ${output.files.length} 份原件`
     const name = sessionFileLabel(input.tool, input) || actions[String(input.tool)] || String(input.tool || event.name)
     const detail = output.reason || output.issue || output.filename
     if (typeof detail === 'string') return name + ' · ' + detail
     return typeof input.query === 'string' && input.query ? `${name}「${input.query}」` : name
   }
-  if (input.operation === 'check_file_receipt') {
-    if (output.decision === 'html') return '核对后补做 HTML'
-    if (output.decision === 'webpage') return '核对后补做网页'
-    if (output.decision === '2d' || output.decision === '3d') return '核对后补做动画'
-    return output.decision === 'plain_answer' ? '已确认本轮可用文字回答' : '核对本轮文件交付'
-  }
-  if (input.stage === 'route' || input.stage === 'resume_route') {
-    if (output.action === 'deliver_material') return '识别索件意图并进入原件交付'
-    if (output.mode === 'search') return '确认先检索正文再回答'
-    if (output.mode === 'read') return '确认先读取原文再回答'
-    return sessionFileLabel(output.action) || actions[String(output.action)] || (input.stage === 'resume_route' ? '判断如何继续当前任务' : '识别本轮目标与所需工具')
-  }
-  if (input.operation === 'select_materials' || Array.isArray(input.tools) && input.tools.includes('select_materials')) {
-    if (typeof output.issue === 'string') return `核对原件选择 · ${output.issue}`
-    if (Array.isArray(output.files)) return `从候选中选出 ${output.files.length} 份原件`
-    if (output.tool === 'find_material') return '调整查询以补齐缺少的候选'
-    if (output.tool === 'clarify_material') return '指出尚需明确的资料条件'
-    return '比对文件说明、路径和正文证据'
-  }
   if (phase(event) === 'reason' && typeof input.iteration === 'number') {
-    const goal = typeof input.goal_no === 'number' ? `目标 ${input.goal_no}` : '本轮答复'
-    if (event.status === 'error' && typeof output.reason === 'string') return `${goal} · ${output.reason}`
-    if (input.mode === '结构化检索参数') return `为${goal}修正检索参数`
-    if (input.mode === '计划中的检索参数') return `采用${goal}已规划的检索参数`
-    if (event.status === 'running') return `正在为${goal}选择下一步`
+    if (typeof output.reason === 'string') return output.reason
+    if (event.status === 'running') return `模型正在处理第 ${input.iteration} 步`
+    const tools = Array.isArray(output.tools) ? output.tools : []
+    if (tools.length) return tools.map(name => actions[String(name)] || String(name)).join('、')
+    if (output.finish_reason) return '模型本步输出完成'
   }
-  if (input.tool === 'python') return actions.python
-  if (Array.isArray(output.plan)) return output.plan.length ? `确定 ${output.plan.length} 项待完成目标` : '确认已有信息足以回答'
-  if (output.decision === 'search_materials') return '确认需要检索授权资料'
-  if (output.decision === 'inspect_originals') return '确认需要读取原文'
-  if (output.decision === 'finish_reading') return '确认当前资料已足够'
-  const tools = Array.isArray(output.tool_names) ? output.tool_names : []
-  if (tools.length) return sessionFileLabel(tools[0]) || actions[String(tools[0])] || '选择本轮工具'
-  if (output.finish_reason) return '组织已有信息并生成答复'
-  if (Array.isArray(input.tools) && input.tools.includes('read_material')) return '确定需要读取的文件与范围'
-  if (typeof output.planned_steps === 'number') return '已规划工具步骤 · ' + output.planned_steps + ' 项'
   const detail = output.issue || output.reason || output.decision || input.operation || input.mode
   return typeof detail === 'string' ? detail : event.name
 }

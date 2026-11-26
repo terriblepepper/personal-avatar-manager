@@ -41,9 +41,9 @@ def merged_work(request, task):
     return request.model_copy(update={'message':objective,'attachment_ids':files})
 
 
-_PUBLIC_ACTIONS = frozenset("""deliver_material find_material select_materials send_material search_materials
-    read_material find_public_material send_public_material create_html
-    list_avatars contact_avatar read_session_file continue_answer require_conversation_tool
+_PUBLIC_ACTIONS = frozenset("""find_material send_material search_materials read_material
+    find_public_material send_public_material create_html edit_html append_html_draft
+    list_avatars contact_avatar read_session_file read_step_receipt require_conversation_tool
     python ask_user get_current_time wait_for_user end_task send_message""".split())
 
 
@@ -99,8 +99,6 @@ def continue_task(chat, user, request, parent, task):
     cfg,key,system,history=context
     if request.agent_control=='continue' and (question:=task['snapshot'].get('user_question')):
         cfg={**cfg,'_answered_question':{**question,'answer':request.message.strip()}}
-    if (request.agent_control=='retry' or not request.message.strip()) and task.get('answer_route'):
-        cfg={**cfg,'_answer_route':task['answer_route']}
     if task['snapshot'].get('reply'):
         prefix,raw=system.split('\n',1)
         background=json.loads(raw)
@@ -213,7 +211,7 @@ def pause(chat, user, request, work, parent, session, overview, error, previous,
         outputs=list(dict.fromkeys([*trusted.get('outputs',()),*(item['id'] for item in files)]))
         document={'run_id':run_id,'sources':state.get('sources') or overview.get('_run_sources') or (previous or {}).get('sources'),
                   'aic':owner['aic'],'owner':owner['user_id'],'session_id':session['id'],
-                  'retry_dispatch':getattr(error,'retry_dispatch',False),'answer_route':getattr(error,'answer_route',None),
+                  'retry_dispatch':getattr(error,'retry_dispatch',False),
                   'checkpoint':error.checkpoint,'objective':work.message,
                   'goal':previous.get('goal',previous['objective']) if previous else work.message,
                   'attachment_ids':work.attachment_ids,'snapshot':result,'outputs':outputs,

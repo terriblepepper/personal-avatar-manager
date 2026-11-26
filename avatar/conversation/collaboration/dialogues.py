@@ -69,8 +69,8 @@ class AgentDialogues:
         return [{'aic':t['aic'],'name':t['name']} for t in self.chat.assistant_router.catalog()
                 if t['row']['user_id']!=user['id'] and t['row']['identity_status']=='active']
 
-    async def trigger(self,user,message,parent,personal=True):
-        return await self.intent.propose(user,message,parent,personal)
+    async def trigger(self, user, message, parent):
+        return await self.intent.navigate(user, message, parent)
 
 
     def request_lock(self, user, request):

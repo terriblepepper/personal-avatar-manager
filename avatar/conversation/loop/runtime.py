@@ -1,35 +1,80 @@
-"""Private execution checkpoints and validated local artifact receipts."""
+"""Versioned checkpoints and validated local artifact receipts."""
 import json
+import re
 from hashlib import sha256
+from uuid import uuid4
 
 from fastapi import HTTPException
+from pydantic import ValidationError
 
-from avatar.core.execution import run_blocking
+from avatar.core.execution import AskUser, run_blocking
+from avatar.core.text_budget import model_text_budget
+from avatar.models.client import ModelResult
+from avatar.models.context_budget import bounded_excerpt
 
 
-def resume_safe(state, *, automatic=False, initial=False):
+_LEGACY_SAFE = {'planning', 'decision', 'writing', 'artifact_receipt'}
+_LEGACY_BINDINGS = (
+    'binding', 'sources', 'files', 'sandbox', 'peer_source', 'peer_style', 'peer_workspace',
+    'objective', 'usage', 'entry_material', 'session_file_reads', 'staged_html_reads',
+)
+
+
+def _valid_held_question(question):
+    if not isinstance(question, dict):
+        return False
+    payload = dict(question)
+    identifier = payload.pop('id', None)
+    if not isinstance(identifier, str) or not re.fullmatch(r'[a-f0-9]{32}', identifier):
+        return False
+    try:
+        # Existing questions were checked against the model budget that produced them.
+        with model_text_budget(len(json.dumps(payload)) // 3 + 1):
+            AskUser.model_validate(payload)
+    except ValidationError:
+        return False
+    return True
+
+
+def resume_safe(state, *, automatic=False, initial=False, allow_question=True):
     if (state.get('sandbox') or {}).get('in_flight'):
         return False
     phase = state.get('phase')
-    return (phase in ('planning', 'decision', 'writing', 'artifact_receipt')
-            or phase is None and initial or phase == 'retry' and not automatic)
+    if state.get('schema_version') == 2:
+        if phase == 'paused' and state.get('user_question') is not None:
+            return allow_question and _valid_held_question(state['user_question'])
+        return phase in ('running', 'completed') or not automatic and phase in ('paused', 'retry')
+    return phase in _LEGACY_SAFE or phase is None and initial or phase in ('paused', 'retry') and not automatic
 
 
-def verified_context(receipts, files, *, compact=False):
-    """Keep verified IDs and modes accessible even after older observations leave the model view."""
-    previous = [{k:r[k] for k in ('goal_no','tool','mode') if r.get(k)} for r in (receipts[-2:] if compact else receipts)]
-    live = {item['id']:item for item in files if item.get('id')}
-    if not previous and not live:
-        return ''
-    # An older confirmed dimension must stay visible when newer attachments fill the view.
-    selected = live
-    if compact:
-        modes = {item['html_mode']:item for item in live.values() if item.get('html_mode') in ('2d','3d','html')}
-        selected = {item['id']:item for item in (*modes.values(),*list(live.values())[-2:])}
-    cards = [{'id':item['id'], 'mode':item.get('html_mode'),
-              **({} if compact else {'filename':str(item.get('filename',''))})} for item in selected.values()]
-    return '\n已核验的本轮回执（数据）：'+json.dumps(
-        {'steps':previous, 'file_count':len(live), 'files':cards}, ensure_ascii=False, separators=(',', ':'))
+def _legacy_summary(state):
+    summary = state.get('history_summary') or {}
+    sections = [summary.get('text', ''), (summary.get('turn') or {}).get('text', ''),
+                (summary.get('objective') or {}).get('text', '')]
+    sections.extend(note for note in state.get('observations', ()) if isinstance(note, str))
+    sections.extend(supplement for supplement in state.get('supplements', ()) if isinstance(supplement, str))
+    sections.extend(f'{item["question"]}：{item["answer"]}' for item in state.get('question_answers', ())
+                    if isinstance(item, dict) and isinstance(item.get('question'), str)
+                    and isinstance(item.get('answer'), str))
+    return bounded_excerpt('\n'.join(filter(None, sections)), 1200)
+
+
+async def load_checkpoint(store):
+    state = await run_blocking(store.load) if store is not None else {}
+    if state.get('schema_version') == 2 or not resume_safe(state, initial=True):
+        return state
+    fresh = {key: state[key] for key in _LEGACY_BINDINGS if key in state}
+    fresh.update(schema_version=2, phase='retry' if state.get('phase') == 'retry' else 'running',
+                 step=0, trajectory=[], drafts={}, receipt_refs={}, supplements=[], question_answers=[])
+    if 'session_file_reads' not in fresh and state.get('generated_reads'):
+        fresh['session_file_reads'] = state['generated_reads']
+    if summary := _legacy_summary(state):
+        fresh['legacy_summary'] = summary
+    if store is not None:
+        keep = {receipt['draft'] for receipt in fresh.get('files', ())}
+        keep.update('sb-' + receipt['token'][:32] for receipt in (fresh.get('sandbox') or {}).get('receipts', ()))
+        await run_blocking(store.migrate, fresh, keep)
+    return fresh
 
 
 async def restore_files(store, state, config):
@@ -40,11 +85,13 @@ async def restore_files(store, state, config):
         identifier = receipt['id']
         if identifier in existing or identifier in persisted:
             continue
+
         def restore():
             data = store.read(receipt['draft']).encode('utf-8')
             if len(data) != receipt['size'] or sha256(data).hexdigest() != receipt['sha256']:
                 raise HTTPException(409, '原作品的校验值发生变化，无法恢复')
             return {key: receipt[key] for key in ('id', 'filename', 'html_mode')} | {'data': data}
+
         config.setdefault('_generated_files', []).append(await run_blocking(restore))
         existing.add(identifier)
 
@@ -55,40 +102,38 @@ class LoopState:
         self.data = state
 
     async def save(self, **fields):
+        if self.store is not None:
+            await run_blocking(self.store.merge, fields)
         self.data.update(fields)
-        if self.store:
-            merge = getattr(self.store, 'merge', None)
-            if merge:
-                await run_blocking(merge, fields)
-            else:
-                await run_blocking(self.store.save, self.data)
 
-    async def answer(self, result):
-        if not self.store:
-            return
-        from uuid import uuid4
+    async def answer(self, result, **fields):
         name = 'answer-' + uuid4().hex
-        data = result.text
-        final = {'name': name, 'size': len(data.encode()), 'finish_reason': result.finish_reason,
-                 'has_material': result.material_delivery is not None}
-        await run_blocking(self.store.append, name, 0, data, patch={
-            'final': final, 'usage': result.usage, 'material': list(result.material_delivery or ()), 'phase': 'decision', 'remaining': [],
-        })
+        encoded = result.text.encode('utf-8')
+        final = {'name': name, 'size': len(encoded), 'sha256': sha256(encoded).hexdigest(),
+                 'finish_reason': result.finish_reason, 'has_material': result.material_delivery is not None,
+                 'tool_calls': list(result.tool_calls), 'material_sources': list(result.material_sources),
+                 'contact_draft': result.contact_draft}
+        patch = {**fields, 'final': final, 'usage': result.usage,
+                 'material': list(result.material_delivery or ()), 'phase': 'completed'}
+        if self.store is not None:
+            if encoded:
+                await run_blocking(self.store.append, name, 0, result.text, patch=patch)
+            else:
+                await run_blocking(self.store.merge, patch)
+        self.data.update(patch)
 
-    async def file(self, item, args_hash, goal_no, fields):
-        name = 'artifact-' + item['id']
-        def commit():
-            data = item['data']
-            receipt = {'id':item['id'], 'filename':item['filename'], 'html_mode':item.get('html_mode','html'),
-                       'draft':name, 'size':len(data), 'sha256':sha256(data).hexdigest(),
-                       'args_hash':args_hash, 'goal_no':goal_no}
-            patch = {**fields, 'files':[*fields['files'], receipt]}
-            if self.store:
-                size = self.store.append(name, 0, data.decode('utf-8'), patch=patch)
-                if size != len(data):
-                    raise HTTPException(409, '已生成作品的大小与草稿不一致')
-            return patch
-        self.data.update(await run_blocking(commit))
+    async def restore_answer(self, delivery):
+        if self.store is None or self.data.get('phase') != 'completed':
+            return None
+        final = self.data['final']
+        text = await run_blocking(self.store.read, final['name']) if final['size'] else ''
+        encoded = text.encode('utf-8')
+        if len(encoded) != final['size'] or sha256(encoded).hexdigest() != final['sha256']:
+            raise HTTPException(409, '已完成正文的校验值发生变化，无法恢复')
+        return ModelResult(text, self.data.get('usage'), tuple(final['tool_calls']), final['finish_reason'],
+                           material_sources=tuple(final['material_sources']), contact_draft=final['contact_draft'],
+                           material_delivery=(tuple(delivery.prepared if delivery else ()) if final['has_material'] else None))
+
 
 
 async def restore_materials(delivery, entries):
@@ -96,8 +141,12 @@ async def restore_materials(delivery, entries):
         return
     if not delivery:
         raise HTTPException(403, '当前会话无权恢复原件')
+    restored = []
     for entry in entries:
+        if entry['id'] not in delivery.visible_ids:
+            raise HTTPException(409, '原件回执缺少本轮可见凭证，请重新查找')
         fresh = await run_blocking(delivery.library.prepare, entry['id'], expected_path=entry['relative_path'])
         if list(fresh['version']) != list(entry['version']):
             raise HTTPException(409, '资料文件已改变，请重新请求')
-        delivery.prepared.append(fresh)
+        restored.append(fresh)
+    delivery.prepared.extend(restored)
