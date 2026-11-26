@@ -12,7 +12,7 @@ from avatar.core.text_budget import fits_text_budget
 from avatar.core.db import dump, now
 from avatar.conversation.schemas import ChatRequest
 from avatar.core.execution import AgentNeedsInput, execution_guard, run_blocking
-from avatar.conversation.loop.runtime import resume_safe
+from avatar.conversation.loop.runtime import prepare_checkpoint, resume_safe
 from avatar.conversation.tools.reply_artifacts import reply_with_artifacts, without_source_footer
 from avatar.conversation.loop.store import RunConflict, RunStore
 from avatar.protocols.identity.ontology import AVATAR_SKILL_IDS
@@ -450,11 +450,10 @@ class PersonalTaskService:
         async def work():
             await self.limit.acquire()
             try:
-                state = store.acquire()
+                state = await run_blocking(store.acquire)
                 if not resume_safe(state, initial=not run.get('claimed'), automatic=run['automatic'], allow_question=False):
                     raise HTTPException(409,'上次操作尚无确定回执，请核对已有结果后重新发起任务')
-                if not state.get('phase'):
-                    store.merge({'phase':'planning'})
+                await run_blocking(prepare_checkpoint, store, state, automatic=run['automatic'], allow_question=False)
                 active = self.target(owner, scope[0])
                 self.approved_skills(active,run['skills'])
                 with execution_guard(guard):

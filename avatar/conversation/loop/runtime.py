@@ -59,10 +59,13 @@ def _legacy_summary(state):
     return bounded_excerpt('\n'.join(filter(None, sections)), 1200)
 
 
-async def load_checkpoint(store, *, automatic=False, allow_question=True):
-    state = await run_blocking(store.load) if store is not None else {}
-    if state.get('schema_version') == 2 or not resume_safe(
-            state, initial=True, automatic=automatic, allow_question=allow_question):
+def prepare_checkpoint(store, state, *, fields=None, automatic=False, allow_question=True):
+    if not resume_safe(state, initial=True, automatic=automatic, allow_question=allow_question):
+        return state
+    if state.get('schema_version') == 2:
+        if fields:
+            store.merge(fields)
+            return {**state, **fields}
         return state
     fresh = {key: state[key] for key in _LEGACY_BINDINGS if key in state}
     fresh.update(schema_version=2, phase='retry' if state.get('phase') == 'retry' else 'running',
@@ -74,11 +77,23 @@ async def load_checkpoint(store, *, automatic=False, allow_question=True):
         fresh['session_source_checks'] = {**fresh.get('session_source_checks', {}), **historic}
     if summary := _legacy_summary(state):
         fresh['legacy_summary'] = summary
+    if fields:
+        fresh.update(fields)
     if store is not None:
-        keep = {receipt['draft'] for receipt in fresh.get('files', ())}
-        keep.update('sb-' + receipt['token'][:32] for receipt in (fresh.get('sandbox') or {}).get('receipts', ()))
-        await run_blocking(store.migrate, fresh, keep)
+        if state:
+            keep = {receipt['draft'] for receipt in fresh.get('files', ())}
+            keep.update('sb-' + receipt['token'][:32] for receipt in (fresh.get('sandbox') or {}).get('receipts', ()))
+            store.migrate(fresh, keep)
+        else:
+            store.merge(fresh)
     return fresh
+
+
+async def load_checkpoint(store, *, automatic=False, allow_question=True):
+    def load():
+        state = store.load() if store is not None else {}
+        return prepare_checkpoint(store, state, automatic=automatic, allow_question=allow_question)
+    return await run_blocking(load)
 
 
 async def restore_files(store, state, config):

@@ -312,6 +312,9 @@ class AvatarChat:
                 def owner_state():
                     with self.service.database.connect() as db:
                         recent = recent_deliveries(db, user['id'], session['id'], self.service.attachments.directory)
+                        if scope is not None:
+                            allowed = set(scope.get('materials', ()))
+                            recent = [item for item in recent if item['file_id'] in allowed]
                         return (self.session_skills.excluded(db,parent_id),
                                 self.session_skills.active(db,user['id'],parent_id),
                                 db.execute('SELECT skills_updated_at,tools_updated_at FROM chat_conversations WHERE id=?',(parent_id,)).fetchone(),
@@ -320,6 +323,7 @@ class AvatarChat:
                 if overview.get('_private_context'):
                     config['_material_owner'] = user['id']
                     if recent:
+                        config['_recent_material_ids'] = tuple(item['file_id'] for item in recent)
                         background['recent_material_deliveries'] = recent
                 background['available_skills']=[item for item in background.get('available_skills',[]) if item['id'] not in excluded]
                 revision=self.owner_memory_revision(overview,parent)

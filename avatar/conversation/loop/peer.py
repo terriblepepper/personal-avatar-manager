@@ -6,7 +6,7 @@ import uuid
 from fastapi import HTTPException
 
 from avatar.core.db import dump, now
-from avatar.conversation.loop.runtime import resume_safe
+from avatar.conversation.loop.runtime import prepare_checkpoint, resume_safe
 from avatar.conversation.loop.store import RunStore
 from avatar.knowledge.learning import auto_style_advance
 
@@ -139,13 +139,12 @@ class PeerTurn:
         if not self.resume_safe(state, initial=not state):
             raise HTTPException(409, '原操作结果尚未确认，请核对后结束任务')
         self.active = store
-        fields = {'peer_source':self.source, 'peer_style':self.style, 'peer_workspace':self.workspace, 'phase':state.get('phase','planning')}
-        if self._legacy_staged_public(state):
-            fields.update(phase='decision', handoff=None, peer_export=None)
+        fields = {'peer_source':self.source, 'peer_style':self.style, 'peer_workspace':self.workspace}
         if not state:
             fields['objective'] = self.task['objective']
-        store.merge(fields)
-        return store, state
+        if self._legacy_staged_public(state):
+            state = {**state, 'phase':'decision'}
+        return store, prepare_checkpoint(store, state, fields=fields)
 
     def charge(self, config, usage):
         if usage is not None:

@@ -26,7 +26,10 @@ class ToolRegistry:
     @staticmethod
     def identity(call, args):
         encoded = json.dumps(args, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
-        return call['name'] + ':' + sha256(encoded.encode()).hexdigest()
+        name = call['name']
+        if name=='read_session_file' and args.get('query') is not None:
+            name = 'session_directory'
+        return name + ':' + sha256(encoded.encode()).hexdigest()
 
     async def dispatch(self, call, seen, step):
         name, args = call['name'], call['arguments']
