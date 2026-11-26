@@ -33,12 +33,13 @@ def entry_evidence(name, note):
     if name == 'read_session_file':
         page = json.loads(note)
         if page.get('kind') == 'directory':
-            return note, 'directory', True, '目录仅含元数据；需要正文时用有效 file_id 读取。未命中可换查询。'
+            return 'directory', True, False, '目录仅含元数据；需要正文时用有效 file_id 读取。未命中可换查询。'
         if not page.get('has_content'):
-            return note, None, False, '只取得文件元数据或空页。请查看后续页或通过已授权的沙箱读取原件后再据内容作答。'
-        return note, 'content', True, None
+            return None, False, False, '只取得文件元数据或空页。请查看后续页或通过已授权的沙箱读取原件后再据内容作答。'
+        complete = page.get('offset') == 0 and 'next_offset' in page and page['next_offset'] is None
+        return 'content', True, complete, None
     if name in ('search_materials','read_material'):
         proof = json.loads(note)
         if not isinstance(proof,dict) or proof.get('has_evidence') is not True:
-            return note, None, False, '本次检索未获得支持当前目标的材料。请调整查询、申请其他工具，或向用户说明缺口。'
-    return note, None, True, None
+            return None, False, False, '本次检索未获得支持当前目标的材料。请调整查询、换用其他工具，或向用户说明缺口。'
+    return None, True, False, None

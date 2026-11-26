@@ -220,10 +220,6 @@ async def disclose_tools(model, settings, key, system, history, question, catalo
             issue=bounded_excerpt(str(error),120)
     return None,usage
 
-REQUEST_TOOLS = {'name':'request_tools','description':'现有工具不足或需要补充子目标时，交给同一分身重新披露授权工具。',
-    'parameters':{'type':'object','properties':{'need':{'type':'string','minLength':1,'description':TEXT_LIMIT},
-        'replace_goals':{'type':'array','items':{'type':'integer','minimum':1},'description':'有新证据需调整的未完成子目标编号。明确交付的作品须保留。'}},
-                  'required':['need'],'additionalProperties':False}}
 UPDATE_TASK = {'name':'update_task','description':'提交已达到验收条件的子目标结果；使用工具的目标需要引用已验证的回执编号。',
     'parameters':{'type':'object','properties':{'goal_no':{'type':'integer','minimum':1},
         'result':{'type':'string','minLength':1,'description':TEXT_LIMIT},'receipts':{'type':'array','items':{'type':'integer','minimum':1}}},
@@ -244,36 +240,11 @@ DELIVERABLES = {'create_html','deliver_material','send_material',
                 'send_public_material','contact_avatar'}
 
 
-def revise_goals(plan, pending, selected, addition, replace_goals):
-    revised = False
-    if addition['steps'] and replace_goals:
-        keep = [s for s in pending if s['goal_no'] not in replace_goals or
-                DELIVERABLES.intersection([s['tool'], *s.get('tools',())])]
-        revised = len(keep)!=len(pending)
-        pending[:] = keep
-    for name in addition['tools']:
-        if name not in selected:
-            selected.append(name)
-            revised = True
-    insert = 0
-    for step in addition['steps']:
-        if not any(s['goal']==step['goal'] and s['tool']==step['tool'] for s in pending):
-            plan.append(dict(step))
-            added=dict(step,goal_no=len(plan))
-            if DELIVERABLES.intersection([step['tool'], *step.get('tools',())]):
-                pending.append(added)
-            else:
-                pending.insert(insert,added)
-                insert+=1
-            revised = True
-    return revised
-
-
 # Alternative read methods can satisfy the evidence requirement of a composite delivery.
 EVIDENCE_TOOLS = {'search_materials','read_material','find_material','find_public_material',
                   'read_session_file','list_avatars'}
 READ_ONLY_GOALS = EVIDENCE_TOOLS | {'get_current_time'}
-WRITING_CONTROLS = READ_ONLY_GOALS | {'ask_user','request_tools','read_step_receipt'}
+WRITING_CONTROLS = READ_ONLY_GOALS | {'ask_user','read_step_receipt'}
 
 
 def read_goals_verified(pending, receipts):

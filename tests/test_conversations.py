@@ -290,6 +290,82 @@ def test_agent_disclosure_can_finish_plain_answer():
     assert purposes == ['task_planning']
 
 
+@pytest.mark.parametrize('scenario', ['authorized', 'unavailable', 'read_then_create', 'partial_read'])
+def test_agent_disclosure_recovers_against_actual_provider_response(scenario):
+    from avatar.conversation.agent_loop import run_agent
+    from avatar.conversation.loop.entry_tools import SessionFileRequest
+    from tests.support import fake_dns
+
+    text = '<!DOCTYPE html><html><body><main>测试页面</main></body></html>'
+    name = 'read_session_file' if scenario != 'unavailable' else 'unknown_tool'
+    definition = {'name':'read_session_file','description':'读取当前会话原件',
+                  'parameters':SessionFileRequest.model_json_schema()}
+    planned_creation = scenario in ('read_then_create', 'partial_read')
+    actual_tools = []
+    executed = []
+    def tool(name, arguments):
+        return {'tool_calls':[{'type':'function','function':{'name':name,'arguments':json.dumps(arguments)}}]}
+    def upstream(request):
+        body = json.loads(request.content)
+        declared = {t['function']['name'] for t in body.get('tools', [])}
+        actual_tools.append(declared)
+        step = len(actual_tools)
+        if step == 1:
+            plan = []
+            if planned_creation:
+                plan = [{'goal':'读取原件','tool':'read_session_file','criterion':'得到完整源码',
+                         'file_access':'content','lookup':{'file_id':'original'}},
+                        {'goal':'生成更新后的页面','tool':'create_html'}]
+            answer = tool('plan_task', {'steps':plan})
+        elif scenario == 'partial_read' and step in (2, 3, 4):
+            assert 'create_html' not in declared
+            if step == 2:
+                answer = tool('create_html', {'filename':'updated.html','html':text})
+            elif step == 3:
+                assert '前置' in body['messages'][-1]['content'] or '必要回执' in body['messages'][-1]['content']
+                answer = tool('read_session_file', {'file_id':'original','offset':10})
+            else:
+                assert 'update_task' in declared
+                answer = tool('update_task', {'goal_no':1,'result':'已读取原件','receipts':[1,2]})
+        elif planned_creation and step == (5 if scenario == 'partial_read' else 2):
+            assert executed == ['read_session_file'] * (2 if scenario == 'partial_read' else 1)
+            assert 'create_html' in declared
+            answer = tool('create_html', {'filename':'updated.html','html':text})
+        elif step == 2:
+            assert name not in declared
+            answer = tool(name, {'file_id':'original'})
+        elif step == 3 and scenario == 'authorized':
+            assert name in declared and executed == []
+            answer = tool(name, {'file_id':'original'})
+        else:
+            assert scenario != 'unavailable' or name not in declared
+            answer = {'content':'已处理。'}
+        return httpx.Response(200,json={'choices':[{'message':answer,
+            'finish_reason':'tool_calls' if 'tool_calls' in answer else 'stop'}]})
+
+    async def execute(tool_name, args):
+        assert args['file_id'] == 'original'
+        executed.append(tool_name)
+        offset = args.get('offset', 0)
+        next_offset = 10 if scenario == 'partial_read' and offset == 0 else None
+        content = text[offset:next_offset]
+        return json.dumps({'kind':'file','has_content':True,'text':content,'offset':offset,'next_offset':next_offset})
+
+    model = ModelClient(httpx.MockTransport(upstream),resolver=fake_dns)
+    rag = SimpleNamespace(chat=SimpleNamespace(model_client=model),validate=lambda _:None)
+    config = {'provider':'custom','model':'test','api_format':'openai','base_url':'https://model.example/v1',
+              'context_tokens':32768,'max_tokens':1024,'_entry_tools':[definition],
+              '_entry_lookup_types':{'read_session_file':SessionFileRequest},'_execute_entry_tool':execute,
+              '_html_enabled':planned_creation}
+    result = asyncio.run(run_agent(rag,(config,'key','测试分身',[]),'处理本轮请求。'))
+    assert result.text == '已处理。'
+    read_count = {'unavailable':0, 'partial_read':2}.get(scenario, 1)
+    assert executed == ['read_session_file'] * read_count
+    assert all('request_tools' not in declared for declared in actual_tools)
+    if planned_creation:
+        assert [item['filename'] for item in config['_generated_files']] == ['updated.html']
+
+
 def test_peer_transport_polls_accepted_task_without_resending(context):
     import asyncio
     from types import SimpleNamespace

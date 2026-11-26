@@ -18,7 +18,6 @@ class TurnInput:
     prompt: str
     history: list
     message: str
-    notes: list
     compressed: bool
 
     async def generate(self, model, key, validate, account):
@@ -80,4 +79,4 @@ async def project_turn(context, step_settings, step_prompt, task_goal, pending, 
     compressed = (working_history != context.history or scope != task_goal
                   or context.summary is not previous_summary
                   or sum(map(len, notes)) < sum(map(len, observations)))
-    return TurnInput(step_settings, step_prompt, working_history, message, notes, compressed)
+    return TurnInput(step_settings, step_prompt, working_history, message, compressed)

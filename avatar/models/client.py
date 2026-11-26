@@ -168,10 +168,12 @@ def parse_response(fmt, data, *, config=None, request_id=None, api_key=''):
             error.model_usage = model_usage
             raise error
     # Distinguish a missing action after private reasoning from a malformed proposed action.
-    if config and config.get('_tools'):
+    tools = config.get('_tools') or ()
+    if tools or retain:
         from avatar.models.tools import parse_tools
         try:
-            calls=tuple(parse_tools(fmt,data,config['_tools'],required=bool(text and str(text).strip()) and not config.get('_optional_tools'),batch=bool(config.get('_batch_tools'))))
+            calls=tuple(parse_tools(fmt,data,tools,required=bool(tools and text and str(text).strip())
+                                    and not config.get('_optional_tools'),batch=bool(config.get('_batch_tools'))))
         except HTTPException as error:
             error.model_usage=model_usage
             if terminal == 'output_limit':
