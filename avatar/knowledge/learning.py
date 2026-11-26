@@ -162,7 +162,7 @@ class StyleLearning:
             for observation in await extract_style(k,row,config,key,chunk):
                 observations.append(observation)
         k.percent,k.stage=80,'整理 EverOS 本人风格记忆'
-        memory=await k.memory.compile(row,config,key,{'new_style_observations':[style_evidence(item) for item in observations]})
+        memory=await k.memory.compile(row,config,key,{'new_style_observations':[style_evidence(item) for item in observations]},worker=worker)
         if not isinstance(memory.get('style_profile_traits'),list):raise HTTPException(502,'EverOS 未返回分层风格画像，未修改当前 soul')
         traits=[StyleTraits.model_validate(item).model_dump() for item in memory['style_profile_traits']]
         k.percent,k.stage=90,'更新独立风格记忆'

@@ -177,26 +177,28 @@ def test_soul_embedding_uncertain_response_is_single_shot(monkeypatch):
 
 
 def test_parent_ack_only_accepts_running_owned_build(tmp_path, pg_database):
-    from types import SimpleNamespace
-    from avatar.core.db import Database, now
-    from avatar.knowledge.everos_memory import EverOSMemory
+    from avatar.core.db import now
+    from avatar.knowledge.build_worker import SoulBuildWorker
+    from avatar.knowledge.service import KnowledgeService
     db = pg_database
     with db.connect(write=True) as conn:
         conn.execute("INSERT INTO users(id,username,password,role,created_at) VALUES('owner','owner','unused','user',?)", (now(),))
         conn.execute("""INSERT INTO soul_builds(id,user_id,prompt,asset_ids,profile_snapshot,profile_revision,status,stage,created_at,updated_at)
                         VALUES('build','owner','','[]','{}','1','canceled','',?,?)""", (now(), now()))
-    bridge = EverOSMemory(SimpleNamespace(database=db,progress=lambda *args:None,percent=1,stage='memory'))
+    workspace = KnowledgeService(db, None)
+    runner = SoulBuildWorker(workspace)
+    bridge = workspace.memory
     owner, private = bridge.scope('owner')
     payload = dict(root=str(private),owner=owner,project=PROJECT,source_id='9'*64)
     result = {'memories':{'episodes':[]}}
     worker.ProjectFiles(MemoryRoot(private),owner,PROJECT).save_result(payload,result)
     row = {'id':'build','user_id':'owner'}
     with pytest.raises(asyncio.CancelledError):
-        asyncio.run(bridge.request(payload,row,fingerprint='verified'))
+        asyncio.run(bridge.request(payload,row,fingerprint='verified',worker=runner))
     with db.connect(write=True) as conn:
         assert conn.execute("SELECT memory_fingerprint FROM soul_builds WHERE id='build'").fetchone()[0] == ''
         conn.execute("UPDATE soul_builds SET status='running' WHERE id='build'")
-    assert asyncio.run(bridge.request(payload,row,fingerprint='verified')) == result
+    assert asyncio.run(bridge.request(payload,row,fingerprint='verified',worker=runner)) == result
     with db.connect() as conn:
         assert conn.execute("SELECT memory_fingerprint FROM soul_builds WHERE id='build'").fetchone()[0] == 'verified'
 
@@ -228,9 +230,10 @@ def test_cross_project_tree_reads_while_model_is_pending(tmp_path, monkeypatch):
 
 def test_compile_verifies_effective_seed_and_model_for_both_caches(tmp_path, monkeypatch, pg_database):
     from fastapi import HTTPException
-    from types import SimpleNamespace
-    from avatar.core.db import Database, now
-    from avatar.knowledge.everos_memory import EverOSMemory, EmbeddingSettings
+    from avatar.core.db import now
+    from avatar.knowledge.build_worker import SoulBuildWorker
+    from avatar.knowledge.service import KnowledgeService
+    from avatar.knowledge.everos_memory import EmbeddingSettings
     database=pg_database
     with database.connect(write=True) as db:
         db.execute("INSERT INTO users(id,username,password,role,created_at) VALUES('owner','owner','unused','user',?)", (now(),))
@@ -239,16 +242,19 @@ def test_compile_verifies_effective_seed_and_model_for_both_caches(tmp_path, mon
                           VALUES(?,'owner','','[]','{}','1',?,'',?,?)""", (build,status,now(),now()))
         db.execute("INSERT INTO active_souls VALUES('owner','legacy')")
     monkeypatch.setattr(EmbeddingSettings,'current',lambda *args:{'encrypted_key':'test','model':'embed','dimensions':2})
-    bridge=EverOSMemory(SimpleNamespace(database=database))
+    workspace = KnowledgeService(database, None)
+    runner = SoulBuildWorker(workspace)
+    bridge = workspace.memory
     source=bridge.project({'id':'legacy','origin':'build'})
     row=dict(id='target',user_id='owner',origin='build',memory_tree={'source_project':source})
     calls=[]
-    async def request(payload,row,config,key,embedding,fingerprint,media):
+    async def request(payload,row,config,key,embedding,fingerprint,media,*,worker):
+        assert worker is runner
         calls.append((payload,fingerprint))
         return {'model':config['model']}
     monkeypatch.setattr(bridge,'request',request)
     def compile(model):
-        return asyncio.run(bridge.compile(row,{'model':model},'test',{'fact':'synthetic'}))
+        return asyncio.run(bridge.compile(row,{'model':model},'test',{'fact':'synthetic'},worker=runner))
     first=compile('a')
     assert calls[0][0]['source_project']==''
     row.update(memory_fingerprint=calls[0][1],memory_context=first)
@@ -584,9 +590,9 @@ def test_actual_build_without_embeddings_stays_keyword_only(pg_connection,tmp_pa
 def test_parent_request_hashes_raw_user_id_before_pg_scope(pg_database,tmp_path):
     import asyncio
     import hashlib
-    from types import SimpleNamespace
     from everos.core.persistence import MemoryRoot
-    from avatar.knowledge.everos_memory import EverOSMemory
+    from avatar.knowledge.build_worker import SoulBuildWorker
+    from avatar.knowledge.service import KnowledgeService
     from tools.everos import worker
 
     raw_uid='stable-user-id'
@@ -602,9 +608,11 @@ def test_parent_request_hashes_raw_user_id_before_pg_scope(pg_database,tmp_path)
              'embedding_enabled':False,'media':[],'evidence':{'prompt':'本人表达风格、语气、措辞、句式、习惯和最新修正'}}
     files=worker.ProjectFiles(MemoryRoot(payload['root']),owner,project)
     files.save_result(payload,{'Subject':'本人表达风格','Summary':'语气措辞句式习惯的最新修正','Content':'本人表达风格、语气、措辞、句式、习惯和最新修正。'},'episode')
-    bridge=EverOSMemory(SimpleNamespace(database=pg_database,progress=lambda *args:None,percent=1,stage='synthetic'))
+    workspace = KnowledgeService(pg_database, None)
+    runner = SoulBuildWorker(workspace)
+    bridge = workspace.memory
     row={'id':'parent-request','user_id':raw_uid}
-    result=asyncio.run(bridge.request(payload,row=row,fingerprint='synthetic-fingerprint'))
+    result=asyncio.run(bridge.request(payload,row=row,fingerprint='synthetic-fingerprint',worker=runner))
     assert result['memories']['episodes']
     with pg_database.connect() as db:
         assert db.execute('SELECT count(*) FROM everos_queue WHERE owner_hash=?',(owner,)).fetchone()[0]>0
@@ -729,3 +737,121 @@ def test_local_store_import_can_overlap_schema_initialization(tmp_path, postgres
         # Startup still owns its DDL locks while the importer opens a separate session.
         report = migrate(root, make_conninfo(postgres_url, options=options))
         assert report['everos']['legacy_rows'] == 5
+
+
+@pytest.mark.parametrize('operation', ('learn', 'build', 'sync', 'visual_refresh', 'unexpected_error'))
+def test_soul_worker_uses_real_workspace_and_everos(context, monkeypatch, caplog, operation):
+    from fastapi import HTTPException
+
+    from avatar.core.db import dump, now
+    from avatar.knowledge import model_refresh
+    from avatar.knowledge.soul_document import FIELDS
+    from avatar.models.client import ModelResult
+    from tests.support import MODEL
+
+    app, client, _ = context
+    database, knowledge, runner = app.state.database, app.state.knowledge, app.state.soul_builds
+    actor = client.get('/api/auth/me').json()['user']
+    uid = actor['id']
+    assert client.put('/api/me/model-settings', json={'model_config_input': MODEL}).status_code == 200
+    document = dict.fromkeys(FIELDS, '') | {'voice': '平实'}
+    traits = {'length': 'short', 'tones': ['direct']}
+    calls = set()
+    fail_episode = operation == 'learn'
+
+    async def generate(config, key, system, history, message):
+        nonlocal fail_episode
+        if operation == 'unexpected_error':
+            raise RuntimeError('synthetic-private-details')
+        if config.get('_tools'):
+            calls.add('profile')
+            return ModelResult('', None, tool_calls=({
+                'name': 'write_style_profile',
+                'arguments': {'explicit_info': [], 'implicit_traits': [{'traits': traits}]},
+            },))
+        if '聊天风格特征提取器' in system:
+            assert 'observations' not in calls
+            calls.add('observations')
+            return ModelResult(dump({'observations': [traits]}), None)
+        if 'EverOS 记忆整理器' in system:
+            if fail_episode:
+                fail_episode = False
+                raise HTTPException(502, 'fixture episode failure')
+            calls.add('episode')
+            return ModelResult(dump({'title': '表达习惯', 'summary': '先说结论', 'content': '表达直接且简短。'}), None)
+        assert '构建分身 soul' in system
+        calls.add('draft')
+        return ModelResult(dump(document), None)
+
+    async def vectors(model, config, key, inputs, *, retry_uncertain):
+        assert not retry_uncertain
+        calls.add('embed')
+        return [[1.0] + [0.0] * (config['dimensions'] - 1) for _ in inputs], {'total_tokens': len(inputs)}
+
+    monkeypatch.setattr(app.state.chat.model_client, 'generate', generate)
+    monkeypatch.setattr('avatar.knowledge.everos_memory.embed', vectors)
+
+    stamp = now()
+    with database.connect(write=True) as db:
+        db.execute("""INSERT INTO avatar_records(user_id,aic,certificate,profile,last_modified_at,created_at,updated_at)
+                   VALUES(?,'soul-test-aic','{}','{}',?,?,?)""", (uid, stamp, stamp, stamp))
+        if operation in ('sync', 'visual_refresh'):
+            db.execute("""INSERT INTO knowledge_assets(id,user_id,filename,mime,size,sha256,kind,created_at,relative_path)
+                       VALUES('image',?,'sample.png','image/png',1,'synthetic-image','image',?,'sample.png')""", (uid, stamp))
+        identifier = 'initial'
+        queued = operation in ('build', 'unexpected_error')
+        db.execute("""INSERT INTO soul_builds(id,user_id,prompt,asset_ids,profile_snapshot,profile_revision,status,stage,created_at,updated_at,document)
+                      VALUES('initial',?,'采用简短表达',?,'{}',?,?,'',?,?,?)""",
+                   (uid, dump(['image'] if operation == 'visual_refresh' else []), stamp,
+                    'queued' if queued else 'approved', stamp, stamp, dump(document)))
+        if not queued:
+            db.execute("INSERT INTO active_souls VALUES(?,'initial')", (uid,))
+        if operation == 'learn':
+            db.execute("""INSERT INTO chat_conversations(id,user_id,channel,target_aic,caller_id,platform,title,created_at,updated_at)
+                       VALUES('owned',?,'assistant','soul-test-aic',?,'web','样本',?,?)""", (uid, uid, stamp, stamp))
+            learned_through = db.execute("""INSERT INTO chat_messages(user_id,channel,role,content,created_at,conversation_id)
+                                            VALUES(?,'assistant','user','好的，先讲结论。',?,'owned')""", (uid, stamp)).lastrowid
+        elif operation == 'sync':
+            db.execute("INSERT INTO knowledge_asset_updates(user_id,revision,updated_at) VALUES(?,'r1','2000-01-01T00:00:00+00:00')",
+                       (uid,))
+        elif operation == 'visual_refresh':
+            identifier = model_refresh.schedule(db, uid, visual=True)
+            assert identifier
+
+    if operation == 'sync':
+        assert not asyncio.run(runner.once('unrelated'))
+        with database.connect() as db:
+            assert db.execute('SELECT count(*) FROM knowledge_asset_updates WHERE user_id=?', (uid,)).fetchone()[0] == 0
+            revision = db.execute("SELECT parent_build,status,asset_ids FROM soul_builds WHERE user_id=? AND origin='refine'",
+                                  (uid,)).fetchone()
+            assert tuple(revision) == ('initial', 'queued', '["image"]')
+        return
+
+    if operation == 'learn':
+        failed = knowledge.learning.queue(actor, 'owned')['id']
+        assert asyncio.run(runner.once(failed))
+        with database.connect() as db:
+            assert tuple(db.execute('SELECT status,error FROM soul_builds WHERE id=?', (failed,)).fetchone()) == (
+                'failed', 'fixture episode failure')
+            assert db.execute("SELECT last_message_id FROM style_learning_settings WHERE conversation_id='owned'").fetchone()[0] == 0
+            assert db.execute('SELECT build_id FROM active_souls WHERE user_id=?', (uid,)).fetchone()[0] == 'initial'
+        identifier = knowledge.learning.retry(actor)['id']
+
+    assert asyncio.run(runner.once(identifier))
+    with database.connect() as db:
+        result = db.execute('SELECT status,phase,progress,memory_fingerprint,error FROM soul_builds WHERE id=?',
+                            (identifier,)).fetchone()
+        if operation == 'unexpected_error':
+            assert result['status'] == 'failed'
+            assert 'synthetic-private-details' not in result['error'] + caplog.text
+            assert identifier in caplog.text and 'RuntimeError' in caplog.text and 'Traceback' in caplog.text
+            return
+        assert result['status'] == ('pending' if operation == 'build' else 'approved'), result['error']
+        assert result['phase'] == 'draft' and result['progress'] == 100 and result['memory_fingerprint']
+        if operation in ('learn', 'visual_refresh'):
+            assert db.execute('SELECT build_id FROM active_souls WHERE user_id=?', (uid,)).fetchone()[0] == identifier
+        if operation == 'learn':
+            assert db.execute("SELECT last_message_id FROM style_learning_settings WHERE conversation_id='owned'").fetchone()[0] == learned_through
+            assert calls == {'observations', 'episode', 'profile', 'embed'}
+        elif operation == 'build':
+            assert calls == {'episode', 'embed', 'draft'}
