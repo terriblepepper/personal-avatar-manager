@@ -118,7 +118,12 @@ async def response_frames(response, wire_limit, event_limit, complete):
 
 class ToolFragments:
     """Keep interleaved arguments apart until the provider confirms completion."""
-    def __init__(self, limit):
+    def __init__(self, limit, *, native=False):
+        self.native = native
+        self.reasoning = StringIO()
+        self.anthropic_replay = {}
+        self.gemini_replay = []
+        self.gemini_text = StringIO()
         self.size = 0
         self.limit = limit
         self.openai = {}
@@ -140,14 +145,16 @@ class ToolFragments:
 
     def add_openai(self, delta):
         tools = delta.get('tool_calls') or ([{'function':delta['function_call']}] if delta.get('function_call') else ())
-        for part in tools:
-            index = part.get('index',0)
+        for offset, part in enumerate(tools):
+            index = part.get('index',offset)
             if type(index) is not int or index < 0:
                 raise ValueError('Invalid tool index')
             if index not in self.openai:
                 self.check_count(self.openai)
-                self.openai[index] = (StringIO(),StringIO())
-            name,args = self.openai[index]
+                self.openai[index] = (StringIO(),StringIO(),{})
+            name,args,metadata = self.openai[index]
+            if part.get('id'):
+                metadata['id'] = part['id']
             function = part.get('function') or {}
             if function.get('name'):
                 self.account(function['name'])
@@ -155,6 +162,9 @@ class ToolFragments:
             if function.get('arguments'):
                 self.account(function['arguments'])
                 args.write(function['arguments'])
+        if self.native and delta.get('reasoning_content'):
+            self.account(delta['reasoning_content'])
+            self.reasoning.write(delta['reasoning_content'])
 
     def add_anthropic(self, kind, data):
         index = data.get('index',0)
@@ -166,7 +176,7 @@ class ToolFragments:
             self.check_count(self.anthropic)
             self.account(block.get('name'))
             self.account(block.get('input',{}))
-            self.anthropic[index] = (block.get('name'),block.get('input',{}),StringIO())
+            self.anthropic[index] = (block.get('name'),block.get('input',{}),StringIO(),block.get('id'))
             self.open_blocks.add(index)
         elif kind=='content_block_delta' and delta.get('type')=='input_json_delta':
             if index not in self.open_blocks:
@@ -175,43 +185,105 @@ class ToolFragments:
             self.anthropic[index][2].write(delta['partial_json'])
         elif kind=='content_block_stop':
             self.open_blocks.discard(index)
+        if self.native:
+            self.add_anthropic_replay(index, kind, block, delta)
 
-    def add_gemini(self, function):
-        self.account(function)
+    def add_anthropic_replay(self, index, kind, block, delta):
+        if kind=='content_block_start' and block.get('type') in ('text','thinking','redacted_thinking'):
+            entry = dict(block)
+            if block['type']!='text':
+                self.account(block)
+            self.anthropic_replay[index] = entry
+        elif kind=='content_block_delta':
+            field = {'text_delta':'text','thinking_delta':'thinking','signature_delta':'signature'}.get(delta.get('type'))
+            if field and index in self.anthropic_replay:
+                entry = self.anthropic_replay[index]
+                value = delta.get(field,'')
+                if field != 'text':
+                    self.account(value)
+                buffer = entry.get(field)
+                if not isinstance(buffer,StringIO):
+                    buffer = entry[field] = StringIO(buffer or '')
+                    buffer.seek(0,2)
+                buffer.write(value)
+
+    def flush_gemini_text(self):
+        if self.gemini_text.tell():
+            self.gemini_replay.append({'text':self.gemini_text.getvalue()})
+            self.gemini_text = StringIO()
+
+    def add_gemini_part(self, part):
+        if 'functionCall' in part and not part.get('thought'):
+            self.add_gemini(part)
+        elif self.native and (part.get('thought') or 'thoughtSignature' in part):
+            self.flush_gemini_text()
+            self.gemini_replay.append(part)
+            if part.get('thought'):
+                self.account(part)
+            elif part.get('thoughtSignature'):
+                self.account(part['thoughtSignature'])
+        elif self.native and 'text' in part:
+            self.gemini_text.write(part['text'])
+
+    def add_gemini(self, part):
+        function = part['functionCall']
+        signature = {k:part[k] for k in ('thoughtSignature',) if k in part}
+        self.account(part if signature else function)
         key = function.get('id') or function.get('name')
-        if key is None and len(self.pending_gemini) == 1:
-            key = next(iter(self.pending_gemini))
-        pending = self.pending_gemini.get(key)
-        if pending is None:
+        if not function.get('id') and key not in self.pending_gemini and len(self.pending_gemini) == 1:
+            pending_key, pending = next(iter(self.pending_gemini.items()))
+            if key is None or pending['functionCall']['name'] == key:
+                key = pending_key
+        pending_part = self.pending_gemini.get(key)
+        if pending_part is None:
             self.check_count(self.gemini)
-            if 'partialArgs' not in function and not function.get('willContinue'):
-                self.gemini.append({'functionCall':function})
+            chunked = 'partialArgs' in function or function.get('willContinue')
+            pending = ({'name':function.get('name',''), 'argumentChunks':[],
+                        **({'id':function['id']} if function.get('id') else {})} if chunked else function)
+            pending_part = {'functionCall':pending, **signature}
+            self.gemini.append(pending_part)
+            if self.native:
+                self.flush_gemini_text()
+                self.gemini_replay.append(pending_part)
+            if not chunked:
                 return
-            pending = {'name':function.get('name',''), 'argumentChunks':[]}
-            self.gemini.append({'functionCall':pending})
+        else:
+            pending = pending_part['functionCall']
+            pending_part.update(signature)
         pending['argumentChunks'].append({k:function[k] for k in ('args','partialArgs','willContinue') if k in function})
         if function.get('willContinue'):
-            self.pending_gemini[key] = pending
+            self.pending_gemini[key] = pending_part
         else:
             self.pending_gemini.pop(key, None)
 
     def names(self):
-        return [name.getvalue() for name, _ in self.openai.values() if name.tell()<=128] + [
-            name for name, _, _ in self.anthropic.values()] + [p['functionCall'].get('name','') for p in self.gemini]
+        return [name.getvalue() for name, _, _ in self.openai.values() if name.tell()<=128] + [
+            name for name, _, _, _ in self.anthropic.values()] + [p['functionCall'].get('name','') for p in self.gemini]
 
     def response(self, fmt, text, usage, reason, thinking, refusal):
         if fmt=='openai':
-            tools=[{'index':index,'function':{'name':name.getvalue(),'arguments':args.getvalue()}} for index,(name,args) in sorted(self.openai.items())]
-            message={'content':text,'tool_calls':tools,'reasoning_content':thinking,'refusal':refusal}
+            tools=[{'index':index,**metadata,'function':{'name':name.getvalue(),'arguments':args.getvalue() or '{}'}}
+                   for index,(name,args,metadata) in sorted(self.openai.items())]
+            message={'content':text,'tool_calls':tools,'reasoning_content':self.reasoning.getvalue() or thinking,'refusal':refusal}
             return {'choices':[{'message':message,'finish_reason':reason}],'usage':usage}
         if fmt=='anthropic':
-            blocks=[{'type':'text','text':text}]
-            if thinking: blocks.append({'type':'thinking'})
-            for index,(name,initial,parts) in sorted(self.anthropic.items()):
-                blocks.append({'type':'tool_use','index':index,'name':name,'input':parts.getvalue() if parts.tell() else initial})
+            tools = {index:{'type':'tool_use','index':index,'id':call_id,'name':name,
+                            'input':parts.getvalue() if parts.tell() else initial}
+                     for index,(name,initial,parts,call_id) in self.anthropic.items()}
+            if self.native:
+                blocks = [{k:v.getvalue() if isinstance(v,StringIO) else v for k,v in block.items()}
+                          for _,block in sorted({**tools,**self.anthropic_replay}.items())]
+            else:
+                blocks = [{'type':'text','text':text}]
+                if thinking: blocks.append({'type':'thinking'})
+                blocks.extend(block for _,block in sorted(tools.items()))
             return {'content':blocks,'stop_reason':reason,'usage':usage}
-        parts=[{'text':text},*self.gemini]
-        if thinking: parts.append({'thought':True})
+        if self.native:
+            self.flush_gemini_text()
+            parts = self.gemini_replay
+        else:
+            parts = [{'text':text},*self.gemini]
+            if thinking: parts.append({'thought':True})
         return {'candidates':[{'content':{'parts':parts},'finishReason':reason}],
                 'usageMetadata':usage,'promptFeedback':{'blockReason':reason} if refusal else {}}
 
@@ -258,11 +330,14 @@ async def stream_response(model, config, api_key, system, history, message, *, c
 
 def usage_event(result, config):
     event = {'type':'usage', 'usage':result.usage}
-    if config.get('_avatar_agent') or config.get('_retain_turn_fragments'):
+    native = config.get('_react_tool_calls')
+    if config.get('_avatar_agent') or config.get('_retain_turn_fragments') or native:
         event['finish_reason'] = result.finish_reason
-    if config.get('_retain_turn_fragments'):
+    if config.get('_retain_turn_fragments') or native:
         event.update(stop_reason=result.stop_reason, partial_tool_calls=result.partial_tool_calls,
                      tool_calls=result.tool_calls)
+    if native and result.replay:
+        event['replay'] = result.replay
     return event
 
 
@@ -314,8 +389,9 @@ async def _stream_once(model, config, api_key, system, history, message, collect
                     return
                 started = last_update = loop.time()
                 chunks = StringIO()
-                fragments = ToolFragments(content_limit)
-                assemble = collect or config.get('_retain_turn_fragments')
+                native = config.get('_react_tool_calls', False)
+                fragments = ToolFragments(content_limit, native=native)
+                assemble = collect or config.get('_retain_turn_fragments') or native
                 usage, finished, thinking, action = {}, False, False, False
                 reason,refusal,visible=None,False,False
                 def complete():
@@ -377,8 +453,7 @@ async def _stream_once(model, config, api_key, system, history, message, collect
                             text = ''.join(p.get('text', '') for p in parts if not p.get('thought'))
                             if assemble:
                                 for part in parts:
-                                    if 'functionCall' in part and not part.get('thought'):
-                                        fragments.add_gemini(part['functionCall'])
+                                    fragments.add_gemini_part(part)
                             action |= any('functionCall' in p for p in parts)
                             thought = any(p.get('thought') and p.get('text') for p in parts)
                             reason=candidates[0].get('finishReason') or reason

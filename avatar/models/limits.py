@@ -35,7 +35,8 @@ def tool_budget(config):
         return 0
     from avatar.models.tools import configure_tools
     body={}
-    configure_tools(config.get('api_format','openai'),body,config['_tools'],required=not config.get('_optional_tools'),batch=bool(config.get('_batch_tools')))
+    configure_tools(config.get('api_format','openai'),body,config['_tools'],required=not config.get('_optional_tools'),
+                    batch=bool(config.get('_batch_tools')),native=bool(config.get('_react_tool_calls')))
     return estimate(json.dumps(body,ensure_ascii=False,separators=(',',':')))
 
 
@@ -43,9 +44,17 @@ def context_window(config):
     return config.get('context_tokens') or (limits(config.get('provider'),config.get('model')) or {}).get('context_tokens',128000)
 
 
+def history_row_tokens(row):
+    cost = estimate(row.get('content') or '') + 16
+    for key in ('tool_calls', 'tool_call_id', 'name', 'replay'):
+        if row.get(key):
+            cost += estimate(json.dumps(row[key], ensure_ascii=False, separators=(',', ':')))
+    return cost
+
+
 def check_context(config,system,history,message):
     window=context_window(config)
-    used=tool_budget(config)+estimate(system)+estimate(message)+sum(estimate(m['content'])+16 for m in history)+config.get('max_tokens',1024)+512
+    used=tool_budget(config)+estimate(system)+estimate(message or '')+sum(map(history_row_tokens,history))+config.get('max_tokens',1024)+512
     if used>window:
         error = HTTPException(422,'当前输入与输出预算超过模型上下文窗口，请缩短输入、降低输出上限或新建会话')
         error.stop_reason = 'context_overflow'

@@ -21,8 +21,157 @@ from avatar.models.client import ModelClient
 from avatar.protocols.tasks.dialogues import PeerDialogueTasks
 from avatar.protocols.tasks.store import ManagementTaskError
 from avatar.protocols.transport.peer import PeerAcpsTransport
+from avatar.core.execution import AgentNeedsInput
 from avatar.skills.execution import SkillExecution, SkillEnrichRequest
 from tests.support import legacy_sqlite
+
+
+
+@pytest.mark.parametrize('fmt', ['openai', 'anthropic', 'gemini'])
+def test_native_tool_protocol_replays_calls_and_results(fmt):
+    from avatar.models.client import parse_response
+    tool = {'name': 'lookup', 'description': 'lookup', 'parameters': {'type':'object'}}
+    config = {'api_format':fmt, 'provider':'custom', 'model':'mock', 'base_url':'https://example.test',
+              'max_tokens':512, '_tools':[tool], '_react_tool_calls':True, '_optional_tools':True, '_batch_tools':True}
+    if fmt == 'openai':
+        payload = {'choices':[{'finish_reason':'tool_calls','message':{'reasoning_content':'private',
+            'tool_calls':[{'id':'actual','function':{'name':'lookup','arguments':'{"q":"one"}'}},
+                          {'id':'other','function':{'name':'hidden','arguments':'{'}}]}}]}
+    elif fmt == 'anthropic':
+        payload = {'stop_reason':'tool_use','content':[{'type':'thinking','thinking':'private','signature':'opaque'},
+            {'type':'tool_use','id':'actual','name':'lookup','input':{'q':'one'}},
+            {'type':'tool_use','id':'other','name':'hidden','input':'{'}]}
+    else:
+        payload = {'candidates':[{'finishReason':'STOP','content':{'parts':[
+            {'text':'private','thought':True,'thoughtSignature':'first'},
+            {'functionCall':{'id':'actual','name':'lookup','args':{'q':'one'}},'thoughtSignature':'opaque'},
+            {'functionCall':{'name':'hidden','args':['bad']}}]}}]}
+    result = parse_response(fmt, payload, config=config)
+    first, second = result.tool_calls
+    assert first['id'] == 'actual' and first['arguments'] == {'q':'one'}
+    assert second['name'] == 'hidden' and second['argument_error'] and second['arguments'] == {}
+    assert result.stop_reason == 'tool'
+    assert 'private' not in repr(result)
+    history = [{'role':'user','content':'look it up'},
+               {'role':'assistant','content':result.text,'tool_calls':result.tool_calls,'replay':result.replay},
+               {'role':'tool','tool_call_id':first['id'],'name':'lookup','content':'found'},
+               {'role':'tool','tool_call_id':second['id'],'name':'hidden','content':'invalid','is_error':True}]
+    *_, body = ModelClient().build_request(config, 'key', 'system', history, None)
+    if fmt == 'openai':
+        assistant, receipt, error = body['messages'][-3:]
+        assert assistant['reasoning_content'] == 'private'
+        assert [c['id'] for c in assistant['tool_calls']] == ['actual','other']
+        assert receipt == {'role':'tool','tool_call_id':'actual','content':'found'}
+        assert error['tool_call_id'] == 'other'
+    elif fmt == 'anthropic':
+        assistant, reply = body['messages'][-2:]
+        assert assistant['content'][0] == payload['content'][0]
+        assert [(r['tool_use_id'],r.get('is_error')) for r in reply['content']] == [('actual',None),('other',True)]
+    else:
+        assistant, reply = body['contents'][-2:]
+        declaration, = body['tools'][0]['functionDeclarations']
+        assert declaration == {'name':'lookup','description':'lookup','parametersJsonSchema':tool['parameters']}
+        assert assistant['parts'][0] == payload['candidates'][0]['content']['parts'][0]
+        assert assistant['parts'][1]['thoughtSignature'] == 'opaque'
+        assert assistant['parts'][1]['functionCall']['id'] == reply['parts'][0]['functionResponse']['id'] == 'actual'
+        assert 'id' not in reply['parts'][1]['functionResponse']
+        assert reply['parts'][1]['functionResponse']['response'] == {'error':'invalid'}
+
+
+
+@pytest.mark.parametrize('fmt', ['openai', 'anthropic', 'gemini'])
+def test_native_tool_stream_preserves_replay_and_call_ids(fmt):
+    from avatar.models.trace import model_io_scope
+    tool = {'name': 'lookup', 'description': 'lookup', 'parameters': {'type':'object'}}
+    config = {'api_format':fmt, 'provider':'custom', 'model':'mock', 'base_url':'https://example.test',
+              'max_tokens':512, '_tools':[tool], '_react_tool_calls':True, '_optional_tools':True, '_batch_tools':True}
+    if fmt == 'openai':
+        frames = [
+            {'choices':[{'delta':{'reasoning_content':'private_'},'finish_reason':None}]},
+            {'choices':[{'delta':{'reasoning_content':'opaque','tool_calls':[
+                {'index':0,'id':'first','function':{'name':'lookup','arguments':'{"q"'}}]},'finish_reason':None}]},
+            {'choices':[{'delta':{'tool_calls':[{'index':0,'function':{'arguments':':"one"}'}}]},
+                         'finish_reason':'tool_calls'}]},
+        ]
+    elif fmt == 'anthropic':
+        frames = [
+            {'type':'content_block_start','index':0,'content_block':{'type':'thinking','thinking':''}},
+            {'type':'content_block_delta','index':0,'delta':{'type':'thinking_delta','thinking':'private_opaque'}},
+            {'type':'content_block_delta','index':0,'delta':{'type':'signature_delta','signature':'signed'}},
+            {'type':'content_block_stop','index':0},
+            {'type':'content_block_start','index':1,'content_block':{'type':'tool_use','id':'first','name':'lookup','input':{}}},
+            {'type':'content_block_delta','index':1,'delta':{'type':'input_json_delta','partial_json':'{"q":"one"}'}},
+            {'type':'content_block_stop','index':1},
+            {'type':'message_delta','delta':{'stop_reason':'tool_use'}},
+            {'type':'message_stop'},
+        ]
+    else:
+        frames = [
+            {'candidates':[{'content':{'parts':[
+                {'text':'private_opaque','thought':True,'thoughtSignature':'signed'},
+                {'functionCall':{'id':'first','name':'lookup','willContinue':True,'partialArgs':[
+                    {'jsonPath':'$.q','stringValue':'o','willContinue':True}]},'thoughtSignature':'opaque'},
+            ]}}]},
+            {'candidates':[{'content':{'parts':[{'functionCall':{'willContinue':True,
+               'partialArgs':[{'jsonPath':'$.q','stringValue':'ne','willContinue':True}]}}]}}]},
+            {'candidates':[{'content':{'parts':[{'functionCall':{'partialArgs':[{'jsonPath':'$.q'}]}}]},
+                            'finishReason':'STOP'}]},
+        ]
+    stream = ''.join('data: '+json.dumps(frame)+'\n\n' for frame in frames)
+    async def resolver(host, port):
+        return '203.0.113.9'
+    model = ModelClient(httpx.MockTransport(lambda _: httpx.Response(
+        200, headers={'content-type':'text/event-stream'}, text=stream)), resolver=resolver)
+
+    async def exercise():
+        events = []
+        with model_io_scope(events.append, private=True):
+            reply = [event async for event in model.stream(config, 'key', 'system', [], 'find')]
+        assert reply[-1]['type'] == 'usage'
+        call, = reply[-1]['tool_calls']
+        assert call['id'] == 'first' and call['arguments'] == {'q':'one'}
+        assert 'private_opaque' in json.dumps(reply[-1]['replay'])
+        assert 'private_opaque' not in json.dumps(events)
+        assert not any(event['type']=='delta' for event in reply)
+        *_, plain = model.build_request(config, 'key', 'system',
+                                        [{'role':'assistant','content':'earlier'}], 'new')
+        if fmt == 'gemini':
+            assert plain['contents'] == [{'role':'model','parts':[{'text':'earlier'}]},
+                                         {'role':'user','parts':[{'text':'new'}]}]
+        else:
+            assert plain['messages'][-2:] == [{'role':'assistant','content':'earlier'},
+                                              {'role':'user','content':'new'}]
+    asyncio.run(exercise())
+
+
+
+@pytest.mark.parametrize(('fmt', 'payload'), [
+    ('openai', {'choices':[{'finish_reason':'content_filter','message':{'content':'unfinished'}}],
+                'usage':{'prompt_tokens':4,'completion_tokens':2}}),
+    ('anthropic', {'stop_reason':'refusal','content':[{'type':'text','text':'unfinished'}],
+                   'usage':{'input_tokens':4,'output_tokens':2}}),
+    ('gemini', {'candidates':[{'finishReason':'MALFORMED_FUNCTION_CALL','content':{'parts':[{'text':'unfinished'}]}}],
+                'usageMetadata':{'promptTokenCount':4,'candidatesTokenCount':2}}),
+])
+def test_native_tool_rejected_terminal_is_not_a_final_answer(fmt, payload):
+    from avatar.models.client import parse_response
+
+    with pytest.raises(HTTPException) as failure:
+        parse_response(fmt, payload, config={'_react_tool_calls':True})
+    assert failure.value.stop_reason == 'error'
+    assert failure.value.model_usage['total_tokens'] == 6
+    assert 'unfinished' not in failure.value.detail
+
+
+def test_native_tool_history_budget_counts_arguments_and_replay():
+    from avatar.models.limits import check_context
+    config = {'api_format':'openai', 'max_tokens':128, 'context_tokens':1200}
+    history = [{'role':'assistant','content':'','tool_calls':[{'id':'one','name':'lookup','arguments':{'q':'x'*1200}}],
+                'replay':{'reasoning_content':'x'*1200}}]
+    with pytest.raises(HTTPException) as failure:
+        check_context(config, 'system', history, None)
+    assert failure.value.stop_reason == 'context_overflow'
+    assert check_context(config, 'system', [{'role':'user','content':'plain'}], 'follow-up') > 0
 
 
 # Persistent generation identity and lifecycle; no external model requests

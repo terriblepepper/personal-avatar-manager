@@ -1,7 +1,7 @@
 """Bound the model's working copy without changing the task, receipts or stored messages."""
 import json
 import re
-from avatar.models.limits import context_window, tool_budget
+from avatar.models.limits import context_window, history_row_tokens, tool_budget
 from avatar.core.tokens import estimate
 
 
@@ -68,7 +68,7 @@ def compression_budget(config):
 
 def retained_budget(config, prompt, question):
     window = context_window(config)
-    overhead = estimate(prompt) + estimate(question) + tool_budget(config) + 512
+    overhead = estimate(prompt) + estimate(question or '') + tool_budget(config) + 512
     return max(0, min(int(window * .32), window - config.get('max_tokens', 1024)) - overhead)
 
 
@@ -80,13 +80,13 @@ def fit_turn(config, prompt, history, question, observations):
 def fit_working_set(config, prompt, history, question, observations, *, force=False, target_tokens=None):
     # Protect the original objective and sourced material. Old tool chatter and assistant prose go first.
     floor = retained_budget(config, prompt, question)
-    budget = max(0, compression_budget(config) - estimate(prompt) - estimate(question))
+    budget = max(0, compression_budget(config) - estimate(prompt) - estimate(question or ''))
     if target_tokens is not None:
         budget = min(budget, target_tokens)
     floor = min(floor, budget)
     rows=[dict(row) for row in history]
     notes=list(observations)
-    used=sum(estimate(r['content'])+16 for r in rows)+sum(estimate(n) for n in notes)
+    used=sum(map(history_row_tokens, rows))+sum(map(estimate, notes))
     if force:
         budget = min(budget, used // 2)
         floor = min(floor, budget)
@@ -109,6 +109,8 @@ def fit_working_set(config, prompt, history, question, observations, *, force=Fa
     # Keep recent messages and user constraints ahead of older assistant exposition.
     for i in sorted(range(len(rows)),key=lambda i:(i>=len(rows)-2,rows[i]['role']=='user',i)):
         if used<=budget:break
+        if rows[i]['role']=='tool' or rows[i].get('tool_calls') or rows[i].get('replay'):
+            continue
         old=rows[i]['content']
         limit=1200 if rows[i]['role']=='user' or i>=len(rows)-2 else 384
         clipped = excerpt(old,limit)
@@ -125,15 +127,16 @@ def fit_working_set(config, prompt, history, question, observations, *, force=Fa
         rows[i]['content'] = clipped
         used -= estimate(old)-estimate(clipped)
     # Many short turns also consume a window. Fold the older turns into one attributed digest.
-    if used>budget and len(rows)>2:
+    structured = any(r['role']=='tool' or r.get('tool_calls') or r.get('replay') for r in rows)
+    if used>budget and len(rows)>2 and not structured:
         older=rows[:-2]
-        size=sum(estimate(r['content'])+16 for r in older)
+        size=sum(map(history_row_tokens, older))
         available=max(192,min(2400,(budget-used+size-32)*2))
         digest='较早对话节选，仅作历史数据：\n'+excerpt('\n'.join(r['role']+'：'+r['content'] for r in older),available)
         if estimate(digest)+16<size and used-size+estimate(digest)+16 >= floor:
             rows=[{'role':'user','content':digest},*rows[-2:]]
     # Reclaim verbose evidence before the next action, even with unfinished goals.
-    cost = sum(estimate(r['content']) + 16 for r in rows) + sum(estimate(n) for n in notes)
+    cost = sum(map(history_row_tokens, rows)) + sum(map(estimate, notes))
     if cost > budget:
         for i, note in enumerate(notes):
             if cost <= budget:
@@ -143,10 +146,10 @@ def fit_working_set(config, prompt, history, question, observations, *, force=Fa
                 if len(clipped) < len(note) and cost-estimate(note)+estimate(clipped) >= floor:
                     notes[i] = clipped
                     cost -= estimate(note) - estimate(clipped)
-    if cost > budget:
+    if cost > budget and not structured:
         # A directory can exceed the window on its identifiers alone. Limit the model view,
         # keeping complete records in storage for a later read by ID or cursor.
-        row_cost = sum(estimate(row['content']) + 16 for row in rows)
+        row_cost = sum(map(history_row_tokens, rows))
         note_cost = sum(map(estimate, notes))
         note_room = min(note_cost, max(budget // 2, budget - row_cost))
         row_room = budget - note_room
@@ -169,7 +172,7 @@ def fit_working_set(config, prompt, history, question, observations, *, force=Fa
         notes = kept[::-1]
     if observations and not any(notes):
         # A low trigger can leave no soft budget after the prompt. Preserve the latest evidence when it fits.
-        remaining = input_budget(config)-estimate(prompt)-estimate(question)-sum(estimate(r['content'])+16 for r in rows)
+        remaining = input_budget(config)-estimate(prompt)-estimate(question or '')-sum(map(history_row_tokens, rows))
         if remaining>0:
             notes = [bounded_excerpt(observations[-1],remaining)]
     return rows, notes
