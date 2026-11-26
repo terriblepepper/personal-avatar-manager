@@ -358,13 +358,18 @@ class ModelClient:
         parts_key = 'parts' if fmt == 'gemini' else 'content'
         last_input = None
         if images or audio:
-            for row in reversed(conversation):
-                if row['role'] != 'user':
-                    continue
-                parts = row[parts_key]
-                if isinstance(parts, str) or any('text' in part for part in parts):
-                    last_input = row
-                    break
+            if fmt in ('anthropic','gemini') and message is not None and not message.strip():
+                if not conversation or conversation[-1]['role'] != 'user':
+                    conversation.append({'role':'user', parts_key:[]})
+                last_input = conversation[-1]
+            else:
+                for row in reversed(conversation):
+                    if row['role'] != 'user':
+                        continue
+                    parts = row[parts_key]
+                    if isinstance(parts, str) or any('text' in part for part in parts):
+                        last_input = row
+                        break
         if audio and (not config.get('audio_enabled') or fmt not in ('openai','gemini')):
             raise HTTPException(422, '当前模型配置或接口不支持音频输入')
         if (images or audio) and last_input and fmt in ('openai','anthropic'):

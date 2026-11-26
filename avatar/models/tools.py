@@ -245,12 +245,12 @@ def _wire_calls(fmt, calls):
 
 
 def _wire_assistant_parts(fmt, row):
-    text = row['content']
+    text = row['content'] or ''
     blocks = _wire_calls(fmt, row.get('tool_calls') or ())
     text_tag = {'type': 'text'} if fmt == 'anthropic' else {}
     layout = (row.get('replay') or {}).get('layout')
     if not layout:
-        return ([{**text_tag, 'text': text}] if text or not blocks else []) + blocks
+        return ([{**text_tag, 'text': text}] if text.strip() else []) + blocks
     offset = 0
     parts = []
     for entry in layout:
@@ -259,11 +259,18 @@ def _wire_assistant_parts(fmt, row):
             parts.append({**blocks[entry['call']], **extras})
         elif 'text_length' in entry:
             end = offset + entry['text_length']
-            parts.append({**text_tag, **extras, 'text': text[offset:end]})
+            segment = text[offset:end]
+            if segment.strip() or extras.get('thoughtSignature'):
+                parts.append({**text_tag, **extras, 'text': segment})
             offset = end
         else:
             parts.append(extras)
     return parts
+
+
+
+def _content_blocks(value, text_tag):
+    return [{**text_tag, 'text':value}] if isinstance(value, str) else value
 
 
 def wire_messages(fmt, history):
@@ -293,10 +300,22 @@ def wire_messages(fmt, history):
         key = 'parts' if fmt == 'gemini' else 'content'
         text_tag = {'type':'text'} if fmt == 'anthropic' else {}
         if role == 'assistant':
-            gemini_ids = {c['id']: c['wire_id'] for c in calls if c.get('wire_id')}
             wire_role = 'model' if fmt == 'gemini' else 'assistant'
-            value = _wire_assistant_parts(fmt, row) if fmt == 'gemini' or calls or row.get('replay') else content
-            rows.append({'role': wire_role, key: value})
+            value = _wire_assistant_parts(fmt, row) if fmt == 'gemini' or calls or row.get('replay') else (
+                content if content and content.strip() else None)
+            if not value:
+                continue
+            if not rows:
+                anchor = '继续已有对话。'
+                rows.append({'role':'user', key:[{'text':anchor}] if fmt == 'gemini' else anchor})
+            ids = {c['id']: c['wire_id'] for c in calls if c.get('wire_id')}
+            if rows[-1]['role'] == wire_role:
+                parts = rows[-1][key] = _content_blocks(rows[-1][key], text_tag)
+                parts.extend(_content_blocks(value, text_tag))
+                gemini_ids.update(ids)
+            else:
+                rows.append({'role': wire_role, key: value})
+                gemini_ids = ids
             continue
         if role == 'tool':
             call_id = row['tool_call_id']
@@ -310,14 +329,14 @@ def wire_messages(fmt, history):
                 if row.get('is_error'):
                     part['is_error'] = True
         else:
+            if not content or not content.strip():
+                continue
             part = {**text_tag, 'text': content}
         if not rows or rows[-1]['role'] != 'user':
             value = content if fmt == 'anthropic' and role == 'user' else [part]
             rows.append({'role': 'user', key: value})
             continue
-        parts = rows[-1][key]
-        if isinstance(parts, str):
-            parts = rows[-1][key] = [{**text_tag, 'text':parts}]
+        parts = rows[-1][key] = _content_blocks(rows[-1][key], text_tag)
         if role == 'tool':
             # Keep the corresponding result blocks directly after the assistant's tool calls.
             first_text = next((index for index, block in enumerate(parts) if 'text' in block), len(parts))

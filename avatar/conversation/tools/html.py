@@ -10,16 +10,16 @@ from avatar.core.artifact_limits import MAX_SOURCE_BYTES
 
 class HtmlFile(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
-    filename: str = Field(min_length=5, max_length=200, pattern=r'(?i)\.html?$')
+    filename: str = Field(min_length=5, max_length=200, pattern=r'(?i)\.html?$', description='先填写文件名。')
 
 
 class WebPage(HtmlFile):
-    html: str = Field(min_length=1, max_length=MAX_SOURCE_BYTES, description='HTML 源码。')
+    html: str = Field(min_length=1, max_length=MAX_SOURCE_BYTES, description='最后填写 HTML 源码。')
 
 
 CREATE_HTML = {
     'name':'create_html',
-    'description':'工具用于生成基于html的网页、2d动画和3d动画。作品在隔离环境中运行，无联网或宿主文件访问权限，可使用内置 Three.js。',
+    'description':'工具用于生成基于html的网页、2d动画和3d动画。先填写 filename，最后填写 html。作品在隔离环境中运行，无联网或宿主文件访问权限，可使用内置 Three.js。',
     'parameters':WebPage.model_json_schema(),
 }
 
