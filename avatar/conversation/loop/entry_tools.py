@@ -26,6 +26,10 @@ class SessionFileRequest(BaseModel):
         return self
 
 
+def is_session_html(item):
+    return item.get('content_type') == 'text/html' or item.get('filename', '').lower().endswith(('.htm', '.html'))
+
+
 @dataclass(frozen=True)
 class EntryToolContext:
     owner: str
@@ -58,6 +62,8 @@ async def bind_entry_tools(chat, context, entry, *, sandbox=None, status=None, d
     if revisions:
         config.update(_rag_access={'originals':True,'scope':scope,'revisions':list(revisions.items())}, _material_sources=sources)
         await run_blocking(chat.rag.validate, context)
+    visible_materials = set(revisions) if current_schema else set()
+    config['_visible_material_keys'] = visible_materials
     outputs = config.setdefault('_generated_files', [])
     tools = list(config.get('_entry_tools', ()))
     session_files = temporary_files
@@ -114,6 +120,18 @@ async def bind_entry_tools(chat, context, entry, *, sandbox=None, status=None, d
         config['_load_session_source'] = session_files.html
     elif previous_reads or source_checks:
         raise HTTPException(409, '此前读取的原件已失去会话授权')
+
+    if session_files is not None:
+        known_files = files or outputs or config.get('_agent_saved_files')
+        if not known_files:
+            if temporary_files is not None:
+                directory = await run_blocking(session_files.discover, '', 0)
+            else:
+                directory = await run_blocking(session_files.files.discover, session_files.owner,
+                    session_files.conversation, '', 0, grants=session_files.grants)
+            known_files = directory['items']
+        config['_has_session_files'] = bool(known_files)
+        config['_has_session_html'] = bool(known_files and any(map(is_session_html, known_files)))
 
     def tool(name, description, schema):
         tools.append({'name':name, 'description':description, 'parameters':schema.model_json_schema()})
@@ -173,6 +191,9 @@ async def bind_entry_tools(chat, context, entry, *, sandbox=None, status=None, d
                         result['image_order']=order
                     else:
                         result.update(coverage='metadata_only',has_content=False,notice='本次已有五张显式图片，请缩小范围')
+            items = result['items'] if result['kind']=='directory' else (result,)
+            if any(map(is_session_html, items)):
+                config['_has_session_html'] = True
             if store:
                 await run_blocking(store.merge, {'session_file_reads':dict(session_files.proofs),
                                                 'session_image_ids':list(read_images),
@@ -212,6 +233,7 @@ async def bind_entry_tools(chat, context, entry, *, sandbox=None, status=None, d
         await check_execution_async(validate)
         if store:
             await run_blocking(store.merge, {'entry_material':{'sources':sources, 'revisions':proof['revisions']}})
+        visible_materials.update(tuple(identity) for identity, _ in observation.revisions)
         if observation.images or observation.audio:
             config['_entry_native_media'] = {'images':observation.images, 'audio':observation.audio}
         return json.dumps({**observation.content, 'sources':observation.sources}, ensure_ascii=False)

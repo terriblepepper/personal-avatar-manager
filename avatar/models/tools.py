@@ -51,6 +51,31 @@ def load_model_json(value, *, object_pairs_hook=None):
         raise ValueError('Model JSON structure too deep') from None
 
 
+
+_SCHEMA_MAPS = {'properties', 'patternProperties', '$defs', 'definitions', 'dependentSchemas', 'dependencies'}
+_SUBSCHEMAS = {'additionalItems', 'additionalProperties', 'allOf', 'anyOf', 'oneOf', 'contains',
+               'contentSchema', 'if', 'then', 'else', 'items', 'prefixItems', 'not', 'propertyNames',
+               'unevaluatedItems', 'unevaluatedProperties'}
+
+
+def compact_schema(node):
+    """Remove schema titles without changing validation, literal values or property order."""
+    if isinstance(node, list):
+        return [compact_schema(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+    result = {}
+    for key, value in node.items():
+        if key == 'title' and isinstance(value, str):
+            continue
+        if key in _SCHEMA_MAPS:
+            value = {name: compact_schema(schema) for name, schema in value.items()}
+        elif key in _SUBSCHEMAS:
+            value = compact_schema(value)
+        result[key] = value
+    return result
+
+
 def configure_tools(fmt, body, tools, *, required=True, batch=False, native=False):
     """同一份函数定义分别转换为 OpenAI、Anthropic、Gemini 的工具声明。"""
     if fmt == 'openai':

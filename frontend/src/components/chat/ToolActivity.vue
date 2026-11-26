@@ -25,6 +25,7 @@ const actions: Record<string, string> = {
   edit_html: '修订 HTML',
   append_html_draft: '续写 HTML 草稿',
   read_step_receipt: '读取工具回执',
+  enable_tools: '加载所需工具',
   get_current_time: '获取北京时间',
   list_avatars: '查询公开分身目录',
   contact_avatar: '准备分身联络草稿',

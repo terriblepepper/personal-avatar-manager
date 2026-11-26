@@ -110,6 +110,11 @@ async def run_agent(rag, context, question, *, progress=None, on_delta=None):
         prompt += '\n本轮已有作品回执（数据）：'+json.dumps(file_ids,ensure_ascii=False)
     manager = ReActContextManager(history, question+original, store=store, checkpoint=state)
     registry, gate = bind_tools(rag.chat, config, question, validate, trace, manager, drafts, delivery, policy)
+    unlocked = [name for name in dict.fromkeys(state.get('unlocked_tools', ())) if name in registry.tools]
+    registry.sync_state(unlocked)
+    registry.register_enable_tools(unlocked)
+    prompt += registry.catalog_prompt(set(registry.active_names(unlocked)))
+
     async def summarize(rows):
         try:
             result = await rag.chat.memory.summarize(context, '', rows, rag.chat.model_client,
@@ -125,7 +130,7 @@ async def run_agent(rag, context, question, *, progress=None, on_delta=None):
 
     engine = ReActEngine(rag.chat.model_client, config, key, prompt, manager, registry, gate,
                          drafts, journal, policy, delivery, trace, emit, discard, report if progress else None,
-                         summarize=summarize if getattr(rag.chat,'memory',None) else None)
+                         unlocked=unlocked, summarize=summarize if getattr(rag.chat,'memory',None) else None)
     trace.point('perceive', {'request_chars':len(question)}, {'history_turns':len(history),'resuming':bool(state.get('step'))})
     try:
         with model_text_budget(input_budget(config)):

@@ -1,9 +1,12 @@
 """Contracts for a native ReAct turn and its authorized tools."""
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel
+
+
+Disclosure = Literal['core', 'state', 'deferred']
 
 
 @dataclass(frozen=True)
@@ -24,6 +27,9 @@ class ToolSpec:
     parameters: type[BaseModel] | None = None
     control: bool = False
     checkpoint: bool = False
+    disclosure: Disclosure = 'core'
+    summary: str = ''
+    when: Callable[[], bool] | None = None
 
 
 @dataclass(frozen=True)
@@ -31,7 +37,8 @@ class ToolOutcome:
     value: str | dict
     is_error: bool = False
     action: dict | None = None
+    activated: tuple[str, ...] = ()
 
     @classmethod
-    def error(cls, message):
-        return cls({'error': message}, True)
+    def error(cls, message, *, activated=()):
+        return cls({'error': message}, True, activated=activated)
