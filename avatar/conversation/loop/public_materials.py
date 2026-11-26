@@ -67,6 +67,7 @@ def bind_public_material_tools(chat, config, library, owner, store, state, *,
         return {'files': [{'id': item['id'], 'filename': item['filename'],
                            'marker': '[[attachment:' + item['id'] + ']]'} for item in files]}
 
+    config['_public_material_ready'] = lambda: bool(allowed())
     config['_react_public_files'] = exports
     config.setdefault('_entry_tools', []).extend((FIND_PUBLIC_MATERIAL, SEND_PUBLIC_MATERIAL))
     config.setdefault('_react_handlers', {}).update(find_public_material=find, send_public_material=send)
