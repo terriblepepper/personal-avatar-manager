@@ -337,10 +337,10 @@ class KnowledgeService:
             retained = [asset for asset in old if asset in available]
             from avatar.files.library.folders import with_folder_caption
             captions = {asset:caption for asset,caption in source['asset_captions'].items() if asset in available}
-            for identifier in requested:
-                asset = self.asset(user['id'],identifier,db)
+            for asset_id in requested:
+                asset = self.asset(user['id'],asset_id,db)
                 require_asset_format(asset['filename'])
-                captions[identifier] = with_folder_caption(db,asset,table='knowledge_folders')['caption']
+                captions[asset_id] = with_folder_caption(db,asset,table='knowledge_folders')['caption']
             changed_captions=any(captions.get(asset)!=source['asset_captions'].get(asset) for asset in requested if asset in old)
             additions=[asset for asset in requested if asset not in old]
             assets=[*retained,*additions]

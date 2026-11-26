@@ -101,18 +101,18 @@ async def has_visual_input(service,row):
     return False
 
 
-async def rebuild(service,row,model,key,embedding):
+async def rebuild(worker,row,model,key,embedding):
     refresh=row['memory_tree']['refresh']
     if target(embedding)!=refresh['target']:
         raise HTTPException(409,'模型索引配置已变化，已保留当前 Soul')
-    if not (refresh['embedding'] or refresh['manual']) and not await has_visual_input(service,row):
-        with service.database.connect(write=True) as db:
+    if not (refresh['embedding'] or refresh['manual']) and not await has_visual_input(worker.workspace,row):
+        with worker.database.connect(write=True) as db:
             db.execute("UPDATE soul_builds SET status='canceled',progress=100,stage='原输入未使用图片，跳过重构',updated_at=? WHERE id=? AND status='running'",(now(),row['id']))
         return
-    service.percent,service.stage=50,'重构已获批的 Soul 索引'
-    async with service.chat.rag.work.slot(row['user_id']):
-        await service.memory.compile(row,model,key,{})
-    with service.database.connect(write=True) as db:
+    worker.percent,worker.stage=50,'重构已获批的 Soul 索引'
+    async with worker.chat.rag.work.slot(row['user_id']):
+        await worker.memory.compile(row,model,key,{},worker=worker)
+    with worker.database.connect(write=True) as db:
         current=active(db,row['user_id'])
         if not current or current['id']!=row['parent_build']:
             raise HTTPException(409,'当前 Soul 已变化，未替换已生效版本')
