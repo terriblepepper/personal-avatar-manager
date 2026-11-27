@@ -1,9 +1,16 @@
 """明确的服务端能力证据优先；未知能力允许用户纠正。"""
 import asyncio
 import json
+import logging
 from urllib.parse import urlsplit
+from fastapi import HTTPException
+
 from avatar.core.db import dump,now
-from avatar.models.artifact_cache import fingerprint
+from avatar.core.execution import run_blocking
+from avatar.models.artifact_cache import UPSERT, fingerprint, prune
+from avatar.models.discovery import discover
+
+log = logging.getLogger(__name__)
 
 
 def target(config):
@@ -13,9 +20,16 @@ def target(config):
 def remember(database,user_id,config,rows,*,on_change):
     signature=target(config)
     with database.connect(write=True, account_scope=user_id) as db:
-        db.executemany('INSERT OR REPLACE INTO model_artifact_cache VALUES(?,?,?,?,?,?,?)',
-            [(user_id,'capabilities',signature,fingerprint(row['id']),'',dump(row),now()) for row in rows])
-        db.execute("DELETE FROM model_artifact_cache WHERE rowid IN (SELECT rowid FROM model_artifact_cache WHERE user_id=? AND kind='capabilities' ORDER BY updated_at DESC LIMIT -1 OFFSET 4000)",(user_id,))
+        with db.raw.cursor() as cursor:
+            cursor.executemany(UPSERT, (
+                (user_id,'capabilities',signature,fingerprint(row['id']),'',dump(row).encode(),now())
+                for row in rows))
+        db.execute("""DELETE FROM model_artifact_cache c USING (
+            SELECT signature,digest FROM model_artifact_cache WHERE user_id=? AND kind='capabilities'
+            ORDER BY updated_at DESC,signature,digest OFFSET 4000) stale
+            WHERE c.user_id=? AND c.kind='capabilities' AND (c.signature,c.digest)=(stale.signature,stale.digest)""",
+            (user_id,user_id))
+        prune(db,user_id)
         refresh_saved(db,user_id,on_change)
 
 
@@ -23,7 +37,10 @@ def automatic(db,user_id,config,*,embedding=False):
     if not config:return config
     row=db.execute("SELECT value FROM model_artifact_cache WHERE user_id=? AND kind='capabilities' AND signature=? AND digest=?",
                    (user_id,target(config),fingerprint(config.get('model','')))).fetchone()
-    info=json.loads(row[0]) if row else {}
+    return apply_capabilities(config, json.loads(row[0]) if row else {}, embedding=embedding)
+
+
+def apply_capabilities(config, info, *, embedding=False):
     if not info and config.get('capability_status')=='confirmed' and config.get('capability_source') in ('api','official_model','official_catalog'):
         # Server-only snapshots survive bounded cache eviction; request schemas never accept these fields.
         info={'vision':config.get('multimodal_enabled') if embedding else config.get('vision_enabled'),'audio':config.get('audio_enabled',False),'input_modalities':config.get('input_modalities',[]),'source':config['capability_source'],'category':'embedding' if embedding else 'text'}
@@ -61,19 +78,23 @@ def refresh_saved(db,user_id,on_change):
 
 async def detect(database,user_id,config,client,vault,*,on_change):
     if not config.get('encrypted_key'):return
-    from avatar.models.discovery import discover
-    from fastapi import HTTPException
     try:
         result=await discover(client,config,vault.decrypt(config['encrypted_key']))
-    except (HTTPException,AttributeError):return
-    await asyncio.to_thread(remember,database,user_id,config,result['models'],on_change=on_change)
+    except HTTPException as error:
+        log.info('Capability discovery unavailable (HTTP %s)', error.status_code)
+        return
+    await run_blocking(remember,database,user_id,config,result['models'],on_change=on_change)
 
 
 async def refresh_all(database,client,vault,*,on_change):
     def list_configs():
         with database.connect() as db:return db.execute('SELECT user_id,model_config FROM model_settings UNION ALL SELECT user_id,config FROM embedding_settings').fetchall()
-    rows=await asyncio.to_thread(list_configs)
+    rows=await run_blocking(list_configs)
     semaphore=asyncio.Semaphore(2)
     async def one(row):
-        async with semaphore:await detect(database,row[0],json.loads(row[1]),client,vault,on_change=on_change)
+        async with semaphore:
+            try:
+                await detect(database,row[0],json.loads(row[1]),client,vault,on_change=on_change)
+            except Exception:
+                log.exception('Saved model capability refresh failed')
     await asyncio.gather(*(one(row) for row in rows))

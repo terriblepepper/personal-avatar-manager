@@ -21,9 +21,8 @@ afterEach(() => {
 const body = '第一段 **强调**。\n\n第二段。\n\n```mermaid\ngraph TD; A-->B\n```\n\n> 引用来源：\n> 私有来源 · RAG'
 const menuitem = () => document.querySelector<HTMLButtonElement>('[role=menuitem]')
 async function chatRequest(path:string) {
-  if (path.startsWith('/conversations?')) return {items:[{id:'c',title:'本人会话'}],default_id:'c'}
+  if (path.startsWith('/conversations?')) return {items:[{id:'c',title:'本人会话'}],default_id:'c',embedding_configured:false}
   if (path.startsWith('/chat?')) return [{id:1,role:'assistant',content:body,responder_name:'助手',tool_events:[{id:'tool',name:'敏感工具',input:'调用参数'}]}]
-  if (path==='/me') return {embedding_configured:false}
   return null
 }
 
@@ -127,7 +126,7 @@ it('keeps the editable draft open while the conversation refreshes its intent st
       status='editing'
       return {id:'i',conversation_id:'c',objective:'任务目标'}
     }
-    if (path==='/me') return {embedding_configured:true}
+    if (path.startsWith('/conversations?')) return {...await chatRequest(path), embedding_configured:true}
     return chatRequest(path)
   })
   const view=mount(ChatView,{global:{stubs:{ChatSettings:true,ChatFilesManager:true,ConversationTools:true,ElSelect:true,IntentDialog:{props:['intent'],template:'<div role="dialog">{{intent.objective}}</div>'}}}})

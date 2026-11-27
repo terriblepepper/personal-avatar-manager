@@ -6,9 +6,11 @@ import logging
 from io import StringIO
 import json
 import httpx
+from avatar.models.model_network import pinned_request_url
 from fastapi import HTTPException
 from avatar.models.tools import invalid_tool_call, load_model_json
-from avatar.models.client import parse_response, tokens, response_limit, generation_http_timeout, generation_deadline
+from avatar.models.codec import parse_response, tokens
+from avatar.models.limits import response_limit, generation_http_timeout, generation_deadline
 from avatar.models.diagnostics import check_terminal, stop_reason, transport_failure, unconfirmed_response
 
 
@@ -358,7 +360,7 @@ async def _stream_once(model, config, api_key, system, history, message, collect
     try:
         async with asyncio.timeout(idle_limit) as watchdog, model.session(url, timeout) as (addresses, client):
             yield {'type': 'status', 'stage': 'waiting', 'message': '等待模型响应'}
-            async with client.stream('POST', url.copy_with(host=addresses[0]), headers=headers, json=body,
+            async with client.stream('POST', pinned_request_url(url, addresses), headers=headers, json=body,
                                      extensions={'sni_hostname': url.host}) as response:
                 from avatar.models.diagnostics import check_response,empty_response,request_id
                 await check_response(response,api_key)

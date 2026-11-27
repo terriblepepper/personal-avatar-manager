@@ -6,6 +6,7 @@ from pathlib import Path
 from fastapi import HTTPException
 from avatar.core.db import now,event
 from avatar.files.library.folders import validate_path,validate_name,ensure_folders,with_folder_caption
+from avatar.files.library.batch import BatchRequest
 
 
 def changed(db,user_id,*,analyse=True):
@@ -39,9 +40,8 @@ def check(db,user,stamp):
 def folder(k,user,body,operation):
     path=validate_path(body.path)
     if operation=='delete' and body.recursive:
-        from avatar.files.library.batch import BatchRequest
         return k.batch(user,BatchRequest(action='delete',folders=[path],last_modified_at=body.last_modified_at))
-    with k.database.connect(write=True) as db:
+    with k.database.connect(write=True,account_scope=user['id']) as db:
         check(db,user,body.last_modified_at)
         existing=db.execute('SELECT 1 FROM knowledge_folders WHERE user_id=? AND path=?',(user['id'],path)).fetchone()
         if operation=='create':
@@ -54,11 +54,8 @@ def folder(k,user,body,operation):
             rows=db.execute('SELECT * FROM knowledge_assets WHERE user_id=? AND substr(relative_path,1,?)=?',(user['id'],len(prefix),prefix)).fetchall()
             if operation=='delete':
                 children=db.execute('SELECT 1 FROM knowledge_folders WHERE user_id=? AND substr(path,1,?)=?',(user['id'],len(prefix),prefix)).fetchone()
-                if not body.recursive and (rows or children):raise HTTPException(409,'文件夹非空，请确认删除全部内容')
-                for row in rows:
-                    if db.execute("SELECT 1 FROM soul_builds b,json_each(b.asset_ids) a WHERE b.user_id=? AND a.value=? AND b.status IN ('queued','running','waiting_user','ready','pending')",(user['id'],row['id'])).fetchone():raise HTTPException(409,'素材正在构建或审核，请先取消对应构建')
-                db.execute('DELETE FROM knowledge_assets WHERE user_id=? AND substr(relative_path,1,?)=?',(user['id'],len(prefix),prefix))
-                db.execute('DELETE FROM knowledge_folders WHERE user_id=? AND (path=? OR substr(path,1,?)=?)',(user['id'],path,len(prefix),prefix))
+                if rows or children:raise HTTPException(409,'文件夹非空，请确认删除全部内容')
+                db.execute('DELETE FROM knowledge_folders WHERE user_id=? AND path=?',(user['id'],path))
             elif body.new_name is not None:
                 target=(path.rpartition('/')[0]+'/' if '/' in path else '')+validate_name(body.new_name)
                 if target!=path:
@@ -73,16 +70,12 @@ def folder(k,user,body,operation):
             else:raise HTTPException(422,'请提供名称或说明')
         stamp=changed(db,user['id'],analyse=operation=='edit' and bool(rows))
         event(db,user['id'],user['username'],'管理 Soul 知识库目录',path,actor_id=user['id'])
-    if operation=='delete':
-        from avatar.files.word_pdfs import discard_original
-        for row in rows:
-            discard_original(k.directory/(row['id']+'.blob'))
     return {**result(k,user['id']),'path':path,'last_modified_at':stamp}
 
 
 def rename(k,user,identifier,body):
     name=validate_name(body.new_name)
-    with k.database.connect(write=True) as db:
+    with k.database.connect(write=True,account_scope=user['id']) as db:
         check(db,user,body.last_modified_at);row=k.asset(user['id'],identifier,db)
         if Path(name).suffix.casefold()!=Path(row['filename']).suffix.casefold():raise HTTPException(422,'请保留原文件扩展名')
         parent=row['relative_path'].rpartition('/')[0];path=(parent+'/' if parent else '')+name;validate_path(path)
@@ -105,11 +98,11 @@ def sync_assets(k):
         if not active:continue
         base=k.decode(active);ids=[r['id'] for r in assets]
         if set(ids).issubset(base['asset_ids']) and all(base['asset_captions'].get(key)==value for key,value in captions.items()):
-            with k.database.connect(write=True) as db:db.execute('DELETE FROM knowledge_asset_updates WHERE user_id=? AND revision=?',(request['user_id'],request['revision']))
+            with k.database.connect(write=True,account_scope=request['user_id']) as db:db.execute('DELETE FROM knowledge_asset_updates WHERE user_id=? AND revision=?',(request['user_id'],request['revision']))
             continue
         try:
             k.refine({'id':request['user_id'],'username':request['username']},base['id'],base['document'],base['updated_at'],asset_ids=ids)
         except HTTPException as exc:
-            with k.database.connect(write=True) as db:db.execute('UPDATE knowledge_asset_updates SET error=? WHERE user_id=? AND revision=?',(str(exc.detail)[:1000],request['user_id'],request['revision']))
+            with k.database.connect(write=True,account_scope=request['user_id']) as db:db.execute('UPDATE knowledge_asset_updates SET error=? WHERE user_id=? AND revision=?',(str(exc.detail)[:1000],request['user_id'],request['revision']))
             continue
-        with k.database.connect(write=True) as db:db.execute('DELETE FROM knowledge_asset_updates WHERE user_id=? AND revision=?',(request['user_id'],request['revision']))
+        with k.database.connect(write=True,account_scope=request['user_id']) as db:db.execute('DELETE FROM knowledge_asset_updates WHERE user_id=? AND revision=?',(request['user_id'],request['revision']))

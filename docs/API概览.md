@@ -1,7 +1,7 @@
 # HTTP 接口概览
 
 本文按模块列出平台对浏览器暴露的全部 HTTP 接口，帮助前端与外部集成快速定位入口。
-机器可读的完整定义以运行时生成的 **OpenAPI** 为准：`/api/openapi.json`，交互文档 `/api/docs`。
+运维在私有环境设置 `AVATAR_ENABLE_API_DOCS=1` 并重启后，可从 `/api/openapi.json` 获取完整定义，在 `/api/docs` 交互查看。生产默认关闭这两个入口。
 
 ## 会话提问与补答
 
@@ -13,7 +13,7 @@
 - Vue 构建资源位于 `/assets`；已知 Vue 子路由由 FastAPI 回退到构建后的 index。`/static` 提供构建内的协议头像与离线预览资源；未知 API 和资源返回 404，不回退为 HTML。
 - 需要登录的接口依赖会话 Cookie（`AVATAR_SECURE_COOKIE=1` 时带 `Secure`）；管理接口额外校验角色。
 - 中间件对每个请求做同源 `Origin` 校验、按路径的请求体大小限额，并下发 `Content-Security-Policy`、`X-Frame-Options`、`X-Content-Type-Options`。
-- 长耗时聊天不走「请求-等待-响应」，而是 **202 + 轮询**：`POST /api/chat/generations` 立即返回受理，结果按 `request_id` 查询；`POST /api/chat/stream` 提供 SSE 流式投递。
+- 长耗时聊天不走「请求-等待-响应」，而是 **202 + 轮询**：`POST /api/chat/generations` 立即返回受理，结果按 `request_id` 查询；`POST /api/chat/stream` 提供 SSE 流式投递。内置网页发送 `X-Avatar-Stream: snapshots`，接收快照与终态。现有集成可继续接收默认的快照、正文增量和状态事件。断开订阅后服务端继续处理已受理的生成任务。
 - 分身对外的 ACPS RPC 不在本文范围，见 [小镇接入交接](小镇接入交接.md)。
 
 `GET /api/updates` 为站内实时更新流，要求完整登录态。`ready` 表示可刷新当前快照，`change` 返回有变化的类型（`inbox`、`dialogue`、管理员的 `reviews`）。客户端沿用各自 API 获取数据。实时服务未就绪返回 503，客户端暂用原有轮询。
@@ -22,35 +22,24 @@
 
 ## 路由模块一览
 
-| 模块 | 前缀 | 接口数 | 主要职责 |
-| --- | --- | --- | --- |
-| `avatar/api/app.py` | — | 3 | 页面入口 |
-| `avatar/api/routes.py` | `/api` | 71 | 账号、认证、资料、附件、会话、聊天、模型设置、管理后台 |
-| `avatar/api/collaboration_routes.py` | `/api` | 41 | Agent 对话、意图、会话、任务、通知、用户技能 |
-| `avatar/api/knowledge_routes.py` | `/api/me/knowledge` | 26 | Soul 资产、构建流程、记忆树、文件夹、持续学习 |
-| `avatar/api/chat_file_routes.py` | `/api/conversations` | 11 | 会话内文件引用、工具授权 |
-| `avatar/api/system_routes.py` | — | 6 | 系统 ACS/AIP 状态、系统注册、`/aip/rpc` |
-| `avatar/api/diagram_routes.py` | `/api` | 8 | Mermaid 渲染、图形缓存与动画资料转存 |
-| `avatar/api/review_routes.py` | `/api/admin/review-queue` | 6 | 审核队列明细 |
-| `avatar/api/question_bank_routes.py` | `/api/admin/soul-question-bank` | 6 | Soul 题库与分类维护 |
-| `avatar/api/town_routes.py` | `/api/town` | 4 | 小镇公开访问与访客任务 |
-| `avatar/api/oidc_routes.py` | `/api/auth` | 3 | OIDC 配置、发起、回调 |
-| `avatar/api/style_learning_routes.py` | `/api/conversations` | 3 | 会话风格学习开关与手动学习 |
-| `avatar/api/entity_routes.py` | `/api/admin/agents` | 2 | 分身身份动作与作业刷新 |
-| `avatar/api/migration_routes.py` | `/api/admin/identity-migration` | 3 | 身份迁移预览与提交 |
-| `avatar/api/rag_routes.py` | `/api/me/file-index` | 3 | 资料索引重建与同步 |
-| `avatar/api/resource_routes.py` | `/api/admin/rag-resources` | 2 | 全局自适应资源预算查询与更新（管理员） |
-| `avatar/api/embedding_routes.py` | `/api/me/embedding-settings` | 3 | 嵌入模型选项 |
+`avatar/api/router.py` 按注册顺序挂载各领域路由。1.5.0 的 OpenAPI 定义含 171 个路径、205 个操作。以下模块位于 `avatar/api/`。
 
-合计 **198** 个接口：OpenAPI 中的业务与协议操作 195 个（含 `/aip/rpc`），另有 3 个页面入口。
+| 功能 | 模块 |
+| --- | --- |
+| 平台、个人资料、账号与认证 | `platform_routes.py`、`auth_routes.py`、`profile_routes.py`、`oidc_routes.py` |
+| 管理、运维、审核与身份迁移 | `admin_routes.py`、`ops_routes.py`、`review_routes.py`、`migration_routes.py` |
+| 聊天、附件、图形与暂停的技能 | `chat_routes.py`、`chat_file_routes.py`、`attachment_routes.py`、`diagram_routes.py`、`skill_routes.py` |
+| 分身协作、收件箱、页面变更推送 | `collaboration_routes.py`、`notification_routes.py`、`update_routes.py` |
+| 模型、资料索引、Soul 与风格学习 | `model_routes.py`、`embedding_routes.py`、`rag_routes.py`、`knowledge_routes.py`、`style_learning_routes.py` |
+| 题库、资源预算、系统及分身身份、小镇 | `question_bank_routes.py`、`resource_routes.py`、`system_routes.py`、`entity_routes.py`、`town_routes.py` |
 
-## 页面入口（`app.py`）
+## 页面入口（`frontend.py`）
 
 - `GET /` — 用户端
 - `GET /admin` — 管理端
 - `GET /platform-entry` — 平台落地入口
 
-## 账号与认证（`routes.py`）
+## 账号、认证与个人设置
 
 - `GET /api/health` — 健康检查
 - `GET /api/help/{document}` — 读取随包文档
@@ -130,6 +119,8 @@
 - `POST /{identifier}/style-learning/learn` — 立即学习需要已审核生效的 Soul。
 
 ## 分身协作（`collaboration_routes.py`，前缀 `/api`）
+
+每位发起人最多同时占用 8 个活跃协作名额，全平台最多 64 个。待对方接收的任务占一个名额。重发同一请求返回既有任务，额度用尽时返回 HTTP 429。
 
 运行中向 `POST /agent-dialogues/{id}/resume` 提交 `steer: true` 和补充文字，当前发言结束后按已认证发送方入列。参与方可用 `POST /agent-dialogues/{id}/end` 直接结束，协议取消回执由后台处理。
 

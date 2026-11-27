@@ -10,7 +10,7 @@ import MarkdownContent from '../MarkdownContent.vue'
 import MaterialFileDialog from '../MaterialFileDialog.vue'
 import type { ChatFile, FilePromotion, ToolEvent } from '../../types'
 
-const props = withDefaults(defineProps<{ source: string; events?: ToolEvent[]; attachments?: ChatFile[]; conversationId?: string; diagrams?: boolean; artifactReply?: boolean; hideCitations?: boolean }>(), { diagrams:true, artifactReply:true })
+const props = withDefaults(defineProps<{ source: string; events?: ToolEvent[]; attachments?: ChatFile[]; conversationId?: string; streaming?: boolean; diagrams?: boolean; artifactReply?: boolean; hideCitations?: boolean }>(), { diagrams:true, artifactReply:true })
 const emit = defineEmits<{ preview: [file: ChatFile] }>()
 const panel = ref<HTMLElement>(), trigger = ref<HTMLButtonElement>(), open = ref(false)
 const saved = ref(new Set<string>()), promoting = ref<ChatFile>()
@@ -107,7 +107,7 @@ function preview(file: ChatFile) {
 </script>
 
 <template>
-  <MarkdownContent v-if="content.body || attachments?.length" :source="content.body" :conversation-id="conversationId" :diagrams="diagrams" :artifact-reply="artifactReply" :sandbox-sources="sandboxSources" :files="attachments || []" :saved-file-ids="saved" @preview="emit('preview',$event)" @promote="promoting = $event"/>
+  <MarkdownContent :streaming="streaming" v-if="content.body || attachments?.length" :source="content.body" :conversation-id="conversationId" :diagrams="diagrams" :artifact-reply="artifactReply" :sandbox-sources="sandboxSources" :files="attachments || []" :saved-file-ids="saved" @preview="emit('preview',$event)" @promote="promoting = $event"/>
   <div v-if="content.entries.length" class="answer-sources">
     <button ref="trigger" type="button" class="source-trigger" aria-haspopup="dialog" :aria-expanded="open" @click="toggle">
       <span class="source-avatar-stack" aria-hidden="true">

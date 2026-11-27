@@ -1,5 +1,4 @@
-"""Private per-user storage; old files are moved once before services open them."""
-import hashlib
+"""Private per-user storage."""
 import logging
 import re
 import stat
@@ -106,56 +105,3 @@ class ConversationBlobs:
                     yield from path.iterdir()
                 else:
                     yield path
-
-
-def migrate_user_storage(database):
-    """Idempotent rename; never overwrite a destination or delete unowned files."""
-    base=database.data_dir
-    for name in ('attachments','chat_attachments','knowledge','everos','file_rag','user_skills','avatar_identities'):
-        if (base/name).is_symlink():raise ValueError('Symlink legacy storage')
-    with database.connect() as db:
-        users=[row[0] for row in db.execute('SELECT id FROM users')]
-        blobs={table:list(db.execute('SELECT id,user_id FROM '+table)) for table in ('attachments','knowledge_assets')}
-        blobs['chat_files']=list(db.execute('SELECT id,user_id,conversation_id FROM chat_files'))
-    conversations = ConversationBlobs(database)
-    for table,kind in (('attachments','attachments'),('chat_files','chat_attachments'),('knowledge_assets','knowledge')):
-        for row in blobs[table]:
-            old=base/kind
-            if old.is_symlink():raise ValueError('Symlink legacy originals')
-            if table == 'chat_files':
-                directory = conversations.workspace(row['user_id'],row['conversation_id'])
-                for suffix in ('.blob','.jpg'):
-                    name = row['id']+suffix
-                    if Path(name).name != name:
-                        raise ValueError('Invalid conversation original name')
-                    for source in (old/name,directory.parent/name):
-                        if source.exists() or source.is_symlink():
-                            move(source,directory/name)
-            else:
-                for source in old.glob('*'+row['id']+'*'):
-                    destination=user_root(base,row['user_id'])/kind/source.name
-                    move(source,destination)
-    for uid in users:
-        digest=hashlib.sha256(uid.encode()).hexdigest()
-        for old,new in ((base/'everos'/digest,'everos'),(base/'file_rag'/digest,'file_rag'),(base/'user_skills'/uid,'skills'),(base/'avatar_identities'/uid,'identity')):
-            destination=user_root(base,uid)/new
-            old_absolute=str(old.absolute());new_absolute=str(destination.absolute())
-            if old.exists():move(old,destination)
-            if destination.exists():
-                if new=='identity':
-                    for file in destination.rglob('*.json'):
-                        if file.is_symlink():raise ValueError('Symlink identity configuration')
-                        text=file.read_text();updated=text.replace(old_absolute,new_absolute)
-                        if updated!=text:file.write_text(updated)
-    for name in ('attachments','chat_attachments','knowledge','everos','file_rag','user_skills','avatar_identities'):
-        old=base/name
-        if old.is_dir() and not old.is_symlink():
-            if not any(old.iterdir()):old.rmdir()
-            else:move(old,base/'maintenance'/'unowned-storage'/name)
-
-
-def move(source,destination):
-    if source.is_symlink() or destination.is_symlink():raise ValueError('Symlink migration path')
-    if destination.exists():raise RuntimeError('Storage migration conflict: '+str(destination))
-    destination.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
-    source.rename(destination)

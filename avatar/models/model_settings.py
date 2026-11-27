@@ -61,10 +61,12 @@ class ModelSettingsService:
     # 职责：返回本人可显示的模型设置。
     # 输入：user_id 为已认证账户。
     # 结果与约束：只返回配置摘要及修改日期，隐藏 Key 明文和密文，不依赖个人资料是否审核。
-    def get(self, user_id):
-        with self.database.connect() as db:
-            row = db.execute('SELECT model_config,updated_at FROM model_settings WHERE user_id=?', (user_id,)).fetchone()
-            config=automatic(db,user_id,json.loads(row['model_config'])) if row else {}
+    def get(self, user_id, db=None):
+        if db is None:
+            with self.database.connect() as db:
+                return self.get(user_id, db)
+        row = db.execute('SELECT model_config,updated_at FROM model_settings WHERE user_id=?', (user_id,)).fetchone()
+        config=automatic(db,user_id,json.loads(row['model_config'])) if row else {}
         return {'model_config': public_config(config), 'updated_at': row['updated_at'] if row else None}
 
     # 职责：在账户事务内校验并保存立即生效的模型配置。

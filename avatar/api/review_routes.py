@@ -1,11 +1,11 @@
 """统一审核队列与批量决策，沿用管理员依赖及全局 CSRF 边界。"""
 from typing import Literal
-from fastapi import APIRouter,Depends,Query,Request,HTTPException
+from fastapi import APIRouter,Depends,Request,HTTPException
 from fastapi.responses import FileResponse
 from avatar.api.file_previews import word_pdf
 import json
 from pydantic import BaseModel,ConfigDict,Field,StrictBool
-from avatar.api.dependencies import admin
+from avatar.api.dependencies import PageOffset, ShortPageSearch, admin
 from avatar.profiles.review_queue import ReviewQueue
 
 router=APIRouter(prefix='/api/admin/review-queue',tags=['统一审核'])
@@ -45,7 +45,7 @@ def dismiss(body:ReviewDeletion,request:Request,user=Depends(admin)):
 
 
 @router.get('')
-def reviews(request:Request,category:Literal['all','teacher','create','update','soul']='all',status:Literal['all','pending','approved','rejected']='pending',search:str=Query(default='',max_length=100),offset:int=Query(default=0,ge=0,le=2147483647),user=Depends(admin)):
+def reviews(request:Request,category:Literal['all','teacher','create','update','soul']='all',status:Literal['all','pending','approved','rejected']='pending',search: ShortPageSearch = '',offset: PageOffset = 0,user=Depends(admin)):
     return ReviewQueue(request.app.state.service).page(user,category,status,search,offset)
 
 

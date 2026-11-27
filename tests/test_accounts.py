@@ -87,6 +87,8 @@ def test_simple_contact_recovery_invalidates_sessions(context, contact):
     login(user, 'tester', 'recovered-pass-123')
     for n in range(3):
         assert anonymous.post('/api/auth/recover-password', json={**body, 'contact': 'unknown@example.com'}).status_code == 200
+    for _ in range(4):
+        assert anonymous.post('/api/auth/recover-password', json=body).status_code == 200
     assert anonymous.post('/api/auth/recover-password', json=body).status_code == 429
 
 def test_controlled_contacts_change_preserves_profile_and_legacy_admin(context):
@@ -273,11 +275,12 @@ def test_admin_views_approved_profile_not_new_draft_or_model_credentials(context
     assert error.value.status_code == 403
 
 
+@pytest.mark.quick
 def test_previously_installed_skills_are_read_only_and_hidden_from_chat(context, previously_installed_skill):
     import json
     from types import SimpleNamespace
 
-    app, user, _ = context
+    app, user, admin = context
     uid = identity(user)['id']
     skill = previously_installed_skill
     cid = user.post('/api/conversations', json={'channel': 'assistant'}).json()['id']
@@ -285,6 +288,16 @@ def test_previously_installed_skills_are_read_only_and_hidden_from_chat(context,
         db.execute('INSERT INTO chat_session_skills(conversation_id,skill_id,authorized) VALUES(?,?,1)', (cid, skill))
 
     assert [row['id'] for row in user.get('/api/me/skills').json()] == [skill]
+    import importlib.util
+    assert importlib.util.find_spec('avatar.skills.packages') is None
+    detail = user.get(f'/api/me/skills/{skill}').json()
+    assert 'Old instructions.' in detail['instructions']
+    assert b'Old instructions.' in user.get(f'/api/me/skills/{skill}/files/SKILL.md').content
+    assert admin.get(f'/api/me/skills/{skill}/files/SKILL.md').status_code == 404
+    assert user.delete(f'/api/me/skills/{skill}').status_code == 403
+    assert user.post('/api/me/skills/batch', json={'ids': [skill], 'action': 'delete'}).status_code == 403
+    assert user.post('/api/me/skills/source', json={'url': 'https://example.org/example'}).status_code == 403
+
     assert user.post('/api/me/skills', files={'file': ('SKILL.md', b'New skill')}).status_code == 403
     assert user.patch(f'/api/me/skills/{skill}', json={'enabled': False}).status_code == 403
     assert user.get(f'/api/conversations/{cid}/skills').json() == []
@@ -358,6 +371,7 @@ def test_profile_scope_applies_to_every_overview_response(context):
 def test_demo_overview_reuses_files_and_reads_without_write_lock(context, monkeypatch):
     from unittest.mock import Mock
     app, user, _ = context
+    uid = identity(user)['id']
     service = app.state.service
     inventory = Mock(wraps=service.attachments.inventory)
     connect = Mock(wraps=service.database.connect)
@@ -368,6 +382,9 @@ def test_demo_overview_reuses_files_and_reads_without_write_lock(context, monkey
     assert response.json()['files'] == response.json()['profile']['files']
     assert inventory.call_count == 1
     assert all(not call.kwargs.get('write') for call in connect.call_args_list)
+    connect.reset_mock()
+    service.overview(uid)
+    assert connect.call_count == 1
 
 
 def test_direct_overview_reserves_once_then_reads_existing_port(context, monkeypatch):
@@ -377,6 +394,7 @@ def test_direct_overview_reserves_once_then_reads_existing_port(context, monkeyp
     app, user, _ = context
     service = app.state.service
     uid = identity(user)['id']
+    profile = user.get('/api/me').json()['profile']
     settings = replace(app.state.settings, entity_aip_enabled=True)
     monkeypatch.setattr(service, 'provider', SimpleNamespace(mode='acps-direct', runner=SimpleNamespace(settings=settings)))
     with service.database.connect(write=True) as db:
@@ -384,8 +402,14 @@ def test_direct_overview_reserves_once_then_reads_existing_port(context, monkeyp
                    (settings.oidc_issuer, 'overview-test', 'tester', uid))
     connect = Mock(wraps=service.database.connect)
     monkeypatch.setattr(service.database, 'connect', connect)
+    preview = user.post('/api/me/acs/preview', json={k:profile[k] for k in ('acs_input','last_modified_at')})
+    assert preview.status_code == 200
+    candidate = preview.json()['document']['endPoints']
+    with service.database.connect() as db:
+        assert not db.execute('SELECT 1 FROM avatar_entity_ports WHERE user_id=?', (uid,)).fetchone()
+    assert not any(call.kwargs.get('write') for call in connect.call_args_list)
     first = user.get('/api/me').json()['profile']['acs_document']['endPoints']
-    assert len(first) == 1
+    assert len(first) == 1 and first == candidate
     assert sum(bool(call.kwargs.get('write')) for call in connect.call_args_list) == 1
     with service.database.connect() as db:
         assert db.execute('SELECT port FROM avatar_entity_ports WHERE user_id=?', (uid,)).fetchone()[0] == settings.entity_aip_port
@@ -839,3 +863,126 @@ def test_tls_background_uses_local_snapshot_without_ca_polling(monkeypatch):
         assert await directory.select('AIC') is entity
         assert calls==['AIC']
     asyncio.run(check())
+
+
+def test_login_rechecks_password_after_hashing_without_a_transaction(context, monkeypatch):
+    from avatar.accounts import auth
+    app, user, _ = context
+    database = app.state.database
+    uid = identity(user)['id']
+    active = 0
+    connect = database.connect
+    verify = auth.verify_password
+
+    @contextmanager
+    def tracked(*args, **kwargs):
+        nonlocal active
+        with connect(*args, **kwargs) as db:
+            active += 1
+            try:
+                yield db
+            finally:
+                active -= 1
+
+    def change_while_verifying(password, stored):
+        assert active == 0
+        verified = verify(password, stored)
+        with connect(write=True, account_scope=uid) as db:
+            db.execute('UPDATE users SET password=? WHERE id=?', ('new-credential', uid))
+        return verified
+
+    monkeypatch.setattr(database, 'connect', tracked)
+    monkeypatch.setattr(auth, 'verify_password', change_while_verifying)
+    with pytest.raises(HTTPException) as failure:
+        auth.login(database, Credentials(username='tester', password='testpassword123'), 'test')
+    assert failure.value.status_code == 401
+
+
+def test_existing_conversation_scope_is_read_only(context, monkeypatch):
+    from unittest.mock import Mock
+    app, user, _ = context
+    uid = identity(user)['id']
+    memory = app.state.chat.memory
+    session = memory.scope(uid, 'assistant', 'onboarding')
+    connect = Mock(wraps=memory.database.connect)
+    monkeypatch.setattr(memory.database, 'connect', connect)
+    assert memory.scope(uid, 'assistant', 'onboarding')['id'] == session['id']
+    with pytest.raises(HTTPException) as failure:
+        memory.scope(uid, 'assistant', 'other', session['id'])
+    assert failure.value.status_code == 404
+    assert all(not call.kwargs.get('write') for call in connect.call_args_list)
+
+
+def test_placeholder_migration_rejects_user_owned_cascade_rows(context):
+    import time
+    from avatar.accounts.identity_migration import IdentityMigrationService
+    from avatar.accounts.oidc import OidcService
+    app, _, _ = context
+    database = app.state.database
+    migration = IdentityMigrationService(database, app.state.settings)
+    oidc = OidcService(database, app.state.settings)
+    _, _, account, _ = oidc.identify({'sub': 'placeholder', 'exp': time.time() + 600}, {})
+    owner = account['id']
+    with database.connect(write=True) as db:
+        summary = migration.summary(db, owner)
+        migration.require_empty(db, owner, summary)
+        db.execute('INSERT INTO town_access_limits(owner_id,total_daily_limit) VALUES(?,?)', (owner, 3))
+        with pytest.raises(HTTPException) as failure:
+            migration.require_empty(db, owner, summary)
+        assert failure.value.status_code == 409
+
+
+def test_chat_uses_one_reclaimable_lock_for_default_and_explicit_session(context):
+    from avatar.conversation.schemas import ChatRequest
+    app, user, _ = context
+    chat = app.state.chat
+    actor = identity(user)
+    parent = chat.session(actor['id'], 'assistant')
+    request = ChatRequest(channel='assistant',message='消息')
+
+    async def check():
+        first = chat.stream(actor, request)
+        second = chat.stream(actor, request.model_copy(update={'conversation_id':parent['id']}))
+        try:
+            assert (await anext(first))['stage'] == 'lookup'
+            assert (await anext(first))['stage'] == 'intent_analysis'
+            assert (await anext(second))['stage'] == 'lookup'
+            assert await anext(second) == {'type':'error','code':409,'message':'上一条消息仍在生成，请等待完成后再发送'}
+        finally:
+            await second.aclose()
+            await first.aclose()
+        assert not chat.locks
+
+    asyncio.run(check())
+
+
+def test_account_page_uses_one_snapshot_when_another_connection_registers(context, monkeypatch):
+    from uuid import uuid4
+    app, _, admin = context
+    actor = identity(admin)
+    database = app.state.database
+    connect = database.connect
+    username = 'concurrent-page-user'
+    inserted = False
+
+    @contextmanager
+    def insert_after_count(*args, **kwargs):
+        nonlocal inserted
+        with connect(*args, **kwargs) as db:
+            execute = db.execute
+            def observed(sql, params=()):
+                nonlocal inserted
+                result = execute(sql, params)
+                if not inserted and sql.startswith('SELECT COUNT(*)'):
+                    with connect(write=True) as writer:
+                        writer.execute('INSERT INTO users(id,username,password,role,created_at) VALUES(?,?,?,?,?)',
+                                       (str(uuid4()), username, 'unused', 'user', now()))
+                    inserted = True
+                return result
+            db.execute = observed
+            yield db
+
+    monkeypatch.setattr(database, 'connect', insert_after_count)
+    page = AccountManagement(database).list(actor, search=username)
+    assert inserted and page['total'] == 0 and page['items'] == []
+    assert AccountManagement(database).list(actor, search=username)['total'] == 1

@@ -2,6 +2,7 @@
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { request, notifyError } from '../../api/client'
+import { usePolling } from '../../composables/usePolling'
 import { useSessionStore } from '../../stores/session'
 import { date } from '../../utils/format'
 interface ResourceState {policy:Record<string,number|boolean>;enforcement:{mode:string;error?:string};effective_cpu_cores:number;effective_memory_bytes:number;active_jobs:number;waiting:number;pressure:boolean}
@@ -24,25 +25,25 @@ const fields:[string,string,number,number,number][]=[
   ['query_wait_seconds','查询等待上限（秒）',.1,120,.1],['sample_seconds','资源采样间隔（秒）',.25,30,.25],
 ]
 const urls:Record<string,string>={registry_url:'Registry 注册中心 URL',certificate_authority_url:'CA 证书颁发机构 URL',registry_entity_mtls_url:'实体注册 mTLS URL（可选）',public_url:'系统对外访问 URL'}
-let timer:ReturnType<typeof setInterval>|undefined,disposed=false,resourceSequence=0
-async function reg(manual=false){
+let disposed=false,resourceSequence=0
+async function reg(manual=false, signal?: AbortSignal){
   if(!session.user?.is_root||checking.value)return
   checking.value=true
   try {
-    const value=await request<Registration>('/admin/system/registration'+(manual?'/refresh':''),manual?'POST':'GET')
-    if(!disposed){registration.value=value;registrationError.value=''}
-  }catch(e){if(!disposed)registrationError.value=e instanceof Error?e.message:'注册状态读取失败'}finally{checking.value=false}
+    const value=await request<Registration>('/admin/system/registration'+(manual?'/refresh':''),manual?'POST':'GET', undefined, signal)
+    if(!disposed && !signal?.aborted){registration.value=value;registrationError.value=''}
+  }catch(e){if(!disposed && !signal?.aborted)registrationError.value=e instanceof Error?e.message:'注册状态读取失败'}finally{checking.value=false}
 }
-async function certificate(renew=false){
+async function certificate(renew=false, signal?: AbortSignal){
   if(certBusy.value)return
   certBusy.value=true
   try{
     if(renew && cert.value?.certificate){
       await request('/admin/system/certificate/'+encodeURIComponent(cert.value.certificate.id)+'/renew','POST')
     }
-    const value=await request<PlatformCert>('/admin/system/certificate')
-    if(!disposed){cert.value=value;certError.value=''}
-  }catch(e){if(!disposed)certError.value=e instanceof Error?e.message:'平台证书操作失败'}
+    const value=await request<PlatformCert>('/admin/system/certificate','GET',undefined,signal)
+    if(!disposed && !signal?.aborted){cert.value=value;certError.value=''}
+  }catch(e){if(!disposed && !signal?.aborted)certError.value=e instanceof Error?e.message:'平台证书操作失败'}
   finally{if(!disposed)certBusy.value=false}
 }
 async function loadResources(initial=false){
@@ -77,15 +78,15 @@ async function save(resource:boolean){
 onMounted(()=>{
   void loadSettings()
   void loadResources(true)
-  void certificate()
-  if(session.user?.is_root)void reg()
-  timer=setInterval(()=>{
-    if(document.hidden)return
-    if(session.user?.is_root)void reg()
-    if(['queued','running'].includes(cert.value?.renewal?.state||''))void certificate()
-  },5000)
 })
-onBeforeUnmount(()=>{disposed=true;clearInterval(timer)})
+usePolling(async signal => {
+  await Promise.all([
+    reg(false, signal),
+    !cert.value || ['queued','running'].includes(cert.value.renewal?.state || '')
+      ? certificate(false, signal) : undefined,
+  ])
+}, () => 5000, { enabled: () => !!session.user?.is_root || !cert.value || ['queued','running'].includes(cert.value.renewal?.state || '') })
+onBeforeUnmount(() => { disposed = true })
 </script>
 <template>
   <section v-if="session.user?.is_root" class="card"><div class="cardhead"><h2>管理系统与个人实体注册</h2><button class="button small" :disabled="checking" @click="reg(true)">立即检查</button></div>

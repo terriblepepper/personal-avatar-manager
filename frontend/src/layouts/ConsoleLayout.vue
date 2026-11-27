@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ElTooltip } from 'element-plus'
-import { SKILL_PAUSE_NOTICE } from '../skillPolicy'
+import { SKILL_PAUSE_NOTICE } from '../utils/skillPolicy'
 import { computed, defineAsyncComponent, nextTick, onMounted, onUnmounted, provide, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import AppIcon from '../components/AppIcon.vue'
@@ -236,7 +236,7 @@ async function logout() { try { await session.logout() } catch (e) { notifyError
         </nav>
         <div v-if="inHub" class="avatar-panel" :style="{ '--avatar-view-offset': 24 * direction + 'px' }"><Transition name="avatar-view" appear><div :key="viewKey"><slot/></div></Transition></div>
         <Transition v-else name="avatar-view" appear><div :key="viewKey" class="workspace-page"><slot/></div></Transition>
-        <footer class="footer"><span>镜像 · 个人分身智能体管理系统</span><span>本地演示</span></footer>
+        <footer class="footer"><span>镜像 · 个人分身智能体管理系统</span></footer>
       </main>
     </div>
   </div>

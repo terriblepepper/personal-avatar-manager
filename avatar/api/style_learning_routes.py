@@ -1,7 +1,7 @@
 """持续学习只开放给本人完整 Web 会话，访客与小镇临时入口不能操作。"""
 from fastapi import APIRouter,Depends,Request
 from pydantic import BaseModel,ConfigDict,StrictBool
-from avatar.api.knowledge_routes import owner
+from avatar.api.dependencies import owner
 
 router=APIRouter(prefix='/api/conversations',tags=['本人风格学习'])
 

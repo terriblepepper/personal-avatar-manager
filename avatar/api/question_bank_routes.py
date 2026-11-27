@@ -3,14 +3,14 @@ import asyncio
 from fastapi import APIRouter,Depends,Request,Query,HTTPException
 from pydantic import ValidationError
 from typing import Literal
-from avatar.api.dependencies import admin
+from avatar.api.dependencies import PageOffset, ShortPageSearch, admin
 from avatar.knowledge.question_bank import BankInput,CategoryInput,QuestionInput
 
 router=APIRouter(prefix='/api/admin/soul-question-bank',tags=['soul 分类题库'])
 
 
 @router.get('')
-def page(request:Request,category:str=Query(default='',max_length=60),status:Literal['all','active','inactive']='all',search:str=Query(default='',max_length=100),offset:int=Query(default=0,ge=0,le=2147483647),user=Depends(admin)):
+def page(request:Request,category:str=Query(default='',max_length=60),status:Literal['all','active','inactive']='all',search: ShortPageSearch = '',offset: PageOffset = 0,user=Depends(admin)):
     return request.app.state.knowledge.bank.page(user,category,status,search,offset)
 
 

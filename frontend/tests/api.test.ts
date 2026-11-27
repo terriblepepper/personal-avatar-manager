@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { request, setCsrfToken, ApiError } from '../src/api/client'
+import { request, setCsrfToken, setSessionExpiryHandler, ApiError } from '../src/api/client'
 import { submitAndObserve, parseSSE } from '../src/api/generations'
 import { requestId } from '../src/utils/requestId'
 
@@ -15,6 +15,23 @@ describe('existing REST and CSRF contract', () => {
     const options = fetcher.mock.calls[0]?.[1] as RequestInit
     expect(new Headers(options.headers).get('X-CSRF-Token')).toBe('test-csrf')
     expect(options.credentials).toBe('same-origin')
+  })
+  it('uploads the original bytes and expires a confirmed stale session on a non-JSON 401', async () => {
+    const expired = vi.fn()
+    setSessionExpiryHandler(expired)
+    setCsrfToken('current')
+    const fetcher = vi.fn().mockResolvedValueOnce(new Response('expired', { status: 401 }))
+      .mockResolvedValueOnce(new Response(null, { status: 401 }))
+    vi.stubGlobal('fetch', fetcher)
+    const file = new File(['bytes'], 'source.txt')
+    await expect(request('/me/attachments', 'POST', file, undefined, 60000, { 'X-Upload-Batch': 'batch' }))
+      .rejects.toMatchObject({ status: 401 })
+    const options = fetcher.mock.calls[0][1]
+    expect(options.body).toBe(file)
+    expect(options.headers.get('Content-Type')).toBe('application/octet-stream')
+    expect(options.headers.get('X-Upload-Batch')).toBe('batch')
+    expect(options.headers.get('X-CSRF-Token')).toBe('current')
+    expect(expired).toHaveBeenCalledOnce()
   })
   it('keeps multipart boundaries for uploads', async () => {
     const fetcher = vi.fn().mockResolvedValue(new Response('{}'))
@@ -90,6 +107,7 @@ describe('durable streamed generation', () => {
     const fetcher = vi.fn().mockResolvedValueOnce(new Response('{"accepted":true}')).mockResolvedValueOnce(new Response(frames))
     vi.stubGlobal('fetch', fetcher)
     const result = await submitAndObserve({ request_id: 'streamed', conversation_id: 'c1', message: '问题', personal: true, channel: 'assistant', attachment_ids: [] }, value => values.push(value.reply), new AbortController().signal)
+    expect(new Headers(fetcher.mock.calls[1]?.[1].headers).get('X-Avatar-Stream')).toBe('snapshots')
     expect(values).toEqual(['部分', '完整回答'])
     expect(result.reply).toBe('完整回答')
     expect(fetcher.mock.calls.map(call => JSON.parse((call[1] as RequestInit).body as string).request_id)).toEqual(['streamed', 'streamed'])

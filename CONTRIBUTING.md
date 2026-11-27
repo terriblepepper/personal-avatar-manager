@@ -46,7 +46,7 @@ fix(conversation): 终态事务内释放会话租约
 uv sync --locked          # 严格按 uv.lock 安装，含 dev 组
 # 预先创建专用库，授予测试角色创建 schema 的权限
 export TEST_POSTGRES_URL=postgresql:///avatar_test
-.venv/bin/python scripts/run_tests.py --jobs 4 unit -q
+.venv/bin/python scripts/run_tests.py --jobs 4 all -q
 ```
 
 - Python 3.12 / 3.13（推荐 3.13，暂不支持 3.14）。
@@ -59,8 +59,8 @@ export TEST_POSTGRES_URL=postgresql:///avatar_test
 ```bash
 uv sync --locked
 export TEST_POSTGRES_URL=postgresql:///avatar_test
-.venv/bin/python scripts/run_tests.py --jobs 4 unit -q
-.venv/bin/python scripts/run_tests.py unit --collect-only -q
+.venv/bin/python scripts/run_tests.py --jobs 4 all -q
+.venv/bin/python scripts/run_tests.py all --collect-only -q
 ```
 
 1. 测试全绿，且新增行为有对应回归用例（先写失败用例，再实现修复）。
@@ -92,3 +92,5 @@ export TEST_POSTGRES_URL=postgresql:///avatar_test
 - `dist/` 本身不入库（见 `.gitignore`），三个产物一律挂到 **GitHub Release** 对应 tag 下，Release 是唯一的对外分发处。
 - 发布顺序：合并发布 PR → 在 `main` 上打 tag 并推送 → 本地执行 `scripts/build_release.py` → 将三个产物上传到该 tag 的草稿 Release → 回读校验后公开发布。发布凭据仅用于操作进程，不写入仓库、打包产物或日志。
 - 部署前按 [docs/操作手册.md](docs/操作手册.md) 在停写窗口成套备份 PostgreSQL、私有文件和 `.env`；回退恢复匹配版本及同批快照。
+
+后端测试运行器默认使用 `all` 全量模式。`unit` 选择无需 PostgreSQL fixture 的用例，`quick` 运行发布冒烟用例。两种模式均接受 pytest 的路径及筛选参数。

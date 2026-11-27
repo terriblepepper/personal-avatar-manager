@@ -5,13 +5,13 @@ from avatar.api.dependencies import admin
 from avatar.core.execution import finish_on_cancel
 from avatar.core.resource_budget import ResourcePolicy
 from avatar.core.resource_limits import ServiceLimits
+from avatar.core.performance import snapshot
 
 router=APIRouter(prefix='/api/admin/rag-resources',tags=['资源预算'])
 
 
 @router.get('')
 def status(request:Request,user=Depends(admin)):
-    from avatar.core.performance import snapshot
     state = request.app.state
     return {**state.rag_resources.status(), 'performance': snapshot(),
             'rag_cache': state.chat.rag.store.cache_stats(), 'dispatch': dict(state.changes.health)}

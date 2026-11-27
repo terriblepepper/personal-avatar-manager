@@ -16,7 +16,7 @@ from avatar.protocols.identity.atr_config import read_atr_config
 from avatar.protocols.identity.system import private_directory,create_identity_json,system_identity_paths
 from avatar.protocols.identity.document import wit_candidate_config,sync_component_acs
 from avatar.protocols.registration.system import plain_json,publish_identity_document
-from avatar.protocols.transport.endpoints import entity_connection,entity_endpoint,entity_oidc_identity
+from avatar.protocols.transport.endpoints import entity_endpoint,entity_oidc_identity
 from avatar.contracts.profile_fields import public_profile
 
 
@@ -92,13 +92,14 @@ def require_profile(profile):
         if not public.get(key):raise HTTPException(422,'实体注册所需的'+label+'必须设置为公开')
 
 
-def direct_candidate(settings,user_id,profile,stored):
+def direct_candidate(settings,user_id,profile,stored,*,database):
     require_profile(profile)
     content=personal_input(stored,profile)
     if content.errors():raise RegistrationFailure('ACS 技能配置不完整：'+'；'.join(content.errors()))
-    with entity_connection(settings, write=True) as db:
+    with database.connect(write=True) as db:
         base = public_base_url(db)
         endpoint = entity_endpoint(settings, user_id, db=db)
+        identity = entity_oidc_identity(settings, user_id, db=db) if endpoint else None
     if not endpoint:raise RegistrationFailure('个人实体通信端点尚未启用')
     content=content.model_copy(update={'icon_url':content.icon_url or base.rstrip('/')+'/static/system-avatar.svg','documentation_url':content.documentation_url or base.rstrip('/')+'/api/docs','provider':content.provider.model_copy(update={'url':content.provider.url or base})})
     doc=build_acs(content,user_id,base)
@@ -109,7 +110,7 @@ def direct_candidate(settings,user_id,profile,stored):
     ipaddress.ip_address(host)
     doc.update(lastModifiedTime=REGISTRATION_CANDIDATE_LAST_MODIFIED_TIME,endPoints=[endpoint])
     doc['certificate']['altNames']={'dns':[],'ip':[host]}
-    doc['entityMeta'].update(environment='1.0.0',registrationMode='direct',**entity_oidc_identity(settings,user_id))
+    doc['entityMeta'].update(environment='1.0.0',registrationMode='direct',**identity)
     validate_registration_candidate_acs(doc)
     return doc
 
@@ -123,7 +124,8 @@ class DirectRegistrationRunner(EntityRegistrationRunner):
         if not source.is_file():raise RegistrationFailure('缺少 Registry 和 CA 连接配置')
         infrastructure=read_atr_config(source,settings.registry_username,settings.registry_password)
         for directory in (paths.root.parent,paths.root,paths.certificates):private_directory(directory)
-        candidate=direct_candidate(settings,user_id,profile,stored or {})
+        from avatar.core.execution import run_blocking
+        candidate=await run_blocking(direct_candidate,settings,user_id,profile,stored or {},database=self.database)
         if paths.acs.is_file() and not (stored or {}).get('template_owner'):
             from avatar.protocols.identity.document import identity_json
             saved = identity_json(paths.acs)
@@ -194,7 +196,7 @@ class DirectRegistrationRunner(EntityRegistrationRunner):
 
 class DirectRegistrationProvider:
     mode='acps-direct'
-    def __init__(self,settings):self.runner=DirectRegistrationRunner(settings)
+    def __init__(self,settings,database):self.runner=DirectRegistrationRunner(settings,database)
 
     # 职责：为首次审核通过的用户注册身份，已有用户只更新业务资料。
     # 输入：user_id 稳定不变，profile 为已审核公开/私密资料快照，previous 为原分身。

@@ -3,12 +3,8 @@ import asyncio
 import base64
 import hashlib
 import json
-import sqlite3
 from pathlib import Path
 
-import lancedb
-import psycopg
-import pyarrow as pa
 import pytest
 from everos.core.persistence import MemoryRoot
 from tools.everos import worker
@@ -255,6 +251,12 @@ def test_compile_verifies_effective_seed_and_model_for_both_caches(tmp_path, mon
     monkeypatch.setattr(bridge,'request',request)
     def compile(model):
         return asyncio.run(bridge.compile(row,{'model':model},'test',{'fact':'synthetic'},worker=runner))
+    connect=database.connect
+    def off_loop(*args,**kwargs):
+        try:asyncio.get_running_loop()
+        except RuntimeError:return connect(*args,**kwargs)
+        raise AssertionError('Soul compile accessed DB on the event loop')
+    monkeypatch.setattr(database,'connect',off_loop)
     first=compile('a')
     assert calls[0][0]['source_project']==''
     row.update(memory_fingerprint=calls[0][1],memory_context=first)
@@ -267,13 +269,20 @@ def test_compile_verifies_effective_seed_and_model_for_both_caches(tmp_path, mon
         compile('a')
 
 
-def test_postgres_bridge_scope_and_vector_round_trip(pg_database):
+def test_postgres_bridge_scope_and_vector_round_trip(pg_database,monkeypatch):
     from types import SimpleNamespace
     from avatar.knowledge.everos_memory import EverOSMemory
     bridge=EverOSMemory(SimpleNamespace(database=pg_database))
-    owner,_=bridge.scope('owner')
+    transactions=[]
+    connect=pg_database.connect
+    def tracked(write=False, *, account_scope=None):
+        transactions.append((write,account_scope))
+        return connect(write=write,account_scope=account_scope)
+    monkeypatch.setattr(pg_database,'connect',tracked)
+    owner='owner'
     index='3'*24
     project='build-'+'4'*32
+    assert bridge.postgres(owner,{'operation':'ensure','project':project,'index_signature':index})=={'ready':True}
     assert bridge.postgres(owner,{'operation':'ensure','project':project,'index_signature':index})=={'ready':True}
     bridge.postgres(owner,{'operation':'vector_begin','project':project,'index_signature':index,'generation':'5'*32})
     bridge.postgres(owner,{'operation':'vector_chunk','project':project,'index_signature':index,'generation':'5'*32,
@@ -281,6 +290,7 @@ def test_postgres_bridge_scope_and_vector_round_trip(pg_database):
     assert bridge.postgres(owner,{'operation':'vector_commit','project':project,'index_signature':index,'generation':'5'*32})=={'committed':1}
     found=bridge.postgres(owner,{'operation':'search','project':project,'index_signature':index,'query':'C','method':'hybrid','embedding':[1.0,0.0]})
     assert found['rows'][0]['record_id']=='one'
+    assert transactions==[(True,None)]+[(True,owner)]*3+[(False,None)]
 
 
 # PostgreSQL-only EverOS queue, real[] vectors, and scope isolation
@@ -423,6 +433,14 @@ def test_copy_vectors_preserves_history_for_new_project(pg_connection):
     assert everos_storage.copy_vectors(pg_connection,(owner,index),source,target)==1
     copied=everos_storage.existing_vectors(pg_connection,(owner,index),target)[0]
     assert copied['embedding']==[1.0,2.0] and copied['subject_embedding']==[2.0,1.0] and copied['record_id']==owner+'_ep_1'
+    assert copied['group_name']=='daily'
+    assert everos_storage.copy_vectors(pg_connection,(owner,index),source,target)==1
+    rows=[{**record,'record_id':f'v-{n:03}','embedding':[1.0,0.0],'subject_embedding':None} for n in range(65)]
+    rows.extend([{**record,'record_id':'z-best','embedding':[0.0,1.0],'subject_embedding':None},
+                 {**record,'record_id':'wrong-dim','embedding':[1.0],'subject_embedding':None}])
+    everos_storage.upsert_file_vectors(pg_connection,(owner,index),target,'episodes/a.md',rows)
+    results=everos_storage.search_vectors(pg_connection,(owner,index),target,'',method='vector',embedding=[0,1],limit=3)
+    assert [row['record_id'] for row in results]==['z-best','v-000','v-001']
 
 
 def test_keyword_works_without_embeddings_and_hybrid_uses_dense_history(pg_connection):
@@ -621,122 +639,56 @@ def test_parent_request_hashes_raw_user_id_before_pg_scope(pg_database,tmp_path)
         assert db.execute("SELECT memory_fingerprint FROM soul_builds WHERE id='parent-request'").fetchone()[0]=='synthetic-fingerprint'
 
 
-# Synthetic legacy SQLite/Lance snapshots against isolated PostgreSQL schemas
+def test_cancel_during_claim_drains_transaction_and_recovers_job(monkeypatch):
+    import threading
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from avatar.knowledge.build_worker import SoulBuildWorker
 
-IMPORT_OWNER = hashlib.sha256(b'test-owner').hexdigest()
-SIGNATURE = 'a' * 24
-
-
-def snapshot(root, *, owner=IMPORT_OWNER, record_id=None):
-    base = root / '.index' / SIGNATURE
-    sqlite = base / 'sqlite' / 'system.db'
-    sqlite.parent.mkdir(parents=True)
-    source_path = f'avatar-soul/{PROJECT}/users/{owner}/episodes/episode-day.md'
-    with sqlite3.connect(sqlite) as db:
-        db.execute("""CREATE TABLE md_change_state(md_path TEXT PRIMARY KEY, kind TEXT, change_type TEXT,
-                      lsn INTEGER, mtime REAL, status TEXT, retryable INTEGER, retry_count INTEGER,
-                      error TEXT, first_seen_at TEXT)""")
-        db.execute("INSERT INTO md_change_state VALUES(?, 'episode','added',4,2.5,'processing',1,2,'old','2001')", (source_path,))
-        db.execute('CREATE TABLE memcell(id TEXT PRIMARY KEY, legacy BLOB)')
-        db.execute("INSERT INTO memcell VALUES('legacy', X'00FF')")
-    lance = lancedb.connect(base / 'lancedb')
-    lance.create_table('episode', data=[dict(app_id='avatar-soul', project_id=PROJECT, owner_id=owner,
-        owner_type='user', id=record_id or owner+'_e1', entry_id='e1', md_path=source_path, subject='Title',
-        summary='summary', episode='body', content_sha256='d'*64, vector=[1., 0.],
-        subject_vector=[0., 1.], episode_tokens='original terms')])
-    lance.create_table('user_profile', data=[dict(app_id='avatar-soul',project_id=PROJECT,owner_id=owner,
-        owner_type='user',id=owner,md_path=source_path.split('/episodes/')[0]+'/user.md',summary='profile',
-        explicit_info_json='[]',implicit_traits_json='[{"traits":{"voice":"warm"}}]',profile_timestamp_ms=15,content_sha256='e'*64)])
-    lance.create_table('atomic_fact', data=[dict(app_id='avatar-soul',project_id=PROJECT,owner_id=owner,id='f',fact='preserve')])
-    return root
-
-
-def test_legacy_everos_roundtrip_and_replay(postgres_url, tmp_path):
-    from scripts.migrate_local_stores import import_everos_snapshot
-    root = snapshot(tmp_path / 'everos')
-    with psycopg.connect(postgres_url) as db:
-        counts = import_everos_snapshot(db, 'test-owner', root)
-        assert counts['indexes'] == 1 and counts['queue_rows'] == 1 and counts['vector_rows'] == 2
-        q=db.execute('SELECT owner_hash,index_signature,project_id,md_path,status,lsn,retryable,retry_count FROM everos_queue').fetchone()
-        assert q == (IMPORT_OWNER, SIGNATURE, PROJECT, 'episodes/episode-day.md', 'pending', 4, True, 2)
-        rows=db.execute('SELECT record_id,content,embedding,subject_embedding,metadata FROM everos_vectors ORDER BY kind').fetchall()
-        assert rows[0][:4] == (IMPORT_OWNER+'_e1','body',[1.,0.],[0.,1.])
-        assert rows[1][0] == IMPORT_OWNER and rows[1][4]['profile_data']['profile_timestamp_ms'] == 15
-        assert rows[1][4]['profile_data']['implicit_traits'][0]['traits']['voice'] == 'warm'
-        # Replaying a completed source must preserve newer runtime work.
-        db.execute("UPDATE everos_queue SET status='done'")
-        assert import_everos_snapshot(db, 'test-owner', root) == counts
-        assert db.execute('SELECT status FROM everos_queue').fetchone()[0] == 'done'
-        assert counts['legacy_rows'] == 5
-        rowid, fields, ddl = db.execute(
-            "SELECT source_row_id,row_data,source_schema FROM everos_archive_rows WHERE source_table='memcell'"
-        ).fetchone()
-        assert rowid == 'system.db:rowid:1'
-        assert base64.b64decode(fields['legacy']['$sqlite_blob']) == b'\x00\xff'
-        def payload(kind, record_id):
-            return db.execute('SELECT payload FROM everos_archive_blobs WHERE kind=%s AND record_id=%s',
-                              (kind,record_id)).fetchone()[0]
-        assert ['table','memcell',ddl] in json.loads(payload('sqlite_schema','system.db'))
-        for name, field, expected in (('atomic_fact','fact','preserve'),('episode','vector',[1.,0.])):
-            schema = pa.ipc.read_schema(pa.BufferReader(payload('arrow_schema',name)))
-            batch = pa.ipc.read_record_batch(pa.BufferReader(payload('arrow_batch',name+':0')),schema)
-            assert batch.to_pylist()[0][field] == expected
-        with sqlite3.connect(root / '.index' / SIGNATURE / 'sqlite' / 'system.db') as db_source:
-            db_source.execute("UPDATE memcell SET legacy=X'01'")
-        with pytest.raises(ValueError, match='different EverOS snapshot'):
-            import_everos_snapshot(db, 'test-owner', root)
-        assert db.execute('SELECT status FROM everos_queue').fetchone()[0] == 'done'
-        db.rollback()
-        assert db.execute("SELECT to_regclass('everos_vectors')").fetchone()[0] is None
+    runner=SoulBuildWorker(SimpleNamespace(database=None,chat=None,memory=None,learning=None,file=None,decode=None))
+    row={'id':'job','user_id':'owner'}
+    failure=Mock()
+    monkeypatch.setattr(runner,'_fail',failure)
+    async def cancel():
+        loop=asyncio.get_running_loop()
+        started=asyncio.Event()
+        release=threading.Event()
+        def claim(identifier,owner):
+            loop.call_soon_threadsafe(started.set)
+            assert release.wait(3)
+            return row,None,None
+        monkeypatch.setattr(runner,'_claim',claim)
+        job=asyncio.create_task(runner.once('job',user_id='owner'))
+        try:
+            await asyncio.wait_for(started.wait(),2)
+            job.cancel()
+            await asyncio.sleep(0)
+            assert not job.done()
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):await job
+        failure.assert_called_once_with(row,'构建中断','构建中断；未自动重试收费请求')
+    asyncio.run(cancel())
 
 
-def test_mismatched_owner_or_unsafe_snapshot_leaves_target_unchanged(postgres_url, tmp_path):
-    from scripts.migrate_local_stores import import_everos_snapshot
-    root = snapshot(tmp_path / 'foreign', owner='0'*64)
-    with psycopg.connect(postgres_url) as db:
-        with pytest.raises(ValueError):
-            import_everos_snapshot(db, 'test-owner', root)
-        assert db.execute("SELECT to_regclass('everos_vectors')").fetchone()[0] is None
-        bad = root / '.index' / SIGNATURE / 'unexpected-link'
-        bad.symlink_to(tmp_path)
-        with pytest.raises(ValueError, match='symlink'):
-            import_everos_snapshot(db, 'test-owner', root)
+def test_legacy_soul_visual_refresh_reads_owned_word_derivative(tmp_path):
+    from types import SimpleNamespace
+    from PIL import Image
+    from avatar.core.execution import run_blocking
+    from avatar.knowledge.model_refresh import has_visual_input
 
-
-
-def test_mismatched_project_record_key_and_queue_path_rejected(postgres_url, tmp_path):
-    from scripts.migrate_local_stores import import_everos_snapshot
-    root = snapshot(tmp_path / 'malformed', record_id='another-owner_e1')
-    with psycopg.connect(postgres_url) as db:
-        with pytest.raises(ValueError, match='record ID'):
-            import_everos_snapshot(db, 'test-owner', root)
-        assert db.execute("SELECT to_regclass('everos_vectors')").fetchone()[0] is None
-        with sqlite3.connect(root / '.index' / SIGNATURE / 'sqlite' / 'system.db') as source:
-            source.execute("UPDATE md_change_state SET md_path=replace(md_path,'/episodes/episode-day.md','/user.md')")
-        with pytest.raises(ValueError, match='Markdown path'):
-            import_everos_snapshot(db, 'test-owner', root)
-        assert db.execute("SELECT to_regclass('everos_queue')").fetchone()[0] is None
-
-
-def test_local_store_import_can_overlap_schema_initialization(tmp_path, postgres_url, postgres_schema):
-    from psycopg.conninfo import conninfo_to_dict, make_conninfo
-    from avatar.core.postgres import SCHEMA_LOCK, lock_schema_transaction
-    from avatar.runtime.schema import install_schema
-    from scripts.migrate_local_stores import migrate
-
-    root = tmp_path / 'snapshot'
-    snapshot(root / 'users' / 'test-owner' / 'everos')
-    with psycopg.connect(postgres_url) as target:
-        install_schema(target)
-        target.execute("INSERT INTO users(id,username,password,role,created_at) VALUES('test-owner','owner','x','user','2026')")
-
-    options = conninfo_to_dict(postgres_url)['options'] + ' -clock_timeout=3s'
-    with postgres_schema() as other_url, psycopg.connect(other_url) as startup:
-        lock_schema_transaction(startup, SCHEMA_LOCK)
-        install_schema(startup)
-        # Startup still owns its DDL locks while the importer opens a separate session.
-        report = migrate(root, make_conninfo(postgres_url, options=options))
-        assert report['everos']['legacy_rows'] == 5
+    path=tmp_path/'original.blob'
+    path.write_bytes(b'word original')
+    Image.new('RGB',(20,20),'white').save(path.with_suffix('.word-vector.pdf'))
+    async def execute(user,stage,call,*args):
+        return await run_blocking(call,*args)
+    asset={'filename':'document.docx','mime':'application/vnd.openxmlformats-officedocument.wordprocessingml.document'}
+    def owned_file(user,identifier):
+        assert (user,identifier)==('owner','original')
+        return path,asset
+    service=SimpleNamespace(asset=lambda *args:asset,file=owned_file,
+                            chat=SimpleNamespace(rag=SimpleNamespace(work=SimpleNamespace(execute=execute))))
+    assert asyncio.run(has_visual_input(service,{'user_id':'owner','asset_ids':['original'],'notes':[]}))
 
 
 @pytest.mark.parametrize('operation', ('learn', 'build', 'sync', 'visual_refresh', 'unexpected_error'))
@@ -818,7 +770,20 @@ def test_soul_worker_uses_real_workspace_and_everos(context, monkeypatch, caplog
             identifier = model_refresh.schedule(db, uid, visual=True)
             assert identifier
 
+    # Only the loop running the worker is checked; TestClient owns a separate thread.
+    import threading
+    worker_thread=threading.get_ident()
+    connect=database.connect
+    def off_loop(*args,**kwargs):
+        if threading.get_ident()==worker_thread:
+            try:asyncio.get_running_loop()
+            except RuntimeError:pass
+            else:raise AssertionError('Soul worker opened a DB connection on its event loop')
+        return connect(*args,**kwargs)
+    monkeypatch.setattr(database,'connect',off_loop)
+
     if operation == 'sync':
+        assert [r['user_id'] for r in runner._pending('[]',10)]==[uid]
         assert not asyncio.run(runner.once('unrelated'))
         with database.connect() as db:
             assert db.execute('SELECT count(*) FROM knowledge_asset_updates WHERE user_id=?', (uid,)).fetchone()[0] == 0

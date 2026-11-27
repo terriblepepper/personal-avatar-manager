@@ -3,6 +3,7 @@ import asyncio
 import json
 import math
 import httpx
+from avatar.models.model_network import pinned_request_url
 from fastapi import HTTPException
 from avatar.models.diagnostics import contextual, transport_failure
 from pydantic import BaseModel,ConfigDict,Field,SecretStr,field_validator
@@ -46,7 +47,8 @@ class EmbeddingSettings:
 
     @staticmethod
     def configured(db,user_id):
-        return bool(EmbeddingSettings.current(db,user_id).get('encrypted_key'))
+        row = db.execute("SELECT NULLIF(config::jsonb->>'encrypted_key', '') IS NOT NULL FROM embedding_settings WHERE user_id=?", (user_id,)).fetchone()
+        return bool(row and row[0])
 
     def get(self,user_id):
         with self.database.connect() as db:
@@ -132,7 +134,7 @@ async def _embed_once(client,config,key,texts):
     client.validate_endpoint(url)
     try:
         async with asyncio.timeout(120),client.session(url, 90) as (addresses, session):
-            async with session.stream('POST',url.copy_with(host=addresses[0]),headers={'Host':url.netloc.decode(),'Authorization':'Bearer '+key},json={'model':config['model'],'input':texts,'encoding_format':'float'},extensions={'sni_hostname':url.host}) as response:
+            async with session.stream('POST',pinned_request_url(url, addresses),headers={'Host':url.netloc.decode(),'Authorization':'Bearer '+key},json={'model':config['model'],'input':texts,'encoding_format':'float'},extensions={'sni_hostname':url.host}) as response:
                 from avatar.models.diagnostics import check_response
                 await check_response(response,key)
                 payload=bytearray()

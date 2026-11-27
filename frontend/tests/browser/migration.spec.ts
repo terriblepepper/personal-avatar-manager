@@ -34,7 +34,7 @@ test('profile saves and submits, uploaded files appear and preview', async ({pag
   await page.getByRole('dialog').getByRole('button', {name:'关闭预览'}).click()
 })
 
-test('model configuration, skill installation, deep links and mobile viewport', async ({page}) => {
+test('model configuration, paused skills, deep links and mobile viewport', async ({page}) => {
   await loginUser(page);await page.goto('/models')
   await expect(page.getByRole('button',{name:'保存模型配置'})).toBeVisible()
   await expect(page.getByRole('textbox',{name:'模型 ID'}).first()).toHaveValue('test-model')
@@ -45,12 +45,10 @@ test('model configuration, skill installation, deep links and mobile viewport', 
   const saveButton = await saved.getByRole('button').boundingBox(), time = await saved.getByRole('status').boundingBox()
   expect(time!.x - (saveButton!.x + saveButton!.width)).toBeGreaterThan(6)
   await page.goto('/skills')
-  await page.locator('input[type=file]').setInputFiles({name:'SKILL.md',mimeType:'text/markdown',buffer:Buffer.from('---\nname: browser-skill\ndescription: 浏览器技能\n---\n请整理测试内容。')})
-  await page.getByRole('button',{name:'安装技能',exact:true}).click()
-  await expect(page.getByText('$browser-skill')).toBeVisible({timeout:20_000})
-  const card = page.locator('.skill-item').filter({hasText:'$browser-skill'})
-  const checkbox = await card.getByRole('checkbox').boundingBox(), title = await card.locator('strong').first().boundingBox()
-  expect(Math.abs(checkbox!.y + checkbox!.height/2 - title!.y - title!.height/2)).toBeLessThan(4)
+  await expect(page.getByRole('heading', {name:'分身技能'})).toBeVisible()
+  await expect(page.getByText('因安全问题暂时停止分身技能的使用', {exact:true})).toBeVisible()
+  await expect(page.locator('input[type=file]')).toHaveCount(0)
+  await expect(page.getByRole('button', {name:'安装技能'})).toHaveCount(0)
   for(const [path,heading] of [['/account','账户设置'],['/history','申请记录'],['/knowledge','Soul'],['/dialogues','我的分身'],['/messages','最近动态']] as const){
     await page.goto(path);await expect(page.getByRole('heading',{name:new RegExp(heading)}).first()).toBeVisible();await page.reload();await expect(page.locator('.shell')).toBeVisible()
   }

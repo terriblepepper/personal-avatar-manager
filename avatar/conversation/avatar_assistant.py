@@ -1,5 +1,6 @@
 # 模块说明：公开目录与旧助手子会话存储；内部旧名称用于兼容历史子会话，与真实叮当平台通信分离。
 """Public directory search and legacy child-session storage; model tools choose intent."""
+from contextlib import nullcontext
 import json
 import re
 import unicodedata
@@ -47,8 +48,8 @@ class AvatarAssistantRouter:
     # 职责：生成当前可调度分身及其公开别名集合。
     # 输入：从 agents 与已激活 users 查询，使用 public_profile 过滤身份资料。
     # 结果与约束：返回含 AIC、显示名、规范化别名及内部行的目标列表；无公开名称的目标不参与名称调度。
-    def catalog(self):
-        with self.database.connect() as db:
+    def catalog(self, db=None):
+        with (nullcontext(db) if db is not None else self.database.connect()) as db:
             rows=db.execute("SELECT a.* FROM avatar_records a JOIN users u ON u.id=a.user_id WHERE u.account_status='active' ORDER BY a.aic").fetchall()
         result=[]
         for row in rows:

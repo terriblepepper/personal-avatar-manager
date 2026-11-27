@@ -20,9 +20,10 @@ from pydantic import ValidationError
 
 def create_admin(database, credentials):
     user_id = str(uuid.uuid4())
+    password_hash = hash_password(credentials.password)
     with database.connect(write=True) as db:
         db.execute("INSERT INTO users(id,username,password,role,created_at) VALUES(?,?,?,?,?)",
-                   (user_id, credentials.username, hash_password(credentials.password), "admin", now()))
+                   (user_id, credentials.username, password_hash, "admin", now()))
         event(db, user_id, "local-operator", "创建管理员账户", credentials.username)
         modified=now()
         db.execute('INSERT INTO profile_records(user_id,draft,last_modified_at,updated_at) VALUES(?,?,?,?)', (user_id,dump({'person_type':'student','student_id':''}),modified,modified))

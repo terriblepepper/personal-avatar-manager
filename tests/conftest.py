@@ -1,5 +1,5 @@
-from avatar.runtime.schema import install_schema
 """所有 pytest 临时数据库和文件位于 data/test，每个用例及整次运行结束后清理。"""
+from avatar.runtime.schema import install_schema
 import sys
 sys.dont_write_bytecode=True
 import os
@@ -20,6 +20,13 @@ def pytest_configure(config):
     config.option.basetemp=str(path/'tmp')
     os.environ['AVATAR_DATA_DIR']=str(path/'default-app')
     signal.signal(signal.SIGTERM,interrupt_test)
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(items):
+    for item in items:
+        if 'postgres_schema' not in item.fixturenames:
+            item.add_marker(pytest.mark.unit)
 
 
 def interrupt_test(signum,frame):

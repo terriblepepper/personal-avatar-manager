@@ -13,19 +13,21 @@ export function notifyError(error: unknown) {
   ElMessage.error(error instanceof Error ? error.message : String(error))
 }
 export async function request<T = unknown>(path: string, method = 'GET', body?: unknown, signal?: AbortSignal,
-    timeoutMs: number | null = method === 'GET' ? 15000 : 60000): Promise<T> {
+    timeoutMs: number | null = method === 'GET' ? 15000 : 60000, extraHeaders?: HeadersInit): Promise<T> {
   const controller = new AbortController()
   const abort = () => controller.abort(signal?.reason)
   if (signal?.aborted) abort()
   else signal?.addEventListener('abort', abort, { once: true })
   const timeout = timeoutMs === null ? undefined : setTimeout(() => controller.abort(new DOMException('请求超时', 'TimeoutError')), timeoutMs)
-  const token = csrfToken, headers = new Headers({ 'X-CSRF-Token': token })
+  const token = csrfToken, headers = new Headers(extraHeaders)
+  headers.set('X-CSRF-Token', token)
   const multipart = body instanceof FormData
-  if (body !== undefined && !multipart) headers.set('Content-Type', 'application/json')
+  const binary = body instanceof Blob
+  if (body !== undefined && !multipart) headers.set('Content-Type', binary ? 'application/octet-stream' : 'application/json')
   try {
     const response = await fetch(path.startsWith('/api/') ? path : '/api' + path, {
       method, credentials: 'same-origin', cache: 'no-store', headers, signal: controller.signal,
-      ...(body !== undefined ? { body: multipart ? body : JSON.stringify(body) } : {}),
+      ...(body !== undefined ? { body: multipart || binary ? body : JSON.stringify(body) } : {}),
     })
     let invalidJSON = false
     const data: unknown = await response.json().catch(() => { invalidJSON = true; return null })

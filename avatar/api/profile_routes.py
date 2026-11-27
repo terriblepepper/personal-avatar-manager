@@ -8,6 +8,8 @@ from typing import Literal
 import avatar.accounts.auth as auth
 from avatar.profiles.schemas import DraftRequest
 from avatar.profiles.schemas import SubmitRequest
+from avatar.contracts.profile_fields import catalog
+from fastapi import HTTPException
 
 
 router = APIRouter()
@@ -18,7 +20,6 @@ router = APIRouter()
 # 结果与约束：返回字段名称、控件、身份范围和默认隐私定义，不返回个人数据。
 @router.get("/profile-fields")
 def profile_fields(user=Depends(auth.current_user)):
-    from avatar.contracts.profile_fields import catalog
     return catalog()
 
 
@@ -72,7 +73,6 @@ def acs_document(request: Request, source: Literal['draft', 'approved'] = 'draft
     result = request.app.state.service.saved_acs(user, source)
     if download:
         if not result['validation']['valid']:
-            from fastapi import HTTPException
             raise HTTPException(422, '；'.join(result['validation']['errors']))
         return Response(json.dumps(result['document'], ensure_ascii=False, indent=2), media_type='application/json',
                         headers={'Content-Disposition': 'attachment; filename="avatar-acs.json"'})

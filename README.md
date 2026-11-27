@@ -70,7 +70,7 @@ agent.install(AvatarPlatformComponent(serve_http=False), required=True)
 | 用户端 | `$AVATAR_PUBLIC_URL/` | 聊天、资料、知识库、技能、模型设置 |
 | 管理端 | `$AVATAR_PUBLIC_URL/admin` | 审核、账户、实体、系统注册 |
 | 健康检查 | `GET /api/health` | 启动脚本用它判断是否就绪 |
-| 接口文档 | `/api/docs`、`/api/openapi.json` | FastAPI 自动生成 |
+| 接口文档 | `/api/docs`、`/api/openapi.json` | 设置 `AVATAR_ENABLE_API_DOCS=1` 并重启后开启 |
 | 管理 RPC | `$AVATAR_SYSTEM_AIP_PUBLIC_URL` | 系统级 AIP，供外部智能体调用 |
 | 个人分身 RPC | `https://<host>:10001..15000/aip/rpc` | 每个分身独占一个端口，路径固定 |
 
@@ -103,7 +103,7 @@ HTTP 中间件会做同源 Origin 校验、按路径的请求体大小限额，�
 
 ## 第三方依赖与许可证
 
-- 根目录的 `wit-3.2.0-*.whl`（按 OS 与架构选用）与 `acps_sdk-2.2.0-*.whl` 通过 `[tool.uv.sources]` 以本地路径安装——**不要**在 `.gitignore` 里用通配 `*.whl` 把它们排除。
+- `vendor/wheels/` 中的 `wit-3.2.0-*.whl`（按 OS 与架构选用）与 `acps_sdk-2.2.0-*.whl` 通过 `[tool.uv.sources]` 以本地路径安装——**不要**在 `.gitignore` 里用通配 `*.whl` 把它们排除。
 - `vendor/EverOS/` 是内嵌的 [EverMind-AI/EverOS](https://github.com/EverMind-AI/EverOS) 1.5.1（Apache-2.0），固定 commit `5b0979b1b7f3a0cbe235756ff098515ec490753e`，作为 uv workspace 成员参与依赖解析；元数据见 `vendor/EverOS/UPSTREAM.json`。
 - `frontend/public/static/vendor/` 存放离线 PDF.js、Mermaid、隔离页使用的 DOMPurify 及许可证。主页面通过 npm 引入 Marked 与 DOMPurify。
 - `psutil`（BSD-3-Clause，PyPI 包）用于检索与索引的资源采样（CPU 亲和性、cgroup、内存）；它是普通 PyPI 依赖，交付 ZIP 的 `dependencies/` 携带 WIT、ACPS、EverOS、Redis 与 Kafka 客户端 wheel。完全离线安装需自备其余依赖，包括 psutil。

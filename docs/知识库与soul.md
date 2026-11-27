@@ -39,7 +39,7 @@ Soul 直接上传总额度 10 GiB；从资料库导入不占此额度，但原�
 `avatar/knowledge/service.py` 管理构建、素材和生效；`style_learning.py` / `style_traits.py` 管理增量与安全风格证据；`everos_memory.py` 管理进程桥和缓存，`everos_storage.py` 管理 PostgreSQL 队列与向量；`question_bank.py` 管理有界、幂等题库导入。
 
 ```bash
-.venv/bin/python scripts/run_tests.py --jobs 4 unit -q
+.venv/bin/python scripts/run_tests.py --jobs 4 all -q
 ```
 
 在同一停写窗口导出 PostgreSQL，并归档保险库主密钥、知识库原件、EverOS 记忆文件、身份材料及私有配置。详见[备份与恢复](PostgreSQL运行.md)。

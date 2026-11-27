@@ -86,7 +86,7 @@ export async function submitAndObserve(body: GenerationRequest, onSnapshot: (val
   try {
     const response = await fetch('/api/chat/stream', {
       method: 'POST', credentials: 'same-origin', signal: stream.signal,
-      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken() }, body: JSON.stringify(body),
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': getCsrfToken(), 'X-Avatar-Stream': 'snapshots' }, body: JSON.stringify(body),
     })
     if (!response.ok || !response.body) throw new Error('流连接暂不可用')
     let latest: GenerationSnapshot | undefined

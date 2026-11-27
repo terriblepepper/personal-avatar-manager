@@ -3,20 +3,18 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
 from avatar.api.file_previews import word_pdf
 from pydantic import BaseModel, ConfigDict, Field
-from starlette.formparsers import MultiPartParser, MultiPartException
-from avatar.accounts.auth import current_user
+from starlette.formparsers import MultiPartException
+from avatar.api.multipart import UploadParser
+from avatar.api.dependencies import owner
 from avatar.knowledge.media import SOUL_FORMATS, supports_asset
 from avatar.files.uploads.batches import batch_id
 from typing import Literal
 import re
 import asyncio
+from avatar.files.uploads.buffer import upload_buffer
+from avatar.knowledge.library import folder, folders, rename
 
 router=APIRouter(prefix='/api/me/knowledge',tags=['知识库与 soul'])
-
-
-def owner(user=Depends(current_user)):
-    if user.get('access_scope','full')!='full':raise HTTPException(403,'知识库仅允许本人完整会话访问')
-    return user
 
 
 class BuildRequest(BaseModel):
@@ -37,45 +35,8 @@ class UnsupportedAsset(MultiPartException):
     pass
 
 
-class AssetUploadParser(MultiPartParser):
-    def __init__(self, headers, stream, file_budget):
-        super().__init__(headers,stream,max_files=1,max_fields=3,max_part_size=65536)
-        self.file_budget = file_budget
-        self.file_bytes = 0
-        self.header_bytes = 0
-
-    def count_header(self,count):
-        self.header_bytes += count
-        if self.header_bytes > 65536:
-            raise MultiPartException('素材表单头部过大')
-
-    def on_header_field(self,data,start,end):
-        self.count_header(end-start)
-        super().on_header_field(data,start,end)
-
-    def on_header_value(self,data,start,end):
-        self.count_header(end-start)
-        super().on_header_value(data,start,end)
-
-    def on_headers_finished(self):
-        super().on_headers_finished()
-        file = self._current_part.file
-        if file is not None:
-            self.file_bytes = 0
-            if not supports_asset(file.filename or ''):
-                raise UnsupportedAsset(SOUL_FORMATS)
-
-    def on_part_data(self,data,start,end):
-        if self._current_part.file is not None:
-            self.file_bytes += end-start
-            if self.file_bytes > self.file_budget:
-                raise MultiPartException('素材超过可用额度')
-        super().on_part_data(data,start,end)
-
-
 @router.post('/assets',status_code=201)
 async def upload(request:Request,user=Depends(owner)):
-    from avatar.files.uploads.buffer import upload_buffer
     knowledge = request.app.state.knowledge
     budget = await asyncio.to_thread(knowledge.upload_budget,user['id'])
     async def limited_stream():
@@ -84,8 +45,12 @@ async def upload(request:Request,user=Depends(owner)):
             total+=len(chunk)
             if total>budget+65536:raise MultiPartException('知识库上传超过大小限制')
             yield chunk
+    def file_limit(filename):
+        if not supports_asset(filename):
+            raise UnsupportedAsset(SOUL_FORMATS)
+        return budget
     try:
-        form = await AssetUploadParser(request.headers,limited_stream(),budget).parse()
+        form = await UploadParser(request.headers, limited_stream(), max_fields=3, file_limit=file_limit).parse()
     except UnsupportedAsset as error:
         raise HTTPException(415,str(error)) from None
     except MultiPartException:
@@ -260,31 +225,26 @@ from avatar.files.library.folders import FolderRequest,FolderRenameRequest,NameR
 
 @router.get('/folders')
 def knowledge_folders(request:Request,user=Depends(owner)):
-    from avatar.knowledge.library import folders
     return folders(request.app.state.knowledge,user['id'])
 
 
 @router.post('/folders',status_code=201)
 def create_folder(body:FolderRequest,request:Request,user=Depends(owner)):
-    from avatar.knowledge.library import folder
     return folder(request.app.state.knowledge,user,body,'create')
 
 
 @router.patch('/folders')
 def edit_folder(body:FolderRenameRequest,request:Request,user=Depends(owner)):
-    from avatar.knowledge.library import folder
     return folder(request.app.state.knowledge,user,body,'edit')
 
 
 @router.delete('/folders')
 def remove_folder(body:FolderRequest,request:Request,user=Depends(owner)):
-    from avatar.knowledge.library import folder
     return folder(request.app.state.knowledge,user,body,'delete')
 
 
 @router.patch('/assets/{identifier}/name')
 def rename_asset(identifier:str,body:NameRequest,request:Request,user=Depends(owner)):
-    from avatar.knowledge.library import rename
     return rename(request.app.state.knowledge,user,identifier,body)
 
 

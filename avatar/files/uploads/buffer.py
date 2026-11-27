@@ -3,6 +3,7 @@ from contextlib import contextmanager
 import hashlib
 import mmap
 import os
+import uuid
 
 
 @contextmanager
@@ -44,6 +45,24 @@ def write_original(path, data, *, extension=None):
 async def upload_work(function,*args,**kwargs):
     from avatar.core.execution import run_blocking
     return await run_blocking(function,*args,**kwargs)
+
+
+@contextmanager
+def staged_removals():
+    """包住数据库事务，在提交后清理原件，回滚时恢复同目录暂存文件。"""
+    originals = []
+    def stage(path):
+        if path.exists():
+            staged = path.with_name('.removed-' + path.stem + '-' + uuid.uuid4().hex)
+            path.replace(staged)
+            originals.append((path, staged))
+    try:
+        yield stage
+    except BaseException:
+        for path, staged in reversed(originals):
+            staged.replace(path)
+        raise
+    clean_removed(originals)
 
 
 def clean_removed(originals):

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, shallowRef, useId, watch } from 'vue'
-import { chatTextFits } from '../../chatTextBudget'
+import { chatTextFits } from '../../utils/chatTextBudget'
 import { ElTooltip } from 'element-plus'
 import { request } from '../../api/client'
 

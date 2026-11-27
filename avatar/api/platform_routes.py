@@ -8,6 +8,7 @@ from typing import Literal
 from wit import __version__ as wit_version
 from fastapi.responses import FileResponse
 import avatar.accounts.auth as auth
+from avatar.core.config import ROOT
 
 
 router = APIRouter()
@@ -30,7 +31,6 @@ def help_document(
     user=Depends(auth.current_user),
 ):
     """仅提供固定的用户帮助文档，不公开目录或接受任意文件路径。"""
-    from avatar.core.config import ROOT
     path = ROOT / 'docs' / document
     headers = None
     if document == '用户操作手册.md':

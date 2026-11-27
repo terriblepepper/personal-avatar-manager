@@ -1,5 +1,6 @@
 # 模块说明：区分模型上下文窗口和输出上限；仅给已核对的模型提供上限，其他模型由用户按供应商声明填写。
 import json
+import httpx
 from fastapi import HTTPException
 from avatar.core.tokens import estimate
 
@@ -60,3 +61,29 @@ def check_context(config,system,history,message):
         error.stop_reason = 'context_overflow'
         raise error
     return window-used
+
+
+def _generates_html(config):
+    return config.get('_call_purpose') == 'html_generation' or any(
+        tool['name'] in ('create_html', 'append_html_draft', 'edit_html') for tool in config.get('_tools') or ())
+
+
+# 按 token 预算分别限制有效内容和 SSE 传输；每个 token 可能单独携带完整的 JSON 事件头。
+def response_limit(config,streaming=False):
+    wire_allowance = min(64*1024*1024,max(8*1024*1024,config['max_tokens']*2048))
+    if _generates_html(config):
+        from avatar.core.artifact_limits import MAX_ENVELOPE_BYTES
+        # HTML is nested inside JSON tool arguments. Escapes and streaming headers do not count toward file size.
+        return MAX_ENVELOPE_BYTES + (wire_allowance if streaming else 0)
+    if streaming:
+        return wire_allowance
+    return min(64*1024*1024,max(2*1024*1024,config['max_tokens']*32))
+
+
+def generation_deadline(config):
+    return 600 if _generates_html(config) else 180
+
+
+def generation_http_timeout(config):
+    read = 600 if _generates_html(config) else 120
+    return httpx.Timeout(120, connect=10, read=read)

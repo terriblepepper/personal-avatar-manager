@@ -6,7 +6,7 @@ from tempfile import TemporaryFile
 
 import pytest
 
-from avatar.core.user_storage import UserBlobs, migrate_user_storage, user_root
+from avatar.core.user_storage import UserBlobs, user_root
 from avatar.files.library.attachments import MAX_STORED_SIZE
 from avatar.files.uploads.buffer import upload_buffer, upload_work
 from avatar.knowledge.media import MAX_ASSET
@@ -284,29 +284,20 @@ def test_agent_rag_stream_reconciles_preview_and_joins_generation(cancel_early):
     asyncio.run(asyncio.wait_for(exercise(), timeout=10))
 
 
-# Owner layout, repeatable migration and containment smoke checks
+# Owner layout and containment smoke checks
 
-def test_owner_originals_migrate_once_and_new_uploads_use_owner(context):
+def test_new_originals_and_uploads_use_owner(context):
     app,client,admin=context
     database=app.state.database
     uid=client.get('/api/auth/me').json()['user']['id']
     blobs=UserBlobs(database,'attachments','attachments')
     path=blobs.new(uid,'example.blob');path.write_bytes(b'original')
     assert path.parent==database.data_dir/'users'/uid/'attachments'
-    legacy=database.data_dir/'everos'/hashlib.sha256(uid.encode()).hexdigest()
-    legacy.mkdir(parents=True);(legacy/'memory.txt').write_text('retained')
     response=client.post('/api/me/attachments',content=b'kept original',headers={'X-Attachment-Filename':'kept.txt'})
     assert response.status_code==201,response.text
     item=response.json();original=blobs/(item['id']+'.blob')
-    old=database.data_dir/'attachments';old.mkdir()
-    original.rename(old/original.name)
-    migrate_user_storage(database);migrate_user_storage(database)
-    assert client.get(item['download_url']).content==b'kept original'
-    assert (user_root(database.data_dir,uid)/'everos/memory.txt').read_text()=='retained'
-    assert path.read_bytes()==b'original' and not legacy.exists()
-    from avatar.skills.service import UserSkills
-    assert UserSkills(database).folder(uid,create=True)==user_root(database.data_dir,uid)/'skills'
-    assert not (user_root(database.data_dir,uid)/'file_rag'/'chroma.sqlite3').exists()
+    assert original.parent == path.parent and client.get(item['download_url']).content == b'kept original'
+    assert path.read_bytes() == b'original'
 
     with pytest.raises(ValueError):user_root(database.data_dir,'../other')
     with pytest.raises(ValueError):blobs/'../private'
@@ -318,3 +309,85 @@ def test_symlink_owner_is_rejected(context):
     (base/'users').mkdir(exist_ok=True)
     (base/'users'/'linked').symlink_to(base,target_is_directory=True)
     with pytest.raises(ValueError):user_root(base,'linked')
+
+
+def test_snapshot_attachments_batch_respects_owner_and_preserves_reference_order(context):
+    import json
+    from avatar.core.db import dump, now
+    app, user, admin = context
+    uid = user.get('/api/auth/me').json()['user']['id']
+    rows = [upload(user, name) for name in ('a.txt','b.txt','c.txt')]
+    foreign = upload(admin, 'private.txt')
+    refs = [{'id':row['id'],'caption':str(index)} for index,row in enumerate([*rows,foreign])]
+    snapshot = {'name':'旧资料','attachments':refs}
+    untouched = '{"name": "保留原格式"}'
+    with app.state.database.connect(write=True) as db:
+        db.executemany("""INSERT INTO profile_submissions(id,user_id,last_modified_at,snapshot,status,submitted_at)
+            VALUES(?,?,?,?,'approved',?)""", [(sid,uid,now(),body,now()) for sid,body in
+            [('referenced',dump(snapshot)),('untouched',untouched)]])
+    history = user.get('/api/records/history').json()['items']
+    previous = next(item for item in history if item['id'] == 'referenced')
+    assert [(f['id'],f['caption']) for f in previous['attachments']] == [(r['id'],str(i)) for i,r in enumerate(rows)]
+    assert user.delete('/api/me/attachments/'+rows[1]['id']).status_code == 200
+    with app.state.database.connect() as db:
+        stored = {r['id']:r['snapshot'] for r in db.execute('SELECT id,snapshot FROM profile_submissions WHERE user_id=?',(uid,))}
+    assert stored['untouched'] == untouched
+    assert json.loads(stored['referenced']) == {**snapshot,'attachments':[refs[0],refs[2],refs[3]]}
+
+
+def test_chat_multipart_limits_only_html_before_spooling(monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    import httpx
+    from fastapi import FastAPI
+    from starlette import formparsers
+    from avatar.api import chat_file_routes
+    from avatar.files.uploads import validation
+
+    assert validation.MAX_SOURCE_BYTES == 100 * 1024**2
+    monkeypatch.setattr(validation, 'MAX_SOURCE_BYTES', 32)
+    opened, stored, written = [], [], []
+    original_spool = formparsers.SpooledTemporaryFile
+    def spool(*args, **kwargs):
+        file = original_spool(*args, **kwargs)
+        opened.append(file)
+        written.append(0)
+        write = file.write
+        def measure(chunk):
+            written[-1] += len(chunk)
+            return write(chunk)
+        file.write = measure
+        return file
+    monkeypatch.setattr(formparsers, 'SpooledTemporaryFile', spool)
+
+    async def store(user, conversation, filename, data, **kwargs):
+        stored.append((filename, len(data)))
+        return {'size': len(data)}
+    app = FastAPI()
+    app.include_router(chat_file_routes.router)
+    app.dependency_overrides[chat_file_routes.current_user] = lambda: {'id':'user'}
+    app.state.chat = SimpleNamespace(chat_files=SimpleNamespace(upload=store,
+        session=lambda *args, **kwargs: None, database=SimpleNamespace(connect=nullcontext)))
+
+    async def check():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://unit.invalid') as client:
+            for name, size, status in [('exact.HTML',32,201), ('large.hTm',33,413), ('ordinary.txt',80,201)]:
+                payload = b'x' * size
+                multipart = httpx.Request('POST','http://unit.invalid',files={'file':(name,payload)})
+                raw = multipart.read()
+                start = raw.index(payload)
+                tail_read = False
+                async def chunks():
+                    nonlocal tail_read
+                    yield raw[:start + 32]
+                    yield raw[start + 32:start + size]
+                    tail_read = True
+                    yield raw[start + size:]
+                response = await client.post('/api/conversations/chat/files',content=chunks(),
+                    headers={'content-type':multipart.headers['content-type']})
+                assert response.status_code == status, response.text
+                assert tail_read == (status == 201)
+                assert opened[-1].closed
+                assert written[-1] == (size if status == 201 else 32)
+        assert stored == [('exact.HTML',32), ('ordinary.txt',80)]
+    asyncio.run(check())

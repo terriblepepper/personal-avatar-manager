@@ -2,6 +2,7 @@
 import { computed, defineAsyncComponent, nextTick, onUnmounted, ref, shallowRef, watch } from 'vue'
 import AppDialog from './AppDialog.vue'
 import PreviewZoom from './PreviewZoom.vue'
+import { usePdfDocument, type PDFPage } from '../composables/usePdfDocument'
 import { usePreviewZoom } from '../composables/usePreviewZoom'
 import { marked } from 'marked'
 import { markText, normalize, pdfMatches } from '../utils/previewMatches'
@@ -13,16 +14,12 @@ import { decodePreviewText, previewKind, readPreviewBytes, TEXT_PREVIEW_LIMIT } 
 import MermaidDiagram from './MermaidDiagram.vue'
 
 const HtmlFrame = defineAsyncComponent(() => import('./HtmlFrame.vue'))
-const props = defineProps<{ file: { id: string; filename: string; content_type?: string }; url: string; diagramSvg?: string; initialFullscreen?: boolean }>()
+const props = defineProps < {
+  file: {
+    id: string;filename: string;content_type ? : string
+  };url: string;diagramSvg ? : string;initialFullscreen ? : boolean
+} > ()
 const emit = defineEmits<{ close: [] }>()
-interface PDFPage {
-  getViewport(options: { scale: number }): { width: number; height: number; convertToViewportPoint(x: number, y: number): number[] }
-  render(options: { canvasContext: CanvasRenderingContext2D; viewport: { width: number; height: number } }): { promise: Promise<void>; cancel(): void }
-  getTextContent(): Promise<{ items: unknown[] }>
-}
-interface PDFDocument { numPages: number; getPage(page: number): Promise<PDFPage>; destroy(): Promise<void> }
-interface PDFLibrary { GlobalWorkerOptions: { workerSrc: string }; getDocument(options: Record<string, unknown>): { promise: Promise<PDFDocument>; destroy(): Promise<void> } }
-function isLibrary(value: unknown): value is PDFLibrary { return !!value && typeof value === 'object' && 'getDocument' in value && typeof value.getDocument === 'function' && 'GlobalWorkerOptions' in value }
 const kind = ref(''), text = ref(''), objectURL = ref(''), error = ref(''), loading = ref(false)
 const source = ref(false), page = ref(1), pages = ref(1)
 const search = ref(''), matches = ref<number[] | null>(null), searchMessage = ref('')
@@ -31,17 +28,24 @@ const contents = ref<HTMLDetailsElement>()
 const initiallyOpen = window.innerWidth > 650
 const documentBody = ref<HTMLElement>(), sheet = ref<HTMLElement>()
 const { available, naturalWidth, naturalHeight, scale, percent, fit, setScale, resetZoom } = usePreviewZoom(documentBody, sheet, kind)
+const { pdf, loadPDF, closePDF, readPage } = usePdfDocument()
 const activePage = shallowRef<PDFPage>()
 const paper = computed(() => activePage.value?.getViewport({ scale: 1 }))
 const zoomable = computed(() => ['text', 'image', 'pdf'].includes(kind.value))
 const sheetWidth = computed(() => (naturalWidth.value || available.value) * scale.value)
 const hasSourceView = computed(() => kind.value === 'html' || kind.value === 'text' && !manual.value
   && (['md', 'markdown'].includes(extension.value) || !!structured.value || !!tabular.value.length))
-const canvas = ref<HTMLCanvasElement>(), pdf = shallowRef<PDFDocument>(), controller = shallowRef<AbortController>()
+const canvas = ref<HTMLCanvasElement>(), controller = shallowRef<AbortController>()
 let renderTask: { promise: Promise<void>; cancel(): void } | undefined, renderSequence = 0
 const extension = computed(() => props.file.filename.split('.').pop()?.toLowerCase() || '')
 const safeURL = computed(() => {
-  try { const url = new URL(props.url, location.href); return url.origin === location.origin && url.pathname.startsWith('/api/') && !url.username && !url.password ? url.href : '' } catch { return '' }
+  try {
+    const url = new URL(props.url, location.href);
+    return url.origin === location.origin && url.pathname.startsWith('/api/') && !url.username && !url.password ?
+      url.href : ''
+  } catch {
+    return ''
+  }
 })
 const downloadURL = computed(() => props.diagramSvg ? objectURL.value : safeURL.value)
 const manual = computed(() => !!safeURL.value && new URL(safeURL.value).pathname.startsWith('/api/help/')
@@ -124,7 +128,7 @@ function goToChapter(number: number) {
 function cleanup() {
   clearSearch()
   activePage.value = undefined
-  controller.value?.abort(); renderSequence++; renderTask?.cancel(); void pdf.value?.destroy().catch(() => {}); pdf.value = undefined
+  controller.value?.abort(); renderSequence++; renderTask?.cancel(); closePDF()
   if (objectURL.value) URL.revokeObjectURL(objectURL.value); objectURL.value = ''
 }
 const open = ref(true)
@@ -135,32 +139,56 @@ function imageLoaded(event: Event) {
 }
 
 async function renderPDF() {
-  const ticket = ++renderSequence, previous = renderTask
+  const ticket = ++renderSequence,
+    previous = renderTask
   previous?.cancel()
   if (previous) await previous.promise.catch(() => {})
-  const item = activePage.value, target = canvas.value
+  const item = activePage.value,
+    target = canvas.value
   if (ticket !== renderSequence || !item || !target) return
   try {
-    const display = item.getViewport({ scale: scale.value })
-    if (![display.width, display.height].every(size => Number.isFinite(size) && size > 0)) throw Error('页面尺寸异常，请下载原件查看')
+    const display = item.getViewport({
+      scale: scale.value
+    })
+    if (![display.width, display.height].every(size => Number.isFinite(size) && size > 0)) throw Error(
+      '页面尺寸异常，请下载原件查看')
     // Keep large zoom levels scrollable without allocating an equally large bitmap.
-    const density = Math.min(window.devicePixelRatio || 1, 2, Math.sqrt(4000000 / (display.width * display.height)), 16000 / Math.max(display.width, display.height))
-    const viewport = item.getViewport({ scale: scale.value * density })
+    const density = Math.min(window.devicePixelRatio || 1, 2, Math.sqrt(4000000 / (display.width * display.height)),
+      16000 / Math.max(display.width, display.height))
+    const viewport = item.getViewport({
+      scale: scale.value * density
+    })
     const context = target.getContext('2d')
     if (!context) return
     target.width = Math.max(1, Math.round(viewport.width))
     target.height = Math.max(1, Math.round(viewport.height))
-    renderTask = item.render({ canvasContext: context, viewport })
+    renderTask = item.render({
+      canvasContext: context,
+      viewport
+    })
     await renderTask.promise
-  } catch (e) { if (ticket === renderSequence && e instanceof Error && e.name !== 'RenderingCancelledException') error.value = e.message }
+  } catch (e) {
+    if (ticket === renderSequence && e instanceof Error && e.name !== 'RenderingCancelledException') error.value = e
+      .message
+  }
 }
 async function load() {
-  cleanup(); const active = new AbortController(); controller.value = active
-  loading.value = true; error.value = ''; text.value = ''; page.value = 1; pages.value = 1; source.value = false; resetZoom()
+  cleanup();
+  const active = new AbortController();
+  controller.value = active
+  loading.value = true;
+  error.value = '';
+  text.value = '';
+  page.value = 1;
+  pages.value = 1;
+  source.value = false;
+  resetZoom()
   try {
     if (props.diagramSvg) {
       kind.value = 'image'
-      objectURL.value = URL.createObjectURL(new Blob([props.diagramSvg], { type: 'image/svg+xml' }))
+      objectURL.value = URL.createObjectURL(new Blob([props.diagramSvg], {
+        type: 'image/svg+xml'
+      }))
       return
     }
     if (!safeURL.value) throw Error('只能预览本平台有权访问的文件')
@@ -169,35 +197,44 @@ async function load() {
     if (ext === 'doc' || ext === 'docx') url.searchParams.set('preview_pdf', 'true')
     kind.value = previewKind(ext)
     if (!kind.value) return
-    const limit = kind.value === 'html' ? MAX_HTML_BYTES : ['audio','video'].includes(kind.value) ? 64 * 1024 * 1024 : ['text','mermaid'].includes(kind.value) ? TEXT_PREVIEW_LIMIT : 10 * 1024 * 1024
-    const bytes = await readPreviewBytes(url.href,limit,active.signal)
+    const limit = kind.value === 'html' ? MAX_HTML_BYTES : ['audio', 'video'].includes(kind.value) ? 64 * 1024 *
+      1024 : ['text', 'mermaid'].includes(kind.value) ? TEXT_PREVIEW_LIMIT : 10 * 1024 * 1024
+    const bytes = await readPreviewBytes(url.href, limit, active.signal)
     if (active.signal.aborted) return
-    if (['text','mermaid','html'].includes(kind.value)) {
+    if (['text', 'mermaid', 'html'].includes(kind.value)) {
       text.value = decodePreviewText(bytes)
       if (kind.value === 'text') pages.value = textPages.value.length
     } else if (kind.value === 'pdf') {
-      const moduleURL = '/static/vendor/pdfjs/legacy/build/pdf.mjs', value: unknown = await import(/* @vite-ignore */ moduleURL)
-      if (active.signal.aborted) return
-      if (!isLibrary(value)) throw Error('PDF 组件加载失败')
-      value.GlobalWorkerOptions.workerSrc = '/static/vendor/pdfjs/legacy/build/pdf.worker.mjs'
-      const task = value.getDocument({ data: bytes, cMapUrl: '/static/vendor/pdfjs/cmaps/', cMapPacked: true, standardFontDataUrl: '/static/vendor/pdfjs/standard_fonts/', wasmUrl: '/static/vendor/pdfjs/wasm/', isEvalSupported: false, enableXfa: false, maxImageSize: 16000000, isOffscreenCanvasSupported: false })
-      active.signal.addEventListener('abort', () => { void task.destroy().catch(() => {}) }, { once: true })
-      const document = await task.promise
-      if (active.signal.aborted) { await document.destroy(); return }
-      pdf.value = document; pages.value = document.numPages
+      const document = await loadPDF(bytes, active.signal)
+      if (document) pages.value = document.numPages
     } else {
-      const mime: Record<string,string> = { mp3:'audio/mpeg', wav:'audio/wav', m4a:'audio/mp4', ogg:'audio/ogg', flac:'audio/flac', mp4:'video/mp4', mov:'video/quicktime', webm:'video/webm', png:'image/png', jpg:'image/jpeg', jpeg:'image/jpeg', webp:'image/webp', gif:'image/gif', bmp:'image/bmp' }
-      objectURL.value = URL.createObjectURL(new Blob([bytes], { type: mime[ext] || 'application/octet-stream' }))
+      const mime: Record < string, string > = {
+        mp3: 'audio/mpeg',
+        wav: 'audio/wav',
+        m4a: 'audio/mp4',
+        ogg: 'audio/ogg',
+        flac: 'audio/flac',
+        mp4: 'video/mp4',
+        mov: 'video/quicktime',
+        webm: 'video/webm',
+        png: 'image/png',
+        jpg: 'image/jpeg',
+        jpeg: 'image/jpeg',
+        webp: 'image/webp',
+        gif: 'image/gif',
+        bmp: 'image/bmp'
+      }
+      objectURL.value = URL.createObjectURL(new Blob([bytes], {
+        type: mime[ext] || 'application/octet-stream'
+      }))
     }
-  } catch (e) { if (!active.signal.aborted) error.value = e instanceof Error ? e.message : '预览失败' }
-  finally { if (!active.signal.aborted) loading.value = false }
+  } catch (e) {
+    if (!active.signal.aborted) error.value = e instanceof Error ? e.message : '预览失败'
+  } finally {
+    if (!active.signal.aborted) loading.value = false
+  }
 }
 async function pageText(number: number) {
-  if (pdf.value) {
-    const pdfPage = await pdf.value.getPage(number)
-    const { items } = await pdfPage.getTextContent()
-    return items.map(item => item && typeof item === 'object' && 'str' in item && typeof item.str === 'string' ? item.str : '').join('')
-  }
   if (richText.value) return tabular.value.length
     ? [tabular.value[0], ...tabular.value.slice(1 + (number - 1) * 100, 1 + number * 100)].flat().join(' ')
     : text.value
@@ -214,9 +251,9 @@ async function find(value: string, direction: 1 | -1 = 1) {
     const found: number[] = []
     try {
       for (let number = 1; number <= pages.value; number++) {
-        const content = await pageText(number)
+        const content = pdf.value ? (await readPage(pdf.value, number)).text : normalize(await pageText(number))
         if (ticket !== searchSequence) return
-        if (normalize(content).includes(needle)) found.push(number)
+        if (content.includes(needle)) found.push(number)
       }
     } catch (e) {
       if (ticket === searchSequence) searchMessage.value = '搜索失败：' + (e instanceof Error ? e.message : String(e))
@@ -239,13 +276,13 @@ watch([activePage, matches, page, search, sheet], async ([item, found, number, q
     if (clear) cleanup(clear)
     return
   }
-  if (!item) return
+  if (!item || !pdf.value) return
   let current = true
   cleanup(() => { current = false })
   try {
-    const { items } = await item.getTextContent()
+    const { items, page: matchedPage } = await readPage(pdf.value, number)
     if (!current) return
-    boxes.value = pdfMatches(items, query, item.getViewport({scale:1}))
+    boxes.value = pdfMatches(items, query, matchedPage.getViewport({scale:1}))
     await nextTick()
     if (current) content.querySelector('mark')?.scrollIntoView({block:'center',inline:'nearest'})
   } catch (error) { if (current) searchMessage.value = error instanceof Error ? error.message : '无法标记搜索结果' }
@@ -267,51 +304,76 @@ onUnmounted(cleanup)
 </script>
 <template>
   <AppDialog align-center v-model="open" :title="file.filename" :subtitle="manual ? '帮助文档' : '文件预览'" close-label="关闭预览"
-    width="min(1100px, calc(100vw - 1rem))" class="vue-file-preview" :class="{ 'preview-media-window': ['image','pdf','video','mermaid','html'].includes(kind) && !error }"
+    width="min(1100px, calc(100vw - 1rem))" class="vue-file-preview"
+    :class="{ 'preview-media-window': ['image','pdf','video','mermaid','html'].includes(kind) && !error }"
     :initial-fullscreen="initialFullscreen" @closed="emit('close')">
     <div class="preview-toolbar">
-      <button v-if="hasSourceView" type="button" class="button small" :aria-pressed="source" @click="source = !source">{{ source ? '返回阅读' : '查看源码' }}</button>
-      <a v-if="downloadURL" :href="downloadURL" :download="file.filename" class="button small">{{ diagramSvg ? '下载 SVG' : manual ? '下载手册' : extension === 'mmd' ? '下载源码' : '下载原件' }}</a>
+      <button v-if="hasSourceView" type="button" class="button small" :aria-pressed="source" @click="source = !source">
+        {{ source ? '返回阅读' : '查看源码' }}</button>
+      <a v-if="downloadURL" :href="downloadURL" :download="file.filename" class="button small">
+        {{ diagramSvg ? '下载 SVG' : manual ? '下载手册' : extension === 'mmd' ? '下载源码' : '下载原件' }}</a>
       <span v-if="chapters.length && !loading && !error" aria-label="当前章节">{{ chapters[page - 1]?.title }}</span>
-      <PreviewZoom v-if="zoomable && !loading && !error" :percent="percent" :fit="fit" :fit-label="kind === 'image' ? '适应窗口' : '适应宽度'" @scale="setScale"/>
+      <PreviewZoom v-if="zoomable && !loading && !error" :percent="percent" :fit="fit"
+        :fit-label="kind === 'image' ? '适应窗口' : '适应宽度'" @scale="setScale" />
     </div>
-    <p v-if="loading" role="status">正在读取文件…</p><p v-if="error" role="alert" class="error-text">{{ error }}</p>
+    <p v-if="loading" role="status">正在读取文件…</p>
+    <p v-if="error" role="alert" class="error-text">{{ error }}</p>
     <div class="preview-reader" :class="{ 'manual-layout': chapters.length && !loading && !error }">
-    <div ref="documentBody" class="preview-document overflow-auto" :data-kind="kind" :class="{ 'visual-preview': kind === 'pdf' || kind === 'image' }">
-      <div v-if="zoomable" class="preview-stage"><div ref="sheet" class="preview-sheet" :style="{ width: sheetWidth ? sheetWidth + 'px' : undefined }">
-      <canvas v-if="kind === 'pdf'" ref="canvas" :aria-label="'PDF 第 ' + page + ' 页'"
-        :style="paper ? { aspectRatio: paper.width + '/' + paper.height } : {}"/>
-      <img v-else-if="kind === 'image' && objectURL" :src="objectURL" :alt="file.filename"
-        @load="imageLoaded">
-      <div v-else-if="kind === 'text'" :style="{ zoom: scale }"><DocumentFields v-if="!source && structured" :value="structured.value"/>
-        <table v-else-if="!source && tabular.length" class="preview-data-table">
-          <thead><tr><th v-for="(cell,index) in tabular[0]" :key="index" scope="col">{{ cell }}</th></tr></thead>
-          <tbody><tr v-for="(row,index) in visibleRows" :key="index"><td v-for="(cell,column) in row" :key="column">{{ cell }}</td></tr></tbody>
-        </table>
-        <MarkdownContent v-else-if="!source && ['md','markdown'].includes(extension)" :source="shownText" :manual-pictures="manualPictures"/><pre v-else>{{ shownText }}</pre></div>
-      <mark v-for="(box, index) in boxes" :key="index" class="preview-pdf-match" aria-label="搜索匹配" :style="box"/>
-      </div></div>
-      <template v-else-if="kind === 'html' && !loading && !error">
-        <pre v-if="source" class="html-source">{{ text }}</pre>
-        <HtmlFrame v-else :source="text" :filename="file.filename"/>
-      </template>
-      <MermaidDiagram v-else-if="kind === 'mermaid' && !loading && !error" :source="text" :filename="file.filename" preview-mode/>
-      <audio v-else-if="kind === 'audio' && objectURL" :src="objectURL" :aria-label="file.filename" controls preload="metadata" />
-      <video v-else-if="kind === 'video' && objectURL" :src="objectURL" :aria-label="file.filename" controls preload="metadata" />
-      <p v-else-if="!loading && !error">此格式请下载原件查看。</p>
+      <div ref="documentBody" class="preview-document overflow-auto" :data-kind="kind"
+        :class="{ 'visual-preview': kind === 'pdf' || kind === 'image' }">
+        <div v-if="zoomable" class="preview-stage">
+          <div ref="sheet" class="preview-sheet" :style="{ width: sheetWidth ? sheetWidth + 'px' : undefined }">
+            <canvas v-if="kind === 'pdf'" ref="canvas" :aria-label="'PDF 第 ' + page + ' 页'"
+              :style="paper ? { aspectRatio: paper.width + '/' + paper.height } : {}" />
+            <img v-else-if="kind === 'image' && objectURL" :src="objectURL" :alt="file.filename" @load="imageLoaded">
+            <div v-else-if="kind === 'text'" :style="{ zoom: scale }">
+              <DocumentFields v-if="!source && structured" :value="structured.value" />
+              <table v-else-if="!source && tabular.length" class="preview-data-table">
+                <thead>
+                  <tr>
+                    <th v-for="(cell,index) in tabular[0]" :key="index" scope="col">{{ cell }}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(row,index) in visibleRows" :key="index">
+                    <td v-for="(cell,column) in row" :key="column">{{ cell }}</td>
+                  </tr>
+                </tbody>
+              </table>
+              <MarkdownContent v-else-if="!source && ['md','markdown'].includes(extension)" :source="shownText"
+                :manual-pictures="manualPictures" /><pre v-else>{{ shownText }}</pre>
+            </div>
+            <mark v-for="(box, index) in boxes" :key="index" class="preview-pdf-match" aria-label="搜索匹配" :style="box" />
+          </div>
+        </div>
+        <template v-else-if="kind === 'html' && !loading && !error">
+          <pre v-if="source" class="html-source">{{ text }}</pre>
+          <HtmlFrame v-else :source="text" :filename="file.filename" />
+        </template>
+        <MermaidDiagram v-else-if="kind === 'mermaid' && !loading && !error" :source="text" :filename="file.filename"
+          preview-mode />
+        <audio v-else-if="kind === 'audio' && objectURL" :src="objectURL" :aria-label="file.filename" controls
+          preload="metadata" />
+        <video v-else-if="kind === 'video' && objectURL" :src="objectURL" :aria-label="file.filename" controls
+          preload="metadata" />
+        <p v-else-if="!loading && !error">此格式请下载原件查看。</p>
+      </div>
+      <nav v-if="chapters.length && !loading && !error" class="manual-contents" aria-label="章节目录">
+        <details ref="contents" :open="initiallyOpen">
+          <summary>目录</summary>
+          <button v-for="(chapter, index) in chapters" :key="index" type="button" class="button small"
+            :aria-current="page === index + 1 ? 'page' : undefined" @click="goToChapter(index + 1)">{{ chapter.title }}
+          </button>
+        </details>
+      </nav>
     </div>
-    <nav v-if="chapters.length && !loading && !error" class="manual-contents" aria-label="章节目录">
-      <details ref="contents" :open="initiallyOpen">
-        <summary>目录</summary>
-        <button v-for="(chapter, index) in chapters" :key="index" type="button" class="button small"
-          :aria-current="page === index + 1 ? 'page' : undefined" @click="goToChapter(index + 1)">{{ chapter.title }}</button>
-      </details>
-    </nav>
-    </div>
-    <RecordPagination v-if="!loading && !error && (kind === 'text' || kind === 'pdf')" :offset="page-1" :total="pages" :page-size="1"
-      :search="search" :label="manual ? '章节分页' : '文档分页'" :unit="manual ? '章' : '页'" @update:offset="go($event + 1)" @update:search="find"/>
+    <RecordPagination v-if="!loading && !error && (kind === 'text' || kind === 'pdf')" :offset="page-1" :total="pages"
+      :page-size="1" :search="search" :label="manual ? '章节分页' : '文档分页'" :unit="manual ? '章' : '页'"
+      @update:offset="go($event + 1)" @update:search="find" />
     <div v-if="matches || searchMessage" class="preview-matches">
-      <small role="status">{{ searchMessage || (matches?.length ? matches.length + (manual ? ' 章匹配' : ' 页匹配') + ' · ' + (matches.indexOf(page) + 1) + ' / ' + matches.length : '未找到匹配内容') }}</small>
+      <small role="status">
+        {{ searchMessage || (matches?.length ? matches.length + (manual ? ' 章匹配' : ' 页匹配') + ' · ' + (matches.indexOf(page) + 1) + ' / ' + matches.length : '未找到匹配内容') }}
+      </small>
       <template v-if="matches?.length">
         <button class="button small" type="button" title="Shift+Enter 上一处" @click="find(search, -1)">上一处</button>
         <button class="button small" type="button" title="Enter 下一处" @click="find(search, 1)">下一处</button>

@@ -13,6 +13,42 @@ IO_GROUPS = {'model_io','tool_io'}
 _INDEPENDENT = {'agent_trace','agent_receipt', *IO_GROUPS}
 
 
+_PUBLIC_ACTIONS = frozenset("""find_material send_material search_materials read_material
+    find_public_material send_public_material create_html edit_html append_html_draft
+    list_avatars contact_avatar read_session_file read_step_receipt require_conversation_tool
+    run_python ask_user get_current_time wait_for_user end_task send_message enable_tools""".split())
+
+
+def public_event(event):
+    if event.get('type','tool') != 'tool':
+        return event
+    public={key:event[key] for key in ('type','id','group','name','phase','status','started_at','finished_at')
+            if key in event}
+    if event.get('group') in ('model_io','tool_io'):
+        # Projected at the model boundary according to the executing owner's scope; never include transport fields.
+        for section, fields in (('input', ('message','message_chars','history_turns','tools','tool_count','attempt','tool','arguments')),
+                                ('output', ('text','text_chars','kind','received_bytes','tool_calls','finish_reason','reason','status_code','attempt','result'))):
+            data = event.get(section)
+            if isinstance(data, dict):
+                public[section] = {key:data[key] for key in fields if key in data}
+        return public
+    for section in ('input','output'):
+        data=event.get(section)
+        if not isinstance(data,dict):continue
+        fields={k:data[k] for k in ('goal_no','iteration','planned_steps','file_count','count','accepted_bytes')
+                if type(data.get(k)) is int}
+        for key,allowed in (('tool',_PUBLIC_ACTIONS),('action',_PUBLIC_ACTIONS),('stage',('route','resume_route')),
+                            ('operation',('check_file_receipt','select_materials')),('mode',('read','search','answer')),
+                            ('file_access',('directory','content'))):
+            if isinstance(data.get(key),str) and data[key] in allowed:
+                fields[key]=data[key]
+        for key in ('tools','tool_names'):
+            if isinstance(data.get(key),list):
+                fields[key]=[tool for tool in data[key] if isinstance(tool,str) and tool in _PUBLIC_ACTIONS]
+        if fields:public[section]=fields
+    return public
+
+
 def without_false_tool_footer(text):
     # 只移除独立的错误尾注，保留正文中的讨论、引用与代码。
     matches = re.search(r'\n{2,}[ \t]*本轮未调用工具(?:[，,]\s*结果基于已有资料直接给出)?[。.]?\s*\Z', text)

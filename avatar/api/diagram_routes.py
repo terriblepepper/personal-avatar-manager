@@ -2,7 +2,6 @@
 import asyncio
 import base64
 import io
-import ipaddress
 import os
 from typing import Literal
 from urllib.parse import urlsplit
@@ -11,7 +10,9 @@ from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
 from fastapi import APIRouter, Depends, HTTPException, Request
 from avatar.accounts.auth import current_user
-from avatar.models.client import resolve_public
+from avatar.core.network import address, is_public, resolve_public
+from avatar.files.conversation.diagrams import save_mermaid
+import json, re
 
 router = APIRouter(prefix='/api')
 _limit = asyncio.Semaphore(4)
@@ -33,7 +34,7 @@ async def public_image(url, *, resolver=None, transport=None):
         raise HTTPException(422,'图表图片仅允许不含凭据的公网 HTTPS 地址（443 端口）')
     async with _limit, asyncio.timeout(20):
         ip = await (resolver or resolve_public)(parsed.hostname,443)
-        if not ipaddress.ip_address(ip).is_global:
+        if not is_public(address(ip)):
             raise HTTPException(422,'禁止访问本机或内网图片')
         try:
             async with httpx.AsyncClient(transport=transport,trust_env=False,follow_redirects=False,timeout=10) as client:
@@ -76,7 +77,6 @@ class DiagramIconsRequest(BaseModel):
 # 按需取得少量图标的 SVG 路径数据；最终仍由沙箱清理，不写业务资料或数据库。
 @router.post('/diagrams/icons')
 async def diagram_icons(body: DiagramIconsRequest,user=Depends(current_user)):
-    import re
     if any(not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,79}',name) for name in body.names):
         raise HTTPException(422,'图标名称无效')
     try:
@@ -90,7 +90,6 @@ async def diagram_icons(body: DiagramIconsRequest,user=Depends(current_user)):
                     async for chunk in response.aiter_bytes():
                         data.extend(chunk)
                         if len(data)>512*1024:raise HTTPException(413,'图标数据过大')
-            import json
             value=json.loads(data)
             if not isinstance(value,dict) or value.get('prefix')!=body.prefix or not isinstance(value.get('icons'),dict):
                 raise HTTPException(502,'图标数据格式无效')
@@ -108,5 +107,4 @@ class DiagramSourcePromoteRequest(BaseModel):
 
 @router.post('/conversations/{conversation_id}/diagrams/promote')
 async def promote_diagram_source(conversation_id: str,body: DiagramSourcePromoteRequest,request: Request,user=Depends(current_user)):
-    from avatar.files.conversation.diagrams import save_mermaid
     return await save_mermaid(request.app.state.chat.chat_files,user,conversation_id,body.source,body.caption,body.visibility,body.new_name)

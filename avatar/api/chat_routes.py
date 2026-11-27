@@ -10,6 +10,10 @@ from avatar.conversation.schemas import ChatRequest
 from avatar.conversation.schemas import ConversationRequest
 from avatar.conversation.schemas import ConversationTitleRequest
 from pydantic import StrictBool
+from avatar.api.streaming import chat_response, submit_generation
+from avatar.conversation.jobs.store import GenerationStore
+from avatar.models.embedding import EmbeddingSettings
+from avatar.skills.policy import require_skills_enabled
 
 
 router = APIRouter()
@@ -35,26 +39,34 @@ def conversations(request: Request, channel: str = 'avatar', personal: bool=Fals
         other='assistant' if channel=='avatar' else 'avatar'
         rows+=chat.memory.list(user['id'],other)
         rows.sort(key=lambda row:row['updated_at'],reverse=True)
+    children = {}
+    selected = any(row.get('selected_aic') for row in rows) and channel == 'assistant' and not personal
+    targets = {t['aic']: t for t in chat.assistant_router.catalog()} if selected else {}
     with chat.service.database.connect() as db:
-        agent = db.execute('SELECT last_modified_at FROM avatar_records WHERE user_id=?', (user['id'],)).fetchone()
-    targets={t['aic']:t for t in chat.assistant_router.catalog()} if channel == 'assistant' and not personal else {}
+        embedding_configured = EmbeddingSettings.configured(db, user['id'])
+        revision = db.execute("""SELECT greatest(a.last_modified_at, f.updated_at, s.updated_at)
+            FROM avatar_records a LEFT JOIN attachment_collections f ON f.user_id=a.user_id
+            LEFT JOIN agent_skill_collections s ON s.user_id=a.user_id WHERE a.user_id=?""", (user['id'],)).fetchone()
+        if targets:
+            children = {(c['parent_id'],c['target_aic']): c for c in db.execute("""
+                SELECT c.parent_id,c.target_aic,c.summary_through,c.summary_profile_modified_at,c.compression_count,
+                    greatest(a.last_modified_at, f.updated_at, s.updated_at) AS revision
+                FROM chat_conversations c JOIN avatar_records a ON a.aic=c.target_aic
+                LEFT JOIN attachment_collections f ON f.user_id=a.user_id
+                LEFT JOIN agent_skill_collections s ON s.user_id=a.user_id
+                WHERE c.platform='dingdang' AND c.parent_id=ANY(?::text[])""", ([r['id'] for r in rows],))}
     for row in rows:
-        row['memory_active'] = bool(row['summary_through'] and agent and row['summary_profile_modified_at'].split('|',1)[0] == max(agent['last_modified_at'],request.app.state.service.attachments.collection_date(user['id']),request.app.state.chat.skills.collection_date(user['id']))) if channel == 'avatar' else False
+        row['memory_active'] = bool((channel == 'avatar' or personal) and row['summary_through'] and revision
+                                    and row['summary_profile_modified_at'].split('|',1)[0] == revision[0])
         row['selected_target'] = None
-        if channel == 'assistant' and not personal and row.get('selected_aic'):
-            target=targets.get(row['selected_aic'])
-            if target:
-                row['selected_target']={'aic':target['aic'],'name':target['name']}
-                with chat.service.database.connect() as db:
-                    child=db.execute("SELECT summary_through,summary_profile_modified_at,compression_count FROM chat_conversations WHERE parent_id=? AND target_aic=? AND platform='dingdang'",(row['id'],target['aic'])).fetchone()
-                row['memory_active']=bool(child and child['summary_through'] and child['summary_profile_modified_at']==max(target['row']['last_modified_at'],request.app.state.service.attachments.collection_date(target['row']['user_id']),request.app.state.chat.skills.collection_date(target['row']['user_id'])))
-                row['compression_count']=child['compression_count'] if child else 0
-    if personal:
-        for row in rows:
-            row['selected_target']=None
-            row['memory_active']=bool(row['summary_through'] and agent and row['summary_profile_modified_at'].split('|',1)[0]==max(agent['last_modified_at'],request.app.state.service.attachments.collection_date(user['id']),chat.skills.collection_date(user['id'])))
+        target = targets.get(row.get('selected_aic'))
+        if target:
+            row['selected_target'] = {'aic': target['aic'], 'name': target['name']}
+            child = children.get((row['id'], target['aic']))
+            row['memory_active'] = bool(child and child['summary_through'] and child['summary_profile_modified_at'] == child['revision'])
+            row['compression_count'] = child['compression_count'] if child else 0
     default_id=next((row['id'] for row in rows if row['message_count']),default['id']) if personal else default['id']
-    return {'default_id':default_id,'items':rows}
+    return {'default_id':default_id,'items':rows,'embedding_configured':embedding_configured}
 
 
 # 职责：为本人新建助手或分身对话会话。
@@ -64,7 +76,7 @@ def conversations(request: Request, channel: str = 'avatar', personal: bool=Fals
 def create_conversation(body: ConversationRequest, request: Request, user=Depends(auth.current_user)):
     row = request.app.state.chat.session(user['id'],body.channel,create=True,title=body.title)
     if body.title not in ('新会话','默认会话'):
-        with request.app.state.database.connect(write=True) as db:
+        with request.app.state.database.connect(write=True, account_scope=user['id']) as db:
             db.execute("UPDATE chat_conversations SET title_source='manual' WHERE id=?", (row['id'],))
     return {'id':row['id'],'title':row['title']}
 
@@ -83,7 +95,7 @@ async def compact_conversation(conversation_id:str,request:Request,focus:str=Bod
 def rename_conversation(conversation_id: str, body: ConversationTitleRequest, request: Request, user=Depends(auth.current_user)):
     chat = request.app.state.chat
     row = chat.session(user['id'], 'assistant', conversation_id, personal=True)
-    with chat.service.database.connect(write=True) as db:
+    with chat.service.database.connect(write=True, account_scope=user['id']) as db:
         db.execute("UPDATE chat_conversations SET title=?,title_source='manual' WHERE id=? AND user_id=?", (body.title,row['id'],user['id']))
     return {'id':row['id'],'title':body.title}
 
@@ -95,7 +107,7 @@ def rename_conversation(conversation_id: str, body: ConversationTitleRequest, re
 def delete_conversation(conversation_id: str, request: Request, channel: str = 'avatar', personal: bool=False, user=Depends(auth.current_user)):
     chat = request.app.state.chat
     session = chat.session(user['id'],channel,conversation_id,personal=personal)
-    chat.memory.remove(session['id'])
+    chat.memory.remove(session['id'], owner=user['id'])
     return {'message':'会话及记忆已删除'}
 
 
@@ -106,7 +118,7 @@ def delete_conversation(conversation_id: str, request: Request, channel: str = '
 def clear_conversation(conversation_id: str, request: Request, channel: str = 'avatar', personal: bool=False, user=Depends(auth.current_user)):
     chat = request.app.state.chat
     session = chat.session(user['id'],channel,conversation_id,personal=personal)
-    chat.memory.remove(session['id'],clear=True)
+    chat.memory.remove(session['id'],clear=True,owner=user['id'])
     return {'message':'历史记录和压缩记忆已清空'}
 
 
@@ -115,22 +127,19 @@ def clear_conversation(conversation_id: str, request: Request, channel: str = 'a
 # 结果与约束：浏览器断开仅停止 SSE 投递，后台继续生成并保存；刷新通过 pending 恢复状态。
 @router.post("/chat/stream")
 def chat_stream(body: ChatRequest, request: Request, user=Depends(auth.current_user)):
-    from avatar.api.streaming import chat_response
     if not body.conversation_id:
         session=request.app.state.chat.session(user['id'],body.channel,None,personal=body.personal)
         body=body.model_copy(update={'conversation_id':session['id']})
-    return chat_response(request.app.state.runtime, user, body, request.app.state.database)
+    return chat_response(request, user, body, request.app.state.database)
 
 
 @router.post('/chat/generations',status_code=202)
 def submit_chat_generation(body: ChatRequest,request: Request,user=Depends(auth.current_user)):
-    from avatar.api.streaming import submit_generation
     return submit_generation(request.app.state.database,user,body)
 
 
 @router.get('/chat/pending')
 def pending_chat(conversation_id: str, request: Request, user=Depends(auth.current_user)):
-    from avatar.conversation.jobs.store import GenerationStore
     return GenerationStore(request.app.state.database).latest(user['id'],conversation_id)
 
 
@@ -141,7 +150,6 @@ async def stop_generation(request_id:str,request:Request,user=Depends(auth.curre
 
 @router.get('/chat/generations/{request_id}')
 def chat_generation(request_id: str,request: Request,user=Depends(auth.current_user)):
-    from avatar.conversation.jobs.store import GenerationStore
     return GenerationStore(request.app.state.database).get(user['id'],request_id)
 
 
@@ -164,10 +172,4 @@ class SessionSkillToggle(BaseModel):
 # 结果与约束：会话生成期间拒绝修改，变更仅影响当前父会话的技能加载与旧摘要。
 @router.patch('/conversations/{conversation_id}/skills/{skill_id}')
 def conversation_skill_update(conversation_id: str,skill_id: str,body: SessionSkillToggle,request: Request,user=Depends(auth.current_user)):
-    from avatar.skills.policy import require_skills_enabled
     require_skills_enabled()
-    chat=request.app.state.chat
-    with request.app.state.database.connect() as db:chat.session_skills.owned(db,user['id'],conversation_id)
-    chat.memory.acquire(conversation_id)
-    try:return chat.session_skills.set_enabled(user['id'],conversation_id,skill_id,body.enabled)
-    finally:chat.memory.release(conversation_id)
