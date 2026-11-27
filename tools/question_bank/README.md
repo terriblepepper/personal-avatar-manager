@@ -2,7 +2,7 @@
 
 保留 `prepare.py`（原表解析、清洗、分类、去重、导出）和 `translate.py`（本地离线翻译）；平台运行时不执行爬虫、翻译或访问原始网站。
 
-`bank.json` 为可导入的 1248 道中文题、12 类；`cleaning-report.json` 保留生成校验和、排除原因及抽检记录。旧 datasets 中的中间文件、重复压缩包和原始网页快照已删除，已导入数据库的题目不受影响。
+`bank.json` 为可导入的 1248 道中文题、12 类；重新导出时可指定本地报告路径，记录校验和、排除原因及抽检。旧 datasets 中的中间文件、重复压缩包和原始网页快照已删除，已导入数据库的题目不受影响。
 
 来源为 [IPIP 官方原表](https://ipip.ori.org/AlphabeticalItemList.htm)，[授权声明](https://ipip.ori.org/newPermission.htm)将原题项置于公有领域。中文内容为机器翻译、规则改写及抽检结果，不能用于临床评估或当作经过验证的心理量表。
 

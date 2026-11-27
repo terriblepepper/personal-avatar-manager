@@ -1,6 +1,7 @@
 """Platform policy for user-uploaded skill packages."""
 from fastapi import HTTPException
 
+MAX_UPLOAD = 50 * 1024 * 1024
 SKILLS_PAUSED = True
 PAUSE_NOTICE = '因安全问题暂时停止分身技能的使用'
 

@@ -92,7 +92,7 @@ class TestRun:
 
 def main():
     parser=argparse.ArgumentParser()
-    parser.add_argument('mode',nargs='?',choices=('unit','quick','all','browser-server'),default='unit')
+    parser.add_argument('mode',nargs='?',choices=('unit','quick','all','browser-server'),default='all',help='unit: 无需 PostgreSQL fixture；quick: 发布冒烟；all: 全量（默认）')
     parser.add_argument('--jobs',type=int,choices=range(1,9),default=2)
     args,extra=parser.parse_known_args()
     if args.mode == 'browser-server':
@@ -110,12 +110,14 @@ def main():
     env={**os.environ,'PYTHONDONTWRITEBYTECODE':'1','AVATAR_SYSTEM_ATR_ENABLED':'0','AVATAR_SYSTEM_AIP_ENABLED':'0','AVATAR_ENTITY_AIP_ENABLED':'0','WIT_REGISTRY_USERNAME':'','WIT_REGISTRY_PASSWORD':''}
     command=[sys.executable,'-m','pytest']
     if args.jobs>1 and '--collect-only' not in extra:command+=['-n',str(args.jobs),'--dist','worksteal']
+    if args.mode in ('unit', 'quick'):
+        command += ['-m', args.mode]
     command+=extra or ['-q']
     process=None
     def interrupt(*_):raise KeyboardInterrupt
     old=signal.signal(signal.SIGTERM,interrupt)
     try:
-        with TestRun('unit'):
+        with TestRun(args.mode):
             process=subprocess.Popen(command,env=env,start_new_session=True)
             return process.wait()
     except KeyboardInterrupt:return 130

@@ -9,7 +9,7 @@ from pathlib import PurePosixPath
 from urllib.parse import quote, unquote, urlsplit
 import httpx
 from fastapi import HTTPException
-from avatar.models.client import resolve_public
+from avatar.core.network import resolve_public
 from avatar.skills.packages import MAX_UPLOAD, read_entries, zip_entries
 
 

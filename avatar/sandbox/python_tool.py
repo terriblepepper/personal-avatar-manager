@@ -10,9 +10,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from avatar.core.db import now
 from avatar.core.execution import AgentNeedsInput, check_execution, current_tool_call, run_blocking, sandbox_checkpoint
-from avatar.skills.effects import SandboxEffects, file_versions, https_versions
-from avatar.skills.https_inputs import configured_resources
-from avatar.skills.sandbox import SandboxExecutionError
+from avatar.sandbox.effects import SandboxEffects, file_versions, https_versions
+from avatar.sandbox.https_inputs import configured_resources
+from avatar.sandbox.sandbox import SandboxExecutionError
 
 
 class PythonArguments(BaseModel):

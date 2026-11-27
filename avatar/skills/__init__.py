@@ -1,1 +1,1 @@
-"""User skill packages and execution."""
+"""Read-only access to paused user-uploaded skills."""

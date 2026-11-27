@@ -7,7 +7,7 @@ from copy import deepcopy
 from fastapi import HTTPException
 
 from avatar.core.execution import AgentNeedsInput, check_execution
-from avatar.skills.https_inputs import configured_resources
+from avatar.sandbox.https_inputs import configured_resources
 from avatar.skills.policy import require_skills_enabled
 
 

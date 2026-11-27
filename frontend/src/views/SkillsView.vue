@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { SKILL_PAUSE_NOTICE } from '../skillPolicy'
+import { SKILL_PAUSE_NOTICE } from '../utils/skillPolicy'
 import { date } from '../utils/format'
 import RecordPagination from '../components/RecordPagination.vue'
 import { computed, onMounted, ref } from 'vue'

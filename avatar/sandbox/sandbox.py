@@ -75,7 +75,7 @@ class LocalPythonSandbox:
         self.users[user_id] = (lock,count+1)
         try:
             async with lock, self.slots:
-                from avatar.skills.https_inputs import fetch_inputs
+                from avatar.sandbox.https_inputs import fetch_inputs
                 if authorize:
                     await run_blocking(authorize)
                 library = RUNTIME / 'cache/npm/registry.npmjs.org/pyodide/0.27.8'

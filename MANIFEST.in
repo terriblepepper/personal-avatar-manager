@@ -1,24 +1,22 @@
 include README.md pyproject.toml setup.py uv.lock .env.example
 include run.sh service.sh
-include redis/redis.conf redis/service.sh redis/redis-*.whl
+include redis/redis.conf redis/service.sh
 include kafka/broker.env kafka/service.sh
-include *.whl
+include vendor/wheels/*.whl
 recursive-include avatar *.py *.ts
 recursive-include frontend/public *
-recursive-include frontend/static *.js
 include frontend/package.json frontend/package-lock.json frontend/index.html frontend/tsconfig.json frontend/vite.config.ts
 include frontend/vitest.config.ts frontend/playwright.config.ts
 recursive-include frontend/src *.vue *.ts *.css
 recursive-include frontend/tests *.ts
 recursive-include frontend/dist *
-include admin-frontend/index.html
+include admin-frontend/index.html admin-frontend/package.json admin-frontend/vite.config.ts admin-frontend/tsconfig.json
 recursive-include admin-frontend/src *.vue *.ts *.css
 recursive-include admin-frontend/dist *
 prune frontend/node_modules
 prune frontend/test-results
 prune frontend/playwright-report
-recursive-include docs *.md
-exclude docs/用户操作手册.md
+include docs/API概览.md docs/PostgreSQL运行.md docs/打包与组件部署.md docs/操作手册.md docs/数据模型.md docs/术语表.md docs/用户操作手册-purge.md docs/知识库与soul.md docs/系统架构.md docs/资料RAG与嵌入.md docs/配置项说明.md docs/身份与协议.md docs/验收说明.md docs/小镇接入交接.md
 recursive-include docs/picture/用户操作手册-purge *.png
 recursive-include deploy *.in *.example *.json
 recursive-include scripts *.py
@@ -29,12 +27,14 @@ prune data
 prune .venv
 prune dist
 prune build
-recursive-include tools/question_bank *.json
+include tools/question_bank/bank.json
 include vendor/EverOS/pyproject.toml vendor/EverOS/README.md vendor/EverOS/LICENSE
 include vendor/EverOS/NOTICE vendor/EverOS/UPSTREAM.json
 recursive-include vendor/EverOS/src *
 
 # Local agent plans and review records must not enter distributable sources.
+prune archive
+prune Agent_Operate_Guide
 prune .superpowers
 prune superpowers
 prune docs/superpowers
