@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { useConfirmation } from '../../composables/useConfirmation'
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import DocumentFields from '../DocumentFields.vue'
 import ProfileDialog from './ProfileDialog.vue'
@@ -14,6 +15,7 @@ interface Profile extends Record<string, unknown> { name?: string; person_type?:
 interface Detail { account: Account; profile: Profile; approved_at: string | null }
 interface Field { key: string; label: string; audience: string; visibility: string; fixed_public?: boolean }
 
+const confirmAction = useConfirmation()
 const session = useSessionStore()
 const canAppointSuper = computed(() => session.user?.is_root && session.user.auth_source === 'local' && session.user.access_scope === 'full')
 const rows = ref<Account[]>([]), search = ref(''), role = ref('all'), offset = ref(0), total = ref(0)
@@ -49,12 +51,14 @@ async function setRole(item: Account, value: User['role']) {
   const message = value === 'user' ? '确认将自己降级为普通用户？管理权限会立即撤销。' :
     '确认将账户 ' + (item.identity_username || item.username) + ' 设为' + accountRoleLabels[value] + '？'
       + (value === 'super_admin' ? '该账户可以管理平台和查看运行监控。' : '该账户可以审核申请、管理平台并授权其他用户。')
-  if (!confirm(message)) return
-  try {
+  await confirmAction(message, '确认角色变更', () => {
+    const target = rows.value.find(row => row.id === item.id)
+    return [target?.id, target?.role, target?.account_status, target?.is_root, canAppointSuper.value]
+  }, async () => {
     await request('/admin/accounts/' + encodeURIComponent(item.id) + '/role', 'PUT', { role: value })
     if (value === 'user') await session.refresh()
     else await load(offset.value)
-  } catch (error) { notifyError(error) }
+  })
 }
 onMounted(() => load())
 onBeforeUnmount(() => { listRequest++; profileRequest++ })

@@ -5,21 +5,20 @@ from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict
 from avatar.models.schemas import ModelConfigInput
 from avatar.core.revisions import ModifiedAt, next_modified_at
-from avatar.models.model_config import public_config
+from avatar.models.model_config import public_config, require_complete
 from avatar.core.db import dump, event
 from avatar.models.capabilities import automatic
+from avatar.models import embedding as embedding_api
 
 
 async def verify_api(client,config,vault,*,embedding=False):
     """用待提交配置执行小请求；校验阶段不写配置、能力缓存或索引。"""
-    from avatar.models.model_config import require_complete
     require_complete(config)
     try:
         async with asyncio.timeout(45):
             key=vault.decrypt(config['encrypted_key'])
             if embedding:
-                from avatar.models.embedding import embed
-                await embed(client,config,key,['API availability check'])
+                await embedding_api.embed(client,config,key,['API availability check'])
             else:
                 result=await client.generate(config,key,
                     'Reply briefly to confirm the API is working.',[],'Reply OK.')

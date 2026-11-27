@@ -73,6 +73,19 @@ async function desktopPanels(page: Page, scope: Locator) {
   }
   const more = scope.locator('summary[aria-label="会话操作"]')
   await more.click()
+  const clear = scope.getByRole('button', { name: '清空记录' })
+  let writes = 0
+  page.on('request', request => {
+    if (request.method() === 'POST' && new URL(request.url()).pathname.endsWith('/clear')) writes++
+  })
+  await clear.click()
+  const confirmation = page.getByRole('dialog', {name:'确认清空会话'})
+  await expect(confirmation).toBeVisible()
+  await page.keyboard.press('Escape')
+  await expect(confirmation).toBeHidden()
+  await expect(more).toBeFocused()
+  expect(writes).toBe(0)
+  await more.click()
   await scope.getByText('表达风格学习', { exact: true }).click()
   await expect(scope.getByRole('checkbox', {name:'自动学习本人表达'})).toBeEnabled()
   await inspect('表达风格学习', scope.locator('.chat-menu-subpanel'))

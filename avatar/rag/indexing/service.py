@@ -28,6 +28,14 @@ from avatar.core.db import dump,now
 from avatar.models.embedding import EmbeddingSettings,embed,embedding_window,require_embedding
 from avatar.core.tokens import estimate
 from avatar.models.artifact_cache import ArtifactCache,fingerprint
+from avatar.core.resource_budget import ResourceController
+from avatar.files.library.folders import with_folder_caption, with_folder_captions
+from avatar.files.parsing.document_images import traverse
+from avatar.rag.indexing.partition import partition
+from avatar.rag.indexing.retry import IndexRetry
+from avatar.rag.indexing.work import AccountIndexWork, INDEX_WORKERS
+from avatar.rag.stores.lexical import LexicalStore
+from avatar.rag.stores.postgres import PostgresFiles
 
 
 def revision(row):
@@ -48,16 +56,12 @@ def native_text(path,extension):
 class FileRag:
     def __init__(self,chat):
         self.chat=chat;self.database=chat.service.database;self.attachments=chat.service.attachments
-        from avatar.rag.indexing.work import AccountIndexWork
-        from avatar.core.resource_budget import ResourceController
         self.resources=ResourceController.from_database(self.database)
         self.work=AccountIndexWork(self.resources)
         self.running={}
         self._publication_locks={};self._publication_guard=threading.Lock()
         self.cache=ArtifactCache(self.database)
-        from avatar.rag.stores.lexical import LexicalStore
         self.lexical=LexicalStore(self.database)
-        from avatar.rag.stores.postgres import PostgresFiles
         self.store=PostgresFiles(self.database)
 
     def publication_lock(self,user_id):
@@ -79,7 +83,6 @@ class FileRag:
         if not row:raise HTTPException(404,'资料文件不存在')
         row=dict(row)
         if source=='profile':
-            from avatar.files.library.folders import with_folder_caption
             row=with_folder_caption(db,row)
         if source=='chat':
             valid=db.execute("SELECT 1 FROM chat_files WHERE id=? AND (expires_at IS NULL OR avatar_utc_time(expires_at)>CURRENT_TIMESTAMP)",(identifier,)).fetchone()
@@ -140,7 +143,6 @@ class FileRag:
         return self.status(user)
 
     def queue_changed_documents(self, db, owner, signature):
-        from avatar.files.library.folders import with_folder_captions
 
         documents = db.execute("""SELECT source,file_id,status,revision,signature,collection,coverage,force_rebuild
             FROM file_rag_documents WHERE user_id=? AND status NOT IN ('queued','running')""", (owner,)).fetchall()
@@ -238,7 +240,7 @@ class FileRag:
             await run_blocking(record_usage, self.database, row['user_id'], model, usage, 'file_parse')
 
     async def prepare(self,row,source,embedding,model):
-        path = self.original_path(row, source)
+        path = await run_blocking(self.original_path, row, source)
         extension = Path(row['filename']).suffix.lower()
         if extension in WORD_SUFFIXES:
             try:
@@ -275,14 +277,12 @@ class FileRag:
                 extracted={'text':'','status':'needs_description'}
             text=extracted['text'];coverage.append('native_text' if text.strip() else 'metadata_only')
             if text.strip():
-                from avatar.rag.indexing.partition import partition
                 rows.extend(await self.work.execute(row['user_id'],'parse',partition,extracted,embedding_window(embedding)))
                 rows.append({'page':None,'text':label,'modality':'text'})
                 if extracted['status'] in ('truncated','ocr_partial','partial'):coverage.append('partial')
             else:
                 rows.append({'page':None,'text':label+'\n[仅文件名和资料说明，正文未解析]','modality':'text'})
             if extension == '.pdf':
-                from avatar.files.parsing.document_images import traverse
                 async with aclosing(traverse(path, vector=vector)) as visuals:
                     async for item in visuals:
                         if embedding.get('multimodal_enabled'):
@@ -346,7 +346,6 @@ class FileRag:
             if claimed is None:return
             row,embedding,model,token,version,generation=claimed
             self.running[(source,identifier)]=generation
-            from avatar.rag.indexing.retry import IndexRetry
             def retry_status(attempt,delay):
                 with self.database.connect(write=True, account_scope=user_id) as db:
                     db.execute("UPDATE file_rag_documents SET error=?,updated_at=? WHERE source=? AND file_id=? AND status='running' AND generation=?",
@@ -435,7 +434,7 @@ class FileRag:
             db.execute("UPDATE file_rag_documents SET status='failed',error='索引任务租约中断，结果未确认；不会自动重发收费请求' WHERE status='running' AND lease_until<?",(time.time(),))
 
     async def run(self):
-        await run_blocking(self.recover_queue)
+        recovered = False
         pending={};heartbeat=0
         try:
             while True:
@@ -448,6 +447,9 @@ class FileRag:
                     except Exception as error:
                         logging.getLogger(__name__).warning('Index task cleanup failed (%s)',type(error).__name__)
                 try:
+                    if not recovered:
+                        await run_blocking(self.recover_queue)
+                        recovered = True
                     if time.monotonic()-heartbeat>=10:
                         await run_blocking(self.renew_leases, tuple(self.running.items()))
                         heartbeat=time.monotonic()
@@ -455,6 +457,9 @@ class FileRag:
                     await self.dispatch(pending)
                 except Exception as error:
                     logging.getLogger(__name__).warning('Index queue temporarily unavailable (%s)',type(error).__name__)
+                    if not recovered:
+                        await asyncio.sleep(2)
+                        continue
                 if pending:await asyncio.wait(pending,timeout=1,return_when=asyncio.FIRST_COMPLETED)
                 else:await wait_work(latch, 1.)
         finally:
@@ -479,7 +484,6 @@ class FileRag:
 
     async def dispatch(self,pending):
         from collections import Counter
-        from avatar.rag.indexing.work import INDEX_WORKERS
         capacity=self.resources.available('index')
         if not capacity:return
         active=Counter(row[2] for row in pending.values())

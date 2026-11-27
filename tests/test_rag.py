@@ -177,8 +177,15 @@ def test_query_budget_is_independent_of_busy_account_index_slots():
 
 
 def test_index_consumer_survives_unexpected_task_failure(context,monkeypatch):
+    from unittest.mock import Mock
     from tests.support import saved_file
     app,client,_=context;rag=app.state.chat.rag
+    startup = Mock(side_effect=[ConnectionError('database starting'), None])
+    recover = rag.recover_queue
+    def flaky_recovery():
+        startup()
+        recover()
+    monkeypatch.setattr(rag, 'recover_queue', flaky_recovery)
     bad=saved_file(client,'bad.txt',b'bad');good=saved_file(client,'good.txt',b'good')
     async def index(source,identifier,uid):
         if identifier==bad:raise RuntimeError('simulated isolated parser failure')
@@ -189,13 +196,13 @@ def test_index_consumer_survives_unexpected_task_failure(context,monkeypatch):
     async def check():
         worker=asyncio.create_task(rag.run())
         try:
-            for _ in range(100):
+            for _ in range(400):
                 with app.state.database.connect() as db:
                     states=dict(db.execute('SELECT file_id,status FROM file_rag_documents'))
                 if states.get(good)=='ready' and states.get(bad)=='failed':break
                 if worker.done():break
                 await asyncio.sleep(.02)
-            assert not worker.done()
+            assert not worker.done() and startup.call_count == 2
             assert states[good]=='ready' and states[bad]=='failed'
         finally:
             worker.cancel();await asyncio.gather(worker,return_exceptions=True)
@@ -297,6 +304,7 @@ def prepared_index(context,monkeypatch):
 
 
 def test_search_materials_returns_exact_query_evidence_and_notices(context, monkeypatch):
+    from fastapi import HTTPException
     from unittest.mock import Mock
     from tests.support import saved_file
 
@@ -321,7 +329,25 @@ def test_search_materials_returns_exact_query_evidence_and_notices(context, monk
     search = Mock(wraps=rag.store.search)
     monkeypatch.setattr(rag.store, 'search', search)
     scope = (owner, 'fixture-aic', {'id':'session'}, [], True)
+    connect=rag.database.connect
+    def off_loop(*args,**kwargs):
+        try:asyncio.get_running_loop()
+        except RuntimeError:return connect(*args,**kwargs)
+        raise AssertionError('RAG retrieval opened a blocking DB connection on its event loop')
+    monkeypatch.setattr(rag.database,'connect',off_loop)
     result = asyncio.run(rag.search_tool(scope, {'query':' retry after timeout ', 'folder':'notes'}))
+
+    async def stale_stream(*args):
+        yield {'type':'delta', 'text':'unreachable'}
+
+    async def read_stale():
+        proof = {'scope':scope, 'revisions':[(('profile', good), 'old-version')]}
+        async for _ in rag.stream(({'_rag_access':proof}, '', '', []), 'query'):
+            pytest.fail('revoked material reached the stream')
+    monkeypatch.setattr(rag.chat.model_client, 'stream', stale_stream)
+    with pytest.raises(HTTPException) as denied:
+        asyncio.run(read_stale())
+    assert denied.value.status_code == 409
 
     assert search.call_args.args[3] == ['retry after timeout']
     assert {(row['file_id'], row['relative_path']) for row in result.content['evidence']} == {(good, 'notes/retry.txt')}

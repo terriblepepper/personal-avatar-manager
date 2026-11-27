@@ -102,7 +102,7 @@ def pause(chat, user, request, work, parent, session, overview, error, previous,
     result['stream_retryable'] = bool(getattr(error,'stream_retryable',False))
     if job:result.update(request_id=job['request_id'],task_id=job['task_id'])
     owner=overview['agent']
-    with ExitStack() as resources, (nullcontext(transaction) if transaction is not None else chat.service.database.connect(write=True)) as db:
+    with ExitStack() as resources, (nullcontext(transaction) if transaction is not None else chat.service.database.connect(write=True, account_scope=user['id'] if owner['user_id']==user['id'] else None)) as db:
         if transaction is None:
             validate_authorization(db,job,lock=True)
         checked(db,user['id'],request)

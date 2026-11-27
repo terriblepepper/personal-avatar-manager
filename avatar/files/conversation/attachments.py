@@ -13,9 +13,12 @@ from fastapi import HTTPException
 from avatar.core.db import now
 from avatar.core.execution import finish_on_cancel
 from avatar.files.library.attachments import AttachmentService
-from avatar.files.uploads.validation import TYPES, inspect_file
+from avatar.files.uploads.validation import TYPES, check_chat_upload_size, inspect_file
 from avatar.files.conversation.resources import ConversationResources, reference_count
-from avatar.files.uploads.buffer import upload_buffer, upload_work, write_original
+from avatar.files.uploads.buffer import upload_buffer, upload_work, write_original, clean_removed
+from avatar.files.library.folders import validate_path, renamed_filename
+from avatar.files.parsing.images import jpeg_bytes
+from avatar.files.word_pdfs import discard_original
 
 
 # 职责：管理本人 Web 会话的文件及发送关联，不把临时文件混入个人资料库。
@@ -172,6 +175,9 @@ class ChatFiles(ConversationResources):
     # 输入：user、conversation_id 为登录作用域，filename/data 是上传文件。
     # 结果与约束：复用个人文件格式校验与解析并发限制，不执行脚本或宏；解析时不持有数据库写锁。
     async def upload(self, user, conversation_id, filename, data, *, origin='upload', description='', source_label='本地上传',temporary=False,html_mode=None):
+        # References copy an already authorized library original and retain its storage policy.
+        if origin != 'reference':
+            check_chat_upload_size(len(data))
         async with self.attachments.parsing:
             extension = await upload_work(inspect_file,filename,data)
             return await upload_work(self._store,user,conversation_id,filename,data,extension,origin,description,source_label,temporary,html_mode)
@@ -193,7 +199,6 @@ class ChatFiles(ConversationResources):
         try:
             extracted,status='','rag_pending'
             if TYPES[extension].startswith('image/'):
-                from avatar.files.parsing.images import jpeg_bytes
                 encoded=jpeg_bytes(path)
                 with os.fdopen(os.open(preview,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'wb') as stream:stream.write(encoded)
                 status='vision_ready'
@@ -223,7 +228,6 @@ class ChatFiles(ConversationResources):
                 db.execute('UPDATE chat_files SET origin=?,description=?,source_label=? WHERE id=?',(origin,description,source_label,identifier))
                 if temporary:db.execute("UPDATE chat_files SET origin='attachment',referenced=0,expires_at=coalesce(expires_at,datetime('now','+7 days')) WHERE id=?",(identifier,))
         except BaseException:
-            from avatar.files.word_pdfs import discard_original
             discard_original(path)
             preview.unlink(missing_ok=True)
             raise
@@ -261,7 +265,6 @@ class ChatFiles(ConversationResources):
             db.execute('DELETE FROM chat_files WHERE id=?',(row['id'],))
         # Callers exit the DB transaction before this context. A rollback leaves originals in place.
         yield
-        from avatar.files.uploads.buffer import clean_removed
         clean_removed((None,path) for path in paths)
         for owner, conversation in workspaces:
             self.directory.remove_workspace(owner,conversation)
@@ -270,7 +273,6 @@ class ChatFiles(ConversationResources):
     # 输入：caption 选填，visibility 默认私密；调用方持有父会话租约阻止并发删除。
     # 结果与约束：复用资料配额、说明及公开规则；失败回收新副本，重复内容禁止再次转存，不触发审核。
     async def promote(self,user,conversation_id,file_id,caption,visibility,folder='',new_name=None):
-        from avatar.files.library.folders import validate_path,renamed_filename
         validate_path(folder,root=True)
         async with self.promotion_locks.setdefault(user['id'],asyncio.Lock()):
             def owned():
@@ -376,7 +378,6 @@ class ChatFiles(ConversationResources):
             if row['content_type'].startswith('image/') and config.get('vision_enabled'):
                 if len(images)>=5:raise HTTPException(422,'每轮最多直接读取五张相关图片，请缩小范围')
                 if row.get('source')=='profile':
-                    from avatar.files.parsing.images import jpeg_bytes
                     encoded=jpeg_bytes(self.attachments.directory/(row['id']+'.blob'))
                 else:encoded=self.directory.path(row['user_id'],row['conversation_id'],row['id']+'.jpg').read_bytes()
                 images.append({'mime_type':'image/jpeg','data':base64.b64encode(encoded).decode()})

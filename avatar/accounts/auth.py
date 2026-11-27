@@ -6,9 +6,11 @@ from psycopg import IntegrityError
 import time
 import uuid
 from fastapi import HTTPException, Request
+from avatar.accounts.sessions import issue_session
 from avatar.accounts.roles import ADMIN_ROLES, can_view_ops
 from avatar.core.db import event, now, dump
 from avatar.accounts.schemas import normalize_email, normalize_phone
+from avatar.accounts.platform_binding import PlatformBindingService
 
 
 # 职责：使用随机盐和 PBKDF2-SHA256 生成账户密码哈希。
@@ -67,32 +69,10 @@ def create_user(database, credentials):
             db.execute("INSERT INTO profile_records(user_id,draft,last_modified_at,updated_at) VALUES(?,?,?,?)", (user_id, dump({"person_type": credentials.person_type, "student_id": credentials.student_id, "name": credentials.name.strip(), "email": credentials.email, "phone": credentials.phone}), modified,modified))
             event(db, user_id, credentials.username, "账户注册", actor_id=user_id)
             if credentials.platform_entry_token:
-                from avatar.accounts.platform_binding import PlatformBindingService
                 PlatformBindingService(database).bind_in_transaction(db,user_id,credentials.platform_entry_token)
     except IntegrityError:
         raise HTTPException(409, "用户名、邮箱或手机号已存在，请登录已有账户或联系管理员关联平台身份")
     return user_id
-
-
-# 职责：在已有数据库事务内生成服务端登录会话。
-# 输入：db 为连接，user_id 指定账户；duration 为秒数，access_scope 为 full 或 profile，auth_method 标识实际认证来源。
-# 结果与约束：仅保存会话令牌哈希并标记认证来源，返回原令牌、CSRF、脱敏账户及统一账号展示名/主体；identity_verified 表示账号验签登录，profile 会话隐藏管理员身份。
-def issue_session(db,user_id,duration=43200,access_scope='full',auth_method='local'):
-    user=db.execute('SELECT * FROM users WHERE id=?',(user_id,)).fetchone()
-    if not user:raise HTTPException(404,'账户不存在')
-    token,csrf=secrets.token_urlsafe(32),secrets.token_urlsafe(24)
-    db.execute('INSERT INTO sessions(token,user_id,csrf,expires,access_scope,auth_method) VALUES(?,?,?,?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),user_id,csrf,time.time()+duration,access_scope,auth_method))
-    result={k:user[k] for k in ('id','username','role','is_root','person_type','student_id','teacher_id','account_status','account_reason','email','phone')}
-    result['onboarding_stage'] = user['onboarding_stage'] if user['role'] == 'user' else 'done'
-    result['access_scope']=access_scope
-    identity=db.execute('SELECT subject,username,verified_at FROM oidc_identities WHERE user_id=?',(user_id,)).fetchone()
-    result['oidc_linked']=bool(identity and not user['is_root'])
-    result.update(auth_source='oidc' if auth_method=='oidc' and not user['is_root'] else 'local',identity_verified=bool(identity and identity['verified_at'] and not user['is_root']),
-                  oidc_subject=identity['subject'] if identity and not user['is_root'] else None,
-                  identity_username=identity['username'] if identity and not user['is_root'] else '')
-    # 只改变本次会话返回的有效角色，绝不改写 users 中原有管理员身份。
-    if access_scope=='profile':result.update(role='user',is_root=0)
-    return token,csrf,result
 
 
 def _login_user(db, username, identifier, *, lock=False):

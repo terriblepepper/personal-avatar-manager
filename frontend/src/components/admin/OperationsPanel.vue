@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { useConfirmation } from '../../composables/useConfirmation'
 import RecordPagination from '../RecordPagination.vue'
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import JobRecords from './JobRecords.vue'
@@ -19,6 +20,7 @@ interface Agent {
 }
 interface Job {id:string;status:string;action?:string;error?:string}
 interface AgentPage {items:Agent[];total:number;offset:number;mode?:string;entity_registration_enabled:boolean;personal_registration_mode:string;entity_port_pool:{error?:string;host?:string;start?:number;end?:number;allocated?:number;registered?:number;online?:number}}
+const confirmAction = useConfirmation()
 const props=defineProps<{page:string}>(), data=ref<AgentPage|null>(null), agentDetail=ref<Agent|null>(null), busy=ref(false)
 const processing=ref(''), feedback=ref<Record<string,string>>({}), checks=ref<Record<string,Health & {aic:string}>>({})
 const search=ref(''), offset=ref(0), detailTitle=ref(''), detailError=ref('')
@@ -54,8 +56,15 @@ function closeDetail(){
   detailSequence++
   detailTitle.value='';agentDetail.value=null
 }
-async function action(path:string,confirmation?:string,method='POST',body:unknown={},key='') {
-  if (busy.value || confirmation && !confirm(confirmation)) return
+async function action(path:string,confirmation?:string,method='POST',body:unknown={},key=''): Promise<void> {
+  if (busy.value) return
+  if (confirmation) {
+    return confirmAction(confirmation, '确认身份操作', () => {
+      const agent = data.value?.items.find(row => row.user_id === key)
+      return [busy.value, data.value?.entity_registration_enabled, agent?.aic, agent?.identity_status,
+        agent?.certificate?.id, agent?.identity_job?.id, agent?.identity_job?.status]
+    }, () => action(path, undefined, method, body, key))
+  }
   busy.value=true; processing.value=key
   try {
     const result=await request<{message?:string}>(path,method,body)

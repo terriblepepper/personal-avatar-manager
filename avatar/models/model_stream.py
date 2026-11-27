@@ -11,7 +11,18 @@ from fastapi import HTTPException
 from avatar.models.tools import invalid_tool_call, load_model_json
 from avatar.models.codec import parse_response, tokens
 from avatar.models.limits import response_limit, generation_http_timeout, generation_deadline
-from avatar.models.diagnostics import check_terminal, stop_reason, transport_failure, unconfirmed_response
+from avatar.models.diagnostics import (
+    check_terminal,
+    stop_reason,
+    transport_failure,
+    unconfirmed_response,
+    check_response,
+    empty_response,
+    request_id,
+    provider_error,
+)
+from avatar.core.execution import check_execution_async
+from avatar.models.trace import ModelExchange
 
 
 def check_size(kind, size, limit):
@@ -291,14 +302,12 @@ class ToolFragments:
 
 
 async def stream_response(model, config, api_key, system, history, message, *, collect=False):
-    from avatar.core.execution import check_execution_async
     attempts = 6
     report_stream = config.get('_aip_stream_state')
     # AIP pauses its task timer while the upstream stream is open. The per-attempt watchdog and retry limit still apply.
     expires = None if report_stream else asyncio.get_running_loop().time() + attempts * generation_deadline(config)
     for attempt in range(attempts):
         await check_execution_async()
-        from avatar.models.trace import ModelExchange
         exchange = ModelExchange(config, api_key, attempt+1)
         try:
             async with asyncio.timeout_at(expires), aclosing(_stream_once(model,config,api_key,system,history,message,collect,exchange,report_stream)) as source:
@@ -362,7 +371,6 @@ async def _stream_once(model, config, api_key, system, history, message, collect
             yield {'type': 'status', 'stage': 'waiting', 'message': '等待模型响应'}
             async with client.stream('POST', pinned_request_url(url, addresses), headers=headers, json=body,
                                      extensions={'sni_hostname': url.host}) as response:
-                from avatar.models.diagnostics import check_response,empty_response,request_id
                 await check_response(response,api_key)
                 receiving = True
                 if report_stream:
@@ -404,7 +412,6 @@ async def _stream_once(model, config, api_key, system, history, message, collect
                         break
                     data = load_model_json(raw)
                     if event == 'error' or data.get('error') or data.get('type') == 'error':
-                        from avatar.models.diagnostics import provider_error
                         raise provider_error(200,data.get('error') or data,request_id(response.headers),api_key)
                     text, thought = '', False
                     size_before = fragments.size

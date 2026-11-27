@@ -9,6 +9,7 @@ from avatar.core.db import dump,now
 from avatar.core.execution import run_blocking
 from avatar.models.artifact_cache import UPSERT, fingerprint, prune
 from avatar.models.discovery import discover
+from avatar.models.metadata import EMBEDDINGS
 
 log = logging.getLogger(__name__)
 
@@ -45,7 +46,6 @@ def apply_capabilities(config, info, *, embedding=False):
         # Server-only snapshots survive bounded cache eviction; request schemas never accept these fields.
         info={'vision':config.get('multimodal_enabled') if embedding else config.get('vision_enabled'),'audio':config.get('audio_enabled',False),'input_modalities':config.get('input_modalities',[]),'source':config['capability_source'],'category':'embedding' if embedding else 'text'}
     if not info and config.get('provider')=='siliconflow' and urlsplit(config.get('base_url','')).hostname=='api.siliconflow.cn':
-        from avatar.models.metadata import EMBEDDINGS
         spec=EMBEDDINGS.get(config.get('model','').removeprefix('Pro/'))
         if spec:info={'vision':spec[2],'audio':False,'input_modalities':['text','image'] if spec[2] else ['text'],'source':'official_model','category':'embedding','chat_compatible':False}
     modalities=info.get('input_modalities',[])

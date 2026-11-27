@@ -3,6 +3,7 @@ import hashlib
 import uuid
 
 from avatar.core.db import dump
+from avatar.models.embedding import index_identity
 
 
 def invalidate(db,user_id,*,force=False):
@@ -14,7 +15,6 @@ def invalidate(db,user_id,*,force=False):
 
 
 def signature(embedding,model):
-    from avatar.models.embedding import index_identity
     return hashlib.sha256(dump(['file-index-v3',index_identity(embedding),modalities(model)]).encode()).hexdigest()
 
 

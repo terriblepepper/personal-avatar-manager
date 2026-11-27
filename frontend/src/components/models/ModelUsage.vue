@@ -1,10 +1,11 @@
 <script setup lang="ts">
+import { useConfirmation } from '../../composables/useConfirmation'
 import RecordPagination from '../RecordPagination.vue'
 import { computed, onMounted, ref } from 'vue'
-import { ElMessageBox } from 'element-plus'
 import AppDialog from '../AppDialog.vue'
 import { date } from '../../utils/format'
 import { request, notifyError } from '../../api/client'
+const confirmAction = useConfirmation()
 interface Call {id:number;model:string;provider:string;purpose:string;created_at:string;usage:{input_tokens?:number;output_tokens?:number;total_tokens?:number}}
 interface Page {items:Call[];total:number;offset:number}
 const rows=ref<Call[]>([]), total=ref(0), offset=ref(0), search=ref(''), selected=ref<number[]>([]), detail=ref<Call|null>(null)
@@ -12,7 +13,14 @@ const allSelected = computed(() => !!rows.value.length && rows.value.every(row=>
 function togglePage() { selected.value = allSelected.value ? [] : rows.value.map(row=>row.id) }
 let sequence=0
 async function load(next=0){const ticket=++sequence;try{const data=await request<Page>('/records/model_calls?'+new URLSearchParams({offset:String(next),search:search.value}));if(ticket!==sequence)return;rows.value=data.items;total.value=data.total;offset.value=data.offset;selected.value=[]}catch(e){notifyError(e)}}
-async function remove(all:boolean){try{await ElMessageBox.confirm(all?'删除所有分页的模型调用记录？':'删除所选模型调用记录？','确认删除');await request('/records/model_calls/delete','POST',{all,ids:selected.value.map(String)});await load(all?0:offset.value)}catch(e){if(e!=='cancel'&&e!=='close')notifyError(e)}}
+async function remove(all: boolean) {
+  if (!all && !selected.value.length) return
+  await confirmAction(all ? '删除所有分页的模型调用记录？' : '删除所选模型调用记录？', '确认删除',
+    () => [offset.value, search.value, all ? null : selected.value], async () => {
+      await request('/records/model_calls/delete', 'POST', { all, ids: selected.value.map(String) })
+      await load(all ? 0 : offset.value)
+    })
+}
 onMounted(()=>load())
 </script>
 <template>

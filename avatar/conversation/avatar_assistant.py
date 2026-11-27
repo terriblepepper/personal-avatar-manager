@@ -77,6 +77,11 @@ class AvatarAssistantRouter:
                     bool(re.search(r'(?<![a-z0-9_])'+re.escape(alias)+r'(?![a-z0-9_])',text))
                     if alias.isascii() else alias in text for alias in target['aliases'])]
 
+    def clear_target(self, caller_id, parent_id):
+        with self.database.connect(write=True, account_scope=caller_id) as db:
+            db.execute('UPDATE chat_conversations SET selected_aic=NULL WHERE id=? AND user_id=? AND caller_id=?',
+                       (parent_id,caller_id,caller_id))
+
     # 职责：取得父会话中对应调用者和目标的内部子会话。
     # 输入：memory 为记忆服务，caller_id 为已认证调用者，parent 为父会话，target 为已选分身。
     # 结果与约束：稳定 UUID 隔离目标记忆，保存 parent_id 与选中目标；内部 platform 标识阻止经 Web 会话接口直接越权访问。
@@ -92,8 +97,8 @@ class AvatarAssistantRouter:
             exists=db.execute('SELECT 1 FROM chat_conversations WHERE id=?',(cid,)).fetchone()
         child=memory.scope(caller_id,'assistant',target['aic'],cid,caller_id=caller_id,
                            platform='dingdang',create=not bool(exists),title=target['name'])
-        with self.database.connect(write=True) as db:
-            db.execute('UPDATE chat_conversations SET parent_id=? WHERE id=?',(parent['id'],cid))
-            db.execute('UPDATE chat_conversations SET selected_aic=?,updated_at=? WHERE id=?',(target['aic'],now(),parent['id']))
+        with self.database.connect(write=True, account_scope=caller_id) as db:
+            db.execute('UPDATE chat_conversations SET parent_id=? WHERE id=? AND user_id=? AND caller_id=?',(parent['id'],cid,caller_id,caller_id))
+            db.execute('UPDATE chat_conversations SET selected_aic=?,updated_at=? WHERE id=? AND user_id=? AND caller_id=?',(target['aic'],now(),parent['id'],caller_id,caller_id))
         child['parent_id']=parent['id']
         return child

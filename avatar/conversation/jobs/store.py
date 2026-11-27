@@ -122,21 +122,27 @@ class GenerationStore:
 
     def heartbeat(self, jobs):
         revoked = []
-        with self.database.connect(write=True) as db:
+        jobs = tuple(jobs)
+        if not jobs:return revoked
+        owners = {job['user_id'] for job in jobs}
+        with self.database.connect(write=True, account_scope=next(iter(owners)) if len(owners)==1 else None) as db:
             for job in jobs:
-                updated=db.execute("""UPDATE chat_generation_jobs SET updated_at=? WHERE task_id=? AND state='running'
-                    AND authorization::jsonb->>'claim_token'=?""",(time.time(),job['task_id'],json.loads(job['authorization'])['claim_token'])).rowcount
+                updated=db.execute("""UPDATE chat_generation_jobs SET updated_at=? WHERE task_id=? AND user_id=? AND state='running'
+                    AND authorization::jsonb->>'claim_token'=?""",(time.time(),job['task_id'],job['user_id'],json.loads(job['authorization'])['claim_token'])).rowcount
                 if not updated:
-                    row=db.execute('SELECT state FROM chat_generation_jobs WHERE task_id=?',(job['task_id'],)).fetchone()
+                    row=db.execute('SELECT state FROM chat_generation_jobs WHERE task_id=? AND user_id=?',(job['task_id'],job['user_id'])).fetchone()
                     if not row or row['state']!='succeeded':revoked.append(job['task_id'])
         return revoked
 
     def release_unstarted(self, jobs):
-        with self.database.connect(write=True) as db:
+        jobs = tuple(jobs)
+        if not jobs:return
+        owners = {job['user_id'] for job in jobs}
+        with self.database.connect(write=True, account_scope=next(iter(owners)) if len(owners)==1 else None) as db:
             for job in jobs:
                 db.execute("""UPDATE chat_generation_jobs SET state='queued',updated_at=? WHERE state='running'
-                    AND task_id=? AND authorization::jsonb->>'claim_token'=?""",
-                    (time.time(),job['task_id'],json.loads(job['authorization'])['claim_token']))
+                    AND task_id=? AND user_id=? AND authorization::jsonb->>'claim_token'=?""",
+                    (time.time(),job['task_id'],job['user_id'],json.loads(job['authorization'])['claim_token']))
 
     def record(self,user_id,request_id,snapshot):
         job=current_generation.get()

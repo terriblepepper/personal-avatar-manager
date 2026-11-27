@@ -7,6 +7,8 @@ from avatar.protocols.transport.certificates import registration_component
 from wit import WitAgent
 from wit.acps.atr import TRUSTED_REGISTRATION, RegistryServerCredentials
 from avatar.core.db import now
+from avatar.core.execution import blocking_context, run_blocking
+from avatar.protocols.identity import document as identity_document
 from avatar.protocols.identity.document import wit_candidate_config, sync_component_acs
 from avatar.protocols.identity.system import system_identity_paths, initialize_system_identity
 from avatar.protocols.registration.system import RegistrationConfigurationError, validate_system_registration, validate_ca_directory, publish_system_acs
@@ -93,27 +95,31 @@ class SystemRegistrationRuntime:
     async def step(self):
         self.stage = 'registration'
         try:
-            config = self.configuration()
+            config = await run_blocking(self.configuration)
         except RegistrationConfigurationError:
             raise
         except (OSError, KeyError, ValueError):
             raise RegistrationConfigurationError('configuration_unavailable') from None
         # 已完成的系统身份只从本地装载；重启平台不是一次新的注册或 CA 健康查询。
-        state_path=config.paths.state_dir/'atr-state.json'
-        if config.mode in ('integrated','entity') and state_path.is_file():
-            from avatar.protocols.identity.document import identity_json,LocalEntityDirectory
-            state=identity_json(state_path)
-            if state.get('phase')=='active':
-                entity=await LocalEntityDirectory({state['aic']:config}).select(state['aic'])
-                self.phase,self.aic='active',entity.aic
-                self.registration_id=state.get('registration_id')
-                self.acs_fingerprint=state.get('fingerprint')
-                self.code,self.reason,self.updated_at='active','',now()
-                await self.activate(config)
-                return self.phase
+        def active_state():
+            path = config.paths.state_dir / 'atr-state.json'
+            if config.mode in ('integrated', 'entity') and path.is_file():
+                state = identity_document.identity_json(path)
+                if state.get('phase') == 'active':
+                    return state
+
+        state = await run_blocking(active_state)
+        if state:
+            entity=await identity_document.LocalEntityDirectory({state['aic']:config}).select(state['aic'])
+            self.phase,self.aic='active',entity.aic
+            self.registration_id=state.get('registration_id')
+            self.acs_fingerprint=state.get('fingerprint')
+            self.code,self.reason,self.updated_at='active','',now()
+            await self.activate(config)
+            return self.phase
         await validate_ca_directory(config)
-        with wit_candidate_config(config) as input_config:
-            component = registration_component(input_config)
+        async with blocking_context(wit_candidate_config(config)) as input_config:
+            component = await run_blocking(registration_component, input_config)
             agent = WitAgent(metadata={'application': 'personal-avatar-manager', 'entry': type(self).__name__})
             agent.install(component, required=True)
             try:
@@ -137,9 +143,9 @@ class SystemRegistrationRuntime:
                             raise RegistrationConfigurationError('registered_identity_mismatch')
                         document = dict(component.final_acs)
             finally:
-                sync_component_acs(config, component, publisher=self.publish)
+                await run_blocking(sync_component_acs, config, component, publisher=self.publish)
             if phase == 'active':
-                self.publish(document, result.aic)
+                await run_blocking(self.publish, document, result.aic)
         # AtrEntityDirectory 与 ATR 写组件共享文件锁，必须等上面的容器完成 teardown 后才接通监听。
         if self.phase == 'active':
             await self.activate(config)

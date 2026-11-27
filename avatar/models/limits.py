@@ -3,6 +3,8 @@ import json
 import httpx
 from fastapi import HTTPException
 from avatar.core.tokens import estimate
+from avatar.core.artifact_limits import MAX_ENVELOPE_BYTES
+from avatar.models.tools import configure_tools
 
 # 来源及核对日期见操作手册；网关可能施加更低限制，不能因名称相同推断其实际配额。
 MODEL_LIMITS = {
@@ -34,7 +36,6 @@ def validate(config):
 def tool_budget(config):
     if not config.get('_tools'):
         return 0
-    from avatar.models.tools import configure_tools
     body={}
     configure_tools(config.get('api_format','openai'),body,config['_tools'],required=not config.get('_optional_tools'),
                     batch=bool(config.get('_batch_tools')),native=bool(config.get('_react_tool_calls')))
@@ -72,7 +73,6 @@ def _generates_html(config):
 def response_limit(config,streaming=False):
     wire_allowance = min(64*1024*1024,max(8*1024*1024,config['max_tokens']*2048))
     if _generates_html(config):
-        from avatar.core.artifact_limits import MAX_ENVELOPE_BYTES
         # HTML is nested inside JSON tool arguments. Escapes and streaming headers do not count toward file size.
         return MAX_ENVELOPE_BYTES + (wire_allowance if streaming else 0)
     if streaming:

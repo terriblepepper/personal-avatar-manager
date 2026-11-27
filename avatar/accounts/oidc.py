@@ -14,8 +14,10 @@ import httpx
 import jwt
 from fastapi import HTTPException
 from avatar.core.http_pool import HttpTransportPool
-from avatar.accounts.auth import issue_session
+from avatar.accounts.sessions import issue_session
 from avatar.core.db import dump, event, now
+from avatar.accounts.login_devices import record_device
+from avatar.accounts.platform_binding import PlatformBindingService
 
 
 # 职责：对随机状态和浏览器凭据生成摘要。
@@ -116,7 +118,6 @@ class OidcService:
         configuration = await self.discovery()
         if platform_token:
             return_to = '/profile'
-            from avatar.accounts.platform_binding import PlatformBindingService
             await asyncio.to_thread(PlatformBindingService(self.database).preview,platform_token)
         def save_state():
             with self.database.connect(write=True, account_scope='oidc-state:' + digest(state)) as db:
@@ -218,9 +219,7 @@ class OidcService:
                 db.execute('UPDATE '+table+' SET username=?,verified_at=? WHERE issuer=? AND subject=?',
                            (identity_username, now(), self.issuer, claims['sub']))
                 if transaction.get('platform_token'):
-                    from avatar.accounts.platform_binding import PlatformBindingService
                     PlatformBindingService(self.database).bind_in_transaction(db, user_id, transaction['platform_token'])
-                from avatar.accounts.login_devices import record_device
                 record_device(db,user_id,device)
                 # ID Token expires after authentication; the server-owned session has its own bounded lifetime.
                 duration = 43200 if claims['exp'] > time.time() else 0

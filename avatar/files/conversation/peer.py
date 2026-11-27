@@ -12,6 +12,7 @@ from avatar.core.db import now
 from avatar.files.conversation.resources import original_hashes, reference_count
 from avatar.files.uploads.validation import MAX_FILE
 from avatar.files.word_pdfs import WORD_PDF_SUFFIXES, link_word_pdf
+from avatar.files.conversation.session_files import SessionFiles
 
 
 GENERATED_FILE = """(f.origin='generated' OR (f.origin='reference' AND f.sha256!='' AND EXISTS (
@@ -311,7 +312,6 @@ class PeerResources:
         return grants
 
     def validate_file_receipts(self,db,task,owner,workspace,proofs,*,lock=True):
-        from avatar.files.conversation.session_files import SessionFiles
         reader=SessionFiles(self.files,owner,workspace,proofs,
                             grants=lambda conn:self.session_file_grants(conn,task,owner,workspace))
         reader.validate_in(db,lock=lock)

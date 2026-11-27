@@ -1,10 +1,17 @@
 # 模块说明：系统独立 AIP mTLS 服务的装配与生命周期；读取 wit 已注册身份，不自动注册、申请证书或调用分身。
+import asyncio
 import json
 import logging
 from urllib.parse import urlsplit
+from avatar.core.execution import finish_on_cancel
 from wit import WitAgent
 from wit.acps.aip.direct import DIRECT_MTLS_SERVER
-from avatar.protocols.identity.system import system_identity_paths, system_aip_endpoint, private_directory
+from avatar.protocols.identity.system import (
+    system_identity_paths,
+    system_aip_endpoint,
+    private_directory,
+    SYSTEM_ENTITY_ID,
+)
 from avatar.protocols.tasks.management import SystemManagementService
 from avatar.runtime.system_partner import SystemPartnerHandler
 from avatar.protocols.identity.atr_config import read_atr_config
@@ -59,7 +66,6 @@ class SystemAipRuntime:
             if config.mode != 'integrated':
                 raise ValueError('管理系统必须使用唯一普通服务身份，不能使用本体或个人派生身份')
             candidate = json.loads(config.paths.acs_path.read_text())
-            from avatar.protocols.identity.system import SYSTEM_ENTITY_ID
             if candidate.get('entityUserId') != SYSTEM_ENTITY_ID:
                 raise ValueError('个人身份不能作为管理系统身份')
             declared = candidate.get('endPoints', [])
@@ -79,13 +85,20 @@ class SystemAipRuntime:
                                                server_name=parsed.hostname, base_path='/aip', public_endpoint=endpoint['url'],
                                                listener=listener), required=True)
             await agent.start()
-            self.agent = agent
-            self.listener = agent.context.get(DIRECT_MTLS_SERVER)
+            self.agent, self.listener = agent, agent.context.get(DIRECT_MTLS_SERVER)
             self.reason = 'ready'
-        except Exception as exc:
+        except (asyncio.CancelledError, Exception) as exc:
+            cancelled = isinstance(exc, asyncio.CancelledError)
+            self.reason = 'stopped' if cancelled else 'identity_or_configuration_not_ready'
             if agent is not None:
-                await agent.stop()
-            self.reason = 'identity_or_configuration_not_ready'
+                try:
+                    await finish_on_cancel(agent.stop())
+                except Exception as cleanup_error:
+                    if cancelled:
+                        raise exc from cleanup_error
+                    raise
+            if cancelled:
+                raise
             logger.warning('系统 AIP 未启用（%s）；请核对正式身份、证书、CA 和端点配置。', type(exc).__name__)
 
     # 职责：关闭协议端口并等待所有活动调用及任务存储清理。

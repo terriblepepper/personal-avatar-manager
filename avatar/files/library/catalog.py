@@ -3,6 +3,7 @@ import json
 
 from avatar.core.db import dump
 from avatar.core.tokens import estimate
+from avatar.models.context_budget import json_text_view
 
 
 def model_animation_metadata(metadata, query=''):
@@ -34,7 +35,6 @@ def fit_catalog(rows, query, budget):
 
 def fit_text_rows(rows, budget, field):
     """Keep ranked rows and their source identifiers, clipping free text only when needed."""
-    from avatar.models.context_budget import json_text_view
     remaining = budget - estimate('[]')
     kept = []
     for row in rows:

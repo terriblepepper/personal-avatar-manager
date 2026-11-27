@@ -3,7 +3,8 @@ import asyncio
 from collections import Counter,OrderedDict
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass,asdict
+from dataclasses import asdict
+from avatar.core.resource_limits import ResourceSample, sample_resources
 import json
 import math
 import time
@@ -42,22 +43,8 @@ class ResourcePolicy(BaseModel):
         return self
 
 
-@dataclass(frozen=True)
-class ResourceSample:
-    cpu_percent:float
-    cpu_cores:int
-    total_bytes:int
-    available_bytes:int
-    process_bytes:int
-    quota_cpu_cores:float|None=None
-    quota_memory_bytes:int|None=None
-    quota_available_bytes:int|None=None
-    loop_delay:float=0
-
-
 class ResourceController:
     def __init__(self,policy=None,*,sampler=None):
-        from avatar.core.resource_limits import sample_resources
         self.policy=policy or ResourcePolicy();self.sampler=sampler or sample_resources
         self.condition=asyncio.Condition();self.settings_lock=asyncio.Lock()
         self.active=Counter();self.index_users=Counter();self.active_jobs=0

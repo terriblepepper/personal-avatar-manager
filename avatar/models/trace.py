@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from avatar.core.execution import model_failure
 from avatar.models.diagnostics import PURPOSES, stop_reason
+from avatar.models.tools import raw_tool_calls
 
 _scope = ContextVar('model_io_scope', default=None)
 _HIDDEN = '[敏感内容已隐藏]'
@@ -150,7 +151,6 @@ class ModelExchange:
     def proposed(self, fmt, payload):
         if not self.event:
             return
-        from avatar.models.tools import raw_tool_calls
         try:
             calls = raw_tool_calls(fmt,payload)
         except (AttributeError, KeyError, IndexError, TypeError, ValueError):

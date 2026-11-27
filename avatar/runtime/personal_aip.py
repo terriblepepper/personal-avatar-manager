@@ -12,12 +12,13 @@ from wit.acps.identity import current_local_entity
 from avatar.protocols.identity.atr_config import read_atr_config
 from avatar.protocols.registration.entity import entity_identity_paths
 from avatar.protocols.transport.endpoints import entity_endpoint, registered_oidc_matches
-from avatar.protocols.registration.base import RegistrationFailure
+from avatar.protocols.errors import RegistrationFailure
 from avatar.protocols.transport.diagnostics import RpcDiagnostics
 from avatar.protocols.transport.directory import CachedEntityDirectory,PassiveTlsListener
 from avatar.protocols.identity.document import LocalEntityDirectory
 from avatar.protocols.tasks.personal import PersonalTaskService
 from avatar.protocols.tasks.store import ManagementTaskError
+from avatar.core.db import now
 
 log = logging.getLogger(__name__)
 
@@ -250,7 +251,6 @@ class PersonalAipRuntime:
                 'state':state,'reason':reason,'endpoint':endpoint}
 
     async def health(self,user_id):
-        from avatar.core.db import now
         from fastapi import HTTPException
         def identity_status():
             with self.database.connect() as db:

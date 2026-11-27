@@ -14,6 +14,7 @@ from avatar.protocols.transport.endpoints import entity_oidc_identity
 
 
 from avatar.conversation.collaboration.transport import PeerEndpointUnavailable, current_protocol
+from avatar.conversation.loop.peer import wire_id
 
 
 # endpoint 只来自已启动、核验 ACS 的运行时，不接受模型或用户指定地址。
@@ -53,7 +54,6 @@ class PeerAcpsTransport:
     async def exchange(self,job,leader_id,partner_id):
         def command_scope():
             with self.runtime.database.connect() as db:
-                from avatar.conversation.loop.peer import wire_id
                 command_id=wire_id(db,job,partner_id)
                 first = db.execute('SELECT command_id FROM agent_wire_results WHERE task_id=? AND session_id=? '
                                    'AND local_aic=(SELECT aic FROM avatar_records WHERE user_id=?) '

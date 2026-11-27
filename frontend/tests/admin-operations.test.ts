@@ -1,3 +1,5 @@
+import { reactive } from 'vue'
+import { ElMessageBox } from 'element-plus'
 import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, expect, it, vi } from 'vitest'
 import { routerKey } from 'vue-router'
@@ -11,7 +13,9 @@ import MigrationPanel from '../src/components/admin/MigrationPanel.vue'
 
 const {request,notifyError}=vi.hoisted(()=>({request:vi.fn(),notifyError:vi.fn()}))
 vi.mock('../src/api/client',()=>({request,notifyError}))
-vi.mock('../src/stores/session',()=>({useSessionStore:()=>({user:{is_root:true}})}))
+const session = reactive({ user: { is_root: true } })
+vi.mock('../src/stores/session',()=>({useSessionStore:()=>session}))
+const accepted = 'confirm' as Awaited<ReturnType<typeof ElMessageBox.confirm>>
 afterEach(()=>{vi.restoreAllMocks();request.mockReset();notifyError.mockReset()})
 
 it('reports each health result once, including a stale list and an unsuccessful probe',async()=>{
@@ -35,7 +39,7 @@ it('reports each health result once, including a stale list and an unsuccessful 
 })
 
 it('confirms each task list selection and only offers eligible rows',async()=>{
-  const confirm=vi.spyOn(window,'confirm').mockReturnValue(false)
+  const confirm=vi.spyOn(ElMessageBox,'confirm').mockRejectedValue('cancel')
   const rows=(statuses:string[])=>statuses.map(status=>({id:status,status,username:status,updated_at:'2026-11-18',action:'renew'}))
   request.mockImplementation(async(_path:string,method?:string)=>method==='POST'?{}:{
     items:rows(['done','failed','waiting']),offset:0,total:3})
@@ -47,7 +51,22 @@ it('confirms each task list selection and only offers eligible rows',async()=>{
     const remove=card.findAll('button').find(button=>button.text()==='删除所选')!
     await remove.trigger('click');await flushPromises()
     expect(request.mock.calls.some(([p])=>p==='/records/'+collection+'/delete')).toBe(false)
-    confirm.mockReturnValueOnce(true)
+    let accept!: () => void
+    confirm.mockImplementationOnce(() => new Promise(resolve => { accept = () => resolve(accepted) }))
+    const prompts = confirm.mock.calls.length
+    await remove.trigger('click'); await remove.trigger('click')
+    expect(confirm).toHaveBeenCalledTimes(prompts + 1)
+    await card.get('input[type=checkbox]').setValue(false)
+    accept(); await flushPromises()
+    expect(request.mock.calls.some(([p])=>p==='/records/'+collection+'/delete')).toBe(false)
+    await card.get('input[type=checkbox]').setValue(true)
+    confirm.mockImplementationOnce(() => new Promise(resolve => { accept = () => resolve(accepted) }))
+    await remove.trigger('click')
+    session.user.is_root = false
+    session.user.is_root = true
+    accept(); await flushPromises()
+    expect(request.mock.calls.some(([p])=>p==='/records/'+collection+'/delete')).toBe(false)
+    confirm.mockResolvedValueOnce(accepted)
     await remove.trigger('click');await flushPromises()
     expect(request).toHaveBeenCalledWith('/records/'+collection+'/delete','POST',{ids:[...ids]})
   }
@@ -81,7 +100,7 @@ it('shows migrated subjects and names the account kept or removed in a preview',
 })
 
 it('deletes one processed review independently of the current selection',async()=>{
-  vi.spyOn(window,'confirm').mockReturnValue(true)
+  vi.spyOn(ElMessageBox,'confirm').mockResolvedValue(accepted)
   request.mockImplementation(async(path:string)=>path.includes('?')?{items:['a','b'].map(id=>({id,kind:'profile',username:id,category:'update',status:'approved'})),total:2,offset:0}:{})
   const wrapper=mount(ReviewsPanel);await flushPromises()
   await wrapper.findAll('tbody tr')[0]!.get('input[type=checkbox]').setValue(true)

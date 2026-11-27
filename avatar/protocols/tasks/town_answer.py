@@ -12,6 +12,8 @@ from avatar.conversation.schemas import ChatRequest
 from avatar.conversation.tools.reply_artifacts import reply_with_artifacts, without_source_footer
 from avatar.protocols.tasks.guest_maintenance import guest_cutoff
 from avatar.protocols.tasks.store import ManagementTaskError
+from avatar.conversation.loop.town import bind_town_tools
+from avatar.models.trace import model_io_scope
 
 
 # 职责：使用已通过本人鉴权的所有者资料和模型配置生成个人回答。
@@ -52,7 +54,6 @@ async def answer_town(chat, files, target, context, session, *, principal=None, 
         raise ManagementTaskError(-32001, '访客会话已过期，请使用新会话')
     await run_blocking(claim, conversation_id)
     try:
-        from avatar.models.trace import model_io_scope
         with model_io_scope(progress,private=False):
             if config.get('_direct_chat'):
                 progress({'type':'status','stage':'result_writing'})
@@ -61,7 +62,6 @@ async def answer_town(chat, files, target, context, session, *, principal=None, 
             else:
                 model = await memory.prepare(conversation, overview['agent']['last_modified_at'], model, question,
                                              chat.model_client, user['id'], progress=progress)
-                from avatar.conversation.loop.town import bind_town_tools
                 previous = await run_blocking(files.files_from_previous,int(store.scope_id),
                                               resume.get('previous_deliveries',()))
                 async with files.workspace() as path:

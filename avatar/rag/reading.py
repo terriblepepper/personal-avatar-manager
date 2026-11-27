@@ -1,5 +1,4 @@
 """按需读取授权原件的正文或原生多媒体。"""
-import asyncio
 import base64
 from dataclasses import dataclass, field
 from io import BytesIO
@@ -12,6 +11,10 @@ from typing import Literal
 from avatar.files.parsing.text_worker import read_original
 from avatar.core.execution import run_blocking
 from avatar.core.text_budget import AgentText
+from avatar.files.parsing.document_images import traverse
+from avatar.files.parsing.images import jpeg_bytes
+from avatar.files.word_pdfs import WORD_SUFFIXES, read_word_pdf
+from avatar.knowledge.media import command, probe
 
 
 def read_has_content(item):
@@ -48,8 +51,6 @@ def _image(raw):
 
 
 async def read_original_tool(path, filename, media_type, request, *, vision, audio):
-    from avatar.files.parsing.images import jpeg_bytes
-    from avatar.files.word_pdfs import WORD_SUFFIXES, read_word_pdf
 
     extension = Path(filename).suffix.lower()
     images = []
@@ -61,10 +62,10 @@ async def read_original_tool(path, filename, media_type, request, *, vision, aud
                 raise ValueError('图片仅支持读取第 1 页')
             if not vision:
                 raise ValueError('当前模型不支持图片输入，未读取原图')
-            return {'coverage':'首帧图像', 'complete':True, 'next':None}, [_image(await asyncio.to_thread(jpeg_bytes, path))], []
+            return {'coverage':'首帧图像', 'complete':True, 'next':None}, [_image(await run_blocking(jpeg_bytes, path))], []
         vector = True
         if extension in WORD_SUFFIXES:
-            path, vector = await asyncio.to_thread(read_word_pdf, path)
+            path, vector = await run_blocking(read_word_pdf, path)
             extension = '.pdf'
         end = None if request.mode == 'full' else request.end
         if request.mode == 'pages' and end is None:
@@ -89,8 +90,6 @@ async def read_original_tool(path, filename, media_type, request, *, vision, aud
 
 
 async def _pdf_observation(path, request, result, images, *, vision, vector):
-    from avatar.files.parsing.document_images import traverse
-    from avatar.files.parsing.images import jpeg_bytes
 
     if request.mode == 'search':
         result['warning'] = '仅搜索 PDF 正文文字，图像中的文字不参与匹配。'
@@ -102,7 +101,7 @@ async def _pdf_observation(path, request, result, images, *, vision, vector):
         async with aclosing(traverse(path, {request.start}, vector=vector)) as visuals:
             item = await anext(visuals, None)
         if item:
-            images.append(_image(await asyncio.to_thread(jpeg_bytes, BytesIO(item['data']))))
+            images.append(_image(await run_blocking(jpeg_bytes, BytesIO(item['data']))))
             result['image_page'] = request.start
     if result['requested_end'] > request.start:
         result['warning'] = '本次最多附带起始页画面，其他页仅读取正文；可按页查看画面。'
@@ -110,8 +109,6 @@ async def _pdf_observation(path, request, result, images, *, vision, vector):
 
 def _media_segment(path, request, *, vision, audio):
     import tempfile
-    from avatar.files.parsing.images import jpeg_bytes
-    from avatar.knowledge.media import command, probe
 
     if request.mode == 'search' or request.offset:
         raise ValueError('音视频请按 30 秒片段读取，不支持字符搜索或偏移')

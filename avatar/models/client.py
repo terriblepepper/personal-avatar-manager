@@ -11,7 +11,8 @@ from avatar.models.model_network import DirectFirstTransport, ModelResolver, Pin
 from avatar.models.codec import ModelResult, build_request, parse_response, tokens
 from avatar.models.limits import generation_deadline, generation_http_timeout, response_limit
 from avatar.models.model_stream import stream_response
-from avatar.models.diagnostics import PURPOSES, transport_error, transport_failure
+from avatar.models.diagnostics import PURPOSES, transport_error, transport_failure, contextual
+from avatar.core.execution import check_execution_async
 
 
 collected_model_status = ContextVar('collected_model_status', default=None)
@@ -94,7 +95,6 @@ class ModelClient:
     # 输入：config、api_key、system、history、message 分别为已审核配置、凭据、身份提示、历史和问题。
     # 结果与约束：返回 ModelResult；完整响应等待通常为 180 秒，HTML 为 600 秒；SSE 按有效输出续期。
     async def generate(self, config, api_key, system, history, message):
-        from avatar.core.execution import check_execution_async
         try:
             await check_execution_async()
             try:
@@ -115,13 +115,11 @@ class ModelClient:
             exc.stop_reason = 'cancelled'
             raise
         except HTTPException as exc:
-            from avatar.models.diagnostics import contextual
             error=contextual(exc,config)
             import logging
             logging.getLogger(__name__).warning('Model request failed: %s',error.detail)
             raise error from None
         except TimeoutError as error:
-            from avatar.models.diagnostics import contextual
             raise contextual(transport_failure(error,total_timeout=generation_deadline(config)),config) from None
 
     @staticmethod
@@ -135,7 +133,6 @@ class ModelClient:
     # 输入：参数与 generate 一致，实际解析委托 model_stream.stream_response。
     # 结果与约束：异步 yield 状态、可见文本及用量；普通 SSE 有效输出间隔上限 180 秒，HTML 制作与动画分镜为 600 秒，aclosing 保证取消时关闭上游生成器。
     async def stream(self, config, api_key, system, history, message):
-        from avatar.core.execution import check_execution_async
         try:
             previous=None
             emitted=False
@@ -165,13 +162,11 @@ class ModelClient:
             exc.stop_reason = 'cancelled'
             raise
         except HTTPException as exc:
-            from avatar.models.diagnostics import contextual
             error=contextual(exc,config)
             import logging
             logging.getLogger(__name__).warning('Model request failed: %s',error.detail)
             raise error from None
         except TimeoutError as error:
-            from avatar.models.diagnostics import contextual
             raise contextual(transport_failure(error,total_timeout=generation_deadline(config)),config) from None
 
     # 职责：执行固定公网 IP 的 HTTPS 模型请求并解析完整回答。

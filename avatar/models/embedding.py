@@ -5,7 +5,7 @@ import math
 import httpx
 from avatar.models.model_network import pinned_request_url
 from fastapi import HTTPException
-from avatar.models.diagnostics import contextual, transport_failure
+from avatar.models.diagnostics import contextual, transport_failure, check_response
 from pydantic import BaseModel,ConfigDict,Field,SecretStr,field_validator
 from typing import Literal
 from avatar.models.schemas import ModelConfigInput
@@ -13,6 +13,7 @@ from avatar.core.db import dump,event,now
 from avatar.models.capabilities import automatic
 from avatar.models.model_config import provider_base_url
 from avatar.core.revisions import next_modified_at
+from avatar.core.tokens import estimate
 
 
 class EmbeddingInput(BaseModel):
@@ -120,7 +121,6 @@ async def embed(client,config,key,texts,*,retry_uncertain=True):
 
 
 async def _embed_once(client,config,key,texts):
-    from avatar.core.tokens import estimate
     if not isinstance(texts,list) or not 1<=len(texts)<=32:raise HTTPException(422,'嵌入批量必须为 1–32 项')
     for item in texts:
         if isinstance(item,str):
@@ -135,7 +135,6 @@ async def _embed_once(client,config,key,texts):
     try:
         async with asyncio.timeout(120),client.session(url, 90) as (addresses, session):
             async with session.stream('POST',pinned_request_url(url, addresses),headers={'Host':url.netloc.decode(),'Authorization':'Bearer '+key},json={'model':config['model'],'input':texts,'encoding_format':'float'},extensions={'sni_hostname':url.host}) as response:
-                from avatar.models.diagnostics import check_response
                 await check_response(response,key)
                 payload=bytearray()
                 async for chunk in response.aiter_bytes():

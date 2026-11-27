@@ -1,6 +1,7 @@
 # 模块说明：正式个人实体证书续期及注销，始终调用 wit/Registry 公开接口。
 import shutil
 from pathlib import Path
+from avatar.core.execution import blocking_context, run_blocking
 import ssl
 import httpx
 from avatar.protocols.transport.certificates import certificate_authority, registration_component
@@ -11,7 +12,7 @@ from avatar.protocols.identity.atr_config import read_atr_config
 from avatar.protocols.registration.entity import entity_identity_paths, certificate_projection
 from avatar.protocols.transport.registry import EntityRegistry
 from avatar.protocols.transport.ready import RegistryReadyTransport
-from avatar.protocols.registration.base import RegistrationFailure, RegistrationPending
+from avatar.protocols.errors import RegistrationFailure, RegistrationPending
 from avatar.protocols.identity.system import create_identity_json
 from avatar.protocols.identity.document import identity_json, wit_candidate_config
 
@@ -44,20 +45,25 @@ class EntityRegistryMaintenance:
     def __init__(self, config, transport=None):
         self.config, self.transport = config, transport
 
+    @staticmethod
+    def _saved_target(path):
+        return identity_json(path) if path.exists() else None
+
     # 职责：删除唯一匹配 AIC 的个人实体并核实删除状态。
     # 输入：aic 必须来自本地已核验的个人实体记录。
     # 结果与约束：先精确查询并核对非本体，再删除和读回；部分提交保留状态供管理员恢复。
     async def unregister(self, aic, *, ontology=False):
-        context = ssl.create_default_context(cafile=str(self.config.endpoints.ca_cert_path))
+        context = await run_blocking(ssl.create_default_context, cafile=str(self.config.endpoints.ca_cert_path))
+        transport = await run_blocking(RegistryReadyTransport, self.config, self.transport)
         async with httpx.AsyncClient(base_url=self.config.endpoints.registry_url, verify=context,
-                                     transport=RegistryReadyTransport(self.config,self.transport), trust_env=False, follow_redirects=False, timeout=30) as client:
+                                     transport=transport, trust_env=False, follow_redirects=False, timeout=30) as client:
             credentials = self.config.registry_credentials
             response = await client.post('/api/v1/auth/login', data={'username': credentials.username, 'password': credentials.password})
             response.raise_for_status()
             tokens = response.json()
             headers = {'Authorization': 'Bearer ' + tokens['access_token']}
             target = self.config.paths.state_dir / 'unregister-target.json'
-            saved = identity_json(target) if target.exists() else None
+            saved = await run_blocking(self._saved_target, target)
             if saved is None:
                 response = await client.get('/api/v1/agent/client', params={'aic': aic, 'page_size': 100}, headers=headers)
                 if response.status_code == 401 and tokens.get('refresh_token'):
@@ -69,7 +75,7 @@ class EntityRegistryMaintenance:
                 matches = [item for item in response.json()['items'] if item.get('aic') == aic]
                 if len(matches) != 1 or matches[0].get('is_ontology') is not ontology:
                     raise RegistrationFailure('未找到唯一的自有个人实体，拒绝注销本体或不明确的记录')
-                saved = create_identity_json(target,{'aic':aic,'id':matches[0]['id'],'is_ontology':ontology})
+                saved = await run_blocking(create_identity_json, target, {'aic':aic,'id':matches[0]['id'],'is_ontology':ontology})
             if saved.get('aic') != aic or saved.get('is_ontology') is not ontology:
                 raise RegistrationFailure('待注销记录与当前身份不一致')
             from urllib.parse import quote
@@ -93,17 +99,24 @@ class EntityRegistryMaintenance:
 # 输入：settings、稳定 user_id、expected_aic、action；只能由已授权管理队列调用。
 # 结果与约束：不在数据库事务内联网；注销保留私有状态和业务数据，续期必须核验完整证书后才能发布。
 async def maintain_entity(settings, user_id, expected_aic, action):
-    paths = entity_identity_paths(settings.data_dir, user_id)
-    config = read_atr_config(paths.registration, settings.registry_username, settings.registry_password)
+    def configuration():
+        paths = entity_identity_paths(settings.data_dir, user_id)
+        return read_atr_config(paths.registration, settings.registry_username, settings.registry_password)
+
+    config = await run_blocking(configuration)
     if config.mode not in ('entity','integrated'):
         raise RegistrationFailure('仅允许维护个人正式实体')
     return await maintain_registered(config, expected_aic, action)
 
 
 async def maintain_registered(config, expected_aic, action, *, expected_certificate=None):
-    with wit_candidate_config(config) as input_config:
-        registry = EntityRegistry(input_config) if config.mode=='entity' else RegistryClient(input_config,transport=RegistryReadyTransport(input_config))
-        component = registration_component(input_config, registry=registry)
+    def maintenance_component(input_config):
+        registry = (EntityRegistry(input_config) if config.mode == 'entity' else
+                    RegistryClient(input_config, transport=RegistryReadyTransport(input_config)))
+        return registration_component(input_config, registry=registry)
+
+    async with blocking_context(wit_candidate_config(config)) as input_config:
+        component = await run_blocking(maintenance_component, input_config)
         agent = WitAgent(metadata={'application': 'personal-avatar-manager', 'entry': 'entity-maintenance'})
         handle = agent.install(component, required=True)
         async with agent:
@@ -116,7 +129,7 @@ async def maintain_registered(config, expected_aic, action, *, expected_certific
                 if not instances and str(component.state.phase)=='active':
                     raise RegistrationFailure('未找到可核验的证书记录，未完成注销')
                 await EntityRegistryMaintenance(config).unregister(expected_aic)
-                ca = certificate_authority(config)
+                ca = await run_blocking(certificate_authority, config)
                 for cert in instances:
                     if cert.status != 'revoked':
                         await certificates.revoke(CertificateRevokeRequest(aic=expected_aic, usage=cert.usage,
@@ -128,16 +141,18 @@ async def maintain_registered(config, expected_aic, action, *, expected_certific
                 return None
             if action != 'renew':
                 raise RegistrationFailure('未知个人证书维护操作')
-            previous = identity_json(config.paths.state_dir / 'atr-state.json')['active']
+            state_path = config.paths.state_dir / 'atr-state.json'
+            previous = (await run_blocking(identity_json, state_path))['active']
             if expected_certificate and previous.get('client') != expected_certificate:
                 raise RegistrationFailure('证书已变化，请重新读取当前代次')
             await certificates.renew(CertificateRenewRequest(aic=expected_aic, usages=('client', 'server')))
             ontology_aic = component.final_acs.get('entityMeta',{}).get('ontologyAic','')
-        material, generation, _ = await registration_component(input_config).read_active_snapshot()
+        component = await run_blocking(registration_component, input_config)
+        material, generation, _ = await component.read_active_snapshot()
         if material.aic != expected_aic:
             raise RegistrationFailure('续期后的证书身份不一致，拒绝发布')
         projection=certificate_projection(material,generation,ontology_aic)
-        active = identity_json(config.paths.state_dir / 'atr-state.json')['active']
+        active = (await run_blocking(identity_json, state_path))['active']
         if (projection['id'] != active.get('client') or not active.get('server') or
                 any(active.get(usage) == previous.get(usage) for usage in ('client','server'))):
             raise RegistrationFailure('未读回新一代客户端和服务端证书')

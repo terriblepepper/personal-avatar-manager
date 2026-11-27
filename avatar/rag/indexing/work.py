@@ -1,6 +1,7 @@
 """File indexing and Soul share per-account and adaptive global admission."""
 from contextlib import asynccontextmanager
 from avatar.core.resource_budget import ResourceController
+from avatar.files.uploads.buffer import upload_work
 
 INDEX_WORKERS=10
 
@@ -13,5 +14,4 @@ class AccountIndexWork:
         async with self.resources.slot(user_id,stage):yield
 
     async def execute(self,user_id,stage,function,*args):
-        from avatar.files.uploads.buffer import upload_work
         async with self.resources.slot(user_id,stage):return await upload_work(function,*args)

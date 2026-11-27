@@ -62,8 +62,7 @@ async def lifespan(app):
 
         start(sample_loop_lag(), 'avatar-event-loop-lag')
         start(state.monitor.run(), 'avatar-platform-monitor')
-        if settings.redis_socket or settings.kafka_bootstrap:
-            start(state.changes.run(), 'avatar-commit-dispatch')
+        start(state.changes.run(), 'avatar-commit-dispatch')
         if settings.system_atr_enabled:
             await state.system_registration.start()
         else:

@@ -160,6 +160,12 @@ def test_uploads_over_old_single_file_limit_use_disk_backed_buffers(context):
     assert profile.status_code == 201, profile.text
     soul = user.post('/api/me/knowledge/assets', files={'file': ('large.txt', data)})
     assert soul.status_code == 201, soul.text
+    cid = user.post('/api/conversations', json={'channel':'assistant'}).json()['id']
+    chat = user.post('/api/conversations/' + cid + '/files', files={'file':('large.txt', data)})
+    assert chat.status_code == 201, chat.text
+    result = chat.json()
+    item = next(row for row in result['items'] if row['id'] == result['file_id'])
+    assert item['size'] == len(data)
     assert user.get(profile.json()['download_url']).content == data
     assert user.get('/api/me/knowledge/assets/' + soul.json()['id']).content == data
 
@@ -335,7 +341,7 @@ def test_snapshot_attachments_batch_respects_owner_and_preserves_reference_order
     assert json.loads(stored['referenced']) == {**snapshot,'attachments':[refs[0],refs[2],refs[3]]}
 
 
-def test_chat_multipart_limits_only_html_before_spooling(monkeypatch):
+def test_chat_multipart_limits_each_file_before_spooling(monkeypatch):
     from contextlib import nullcontext
     from types import SimpleNamespace
     import httpx
@@ -344,8 +350,9 @@ def test_chat_multipart_limits_only_html_before_spooling(monkeypatch):
     from avatar.api import chat_file_routes
     from avatar.files.uploads import validation
 
-    assert validation.MAX_SOURCE_BYTES == 100 * 1024**2
+    assert validation.MAX_CHAT_UPLOAD == 100 * 1024**2
     monkeypatch.setattr(validation, 'MAX_SOURCE_BYTES', 32)
+    monkeypatch.setattr(validation, 'MAX_CHAT_UPLOAD', 32)
     opened, stored, written = [], [], []
     original_spool = formparsers.SpooledTemporaryFile
     def spool(*args, **kwargs):
@@ -371,7 +378,7 @@ def test_chat_multipart_limits_only_html_before_spooling(monkeypatch):
 
     async def check():
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://unit.invalid') as client:
-            for name, size, status in [('exact.HTML',32,201), ('large.hTm',33,413), ('ordinary.txt',80,201)]:
+            for name, size, status in [('exact.HTML',32,201), ('large.hTm',33,413), ('ordinary.txt',32,201), ('large.txt',33,413)]:
                 payload = b'x' * size
                 multipart = httpx.Request('POST','http://unit.invalid',files={'file':(name,payload)})
                 raw = multipart.read()
@@ -389,5 +396,33 @@ def test_chat_multipart_limits_only_html_before_spooling(monkeypatch):
                 assert tail_read == (status == 201)
                 assert opened[-1].closed
                 assert written[-1] == (size if status == 201 else 32)
-        assert stored == [('exact.HTML',32), ('ordinary.txt',80)]
+            async def interrupted():
+                yield raw[:start + 32]
+                raise asyncio.CancelledError
+            with pytest.raises(asyncio.CancelledError):
+                await client.post('/api/conversations/chat/files', content=interrupted(),
+                    headers={'content-type':multipart.headers['content-type']})
+            assert opened[-1].closed
+        assert stored == [('exact.HTML',32), ('ordinary.txt',32)]
+    asyncio.run(check())
+
+
+def test_internal_chat_upload_checks_limit_before_storage(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from fastapi import HTTPException
+    from avatar.files.conversation.attachments import ChatFiles
+    from avatar.files.uploads import validation
+    monkeypatch.setattr(validation, 'MAX_CHAT_UPLOAD', 32)
+    files = ChatFiles.__new__(ChatFiles)
+    files.attachments = SimpleNamespace(parsing=asyncio.Semaphore(1))
+    files._store = Mock(return_value='stored')
+    async def check():
+        for name in ('sample.html', 'sample.txt'):
+            with pytest.raises(HTTPException) as error:
+                await files.upload({'id':'user'}, 'chat', name, b'x' * 33)
+            assert error.value.status_code == 413
+        files._store.assert_not_called()
+        assert await files.upload({'id':'user'}, 'chat', 'sample.txt', b'x'*32) == 'stored'
+        assert await files.upload({'id':'user'}, 'chat', 'saved.txt', b'x'*33, origin='reference') == 'stored'
     asyncio.run(check())

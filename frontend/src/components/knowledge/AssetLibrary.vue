@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { useConfirmation } from '../../composables/useConfirmation'
 import { fileSizeMB, quotaSummary, type StorageQuota } from '../../utils/format'
 import { SOUL_ACCEPT, supportsSoulAsset } from '../../utils/soulFormats'
 import { computed, onMounted, ref, watch } from 'vue'
@@ -10,6 +11,7 @@ import MaterialTypeIcon from '../MaterialTypeIcon.vue'
 import RecordPagination from '../RecordPagination.vue'
 import FilePreview from '../FilePreview.vue'
 import type { Asset } from './types'
+const confirmAction = useConfirmation()
 const props=defineProps<{assets:Asset[];selected:string[];quota?:StorageQuota}>()
 const emit=defineEmits<{refresh:[]; 'update:selected':[value:string[]]}>()
 const folder=ref(''), folders=ref<string[]>([]), captions=ref<Record<string,string>>({}), caption=ref(''), selectedFiles=ref<string[]>([]), selectedFolders=ref<string[]>([]), search=ref(''), inspected=ref<Asset|null>(null), preview=ref<Asset|null>(null), importOpen=ref(false), materials=ref<Asset[]>([]), imports=ref<string[]>([]), busy=ref(false), offset=ref(0)
@@ -73,7 +75,18 @@ function selectPage(){
     selectedFolders.value=[...new Set([...selectedFolders.value,...directories])]
   }
 }
-async function remove(){if(!selectedFiles.value.length&&!selectedFolders.value.length)return;if(!confirm('删除所选文件或文件夹？已学到的风格保留。'))return;if(await act('/me/knowledge/assets/batch','POST',{action:'delete',ids:selectedFiles.value,folders:selectedFolders.value})){selectedFiles.value=[];selectedFolders.value=[];inspected.value=null}}
+async function remove() {
+  if (busy.value || (!selectedFiles.value.length && !selectedFolders.value.length)) return
+  await confirmAction('删除所选文件或文件夹？已学到的风格保留。', '确认删除素材', () => [
+    busy.value, folder.value, selectedFiles.value, selectedFolders.value,
+    props.assets.filter(item => selectedFiles.value.includes(item.id)).map(item => item.id),
+    folders.value.filter(path => selectedFolders.value.includes(path)),
+  ], async () => {
+    if (await act('/me/knowledge/assets/batch','POST',{action:'delete',ids:selectedFiles.value,folders:selectedFolders.value})) {
+      selectedFiles.value=[]; selectedFolders.value=[]; inspected.value=null
+    }
+  })
+}
 async function openImport(){try{const value=await request<Asset[]>('/me/attachments');materials.value=value.filter(item=>supportsSoulAsset(item.filename));imports.value=[];importOpen.value=true}catch(e){notifyError(e)}}
 async function importFiles(){busy.value=true;let count=0;try{for(const id of imports.value){const item=materials.value.find(x=>x.id===id);const parent=(item?.relative_path||item?.filename||'').split('/').slice(0,-1).join('/');await request('/me/knowledge/assets/import','POST',{attachment_id:id,folder:[folder.value,parent].filter(Boolean).join('/')});count++}importOpen.value=false;ElMessage.success(`已导入 ${count} 份素材`)}catch(e){ElMessage.warning(`已导入 ${count} 份；后续导入未完成`);notifyError(e)}finally{if(count){await loadFolders();emit('refresh')}busy.value=false}}
 onMounted(loadFolders)

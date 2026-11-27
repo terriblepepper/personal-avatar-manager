@@ -4,7 +4,8 @@ import asyncio
 import json
 import re
 import uuid
-from contextlib import contextmanager
+import sys
+from contextlib import ExitStack, asynccontextmanager, contextmanager
 from contextvars import ContextVar
 
 from typing import Annotated
@@ -39,6 +40,19 @@ async def check_execution_async(validate=None):
 async def run_blocking(function, *args, **kwargs):
     """A cancelled caller must outlive its transaction, lease or temporary input."""
     return await finish_on_cancel(asyncio.to_thread(function, *args, **kwargs))
+
+
+@asynccontextmanager
+async def blocking_context(manager):
+    """Retain ownership if cancellation races a resource-opening worker."""
+    stack=ExitStack()
+    try:
+        value=await run_blocking(stack.enter_context,manager)
+        yield value
+    except BaseException:
+        if not await run_blocking(stack.__exit__,*sys.exc_info()):raise
+    else:
+        await run_blocking(stack.close)
 
 
 async def finish_on_cancel(coroutine):

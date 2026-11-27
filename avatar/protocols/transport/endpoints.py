@@ -1,6 +1,6 @@
 """个人分身使用服务器 IP 和稳定独占端口。"""
 from urllib.parse import urlsplit
-from avatar.protocols.registration.base import RegistrationFailure
+from avatar.protocols.errors import RegistrationFailure
 
 # 职责：取得指定内部账户已绑定的 Keycloak 身份，不使用本地用户名冒充 OIDC 用户。
 # 仅信任配置 issuer 下的唯一绑定；根管理员无外部身份，不能注册为小镇个人分身。

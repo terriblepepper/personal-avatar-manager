@@ -1,9 +1,23 @@
 """Host/cgroup observation and optional limits on this platform's own service."""
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import subprocess
 import psutil
 from fastapi import HTTPException
+
+
+@dataclass(frozen=True)
+class ResourceSample:
+    cpu_percent:float
+    cpu_cores:int
+    total_bytes:int
+    available_bytes:int
+    process_bytes:int
+    quota_cpu_cores:float|None=None
+    quota_memory_bytes:int|None=None
+    quota_available_bytes:int|None=None
+    loop_delay:float=0
 
 
 def _number(path):
@@ -14,7 +28,6 @@ def _number(path):
 
 
 def sample_resources():
-    from avatar.core.resource_budget import ResourceSample
     memory=psutil.virtual_memory();process=psutil.Process()
     used=process.memory_info().rss
     for child in process.children(recursive=True):

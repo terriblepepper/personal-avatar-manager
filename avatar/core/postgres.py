@@ -18,11 +18,12 @@ SCHEMA_LOCK = 1096172627
 ACCOUNT_WRITE_LOCK = 1096172628
 
 
-def lock_schema_transaction(raw, domain, *, account_scope=None, dispatch=False):
+def lock_schema_transaction(raw, domain, *, account_scope=None, dispatch=None):
     # Acquire the legacy barrier, schema barrier and account lock in the same order across writers.
     legacy = "SELECT pg_advisory_xact_lock_shared(%s::bigint)"
-    if dispatch:
-        legacy += ", set_config('avatar.dispatch_enabled','on',true)"
+    if dispatch is not None:
+        mode = 'on' if dispatch else 'detect'
+        legacy += f", set_config('avatar.dispatch_enabled','{mode}',true)"
     if account_scope is None:
         raw.execute(f"""WITH legacy AS MATERIALIZED ({legacy})
             SELECT pg_advisory_xact_lock(%s::integer,hashtext(current_schema())) FROM legacy""",

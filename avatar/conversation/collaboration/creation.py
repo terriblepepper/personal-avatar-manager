@@ -178,7 +178,7 @@ def retry_draft(dialogues,user,identifier,request_id):
 def task_draft(dialogues,user,identifier,body):
     """用户主动创建任务时复用通信确认表单；保存草稿不会投递或调用模型。"""
     intent_id=str(uuid.uuid5(uuid.NAMESPACE_URL,user['id']+':task-draft:'+body.request_id))
-    with dialogues.database.connect(write=True) as db:
+    with dialogues.database.connect(write=True, account_scope=user['id']) as db:
         pair=dialogues.session_store.member(db,user,identifier)
         peer=pair['right_user_id'] if pair['left_user_id']==user['id'] else pair['left_user_id']
         avatar=db.execute('SELECT aic,profile FROM avatar_records WHERE user_id=?',(peer,)).fetchone()

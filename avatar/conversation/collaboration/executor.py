@@ -44,7 +44,7 @@ class PeerTurnExecutor:
             run.charge(config,result.usage)
         else:
             def record_usage():
-                with self.database.connect(write=True) as db:
+                with self.database.connect(write=True, account_scope=speaker['user_id']) as db:
                     db.execute('INSERT INTO model_calls(user_id,provider,model,usage,created_at,purpose,caller_id) VALUES(?,?,?,?,?,?,?)',(speaker['user_id'],config['provider'],config['model'],dump(result.usage),now(),purpose,job['user_id']))
             await run_blocking(record_usage)
         if isinstance(result,AgentNeedsInput):raise result
@@ -262,7 +262,7 @@ class PeerTurnExecutor:
             result=await self.billed(job,turn.speaker,config,self.chat.memory.summarize((config,key,system,history),summary,history[:split],self.chat.model_client),'agent_dialogue_memory')
             summary=result.text;history=history[split:]
             def save_summary():
-                with self.database.connect(write=True) as db:
+                with self.database.connect(write=True, account_scope=speaker_id) as db:
                     if turn.ordinary:db.execute('UPDATE agent_session_members SET summary=?,summary_through=? WHERE session_id=? AND user_id=? AND cleared_through=? AND summary_through=?',(summary,turn.rows[split-1]['id'],job['session_id'],speaker_id,turn.member['cleared_through'],turn.memory['summary_through']))
                     else:db.execute('UPDATE agent_task_members SET summary=?,summary_through=? WHERE task_id=? AND user_id=? AND hidden=0 AND summary_through=? AND EXISTS(SELECT 1 FROM agent_session_members WHERE session_id=? AND user_id=? AND cleared_through=?)',(summary,turn.rows[split-1]['id'],job['id'],speaker_id,turn.memory['summary_through'],job['session_id'],speaker_id,turn.member['cleared_through']))
             await run_blocking(save_summary)

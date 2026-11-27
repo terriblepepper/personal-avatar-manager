@@ -387,7 +387,7 @@ def test_demo_overview_reuses_files_and_reads_without_write_lock(context, monkey
     assert connect.call_count == 1
 
 
-def test_direct_overview_reserves_once_then_reads_existing_port(context, monkeypatch):
+def test_direct_reads_project_ports_and_only_save_reserves(context, monkeypatch):
     from dataclasses import replace
     from types import SimpleNamespace
     from unittest.mock import Mock
@@ -410,12 +410,21 @@ def test_direct_overview_reserves_once_then_reads_existing_port(context, monkeyp
     assert not any(call.kwargs.get('write') for call in connect.call_args_list)
     first = user.get('/api/me').json()['profile']['acs_document']['endPoints']
     assert len(first) == 1 and first == candidate
-    assert sum(bool(call.kwargs.get('write')) for call in connect.call_args_list) == 1
+    assert user.get('/api/me/acs?source=draft').json()['document']['endPoints']==first
     with service.database.connect() as db:
-        assert db.execute('SELECT port FROM avatar_entity_ports WHERE user_id=?', (uid,)).fetchone()[0] == settings.entity_aip_port
+        connect.reset_mock()
+        assert service.overview(uid,db=db)['profile']['acs_document']['endPoints']==first
+        assert service.saved_acs({'id':uid},'draft',db=db)['document']['endPoints']==first
+        assert not connect.called
+        assert not db.execute('SELECT 1 FROM avatar_entity_ports WHERE user_id=?',(uid,)).fetchone()
+    response=user.put('/api/me/profile',json={'profile':PROFILE,'last_modified_at':profile['last_modified_at']})
+    assert response.status_code==200,response.text
+    with service.database.connect() as db:
+        assert db.execute('SELECT port FROM avatar_entity_ports WHERE user_id=?',(uid,)).fetchone()[0]==settings.entity_aip_port
     connect.reset_mock()
-    assert user.get('/api/me').json()['profile']['acs_document']['endPoints'] == first
-    assert not any(call.kwargs.get('write') for call in connect.call_args_list)
+    assert service.saved_acs({'id':uid},'draft')['document']['endPoints']==first
+    assert connect.call_count==1 and not connect.call_args.kwargs.get('write')
+
 
 
 def test_onboarding_progress_belongs_to_account_and_only_moves_forward(context):
@@ -633,7 +642,6 @@ def redis_socket():
 def test_overview_push_uses_committed_owner_scope(pg_database, redis_socket):
     from avatar.core.dispatch import Changes
 
-    pg_database.dispatch_enabled = True
     def save_profile():
         with pg_database.connect(write=True, account_scope='overview-owner') as db:
             db.execute("INSERT INTO users(id,username,password,role,created_at) VALUES('overview-owner','overview-owner','hash','user','2026')")
@@ -643,7 +651,7 @@ def test_overview_push_uses_committed_owner_scope(pg_database, redis_socket):
         worker = asyncio.create_task(changes.run())
         try:
             async with asyncio.timeout(10):
-                while not changes.can_push:
+                while not (changes.can_push and changes.health['redis']):
                     await asyncio.sleep(.05)
             with changes.watch(('overview','overview-owner')) as selected, changes.watch(('overview','unrelated')) as other:
                 await asyncio.to_thread(save_profile)
@@ -745,6 +753,137 @@ def owner(tmp_path, pg_database):
     identity.parent.mkdir(parents=True)
     settings = SimpleNamespace(provider='acps-direct', data_dir=tmp_path, system_atr_call_timeout=5, entity_aip_enabled=True)
     return pg_database, identity, settings
+
+
+def test_registration_reads_files_outside_loop_and_releases_candidate_on_cancel(tmp_path, monkeypatch):
+    import ssl
+    import threading
+    from avatar.core.execution import blocking_context
+    from avatar.protocols.registration import maintenance, system
+    from avatar.protocols.transport.registry import EntityRegistry
+
+    # Stop at the first disk access, before any request can leave this process.
+    class FileReached(Exception):
+        pass
+
+    def stop_at_file(*args, **kwargs):
+        with pytest.raises(RuntimeError, match='no running event loop'):
+            asyncio.get_running_loop()
+        raise FileReached
+
+    monkeypatch.setattr(ssl, 'create_default_context', stop_at_file)
+    monkeypatch.setattr(maintenance, 'read_atr_config', stop_at_file)
+    config = SimpleNamespace(endpoints=SimpleNamespace(
+        ca_cert_path=tmp_path/'ca.pem', certificate_authority_url='https://ca.example.test'))
+    settings = SimpleNamespace(data_dir=tmp_path, registry_username='test', registry_password='test')
+    registry = EntityRegistry(config, delegate=object())
+    for operation in (lambda: system.validate_ca_directory(config), registry.prepare,
+                      lambda: maintenance.maintain_entity(settings, 'owner', 'aic', 'renew')):
+        with pytest.raises(FileReached):
+            asyncio.run(operation())
+
+    entering, release, disposed = threading.Event(), threading.Event(), threading.Event()
+    @contextmanager
+    def candidate():
+        entering.set()
+        assert release.wait(5)
+        try:
+            yield
+        finally:
+            disposed.set()
+
+    async def scenario():
+        async def open_candidate():
+            async with blocking_context(candidate()):
+                pytest.fail('cancelled caller resumed inside the context')
+        task = asyncio.create_task(open_candidate())
+        try:
+            assert await asyncio.to_thread(entering.wait, 5)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done() and not disposed.is_set()
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert disposed.is_set()
+    asyncio.run(scenario())
+
+
+def test_cancelled_certificate_read_closes_response_and_keeps_request_interval(tmp_path, monkeypatch):
+    import time
+    from pathlib import Path
+    from avatar.protocols.transport.certificates import CertificateTransport
+
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    async def check():
+        entered = asyncio.Event()
+        closed = asyncio.Event()
+
+        class PendingBody(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                entered.set()
+                await asyncio.Event().wait()
+                yield b''
+
+            async def aclose(self):
+                closed.set()
+
+        calls = []
+        def send(request):
+            calls.append(time.monotonic())
+            return httpx.Response(200, stream=PendingBody()) if len(calls) == 1 else httpx.Response(200, content=b'ok')
+
+        transport = CertificateTransport(None, httpx.MockTransport(send))
+        async with httpx.AsyncClient(transport=transport) as client:
+            first = asyncio.create_task(client.get('https://ca.example.test/first'))
+            await asyncio.wait_for(entered.wait(), 2)
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            assert closed.is_set()
+            assert (await client.get('https://ca.example.test/next')).content == b'ok'
+            assert calls[1] - calls[0] >= 0.49
+    asyncio.run(check())
+
+
+def test_identity_retries_startup_without_replaying_interrupted_renewal(owner, monkeypatch):
+    from unittest.mock import Mock
+    database, _, settings = owner
+    maintainer = AsyncMock()
+    service = EntityLifecycleService(database, settings, runner=object(), maintainer=maintainer)
+    job = service.enqueue({'id':'owner','username':'owner'}, 'owner', 'renew')
+    with database.connect(write=True) as db:
+        db.execute("UPDATE avatar_identity_jobs SET status='running' WHERE id=?", (job['id'],))
+    recover = service._recover
+    attempts = Mock(side_effect=[ConnectionError('database starting'), None])
+    def flaky_recovery():
+        attempts()
+        recover()
+    monkeypatch.setattr(service, '_recover', flaky_recovery)
+
+    async def check():
+        scanned = asyncio.Event()
+        once = service.once
+        async def poll():
+            assert not await once()
+            scanned.set()
+            return False
+        monkeypatch.setattr(service, 'once', poll)
+        worker = asyncio.create_task(service.run())
+        ready = asyncio.create_task(scanned.wait())
+        try:
+            await asyncio.wait((worker, ready), timeout=8, return_when=asyncio.FIRST_COMPLETED)
+            assert not worker.done() and ready.done()
+        finally:
+            worker.cancel()
+            ready.cancel()
+            await asyncio.gather(worker, ready, return_exceptions=True)
+    asyncio.run(check())
+    assert attempts.call_count == 2
+    with database.connect() as db:
+        assert db.execute('SELECT status FROM avatar_identity_jobs WHERE id=?', (job['id'],)).fetchone()[0] == 'failed'
+    maintainer.assert_not_awaited()
 
 
 def test_unregister_waits_for_local_cleanup_and_resumes_without_remote_call(owner):

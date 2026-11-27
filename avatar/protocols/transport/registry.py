@@ -3,9 +3,23 @@ import os
 import ssl
 import tempfile
 from pathlib import Path
+from avatar.core.execution import run_blocking
 from .certificates import CertificateTransport, trust_context
 import httpx
 from wit.acps.atr import RegistryClient, RegistryRequestRejected, RegistrationReview
+
+
+def _entity_context(config, ontology):
+    with tempfile.TemporaryDirectory(prefix='.entity-mtls-', dir=config.paths.state_dir) as temporary:
+        directory = Path(temporary)
+        for name, value in (('client.pem', ontology.certificate), ('client.key', ontology.private_key)):
+            path = directory / name
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, 'w') as stream:
+                stream.write(value)
+        context = ssl.create_default_context(cafile=str(config.endpoints.ca_cert_path))
+        context.load_cert_chain(str(directory / 'client.pem'), str(directory / 'client.key'))
+        return context
 
 
 # 职责：通过 Registry mTLS 平面注册派生实体，其余操作委托 wit 的公开 RegistryClient。
@@ -25,7 +39,7 @@ class EntityRegistry:
     # 输入：配置中的 Registry 用户名和密码，与 Keycloak 登录及本地 admin 无关。
     # 结果与约束：仅接受明确返回的 access_token；不继承环境代理、不跟随重定向；默认不记录正文，CLI 可显式注入脱敏诊断 hook。
     async def prepare(self):
-        context = ssl.create_default_context(cafile=str(self.config.endpoints.ca_cert_path))
+        context = await run_blocking(ssl.create_default_context, cafile=str(self.config.endpoints.ca_cert_path))
         credentials = self.config.registry_credentials
         async with httpx.AsyncClient(verify=context, transport=CertificateTransport(context, self.transport), trust_env=False,
                                      follow_redirects=False, timeout=30, event_hooks=self.event_hooks) as client:
@@ -46,19 +60,11 @@ class EntityRegistry:
             raise ValueError('派生实体需要显式 mTLS URL 及已认证 Registry 用户')
         payload = {'ontologyAic': ontology.aic}
         payload.update({key: candidate[key] for key in ('endPoints', 'entityUserId', 'entityMeta', 'certificate') if key in candidate})
-        with tempfile.TemporaryDirectory(prefix='.entity-mtls-', dir=self.config.paths.state_dir) as temporary:
-            directory = Path(temporary)
-            for name, value in (('client.pem', ontology.certificate), ('client.key', ontology.private_key)):
-                path = directory / name
-                descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                with os.fdopen(descriptor, 'w') as stream:
-                    stream.write(value)
-            context = ssl.create_default_context(cafile=str(self.config.endpoints.ca_cert_path))
-            context.load_cert_chain(str(directory / 'client.pem'), str(directory / 'client.key'))
-            async with httpx.AsyncClient(verify=context, transport=CertificateTransport(context, self.transport), trust_env=False,
-                                         follow_redirects=False, timeout=30, event_hooks=self.event_hooks) as client:
-                response = await client.post(root.rstrip('/') + '/entity', json=payload,
-                                             headers={'Authorization': 'Bearer ' + self.token})
+        context = await run_blocking(_entity_context, self.config, ontology)
+        async with httpx.AsyncClient(verify=context, transport=CertificateTransport(context, self.transport), trust_env=False,
+                                     follow_redirects=False, timeout=30, event_hooks=self.event_hooks) as client:
+            response = await client.post(root.rstrip('/') + '/entity', json=payload,
+                                         headers={'Authorization': 'Bearer ' + self.token})
         if 400 <= response.status_code < 500 and response.status_code not in (408, 429):
             raise RegistryRequestRejected(response.status_code, 'Registry 拒绝实体注册，请核对权限、本体与端点')
         response.raise_for_status()
