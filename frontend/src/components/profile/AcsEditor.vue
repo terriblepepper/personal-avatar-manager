@@ -26,7 +26,41 @@ const required = (skill: Skill) => skill.id==='personal-profile.introduction.qa'
 watch(()=>props.document,value=>{ preview.value=value; if(!editing.value || props.inherited)valid.value=!!value })
 function addSkill(){props.modelValue?.skills.push({id:'skill.'+Array.from(crypto.getRandomValues(new Uint8Array(16)),x=>x.toString(16).padStart(2,'0')).join(''),name:'',description:'',version:'1.0.0',tags:[],examples:[],input_modes:[...props.modelValue.default_input_modes],output_modes:[...props.modelValue.default_output_modes]})}
 let sequence=0, timer:ReturnType<typeof setTimeout>|undefined
-async function validate(reset = false){if(!props.modelValue||!editing.value||props.inherited)return;clearTimeout(timer);const ticket=++sequence;errors.value='正在校验…';try{const p=props.profile;const result=await request<{document:{name:string;description:string};validation:{valid:boolean;errors:string[]};generated_description?:string}>('/me/acs/preview','POST',{acs_input:props.modelValue,last_modified_at:props.modified,profile_name:p.name||'',profile_avatar_name:p.avatar_name||'',profile_bio:p.bio||'',profile_organization:p.organization||'',name_visibility:'public',bio_visibility:visibility('bio'),organization_visibility:visibility('organization')});if(ticket!==sequence)return;preview.value=result.document;valid.value=result.validation.valid;if(reset && props.modelValue)props.modelValue.description=result.generated_description ?? result.document.description;errors.value=result.validation.valid?'校验通过':result.validation.errors.join('；')}catch(e){if(ticket===sequence){valid.value=false;errors.value=e instanceof Error?e.message:'校验失败'}}}
+async function validate(reset = false) {
+  if (!props.modelValue || !editing.value || props.inherited) return
+  clearTimeout(timer)
+  const ticket = ++sequence
+  errors.value = '正在校验…'
+  try {
+    const p = props.profile
+    const result = await request<{
+      document: { name: string; description: string }
+      validation: { valid: boolean; errors: string[] }
+      generated_description?: string
+    }>('/me/acs/preview', 'POST', {
+      acs_input: props.modelValue,
+      last_modified_at: props.modified,
+      profile_name: p.name || '',
+      profile_avatar_name: p.avatar_name || '',
+      profile_bio: p.bio || '',
+      profile_organization: p.organization || '',
+      name_visibility: 'public',
+      bio_visibility: visibility('bio'),
+      organization_visibility: visibility('organization')
+    })
+    if (ticket !== sequence) return
+    preview.value = result.document
+    valid.value = result.validation.valid
+    if (reset && props.modelValue)
+      props.modelValue.description = result.generated_description ?? result.document.description
+    errors.value = result.validation.valid ? '校验通过' : result.validation.errors.join('；')
+  } catch (e) {
+    if (ticket === sequence) {
+      valid.value = false
+      errors.value = e instanceof Error ? e.message : '校验失败'
+    }
+  }
+}
 const skillPrefix=computed(()=>(String(props.profile.name || '').trim() || '该用户')+'能够')
 function suffix(description:string){return description.startsWith(skillPrefix.value)?description.slice(skillPrefix.value.length):description}
 function updateSkill(skill:Skill,event:Event){const value=(event.target as HTMLTextAreaElement).value;skill.description=value?skillPrefix.value+value:''}

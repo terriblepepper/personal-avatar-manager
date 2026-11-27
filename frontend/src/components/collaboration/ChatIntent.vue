@@ -21,4 +21,44 @@ async function edit(){if(!identifier.value||busy.value)return;busy.value=true;tr
 async function cancel(){if(!identifier.value||busy.value)return;busy.value=true;try{await request(`/agent-intents/${encodeURIComponent(identifier.value)}/cancel`,'POST',{});emit('updated')}catch(e){notifyError(e)}finally{busy.value=false}}
 async function open(){const id=typeof props.intent.task_id==='string'?props.intent.task_id:'';if(!id)return;try{const result=await request<{session_id:string}>(`/agent-dialogues/${encodeURIComponent(id)}`);emit('opened',result.session_id,id)}catch(e){notifyError(e)}}
 </script>
-<template><section class="avatar-intent-choice"><header class="intent-choice-heading">分身通信</header><template v-if="status==='pending'"><p>选择发送消息或任务，确认发送前不会联系对方。</p><ElRadioGroup v-model="mode"><ElRadio value="message">发送消息</ElRadio><ElRadio value="negotiation">任务</ElRadio></ElRadioGroup><div class="actions"><ElButton :loading="busy" @click="choose">确认并填写</ElButton><ElButton :disabled="busy" @click="cancel">取消</ElButton></div></template><template v-else-if="status==='editing'"><p>已选择{{ intent.delivery_mode==='message'?'发送消息':'任务' }}，尚未发送。</p><ElButton :loading="busy" @click="edit">继续填写</ElButton><ElButton :disabled="busy" @click="cancel">取消</ElButton></template><p v-else-if="status==='cancelled'">已取消，本次未发送。</p><template v-else-if="status==='confirmed'"><p>请求已提交，请查看实际送达状态。</p><ElButton @click="open">查看分身会话</ElButton></template><IntentDialog v-if="editing" :intent="editing" @closed="editing=null;emit('updated')" @sent="(session,task)=>{editing=null;emit('updated');emit('opened',session,task)}"/></section></template>
+<template>
+  <section class="avatar-intent-choice">
+    <header class="intent-choice-heading">分身通信</header>
+    <template v-if="status === 'pending'">
+      <p>选择发送消息或任务，确认发送前不会联系对方。</p>
+      <ElRadioGroup v-model="mode">
+        <ElRadio value="message">发送消息</ElRadio>
+        <ElRadio value="negotiation">任务</ElRadio>
+      </ElRadioGroup>
+      <div class="actions">
+        <ElButton :loading="busy" @click="choose">确认并填写</ElButton>
+        <ElButton :disabled="busy" @click="cancel">取消</ElButton>
+      </div>
+    </template>
+    <template v-else-if="status === 'editing'">
+      <p>已选择{{ intent.delivery_mode === 'message' ? '发送消息' : '任务' }}，尚未发送。</p>
+      <ElButton :loading="busy" @click="edit">继续填写</ElButton>
+      <ElButton :disabled="busy" @click="cancel">取消</ElButton>
+    </template>
+    <p v-else-if="status === 'cancelled'">已取消，本次未发送。</p>
+    <template v-else-if="status === 'confirmed'">
+      <p>请求已提交，请查看实际送达状态。</p>
+      <ElButton @click="open">查看分身会话</ElButton>
+    </template>
+    <IntentDialog
+      v-if="editing"
+      :intent="editing"
+      @closed="
+        editing = null;
+        emit('updated');
+      "
+      @sent="
+        (session, task) => {
+          editing = null;
+          emit('updated');
+          emit('opened', session, task);
+        }
+      "
+    />
+  </section>
+</template>

@@ -63,7 +63,13 @@ onMounted(load)
       </div>
       <div v-else>
         <h3>确认迁移预览</h3><p>目标身份源：{{ preview.issuer }}</p><p>保留账号：{{ preview.target.account?.username || selected.username }} · Keycloak User ID：{{ preview.subject }}</p>
-        <p>保留分身：{{ preview.target.aic || '尚未创建' }} · {{ preview.target.submissions || 0 }} 条申请 · {{ preview.target.files || 0 }} 个文件 · {{ preview.target.messages || 0 }} 条消息 · {{ preview.target.conversations || 0 }} 个会话 · {{ preview.target.skills || 0 }} 个技能 · {{ preview.target.chat_files || 0 }} 个会话附件 · {{ preview.target.dialogues || 0 }} 项任务 · {{ preview.target.model_settings?'已配置模型':'未配置模型' }}</p>
+        <p>保留分身：{{ preview.target.aic || '尚未创建' }} ·
+          {{ preview.target.submissions || 0 }} 条申请 · {{ preview.target.files || 0 }} 个文件 ·
+          {{ preview.target.messages || 0 }} 条消息 · {{ preview.target.conversations || 0 }} 个会话
+          · {{ preview.target.skills || 0 }} 个技能 ·
+          {{ preview.target.chat_files || 0 }} 个会话附件 ·
+          {{ preview.target.dialogues || 0 }} 项任务 ·
+          {{ preview.target.model_settings ? '已配置模型' : '未配置模型' }}</p>
         <p v-if="preview.empty_account" class="notice">将清理空占位账号 {{ preview.empty_account.account?.username }}，服务器提交时再次核验。</p>
         <p>{{ preview.oidc_enabled?'迁移后原登录会话失效，请重新统一登录。':'当前仅提前关联，启用统一认证前仍可用旧密码登录。' }}预览有效 5 分钟。</p>
         <ElCheckbox v-model="verified">我已在 Keycloak 核验该 User ID 属于原账号本人</ElCheckbox>

@@ -448,6 +448,26 @@ def test_dispatch_title_and_save_respect_thread_and_account_boundaries(context, 
     assert denied.value.status_code == 404
 
 
+def test_pause_settlement_locks_the_accounts_being_billed(jobs):
+    from avatar.conversation.pause_state import settlement_write
+    from avatar.core.postgres import ACCOUNT_WRITE_LOCK
+
+    store, user, peer, cid = jobs
+    caller = user['id']
+    with store.database.connect(write=True) as db:
+        db.execute("INSERT INTO chat_agent_pauses VALUES(?, 'pause', ?)", (cid, json.dumps({'run_id': 'held'})))
+        for run, payer in [('own', caller), ('held', peer)]:
+            db.execute("""INSERT INTO agent_loop_runs(owner,scope,scope_id,run_id,writer,state)
+                VALUES(?,'chat',?,?,'writer',?::jsonb)""",
+                (caller, cid, run, json.dumps({'binding': {'owner': payer}})))
+    for run, account_only in [('own', True), ('held', False), (None, False)]:
+        with settlement_write(store.database, caller, cid, run) as db:
+            locked = db.execute("""SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid=pg_backend_pid()
+                AND locktype='advisory' AND classid=?::oid AND mode='ExclusiveLock' AND granted)""",
+                (ACCOUNT_WRITE_LOCK,)).fetchone()[0]
+            assert locked == account_only
+
+
 def test_context_reads_owner_overview_within_repeatable_read(provisioned_context, monkeypatch):
     app, client, admin = provisioned_context
     user = client.get('/api/auth/me').json()['user']

@@ -30,4 +30,31 @@ useLivePolling('dialogue', async signal => {
 async function open(){if(!taskId.value)return;busy.value=true;try{const result=await request<{session_id:string}>(`/agent-dialogues/${encodeURIComponent(taskId.value)}`);emit('opened',result.session_id,taskId.value)}catch(e){notifyError(e)}finally{busy.value=false}}
 async function retry(){if(!taskId.value||busy.value)return;retryRequest ||= requestId();busy.value=true;try{intent.value=await request<Intent>(`/agent-dialogues/${encodeURIComponent(taskId.value)}/retry-draft`,'POST',{request_id:retryRequest});retryRequest=''}catch(e){notifyError(e)}finally{busy.value=false}}
 </script>
-<template><section class="task-event-card" :class="event.kind==='start'?'task-event-start':'task-event-end'"><header><span class="task-event-badge">{{ event.mode==='message'?'消息':event.kind==='start'?'任务开始':'任务结束' }}</span><strong class="task-event-excerpt">{{ event.title || '分身任务' }}</strong></header><div v-if="event.summary" class="task-event-excerpt task-event-summary">{{ event.summary }}</div><div class="task-status peer-message-status" role="status">● {{ string(value.waiting_label) || labels[state] || state }} <span v-if="value.error || value.reason || value.waiting_reason || value.end_reason">· {{ value.error || value.reason || value.waiting_reason || value.end_reason }}</span><span v-if="state==='retrying'">；每 30 秒自动尝试，最多等待 5 分钟</span></div><ElButton v-if="taskId" :loading="busy" @click="open">查看{{ event.mode==='message'?'会话':'任务' }} ↗</ElButton><ElButton v-if="value.can_retry" :loading="busy" @click="retry">重新编辑并发送</ElButton><IntentDialog v-if="intent" :intent="intent" @closed="intent=null" @sent="(session,task)=>{intent=null;emit('opened',session,task)}"/></section></template>
+<template>
+  <section
+    class="task-event-card"
+    :class="event.kind === 'start' ? 'task-event-start' : 'task-event-end'"
+  >
+    <header>
+      <span class="task-event-badge">{{ event.mode === 'message' ? '消息' : event.kind === 'start' ? '任务开始' : '任务结束' }}</span>
+      <strong class="task-event-excerpt">{{ event.title || '分身任务' }}</strong>
+    </header>
+    <div v-if="event.summary" class="task-event-excerpt task-event-summary">{{ event.summary }}</div>
+    <div class="task-status peer-message-status" role="status">● {{ string(value.waiting_label) || labels[state] || state }} <span v-if="value.error || value.reason || value.waiting_reason || value.end_reason">· {{ value.error || value.reason || value.waiting_reason || value.end_reason }}</span>
+      <span v-if="state === 'retrying'">；每 30 秒自动尝试，最多等待 5 分钟</span>
+    </div>
+    <ElButton v-if="taskId" :loading="busy" @click="open">查看{{ event.mode === 'message' ? '会话' : '任务' }} ↗</ElButton>
+    <ElButton v-if="value.can_retry" :loading="busy" @click="retry">重新编辑并发送</ElButton>
+    <IntentDialog
+      v-if="intent"
+      :intent="intent"
+      @closed="intent = null"
+      @sent="
+        (session, task) => {
+          intent = null;
+          emit('opened', session, task);
+        }
+      "
+    />
+  </section>
+</template>

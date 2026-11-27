@@ -61,7 +61,21 @@ async function requestName(title:string, initial=''){
   }
 }
 async function create(){const name=await requestName('新建文件夹');if(name)await act('/me/knowledge/folders','POST',{path:[folder.value,name].filter(Boolean).join('/')})}
-async function rename(path:string,asset?:Asset){const name=await requestName('重命名',asset?.filename||path.split('/').at(-1));if(!name)return;if(await act(asset?`/me/knowledge/assets/${encodeURIComponent(asset.id)}/name`:'/me/knowledge/folders','PATCH',asset?{new_name:name}:{path,new_name:name}) && !asset){const parent=path.split('/').slice(0,-1).join('/');folder.value=[parent,name].filter(Boolean).join('/')}}
+async function rename(path: string, asset?: Asset) {
+  const name = await requestName('重命名', asset?.filename || path.split('/').at(-1))
+  if (!name) return
+  if (
+    (await act(
+      asset ? `/me/knowledge/assets/${encodeURIComponent(asset.id)}/name` : '/me/knowledge/folders',
+      'PATCH',
+      asset ? { new_name: name } : { path, new_name: name }
+    )) &&
+    !asset
+  ) {
+    const parent = path.split('/').slice(0, -1).join('/')
+    folder.value = [parent, name].filter(Boolean).join('/')
+  }
+}
 const pageSelected = computed(()=>!!page.value.length && page.value.every(entry=>entry.kind==='file'
   ? selectedFiles.value.includes(entry.asset.id) : selectedFolders.value.includes(entry.path)))
 function selectPage(){
@@ -88,7 +102,32 @@ async function remove() {
   })
 }
 async function openImport(){try{const value=await request<Asset[]>('/me/attachments');materials.value=value.filter(item=>supportsSoulAsset(item.filename));imports.value=[];importOpen.value=true}catch(e){notifyError(e)}}
-async function importFiles(){busy.value=true;let count=0;try{for(const id of imports.value){const item=materials.value.find(x=>x.id===id);const parent=(item?.relative_path||item?.filename||'').split('/').slice(0,-1).join('/');await request('/me/knowledge/assets/import','POST',{attachment_id:id,folder:[folder.value,parent].filter(Boolean).join('/')});count++}importOpen.value=false;ElMessage.success(`已导入 ${count} 份素材`)}catch(e){ElMessage.warning(`已导入 ${count} 份；后续导入未完成`);notifyError(e)}finally{if(count){await loadFolders();emit('refresh')}busy.value=false}}
+async function importFiles() {
+  busy.value = true
+  let count = 0
+  try {
+    for (const id of imports.value) {
+      const item = materials.value.find((x) => x.id === id)
+      const parent = (item?.relative_path || item?.filename || '').split('/').slice(0, -1).join('/')
+      await request('/me/knowledge/assets/import', 'POST', {
+        attachment_id: id,
+        folder: [folder.value, parent].filter(Boolean).join('/')
+      })
+      count++
+    }
+    importOpen.value = false
+    ElMessage.success(`已导入 ${count} 份素材`)
+  } catch (e) {
+    ElMessage.warning(`已导入 ${count} 份；后续导入未完成`)
+    notifyError(e)
+  } finally {
+    if (count) {
+      await loadFolders()
+      emit('refresh')
+    }
+    busy.value = false
+  }
+}
 onMounted(loadFolders)
 </script>
 <template>
@@ -131,7 +170,29 @@ onMounted(loadFolders)
               <td>—</td><td><button type="button" class="button small" @click="rename(entry.path)">重命名</button></td>
             </template>
             <template v-else>
-              <td><input v-model="selectedFiles" type="checkbox" data-material-pick :value="entry.asset.id" :aria-label="'选择 '+entry.asset.filename"><button type="button" class="material-entry" @click="inspected={...entry.asset}"><MaterialTypeIcon :filename="entry.asset.filename"/><span>{{ entry.asset.filename }}<small v-if="entry.asset.relative_path && entry.asset.relative_path!==entry.asset.filename">{{ entry.asset.relative_path }}</small></span></button></td>
+              <td>
+                <input
+                  v-model="selectedFiles"
+                  type="checkbox"
+                  data-material-pick
+                  :value="entry.asset.id"
+                  :aria-label="'选择 ' + entry.asset.filename"
+                />
+                <button
+                  type="button"
+                  class="material-entry"
+                  @click="inspected = { ...entry.asset }"
+                >
+                  <MaterialTypeIcon :filename="entry.asset.filename" />
+                  <span>{{ entry.asset.filename }}<small
+                      v-if="
+                        entry.asset.relative_path &&
+                        entry.asset.relative_path !== entry.asset.filename
+                      "
+                    >{{ entry.asset.relative_path }}</small>
+                  </span>
+                </button>
+              </td>
               <td><input type="checkbox" :checked="selected.includes(entry.asset.id)" :disabled="!supportsSoulAsset(entry.asset.filename)" :aria-label="'用于构建 '+entry.asset.filename" @change="emit('update:selected',($event.target as HTMLInputElement).checked ? [...selected,entry.asset.id] : selected.filter(id=>id!==entry.asset.id))"></td>
               <td><div class="soul-asset-actions"><button type="button" class="button small" @click="preview=entry.asset">预览</button><a class="button small" :href="entry.asset.download_url || `/api/me/knowledge/assets/${encodeURIComponent(entry.asset.id)}`" target="_blank" rel="noopener">下载</a><button type="button" class="button small" @click="rename('',entry.asset)">重命名</button></div></td>
             </template>
@@ -141,4 +202,35 @@ onMounted(loadFolders)
     </div>
     <p v-else class="sub">{{ search ? '没有匹配的素材。' : '当前目录暂无素材。' }}</p>
     <RecordPagination v-model:offset="offset" :total="entries.length" :search="search" unit="项" label="知识库素材分页" @update:search="search=$event;offset=0"/>
-    <AppDialog :model-value="!!inspected" title="文件详情" @close="inspected=null"><template v-if="inspected"><p>{{ inspected.filename }} · {{ inspected.relative_path }} · {{ fileSizeMB(inspected.size) }} · {{ inspected.created_at }}</p><label>素材说明<ElInput placeholder=" " v-model="inspected.caption" type="textarea" maxlength="2000"/></label><ElButton @click="saveCaption">保存说明</ElButton></template></AppDialog><FilePreview v-if="preview" :file="{id:preview.id,filename:preview.filename,content_type:preview.mime}" :url="preview.download_url || `/api/me/knowledge/assets/${encodeURIComponent(preview.id)}`" @close="preview=null"/><AppDialog v-model="importOpen" title="从资料文件导入"><ElCheckbox v-for="item in materials" :key="item.id" :model-value="imports.includes(item.id)" @change="value => { imports=value ? [...imports,item.id] : imports.filter(id=>id!==item.id) }">{{ item.relative_path || item.filename }}</ElCheckbox><template #footer><ElButton :loading="busy" @click="importFiles">导入所选</ElButton></template></AppDialog></section></template>
+    <AppDialog :model-value="!!inspected" title="文件详情" @close="inspected = null">
+      <template v-if="inspected">
+        <p>{{ inspected.filename }} · {{ inspected.relative_path }} ·
+          {{ fileSizeMB(inspected.size) }} · {{ inspected.created_at }}</p>
+        <label>素材说明<ElInput placeholder=" " v-model="inspected.caption" type="textarea" maxlength="2000" />
+        </label>
+        <ElButton @click="saveCaption">保存说明</ElButton>
+      </template>
+    </AppDialog>
+    <FilePreview
+      v-if="preview"
+      :file="{ id: preview.id, filename: preview.filename, content_type: preview.mime }"
+      :url="preview.download_url || `/api/me/knowledge/assets/${encodeURIComponent(preview.id)}`"
+      @close="preview = null"
+    />
+    <AppDialog v-model="importOpen" title="从资料文件导入">
+      <ElCheckbox
+        v-for="item in materials"
+        :key="item.id"
+        :model-value="imports.includes(item.id)"
+        @change="
+          (value) => {
+            imports = value ? [...imports, item.id] : imports.filter((id) => id !== item.id);
+          }
+        "
+      >{{ item.relative_path || item.filename }}</ElCheckbox>
+      <template #footer>
+        <ElButton :loading="busy" @click="importFiles">导入所选</ElButton>
+      </template>
+    </AppDialog>
+  </section>
+</template>

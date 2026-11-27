@@ -126,7 +126,15 @@ onBeforeUnmount(()=>{disposed=true;listSequence++;detailSequence++})
             <td><strong>{{ agent.profile?.avatar_name || agent.username }}</strong><small>{{ agent.username }}<template v-if="agent.last_modified_at"> · {{ date(agent.last_modified_at) }}</template></small></td>
             <td class="mono">{{ agent.aic }}</td>
             <td>{{ date(agent.certificate?.expires_at) }}<small>ACS {{ agent.acs_document?.version || '未声明' }} · 运行环境 {{ agent.acs_document?.entityMeta?.environment || '未声明' }} · {{ modes[agent.certificate?.mode || ''] || '待确认' }}</small></td>
-            <td><span class="tag" :class="{approved:deployed(agent)}">{{ statusLabel(agent) }}</span><small v-if="latestHealth(agent)" :role="latestHealth(agent)?.ok===false?'alert':'status'">{{ latestHealth(agent)?.message }}<template v-if="latestHealth(agent)?.checked_at"> · {{ date(latestHealth(agent)?.checked_at) }}</template></small><small v-else-if="deployed(agent)">尚未手动 Health 检查</small></td>
+            <td>
+              <span class="tag" :class="{ approved: deployed(agent) }">{{ statusLabel(agent) }}</span>
+              <small
+                v-if="latestHealth(agent)"
+                :role="latestHealth(agent)?.ok === false ? 'alert' : 'status'"
+              >{{ latestHealth(agent)?.message }}<template v-if="latestHealth(agent)?.checked_at"> · {{ date(latestHealth(agent)?.checked_at) }}</template>
+              </small>
+              <small v-else-if="deployed(agent)">尚未手动 Health 检查</small>
+            </td>
             <td>
               <div class="admin-row-actions">
                 <button type="button" class="button small" @click="showDetail(agent)">详情</button>
