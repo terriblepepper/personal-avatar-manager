@@ -5,7 +5,11 @@ import { createRouter, createMemoryHistory } from 'vue-router'
 import SkillsView from '../src/views/SkillsView.vue'
 import ModelForm from '../src/components/models/ModelForm.vue'
 const request = vi.hoisted(() => vi.fn())
-vi.mock('../src/api/client', () => ({ request, notifyError: vi.fn(), setSessionExpiryHandler:vi.fn(), setCsrfToken:vi.fn() }))
+vi.mock('../src/api/client', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/api/client')>()
+  return { ...actual, notifyError: vi.fn(), request: (...args: Parameters<typeof actual.request>) =>
+    args[2] instanceof Blob ? actual.request(...args) : request(...args) }
+})
 vi.mock('element-plus', async importOriginal => {
   const actual = await importOriginal<typeof import('element-plus')>()
   return { ...actual, ElMessage: { success: vi.fn(), error: vi.fn() } }
@@ -82,7 +86,7 @@ it('uses the current collection version for folder creation', async () => {
 
 it('reports a cancelled upload and still completes its batch', async () => {
   const { useSessionStore } = await import('../src/stores/session')
-  const session=useSessionStore();session.csrf='csrf-token'
+  const session=useSessionStore();session.accept({user:{id:'file-owner'} as NonNullable<typeof session.user>,csrf:'csrf-token'})
   request.mockImplementation(async (path:string) => {
     if(path==='/me/attachments')return []
     if(path==='/me/material-folders')return {items:[],captions:{},visibility:{}}
@@ -183,7 +187,7 @@ it('uploads every directory batch and plain files from a mixed browser drop', as
     await flushPromises()
     expect(fetcher.mock.calls.map(([, options]) => decodeURIComponent(new Headers(options.headers).get('X-Attachment-Relative-Path')!)))
       .toEqual(['root/first.md', 'root/sub/second.pdf', 'top.txt'])
-    expect(request).toHaveBeenCalledWith('/me/material-folders', 'POST', expect.objectContaining({ path: 'root/empty' }))
+    expect(request).toHaveBeenCalledWith('/me/material-folders', 'POST', expect.objectContaining({ path: 'root/empty' }), expect.any(AbortSignal))
   } finally { wrapper.unmount(); vi.unstubAllGlobals() }
 })
 

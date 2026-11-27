@@ -18,7 +18,7 @@ check_sandbox() {
   .venv/bin/python - <<'PYTHON'
 import asyncio
 import sys
-from avatar.skills.sandbox import LocalPythonSandbox
+from avatar.sandbox.sandbox import LocalPythonSandbox
 
 try:
     result = asyncio.run(LocalPythonSandbox().execute('runtime-check', {
@@ -57,16 +57,6 @@ pg_start() {
     { echo 'PostgreSQL 启动失败，请检查 data/pgsql.startup.log。' >&2; exit 1; }
 }
 
-stop_dependencies() {
-  ./kafka/service.sh stop || echo "Kafka 未正常停止，请检查项目的 kafka/ 目录。" >&2
-  ./redis/service.sh stop || echo "Redis 未正常停止，请检查项目的 redis/ 目录。" >&2
-  [[ -x "$pg_bin/pg_ctl" && -d "$pg_data" ]] || return 0
-  export LD_LIBRARY_PATH="$pg_home/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-  "$pg_bin/pg_ctl" -D "$pg_data" status >/dev/null 2>&1 || return 0
-  "$pg_bin/pg_ctl" -D "$pg_data" -m fast stop >/dev/null ||
-    { echo 'PostgreSQL 停止失败，请检查 data/pgsql.startup.log。' >&2; exit 1; }
-}
-
 if [[ "$action" == install ]]; then
   if [[ "$PWD" == *'%'* || "$PWD" == *'"'* || "$PWD" == *$'\n'* ]]; then
     echo 'systemd 安装路径不能包含 %、双引号或换行。' >&2; exit 1
@@ -85,12 +75,12 @@ fi
 if [[ -f "$service_file" ]]; then
   [[ "$action" == stop ]] || pg_start
   systemctl --user "$action" "$service"
-  [[ "$action" != stop ]] || { stop_dependencies; echo 'systemd 服务已停止。'; exit 0; }
+  [[ "$action" != stop ]] || { echo 'systemd 服务已停止。'; exit 0; }
 else
   mkdir -p data
   exec 9>data/process.lock
   flock -x 9
-  [[ "$action" != stop || -f data/avatar.pid ]] || { echo '系统未运行。'; stop_dependencies; exit 0; }
+  [[ "$action" != stop || -f data/avatar.pid ]] || { echo '系统未运行。'; exit 0; }
   pid=''
   if [[ -f data/avatar.pid ]]; then read -r pid <data/avatar.pid || true; fi
   if [[ "$action" == stop || ( "$action" == restart && -f data/avatar.pid ) ]]; then
@@ -106,7 +96,6 @@ else
     fi
     rm -f data/avatar.pid
     if [[ "$action" == stop ]]; then
-      stop_dependencies
       echo '系统已停止。'; exit 0
     fi
     pid=''

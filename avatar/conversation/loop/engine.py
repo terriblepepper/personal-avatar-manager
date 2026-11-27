@@ -15,6 +15,7 @@ from avatar.models.client import ModelResult, accumulate_usage
 from avatar.models.effort import visible_output_config
 from avatar.models.limits import check_context, history_row_tokens
 from avatar.models.context_budget import input_budget
+from avatar.conversation.collaboration.intent import CONTACT_REPLY
 
 
 log = logging.getLogger(__name__)
@@ -111,7 +112,7 @@ class ReActEngine:
     def unlock(self, names):
         added = []
         for name in names:
-            if (spec := self.registry.tools.get(name)) and spec.disclosure != 'core' and name not in self.unlocked:
+            if self.registry.activatable(name) and name not in self.unlocked:
                 self.unlocked.append(name)
                 added.append(name)
         return added
@@ -121,7 +122,7 @@ class ReActEngine:
         calls = frame['tool_calls']
         # Older v2 checkpoints were created with every authorized tool declared.
         declared = batch.get('declared', self.registry.tools.keys() - {'enable_tools'})
-        active = set(declared) & self.registry.tools.keys()
+        active = {name for name in declared if self.registry.available(name)}
         controls = [call for call in calls if call['name'] in active and self.registry.tools[call['name']].control]
         if pending and 'ref' in pending:
             receipts.update(pending.get('receipts', {}))
@@ -140,7 +141,7 @@ class ReActEngine:
                 outcome = ToolOutcome.error('上一项操作的结果尚未确认，本项未执行。')
             elif len(controls)>1:
                 outcome = ToolOutcome.error('同一批含多个相互冲突的控制动作。请在下一轮只选择一个。')
-            elif capture and call['name'] not in active:
+            elif capture and (call['name'] not in active or not self.registry.available(call['name'])):
                 outcome = ToolOutcome.error('当前会话未授权此工具。请选择已声明的工具。')
             elif capture:
                 try:
@@ -222,12 +223,12 @@ class ReActEngine:
             self.registry.sync_state(self.unlocked)
             tools = [] if force_finish else self.registry.active_schemas(self.unlocked)
             settings = {**settings, '_tools':tools}
-            count = len(self.unlocked)
+            disclosed = list(self.unlocked)
             history = await self.context.project(settings, prompt, self.trajectory, recovering=recovering,
                                                  summarize=self.summarize)
             self.consume_projection()
             # Projection can create a receipt the upcoming request should be able to read.
-            if force_finish or len(self.registry.sync_state(self.unlocked)) == count:
+            if force_finish or self.registry.sync_state(self.unlocked) == disclosed:
                 break
         settings = {**settings, '_image_inputs':self.media('images')[:_MEDIA_LIMITS['images']],
                     '_audio_inputs':self.media('audio')[:_MEDIA_LIMITS['audio']]}
@@ -281,7 +282,6 @@ class ReActEngine:
                           'who':self.config['_conversation_tool_owner']}},)
             return await self.final(ModelResult(args['content'], None, calls, 'tool_required'))
         if name=='contact_avatar':
-            from avatar.conversation.collaboration.intent import CONTACT_REPLY
             return await self.final(ModelResult(CONTACT_REPLY, None, finish_reason='stop', contact_draft=args))
         return await self.final(ModelResult(args['content'], None, (action,), 'tool_calls'))
 

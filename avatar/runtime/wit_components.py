@@ -55,7 +55,7 @@ class ApplicationServices:
         database.initialize()
         try:
             bootstrap(database, settings.data_dir)
-            provider = provider or build_provider(settings.provider, settings)
+            provider = provider or build_provider(settings.provider, settings, database)
             vault = SecretVault(settings.data_dir, database)
             model_client = model_client or ModelClient(
                 proxy=settings.model_proxy, resolver=ModelResolver(settings.model_dns_aliases))

@@ -1,5 +1,5 @@
 """Assistant navigation and user-authorized cross-avatar contact drafts."""
-import asyncio
+from datetime import datetime, timezone, timedelta
 import json
 import uuid
 
@@ -8,8 +8,12 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError
 
 from avatar.conversation.avatar_assistant import CatalogArguments, LIST_AVATARS, QueryArguments, normalized
 from avatar.core.db import dump, now
-from avatar.core.execution import call_with_retry, recoverable, run_blocking
+from avatar.core.execution import call_with_retry, recoverable, run_blocking, authorization
 from avatar.core.text_budget import AgentText
+from avatar.models.context_budget import fit_turn
+from avatar.models.effort import with_chat_effort
+from avatar.models.embedding import EmbeddingSettings
+from avatar.models.model_config import require_complete
 
 
 class ContactArguments(BaseModel):
@@ -92,13 +96,9 @@ class DialogueIntent:
                     ORDER BY id DESC LIMIT 12""", (uid, parent['id'], parent['id'], uid)).fetchall()
                 return service.models.current(db, uid), [dict(row) for row in reversed(rows)]
 
-        config, history = await asyncio.to_thread(load)
+        config, history = await run_blocking(load)
         if not config:
             return None
-        from avatar.core.execution import authorization
-        from avatar.models.context_budget import fit_turn
-        from avatar.models.effort import with_chat_effort
-        from avatar.models.model_config import require_complete
 
         default_effort = json.loads(parent['tools_config']).get('reasoning_effort')
         config = with_chat_effort(config, (authorization() or {}).get('reasoning_effort', default_effort))
@@ -143,11 +143,10 @@ class DialogueIntent:
         chosen = set(args.get('file_ids', []))
         if not chosen.issubset({file['id'] for file in catalog}):
             raise HTTPException(404, '分身选择了不可用的文件，未建立引用或发送')
-        commands, _ = self.dialogues.chat.skills.split_commands(user['id'], message)
         return {'target_query': args['target_query'],
                 'target_aic': page['items'][0]['aic'] if page and page['total'] == 1 else '',
                 'objective': args['content'], 'shared_content': args['shared_content'],
-                'requires_confirmation': args['requires_owner_confirmation'], 'skills': commands,
+                'requires_confirmation': args['requires_owner_confirmation'], 'skills': '',
                 'requested_files': [{'source': file['source'], 'id': file['id']} for file in catalog if file['id'] in chosen]}
 
     async def requires_confirmation(self,user,message):
@@ -163,12 +162,14 @@ class DialogueIntent:
         tools=[declaration('require_owner_confirmation','涉及本人预约、承诺、交易等，须本人明确确认。',{'type':'object','properties':{},'additionalProperties':False}),
                declaration('continue_chat','普通聊天、转发或一般任务，不要求本人承诺。',{'type':'object','properties':{},'additionalProperties':False})]
         service=self.dialogues.chat.service
-        from avatar.models.embedding import EmbeddingSettings
-        with self.dialogues.database.connect() as db:
-            if not EmbeddingSettings.configured(db,user['id']):
-                return True
-            config=service.models.current(db,user['id'])
-        from avatar.models.model_config import require_complete
+        def configuration():
+            with self.dialogues.database.connect() as db:
+                if not EmbeddingSettings.configured(db,user['id']):
+                    return None
+                return service.models.current(db,user['id'])
+        config = await run_blocking(configuration)
+        if config is None:
+            return True
         require_complete(config)
         result=await self.model_selection(user['id'],None,{**config,'_tools':tools},service.vault.decrypt(config['encrypted_key']),'你是本人的分身，目标会话已经由用户选择。请选择当前要求是否需要本人确认。只选择工具，不执行任务。',[],message)
         calls=getattr(result,'tool_calls',())
@@ -192,7 +193,7 @@ class DialogueIntent:
             catalog=[{'id':item['id'],'source':'chat'} for item in outputs]
             if ids:
                 catalog.extend(dict(row) for row in db.execute('''SELECT id,'chat' AS source FROM chat_files
-                    WHERE user_id=? AND conversation_id=? AND id=ANY(?) AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))
+                    WHERE user_id=? AND conversation_id=? AND id=ANY(?) AND (expires_at IS NULL OR avatar_utc_time(expires_at)>CURRENT_TIMESTAMP)
                     UNION ALL SELECT id,'profile' AS source FROM attachments WHERE user_id=? AND id=ANY(?)''',
                     (owner,conversation,ids,owner,ids)))
         return self.prepare_confirmation({'id': owner}, message, args, catalog)
@@ -207,7 +208,6 @@ class DialogueIntent:
 
     def check_pending(self, row, expected=None):
         """取消、已发送与过期调用均不能再次发送；阶段必须由服务器确认。"""
-        from datetime import datetime, timezone, timedelta
         if row['status'] not in ('pending','editing') or expected and row['status']!=expected:
             raise HTTPException(409,'调用状态已变化，请刷新会话；已取消的调用不能发送')
         created=datetime.fromisoformat(row['created_at'])
@@ -223,31 +223,39 @@ class DialogueIntent:
 
     async def choose(self, user, identifier, mode):
         """第一步用户显式选消息或任务；选择后才允许打开内容编辑表单。"""
-        with self.dialogues.database.connect(write=True) as db:
-            row=self.load(db,user,identifier);self.check_pending(row)
-            document=json.loads(row['document'])
-            if row['status']=='editing' and document.get('delivery_mode')!=mode:
-                raise HTTPException(409,'已进入表单编辑，请先取消再重新提出要求')
-            document['delivery_mode']=mode
-            db.execute("UPDATE agent_intents SET status='editing',document=? WHERE id=?",(dump(document),identifier))
+        def begin():
+            with self.dialogues.database.connect(write=True) as db:
+                row=self.load(db,user,identifier);self.check_pending(row)
+                document=json.loads(row['document'])
+                if row['status']=='editing' and document.get('delivery_mode')!=mode:
+                    raise HTTPException(409,'已进入表单编辑，请先取消再重新提出要求')
+                document['delivery_mode']=mode
+                db.execute("UPDATE agent_intents SET status='editing',document=? WHERE id=?",(dump(document),identifier))
+            return row, document
+        row, document = await run_blocking(begin)
         if document.get('requested_files') and not document.get('files_prepared'):
             files=self.dialogues.chat.chat_files;selected=[]
             for candidate in document['requested_files']:
-                with self.dialogues.database.connect() as db:
-                    if candidate['source']=='profile':
-                        source=db.execute('SELECT sha256 FROM attachments WHERE id=? AND user_id=?',(candidate['id'],user['id'])).fetchone()
-                        if not source:raise HTTPException(404,'指定资料文件已不存在')
-                        match=db.execute("SELECT id FROM chat_files WHERE user_id=? AND conversation_id=? AND sha256=? AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))",(user['id'],row['conversation_id'],source['sha256'])).fetchone()
-                    else:
-                        files.owned(db,user['id'],row['conversation_id'],candidate['id']);match=(candidate['id'],)
+                def find_match(candidate):
+                    with self.dialogues.database.connect() as db:
+                        if candidate['source']=='profile':
+                            source=db.execute('SELECT sha256 FROM attachments WHERE id=? AND user_id=?',(candidate['id'],user['id'])).fetchone()
+                            if not source:raise HTTPException(404,'指定资料文件已不存在')
+                            match=db.execute("SELECT id FROM chat_files WHERE user_id=? AND conversation_id=? AND sha256=? AND (expires_at IS NULL OR avatar_utc_time(expires_at)>CURRENT_TIMESTAMP)",(user['id'],row['conversation_id'],source['sha256'])).fetchone()
+                        else:
+                            files.owned(db,user['id'],row['conversation_id'],candidate['id']);match=(candidate['id'],)
+                    return match
+                match = await run_blocking(find_match, candidate)
                 if not match:
                     resource=await files.reference(user,row['conversation_id'],'profile',candidate['id'],temporary=True)
                     match=(resource['file_id'],)
                 if match[0] not in selected:selected.append(match[0])
-            with self.dialogues.database.connect(write=True) as db:
-                fresh=self.load(db,user,identifier);self.check_pending(fresh,'editing');document=json.loads(fresh['document']);document.update(file_ids=selected,files_prepared=True)
-                db.execute('UPDATE agent_intents SET document=? WHERE id=?',(dump(document),identifier))
-        return self.get(user,identifier)
+            def save():
+                with self.dialogues.database.connect(write=True) as db:
+                    fresh=self.load(db,user,identifier);self.check_pending(fresh,'editing');document=json.loads(fresh['document']);document.update(file_ids=selected,files_prepared=True)
+                    db.execute('UPDATE agent_intents SET document=? WHERE id=?',(dump(document),identifier))
+            await run_blocking(save)
+        return await run_blocking(self.get,user,identifier)
 
     def record_result(self, db, row, text,task_event=None):
         """用户授权/取消结果与状态变更原子保存，供后续回答和记忆压缩读取。"""

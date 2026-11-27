@@ -223,26 +223,29 @@ def insert_soul(database,identifier,uid,status='queued'):
 
 
 def test_soul_consumer_starts_other_users_without_waiting_for_first(context,monkeypatch):
+    from avatar.core.execution import run_blocking
     app,client,admin=context;service=app.state.soul_builds
+    service.chat.rag.resources.update(quiet())
     ids=[client.get('/api/auth/me').json()['user']['id'],admin.get('/api/auth/me').json()['user']['id']]
     for i,uid in enumerate(ids):insert_soul(app.state.database,'parallel-'+str(i),uid)
     async def check():
-        gate=asyncio.Event();started=[]
-        async def once(identifier=None):
-            if identifier is None:
-                with app.state.database.connect() as db:identifier=db.execute("SELECT id FROM soul_builds WHERE status='queued' ORDER BY created_at LIMIT 1").fetchone()[0]
-            started.append(identifier)
-            with app.state.database.connect(write=True) as db:db.execute("UPDATE soul_builds SET status='running' WHERE id=?",(identifier,))
+        gate=asyncio.Event();both_started=asyncio.Event();started=[]
+        def transition(identifier,user_id,status):
+            with app.state.database.connect(write=True,account_scope=user_id) as db:
+                assert db.execute('UPDATE soul_builds SET status=? WHERE id=? AND user_id=?',
+                                  (status,identifier,user_id)).rowcount==1
+        async def once(identifier,*,user_id):
+            await run_blocking(transition,identifier,user_id,'running')
+            started.append((identifier,user_id))
+            if len(started)==2:both_started.set()
             await gate.wait()
-            with app.state.database.connect(write=True) as db:db.execute("UPDATE soul_builds SET status='ready' WHERE id=?",(identifier,))
+            await run_blocking(transition,identifier,user_id,'ready')
             return True
         monkeypatch.setattr(service,'once',once);monkeypatch.setattr(service.learning,'schedule',lambda:None)
         worker=asyncio.create_task(service.run())
         try:
-            for _ in range(100):
-                if len(started)==2:break
-                await asyncio.sleep(.01)
-            assert set(started)=={'parallel-0','parallel-1'}
+            await asyncio.wait_for(both_started.wait(),5)
+            assert set(started)=={('parallel-0',ids[0]),('parallel-1',ids[1])}
         finally:
             gate.set();worker.cancel();await asyncio.gather(worker,return_exceptions=True)
     asyncio.run(check())
@@ -398,27 +401,6 @@ def test_lexical_incomplete_write_does_not_publish(context,monkeypatch):
     monkeypatch.setattr(LexicalStore,'contains',lambda *args,**kwargs:False)
     asyncio.run(rag.index('profile',fid,uid))
     with rag.database.connect() as db:assert db.execute('SELECT status FROM file_rag_documents WHERE file_id=?',(fid,)).fetchone()[0]=='failed'
-
-
-def test_offline_publication_migration_preserves_lexical_search(context,monkeypatch):
-    from scripts.migrate_local_stores import migrate_postgres_publications
-    from avatar.rag.stores.lexical import LexicalStore
-    from avatar.rag.stores.postgres import PostgresFiles
-    rag,uid,fid,_=prepared_index(context,monkeypatch)
-    monkeypatch.setattr(rag,'store',PostgresFiles(rag.database))
-    asyncio.run(rag.index('profile',fid,uid))
-    with rag.database.connect(write=True) as db:
-        db.execute("UPDATE file_rag_documents SET active_publication='' WHERE file_id=?",(fid,))
-        db.execute('DELETE FROM rag_publications WHERE file_id=?',(fid,))
-        db.execute('DELETE FROM rag_lexical_records WHERE user_id=?',(uid,))
-        assert migrate_postgres_publications(db.raw)['publications']==1
-        assert migrate_postgres_publications(db.raw)['publications']==0
-        assert db.execute('SELECT count(*) FROM rag_publications WHERE file_id=?',(fid,)).fetchone()[0]==1
-    with rag.database.connect() as db:
-        doc=db.execute('SELECT collection,legacy_backfill FROM file_rag_documents WHERE file_id=?',(fid,)).fetchone()
-        ids=[r[0] for r in db.execute('SELECT record_id FROM file_rag_nodes WHERE file_id=?',(fid,))]
-        assert doc['legacy_backfill']==0
-    assert LexicalStore(rag.database).search(uid,doc['collection'],ids,['智能体'],12)
 
 
 def test_gc_cannot_delete_staging_records_during_publication(context,monkeypatch):
@@ -653,20 +635,6 @@ def test_dense_cache_validates_current_rows_on_every_search(pg_database, monkeyp
     assert store.search('alice', 'c', ids, [], [[1., 0.]], FileQuery(query='q')) == []
 
 
-def test_chroma_snapshot_refuses_missing_database_and_symlinks(tmp_path):
-    from scripts.migrate_local_stores import import_chroma_snapshot
-
-    empty = tmp_path / 'empty'
-    empty.mkdir()
-    with pytest.raises(ValueError, match='chroma.sqlite3'):
-        import_chroma_snapshot(None, 'owner', empty)
-    assert list(empty.iterdir()) == []
-    (empty / 'chroma.sqlite3').touch()
-    (empty / 'unexpected').symlink_to(tmp_path)
-    with pytest.raises(ValueError, match='symlink'):
-        import_chroma_snapshot(None, 'owner', empty)
-
-
 def test_visual_index_preserves_errors_and_uses_non_thinking_budget(context,tmp_path,monkeypatch):
     from PIL import Image
     from types import SimpleNamespace
@@ -685,6 +653,9 @@ def test_visual_index_preserves_errors_and_uses_non_thinking_budget(context,tmp_
         return SimpleNamespace(text='图片文字',usage={},finish_reason='stop')
     monkeypatch.setattr(app.state.chat.model_client,'generate',success)
     assert asyncio.run(rag.describe(row,path,config))==('图片文字','llm_vision')
+    assert asyncio.run(rag.describe(row,path.read_bytes(),config))==('图片文字','llm_vision')
+    assert seen[0][3]==seen[1][3]
+    seen.pop()
     assert len(seen)==1
     async def truncated(*args,**kwargs):return SimpleNamespace(text='未完成',usage={},finish_reason='length')
     monkeypatch.setattr(app.state.chat.model_client,'generate',truncated)

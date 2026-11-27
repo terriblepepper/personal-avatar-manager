@@ -3,6 +3,8 @@ import asyncio
 import json
 import logging
 from urllib.parse import urlsplit
+from avatar.core.dispatch import begin_work, wait_work
+from avatar.core.execution import run_blocking
 from wit import WitAgent
 from wit.acps.aip.direct import BaseDirectPartnerComponent, DirectRpcError, DIRECT_MTLS_SERVER
 from avatar.protocols.transport.direct_leader import DirectLeaderComponent
@@ -36,7 +38,7 @@ class PersonalPartnerHandler(BaseDirectPartnerComponent):
         self.diagnostics=RpcDiagnostics(service.settings.data_dir/'users'/user_id/'identity'/'rpc-diagnostics.jsonl')
 
     async def _teardown(self,ctx):
-        self.diagnostics.close()
+        await run_blocking(self.diagnostics.close)
         await super()._teardown(ctx)
 
     # 职责：把通过传输认证的命令交给个人任务服务。
@@ -55,12 +57,12 @@ class PersonalPartnerHandler(BaseDirectPartnerComponent):
             # 本人证书发起的只读探测：返回标准任务不存在，不进入访客会话或模型流程。
             raise DirectRpcError({'code':-32001,'message':'Health 探测任务不存在；分身 ACPS 端点正常响应'})
         try:
-            self.diagnostics.write(event='request',peer_aic=context.peer_aic,request=command,header_names=list(context.headers))
+            await run_blocking(self.diagnostics.write, event='request',peer_aic=context.peer_aic,request=command,header_names=list(context.headers))
             result=await self.service.handle(command,context,self.user_id,self.aic)
-            self.diagnostics.write(event='response',peer_aic=context.peer_aic,response=result)
+            await run_blocking(self.diagnostics.write, event='response',peer_aic=context.peer_aic,response=result)
             return result
         except ManagementTaskError as exc:
-            self.diagnostics.write(event='error',peer_aic=context.peer_aic,code=exc.code,message=exc.message)
+            await run_blocking(self.diagnostics.write, event='error',peer_aic=context.peer_aic,code=exc.code,message=exc.message)
             raise DirectRpcError({'code': exc.code, 'message': exc.message}) from None
 
 
@@ -80,18 +82,24 @@ class PersonalAipRuntime:
 
     # 职责：核验 ACS、OIDC、端点与证书，并启动独占端口的单实体 Partner。
     # 任意字段不一致拒绝该实体，不能降级为匿名或共用其他账户的证书。
-    async def activate(self, row):
+    def _materials(self, row):
         # 旧 ACS 的身份由下方可信绑定核验；切换登录 issuer 不重新分配端口。
-        endpoint = entity_endpoint(self.settings, row['user_id'], allocate=False)
         paths = entity_identity_paths(self.settings.data_dir, row['user_id'])
         document = json.loads(paths.acs.read_text())
+        with self.database.connect() as db:
+            endpoint = entity_endpoint(self.settings, row['user_id'], allocate=False, db=db)
+            bound = registered_oidc_matches(self.settings, row['user_id'], document.get('entityMeta', {}), db=db)
         if (document.get('aic') != row['aic'] or document.get('entityUserId') != row['user_id']
                 or document.get('endPoints') != [endpoint]
-                or not registered_oidc_matches(self.settings, row['user_id'], document.get('entityMeta', {}))):
+                or not bound):
             raise ValueError('正式个人 ACS 与当前账户、OIDC 或固定端点不一致')
         config = read_atr_config(paths.registration)
         if config.mode not in ('entity','integrated'):
             raise ValueError('个人端点必须使用正式实体证书')
+        return endpoint, config
+
+    async def activate(self, row):
+        endpoint, config = await run_blocking(self._materials, row)
         directory = CachedEntityDirectory({row['aic']: config}, LocalEntityDirectory({row['aic']: config}), ttl=60)
         await directory.select(row['aic'])
         parsed = urlsplit(endpoint['url'])
@@ -102,8 +110,10 @@ class PersonalAipRuntime:
         listener=PassiveTlsListener(directory,local_aic=row['aic'],
             bind_address=self.settings.system_aip_bind_address,bind_port=parsed.port,
             max_connections=128,max_streams=1,request_timeout=180,max_body_bytes=65536)
-        agent.install(PersonalPartnerHandler(self.tasks,row['user_id'],row['aic'],admission_directory=directory,server_name=parsed.hostname,
-            base_path='/aip',public_endpoint=endpoint['url'],listener=listener),required=True)
+        handler = await run_blocking(PersonalPartnerHandler, self.tasks, row['user_id'], row['aic'],
+                                     admission_directory=directory, server_name=parsed.hostname,
+                                     base_path='/aip', public_endpoint=endpoint['url'], listener=listener)
+        agent.install(handler, required=True)
         try:
             await agent.start()
         except BaseException:
@@ -136,9 +146,17 @@ class PersonalAipRuntime:
             return
         def active_entities():
             with self.database.connect() as db:
-                return db.execute("SELECT a.*,o.username AS oidc_username,o.subject AS oidc_subject,o.issuer AS oidc_issuer FROM avatar_records a JOIN users u ON u.id=a.user_id LEFT JOIN oidc_identities o ON o.user_id=u.id WHERE a.aic NOT LIKE 'DEMO-%' AND a.identity_status='active' AND u.account_status='active' ORDER BY a.user_id").fetchall()
-        rows = await asyncio.to_thread(active_entities)
-        topology = tuple((r['user_id'],r['aic'],r['oidc_username'],r['oidc_subject'],r['oidc_issuer']) for r in rows)
+                return db.execute("""SELECT a.user_id,a.aic,o.username,o.subject,o.issuer,p.port,
+                    (SELECT jsonb_agg(jsonb_build_array(l.issuer,l.subject,l.username)
+                        ORDER BY l.issuer,l.subject,l.username)::text FROM oidc_identity_links l
+                        WHERE l.user_id=a.user_id) AS linked_identities
+                    FROM avatar_records a JOIN users u ON u.id=a.user_id
+                    LEFT JOIN oidc_identities o ON o.user_id=u.id
+                    LEFT JOIN avatar_entity_ports p ON p.user_id=u.id
+                    WHERE a.aic NOT LIKE 'DEMO-%' AND a.identity_status='active'
+                    AND u.account_status='active' ORDER BY a.user_id""").fetchall()
+        rows = await run_blocking(active_entities)
+        topology = tuple(tuple(row) for row in rows)
         if topology == self._topology and not any(deadline <= time.time() for deadline in self.failures.values()):
             return
         previous={item[0]:item for item in self._topology or ()}
@@ -175,16 +193,20 @@ class PersonalAipRuntime:
 
     # 职责：恢复中断任务后轮询状态；应用退出始终先关闭入口。
     async def run(self):
-        self.tasks.recover()
+        recovered = False
         try:
             while True:
+                latch = begin_work(self.database, 'topology')
                 try:
+                    if not recovered:
+                        await run_blocking(self.tasks.recover)
+                        recovered = True
                     await self.sync()
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
                     log.warning('个人端口监听协调异常：%s', type(exc).__name__)
-                await asyncio.sleep(2)
+                await wait_work(latch, 30., reconcile=30.)
         finally:
             await self.stop()
 
@@ -196,7 +218,7 @@ class PersonalAipRuntime:
         return sum(bool(instance[2] and instance[2].serving) for instance in tuple(self.instances.values()))
 
     # 职责：报告真实 TLS 接纳状态，不把已分配 AIC 或已登记端点误报为上线。
-    def status(self, user_id):
+    def status(self, user_id, *, endpoint_result=None):
         instance = self.instances.get(user_id)
         directory = self.directories.get(user_id)
         serving = bool(instance and instance[2] and instance[2].serving)
@@ -213,12 +235,17 @@ class PersonalAipRuntime:
             state,reason='offline','正式身份尚未上线或已停用'
         endpoint=instance[3] if instance else None
         if not endpoint and self.settings.entity_aip_enabled:
-            try:
-                with self.database.connect() as db:
-                    configured = entity_endpoint(self.settings, user_id, allocate=False, db=db)
-                endpoint=configured['url'] if configured else None
-            except RegistrationFailure as exc:
-                if user_id not in self.failures and not instance:reason=str(exc)
+            if endpoint_result is not None:
+                endpoint, error = endpoint_result
+                if error and user_id not in self.failures and not instance:
+                    reason = error
+            else:
+                try:
+                    with self.database.connect() as db:
+                        configured = entity_endpoint(self.settings, user_id, allocate=False, db=db)
+                    endpoint=configured['url'] if configured else None
+                except RegistrationFailure as exc:
+                    if user_id not in self.failures and not instance:reason=str(exc)
         return {'enabled': self.settings.entity_aip_enabled, 'serving':serving,'health':self.health_checks.get(user_id),
                 'state':state,'reason':reason,'endpoint':endpoint}
 

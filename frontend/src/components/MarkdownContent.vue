@@ -10,7 +10,7 @@ import InlineTextFile from './chat/InlineTextFile.vue'
 
 const GeneratedImage = defineAsyncComponent(() => import('./chat/GeneratedImage.vue'))
 
-const props = withDefaults(defineProps<{ source: string; documentMode?: boolean; manualPictures?: boolean; diagrams?: boolean; conversationId?: string; files?: ChatFile[]; artifactReply?: boolean; sandboxSources?: string[]; savedFileIds?: ReadonlySet<string> }>(), { diagrams: true })
+const props = withDefaults(defineProps<{ source: string; streaming?: boolean; documentMode?: boolean; manualPictures?: boolean; diagrams?: boolean; conversationId?: string; files?: ChatFile[]; artifactReply?: boolean; sandboxSources?: string[]; savedFileIds?: ReadonlySet<string> }>(), { diagrams: true })
 const emit = defineEmits<{ preview: [file: ChatFile]; promote: [file: ChatFile] }>()
 function fileLink(node: HTMLAnchorElement | HTMLImageElement, url: URL) {
   if (!props.files || url.origin !== location.origin) return false
@@ -108,8 +108,22 @@ function closedFence(raw: string) {
   return !!opening && !!closing && closing[0] === opening[0] && closing.length >= opening.length
 }
 
+type TextBlock = { kind: 'text'; source: string }
+let stableSource = ''
+let stableBlocks: TextBlock[] = []
+function plainInline(token: Token): boolean {
+  if (token.type === 'text') return !token.tokens || token.tokens.every(plainInline)
+  return token.type === 'br' || token.type === 'escape'
+    || ['strong', 'em', 'del'].includes(token.type) && 'tokens' in token && !!token.tokens?.every(plainInline)
+}
+
 const rendered = computed(() => {
-  const blocks: ({ kind: 'text' | 'diagram'; source: string } | FileBlock)[] = []
+  const source = props.source || ''
+  if (!props.streaming || !source.startsWith(stableSource)) {
+    stableSource = ''
+    stableBlocks = []
+  }
+  const blocks: ({ kind: 'text' | 'diagram'; source: string } | FileBlock)[] = [...stableBlocks]
   const embedded = new Set<string>()
   let pending: Token[] = []
   const generatedHtml = props.artifactReply ? props.files?.filter(htmlFile) || [] : []
@@ -124,7 +138,23 @@ const rendered = computed(() => {
   function flush() {
     if (pending.length) { blocks.push({ kind: 'text', source: clean(pending) }); pending = [] }
   }
-  for (const token of marked.lexer(props.source || '', { gfm: true, breaks: true })) {
+  const tokens = marked.lexer(source.slice(stableSource.length), { gfm: true, breaks: true })
+  let index = 0
+  // Later definitions can resolve earlier bracketed links. Only freeze self-contained prose.
+  while (props.streaming && index < tokens.length) {
+    const token = tokens[index]!
+    if ((token.type !== 'paragraph' && token.type !== 'heading') || token.raw.includes('[')
+        || !token.tokens?.every(plainInline)) break
+    const space = tokens[index + 1]?.type === 'space' ? tokens[index + 1] : undefined
+    const raw = token.raw + (space?.raw || '')
+    if (!raw.endsWith('\n\n') || !source.startsWith(raw, stableSource.length)) break
+    const block: TextBlock = { kind: 'text', source: clean([token]) }
+    stableBlocks.push(block)
+    blocks.push(block)
+    stableSource += raw
+    index += space ? 2 : 1
+  }
+  for (const token of tokens.slice(index)) {
     if (props.files && token.type === 'paragraph' && token.raw.includes('[[attachment:')) {
       for (const part of attachmentParts(token as Tokens.Paragraph)) {
         if (typeof part !== 'string') { pending.push(part); continue }

@@ -19,19 +19,19 @@ ACCOUNT_WRITE_LOCK = 1096172628
 
 
 def lock_schema_transaction(raw, domain, *, account_scope=None, dispatch=False):
-    # 旧版进程仍取全库排他锁；共享同一旧锁后，再按当前 schema 互斥。
-    raw.execute(
-        "SELECT pg_advisory_xact_lock_shared(%s::bigint), set_config('avatar.dispatch_enabled','on',true)"
-        if dispatch else 'SELECT pg_advisory_xact_lock_shared(%s::bigint)', (domain,))
+    # Acquire the legacy barrier, schema barrier and account lock in the same order across writers.
+    legacy = "SELECT pg_advisory_xact_lock_shared(%s::bigint)"
+    if dispatch:
+        legacy += ", set_config('avatar.dispatch_enabled','on',true)"
     if account_scope is None:
-        raw.execute('SELECT pg_advisory_xact_lock(%s::integer, hashtext(current_schema()))', (domain,))
+        raw.execute(f"""WITH legacy AS MATERIALIZED ({legacy})
+            SELECT pg_advisory_xact_lock(%s::integer,hashtext(current_schema())) FROM legacy""",
+            (domain, domain))
         return
-    # Materialize the schema barrier before taking the account lock in the same round trip.
-    raw.execute("""WITH barrier AS MATERIALIZED (
-                     SELECT pg_advisory_xact_lock_shared(%s::integer, hashtext(current_schema()))
-                   )
-                   SELECT pg_advisory_xact_lock(%s::integer, hashtext(current_schema() || ':' || %s::text))
-                   FROM barrier""", (domain, ACCOUNT_WRITE_LOCK, account_scope))
+    raw.execute(f"""WITH legacy AS MATERIALIZED ({legacy}), barrier AS MATERIALIZED (
+            SELECT pg_advisory_xact_lock_shared(%s::integer,hashtext(current_schema())) FROM legacy)
+        SELECT pg_advisory_xact_lock(%s::integer,hashtext(current_schema() || ':' || %s::text)) FROM barrier""",
+        (domain, domain, ACCOUNT_WRITE_LOCK, account_scope))
 
 
 class Row:
@@ -69,12 +69,7 @@ def _translate(sql):
     parts = _tokens(sql)
     for i in range(0, len(parts), 2):
         part = parts[i].replace('%', '%%').replace('?', '%s')
-        part = re.sub(r'\bLIMIT\s+-1\b', 'LIMIT ALL', part, flags=re.I)
-        part = re.sub(r'\bMAX\s*\(\s*last_message_id\s*,', 'GREATEST(last_message_id,', part, flags=re.I)
-        part = re.sub(r'\bMIN\s*\(\s*round_limit\s*,', 'LEAST(round_limit,', part, flags=re.I)
         part = re.sub(r'\bauthorization\b', '"authorization"', part, flags=re.I)
-        part = re.sub(r'\browid\b', '_rowid', part, flags=re.I)
-        part = re.sub(r'\bIS\s+NOT\s+(?=\')', 'IS DISTINCT FROM ', part, flags=re.I)
         parts[i] = part
     # Psycopg's param parser also sees percent signs in literal strings.
     for i in range(1, len(parts), 2):
@@ -83,31 +78,18 @@ def _translate(sql):
 
 
 class Cursor:
-    def __init__(self, cursor, lastrowid=None, expose_rowid=False):
+    def __init__(self, cursor, lastrowid=None):
         self.cursor = cursor
         self.lastrowid = lastrowid
         self.rowcount = cursor.rowcount
-        columns = [column.name for column in cursor.description or ()]
-        self.names = []
-        positions = []
-        for index, name in enumerate(columns):
-            # The hidden identity is never part of SQLite's SELECT *.
-            if name == '_rowid':
-                if not expose_rowid:
-                    continue
-                name, expose_rowid = 'rowid', False
-            self.names.append(name)
-            positions.append(index)
+        self.names = [column.name for column in cursor.description or ()]
         self.indexes = {}
         for index, name in enumerate(self.names):
             self.indexes.setdefault(name, index)
-        self.positions = positions if len(positions) != len(columns) else None
 
     def _row(self, values):
         if values is None:
             return None
-        if self.positions is not None:
-            values = tuple(values[index] for index in self.positions)
         return Row(self.names, self.indexes, values)
 
     def fetchone(self):
@@ -122,10 +104,6 @@ class Cursor:
 
 def _compile_sql(metadata, sql):
     original = sql
-    if re.search(r'\bsqlite_master\b', sql, re.I):
-        sql = re.sub(r'\bsqlite_master\b',
-            "(SELECT table_name AS name, 'table' AS type FROM information_schema.tables WHERE table_schema=current_schema()) AS sqlite_master",
-            sql, flags=re.I)
     match = re.match(r'\s*INSERT\s+(?:(OR\s+(IGNORE|REPLACE))\s+)?INTO\s+(\w+)\s*(\([^)]*\))?', sql, re.I)
     identity = None
     if match:
@@ -134,9 +112,7 @@ def _compile_sql(metadata, sql):
         if match.group(4):
             inserted = [x.strip().strip('"') for x in match.group(4)[1:-1].split(',')]
         else:
-            inserted = [c for c in columns if c != '_rowid']
-            if '_rowid' in columns:
-                sql = sql[:match.end(3)] + ' (' + ','.join('"'+c+'"' for c in inserted) + ')' + sql[match.end(3):]
+            inserted = columns
         if mode:
             sql = re.sub(r'\bINSERT\s+OR\s+(?:IGNORE|REPLACE)\b', 'INSERT', sql, count=1, flags=re.I)
             if mode.upper() == 'IGNORE':
@@ -146,17 +122,16 @@ def _compile_sql(metadata, sql):
                 sql += ' ON CONFLICT (' + ','.join('"'+c+'"' for c in pk) + ') DO UPDATE SET ' + ','.join('"'+c+'"=EXCLUDED."'+c+'"' for c in updates) if updates else ' ON CONFLICT DO NOTHING'
             else:
                 raise ValueError('No primary key for INSERT OR REPLACE: ' + table)
-        if identity and re.search(r'\bRETURNING\b', sql, re.I) is None:
+        if re.search(r'\bRETURNING\b', sql, re.I):
+            identity = None
+        elif identity:
             sql += ' RETURNING "' + identity + '"'
-    # Preserve SQLite rowid alias while hiding SELECT * identity columns.
-    sql = re.sub(r'\bSELECT\s+rowid\s*,', 'SELECT rowid AS rowid,', sql, flags=re.I)
     sql = re.sub(r"\bIS\s+NOT\s+(?=')", 'IS DISTINCT FROM ', sql, flags=re.I)
     sql = re.sub(r'\?\s+IS\s+NULL', '?::text IS NULL', sql, flags=re.I)
     translated = _translate(sql)
-    expose_rowid = bool(re.search(r"\bSELECT\s+(?:\w+\.)?rowid\b", original, re.I))
     bulk_write = bool(match or re.match(r'\s*(UPDATE|DELETE)\b', original, re.I))
     bulk_write = bulk_write and not identity and not re.search(r'\bRETURNING\b', sql, re.I)
-    return translated, identity, expose_rowid, bulk_write
+    return translated, identity, bulk_write
 
 
 def _params(values):
@@ -177,13 +152,13 @@ class Connection:
         return _compile_sql(self.metadata, sql), static
 
     def _execute(self, plan, params, static):
-        translated, identity, expose_rowid, _ = plan
+        translated, identity, _ = plan
         cur = self.raw.execute(translated, _params(params), prepare=None if static else False)
         lastrowid = None
         if identity:
             returned = cur.fetchone()
             lastrowid = returned[0] if returned else None
-        return Cursor(cur, lastrowid, expose_rowid)
+        return Cursor(cur, lastrowid)
 
     def execute(self, sql, params=()):
         plan, static = self._plan(sql, sys._getframe(1).f_code.co_consts)
@@ -196,7 +171,7 @@ class Connection:
         if first is sentinel:
             return None
         plan, static = self._plan(sql, sys._getframe(1).f_code.co_consts)
-        if not plan[3] or not static or not hasattr(self.raw, "cursor"):
+        if not plan[2] or not static or not hasattr(self.raw, "cursor"):
             for values in chain((first,), rows):
                 result = self._execute(plan, values, static)
             return result
@@ -241,19 +216,20 @@ class PostgresDatabase:
 
     def _load_metadata(self, raw):
         metadata = {}
-        rows = raw.execute("""SELECT c.table_name,c.column_name,(c.is_identity = 'YES' OR c.column_default LIKE 'nextval(%'),
-            EXISTS (SELECT 1 FROM information_schema.table_constraints t
-              JOIN information_schema.key_column_usage k USING (constraint_catalog,constraint_schema,constraint_name)
-              WHERE t.constraint_type='PRIMARY KEY' AND t.table_schema=c.table_schema
-                AND t.table_name=c.table_name AND k.column_name=c.column_name)
-            FROM information_schema.columns c WHERE c.table_schema=current_schema()
-            ORDER BY c.table_name,c.ordinal_position""").fetchall()
+        rows = raw.execute("""SELECT t.relname, a.attname,
+                (a.attidentity<>'' OR pg_get_expr(d.adbin,d.adrelid) LIKE 'nextval(%'),
+                coalesce(a.attnum=ANY((k.indkey::smallint[])[0:k.indnkeyatts-1]),false)
+            FROM pg_class t JOIN pg_attribute a ON a.attrelid=t.oid
+            LEFT JOIN pg_index k ON k.indrelid=t.oid AND k.indisprimary
+            LEFT JOIN pg_attrdef d ON d.adrelid=t.oid AND d.adnum=a.attnum
+            WHERE t.relnamespace=current_schema()::regnamespace AND t.relkind IN ('r','p','v','m','f')
+              AND a.attnum>0 AND NOT a.attisdropped ORDER BY t.relname,a.attnum""").fetchall()
         for table, column, identity, primary in rows:
             cols, pk, generated = metadata.setdefault(table, ([], [], None))
             cols.append(column)
             if primary:
                 pk.append(column)
-            if identity and column != '_rowid':
+            if identity and primary:
                 metadata[table] = (cols, pk, column)
         self.metadata = metadata
         self.compile_static = lru_cache(maxsize=512)(partial(_compile_sql, metadata))

@@ -120,8 +120,8 @@ class EntityRegistrationRunner:
     # 职责：保存只读服务配置。
     # 输入：settings 为应用启动配置。
     # 结果与约束：构造无网络或文件副作用。
-    def __init__(self, settings):
-        self.settings = settings
+    def __init__(self, settings, database):
+        self.settings, self.database = settings, database
 
     # 职责：核验本体并冻结一个实体候选及独占注册配置。
     # 输入：内部 user_id、已审核 profile；父目录只允许个人能力本体。
@@ -174,8 +174,12 @@ class EntityRegistrationRunner:
             raise RegistrationFailure('个人分身本体用途或技能不符，拒绝使用管理系统模板注册个人分身') from None
         for directory in (paths.root.parent, paths.root, paths.certificates):
             private_directory(directory)
-        endpoint = entity_endpoint(settings, user_id)
-        oidc_identity = entity_oidc_identity(settings, user_id) if endpoint else None
+        from avatar.core.execution import run_blocking
+        def allocate():
+            with self.database.connect(write=True) as db:
+                endpoint = entity_endpoint(settings, user_id, db=db)
+                return endpoint, entity_oidc_identity(settings, user_id, db=db) if endpoint else None
+        endpoint, oidc_identity = await run_blocking(allocate)
         create_identity_json(paths.acs, build_entity_candidate(ontology, user_id, profile, endpoint, oidc_identity))
         create_identity_json(paths.registration, {
             'registry_url': parent.endpoints.registry_url,

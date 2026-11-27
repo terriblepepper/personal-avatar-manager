@@ -51,7 +51,7 @@ def bind_tools(chat, config, question, validate, trace, context, drafts, deliver
 
     state_tools = {'read_material': has_material_targets, 'read_session_file': has_session_files,
                    'send_public_material': has_public_targets}
-    summaries = {'read_session_file':'浏览或读取会话文件', 'run_python':'沙箱计算、分析和绘图',
+    summaries = {'run_python':'沙箱计算、分析和绘图',
                  'find_public_material':'查找公开资料原件', 'list_avatars':'查找平台公开分身',
                  'application_status':'查询分身申请进度'}
 

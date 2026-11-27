@@ -1,7 +1,7 @@
 """Private generation checkpoints installed after the business scope tables."""
 
 STATEMENTS = (
-    """CREATE TABLE agent_loop_runs (
+    """CREATE TABLE IF NOT EXISTS agent_loop_runs (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         owner TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         scope TEXT NOT NULL CHECK(scope IN ('chat','dialogue','protocol')), scope_id TEXT NOT NULL,
@@ -16,14 +16,10 @@ STATEMENTS = (
         dialogue_id TEXT GENERATED ALWAYS AS (CASE WHEN scope='dialogue' THEN scope_id END) STORED
             REFERENCES agent_dialogues(id) ON DELETE CASCADE,
         protocol_id BIGINT GENERATED ALWAYS AS (CASE WHEN scope='protocol' THEN scope_id::bigint END) STORED
-            REFERENCES avatar_aip_tasks(_rowid) ON DELETE CASCADE,
+            REFERENCES avatar_aip_tasks(task_number) ON DELETE CASCADE,
         UNIQUE(owner,scope,scope_id,run_id))""",
-    """CREATE INDEX agent_loop_expiry ON agent_loop_runs(updated_at)""",
-    """CREATE INDEX agent_loop_job ON agent_loop_runs(chat_job) WHERE chat_job IS NOT NULL""",
-    """CREATE INDEX agent_loop_chat ON agent_loop_runs(chat_id) WHERE chat_id IS NOT NULL""",
-    """CREATE INDEX agent_loop_dialogue ON agent_loop_runs(dialogue_id) WHERE dialogue_id IS NOT NULL""",
-    """CREATE INDEX agent_loop_protocol ON agent_loop_runs(protocol_id) WHERE protocol_id IS NOT NULL""",
-    """CREATE TABLE agent_loop_chunks (
+    """CREATE INDEX IF NOT EXISTS agent_loop_expiry ON agent_loop_runs(updated_at)""",
+    """CREATE TABLE IF NOT EXISTS agent_loop_chunks (
         run UUID NOT NULL REFERENCES agent_loop_runs(id) ON DELETE CASCADE,
         draft TEXT NOT NULL, start_byte BIGINT NOT NULL CHECK(start_byte>=0),
         is_binary BOOLEAN NOT NULL, content BYTEA NOT NULL,

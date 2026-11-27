@@ -1,4 +1,5 @@
 """Tool bindings for a temporary ACPs turn using the same agent loop as Web chat."""
+from base64 import b64encode
 import hashlib
 import subprocess
 import uuid
@@ -14,7 +15,9 @@ from avatar.files.conversation.resources import validate_output
 from avatar.files.conversation.session_files import SessionFiles, usable_text
 from avatar.files.library.delivery import SavedMaterials
 from avatar.files.parsing import PLAIN_TEXT_EXTENSIONS
-from avatar.skills.python_tool import AtomicPython
+from avatar.sandbox.python_tool import AtomicPython
+from avatar.files.parsing.images import jpeg_bytes
+from avatar.files.parsing.text_worker import read_original
 
 
 class TemporarySessionFiles(SessionFiles):
@@ -75,7 +78,6 @@ class TemporarySessionFiles(SessionFiles):
                 if not path.exists():
                     path.write_bytes(data)
             if extension in ('.pdf','.doc','.docx','.ppt','.pptx','.xlsx'):
-                from avatar.files.parsing.text_worker import read_original
                 try:
                     parsed = read_original(path,extension,start=page,end=page,offset=offset,limit=max(1,limit//4))
                 except (subprocess.SubprocessError, OSError, ValueError):
@@ -85,8 +87,6 @@ class TemporarySessionFiles(SessionFiles):
                 if not parsed.get('next') and page<parsed.get('total_pages',0):
                     result.update(next={'start':page+1,'offset':0}, complete=False)
             if vision and mime.startswith('image/'):
-                from base64 import b64encode
-                from avatar.files.parsing.images import jpeg_bytes
                 result.update(coverage='visual',has_content=True,
                               image_input={'mime_type':'image/jpeg','data':b64encode(jpeg_bytes(path)).decode('ascii')})
         if not result['has_content']:

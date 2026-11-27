@@ -9,9 +9,14 @@ from contextlib import aclosing
 from fastapi import HTTPException
 from avatar.conversation.schemas import ChatRequest
 from avatar.models.client import collected_model_status
-from avatar.core.execution import run_blocking
+from avatar.core.execution import run_blocking, AgentNeedsInput
 from avatar.conversation.jobs.store import LEASE_SECONDS, GenerationStore, run_key
-from avatar.conversation.jobs.pipeline import generation_scope
+from avatar.conversation.jobs.pipeline import generation_scope, validate_versions
+from avatar.conversation import pauses
+from avatar.conversation.jobs.titles import generate_title
+from avatar.conversation.loop.personal import validate_sources_in
+from avatar.conversation.loop.store import RunStore
+from avatar.conversation.tools.activity import public_event
 
 log = logging.getLogger(__name__)
 
@@ -35,7 +40,6 @@ class GenerationRunner:
         return await run_blocking(self._cancel, actor, request_id, asyncio.get_running_loop(), active[0] if active else None)
 
     def _cancel(self,actor,request_id,loop,active=None):
-        from avatar.conversation import pauses
         uid=actor['id']
         with self.database.connect(write=True) as db:
             row=db.execute('SELECT * FROM chat_generation_jobs WHERE user_id=? AND request_id=? FOR UPDATE',(uid,request_id)).fetchone()
@@ -47,17 +51,14 @@ class GenerationRunner:
             result={'reply':'已停止本次任务。','conversation_id':parent['id']}
             chat=getattr(getattr(self.chat,'services',None),'chat',self.chat)
             if payload.get('personal') and hasattr(chat, 'service'):
-                from avatar.core.execution import AgentNeedsInput
                 request=ChatRequest.model_validate(payload).model_copy(update={'channel':parent['channel']})
                 previous=pauses.pending(db,uid,parent['id'])
                 if active and active['authorization'] != row['authorization']:
                     active = None
                 state=(active or {}).get('_pause_state')
-                from avatar.conversation.loop.store import RunStore
                 checkpoint=RunStore.inspect_in(db,*run_key(row)) or {}
                 binding=checkpoint.get('binding') or {}
                 if binding:
-                    from avatar.conversation.loop.personal import validate_sources_in
                     try:
                         validate_sources_in(db,uid,parent['id'],binding,checkpoint['sources'])
                     except HTTPException:
@@ -110,7 +111,6 @@ class GenerationRunner:
         saved=await asyncio.to_thread(self.store.get,row['user_id'],row['request_id'])
         engine=getattr(getattr(self.chat,'services',None),'chat',self.chat)
         if saved and saved['done'] and hasattr(engine,'service') and json.loads(row['payload']).get('personal') and not json.loads(row['payload']).get('agent_control'):
-            from avatar.conversation.jobs.titles import generate_title
             await generate_title(engine,row['user_id'],saved['conversation_id'],saved['message'],saved['reply'])
 
     async def generate(self, row):
@@ -123,7 +123,6 @@ class GenerationRunner:
             def load_actor():
                 with self.database.connect() as db:
                     actor = db.execute('SELECT * FROM users WHERE id=?', (uid,)).fetchone()
-                    from avatar.conversation.jobs.pipeline import validate_versions
                     validate_versions(db,uid,json.loads(row['authorization']))
                 return actor
             actor = await asyncio.to_thread(load_actor)
@@ -152,7 +151,6 @@ class GenerationRunner:
                             elif kind == 'skills': snapshot['used_skills'] = event['items']
                             elif kind == 'tools': snapshot['mermaid_enabled'] = event['mermaid']
                             elif kind == 'tool':
-                                from avatar.conversation.pauses import public_event
                                 event=public_event(event)
                                 items=snapshot.setdefault('tool_events',[])
                                 item=next((item for item in items if item['id']==event['id']),None)

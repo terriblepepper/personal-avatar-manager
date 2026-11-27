@@ -31,7 +31,7 @@ function render(event: Event) {
 
 <template>
   <p v-if="error" role="alert">{{ error }}</p>
-  <iframe v-else-if="markup" :key="revision" class="html-frame" src="/static/preview/html.html?v=4"
+  <iframe v-else-if="markup" :key="revision" class="html-frame" src="/static/preview/html.html?v=5"
     sandbox="allow-scripts" referrerpolicy="no-referrer" :title="filename" @load.once="render"/>
   <p v-else role="status">正在准备 HTML 预览…</p>
 </template>

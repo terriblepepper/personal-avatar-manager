@@ -10,42 +10,23 @@ CREATE ROLE avatar_app LOGIN;
 CREATE DATABASE avatar OWNER avatar_app;
 ```
 
-在服务的私有 `.env` 中填写 `DATABASE_URL`。直接运行 CLI、Uvicorn 或迁移脚本时，须通过调用进程的环境显式传入。使用 psycopg 的原生 DSN，URL 中密码的特殊字符需要编码。示例使用已配置本机认证的数据库角色。
+在服务的私有 `.env` 中填写 `DATABASE_URL`。直接运行 CLI 或 Uvicorn时，须通过调用进程的环境显式传入。使用 psycopg 的原生 DSN，URL 中密码的特殊字符需要编码。示例使用已配置本机认证的数据库角色。
 
 ```bash
 export DATABASE_URL='postgresql:///avatar?user=avatar_app'
 ```
 
-源码部署的 `./service.sh start` 先启动自管 PostgreSQL 16（`data/pgsql`），再启动应用。`./service.sh restart` 保留数据库和项目独立运行的消息依赖。`./service.sh stop` 同时停止自管数据库。外部 PostgreSQL 由其管理员维护。可选读缓存使用服务器项目根目录的 `redis/`，套接字示例为 `AVATAR_REDIS_SOCKET=redis/redis.sock`。Redis 不可用时管理员待审计数回源 PostgreSQL。
+源码部署的 `./service.sh start` 先启动自管 PostgreSQL 16（`data/pgsql`），再启动应用。`./service.sh restart` 保留数据库和项目独立运行的消息依赖。`./service.sh stop` 仅停止应用。PostgreSQL、Redis 和 Kafka 可继续供其他进程使用。外部 PostgreSQL 由其管理员维护。可选读缓存使用服务器项目根目录的 `redis/`，套接字示例为 `AVATAR_REDIS_SOCKET=redis/redis.sock`。Redis 不可用时管理员待审计数回源 PostgreSQL。
 
-任务和通知继续在 PostgreSQL 提交后生效。应用启动时在当前 schema 安装事务内事件表和变更触发器。回滚同时撤销事件。转发器分批读取和清理事件，避免 PostgreSQL NOTIFY 给并发提交增加全局锁。Kafka 的任务唤醒和 Redis 的客户端刷新可通过数据库账本与快照恢复，队列或缓存数据可重新生成。认证的会话和 OIDC 查询复用一次连接池借用。已核对的单账户写入使用账户锁。同一账户仍串行，跨账户事务继续使用 Schema 写入屏障。
+任务和通知继续在 PostgreSQL 提交后生效。应用启动时在当前 schema 安装事务内事件表和变更触发器。触发器同时发送当前 schema 专用的空载荷 NOTIFY。事务回滚会撤销事件与通知。单进程转发器先 LISTEN 再扫描，每批最多处理 128 行；空闲 8 秒复查一次，重连时继续读取已提交的积压。Kafka 不可用时仍在本进程唤醒任务，Redis 不可用时客户端按原接口读取快照。认证的会话和 OIDC 查询复用一次连接池借用。已核对的单账户写入使用账户锁。同一账户仍串行，跨账户事务继续使用 Schema 写入屏障。
 
 连接池按进程配置。 `AVATAR_PG_POOL_MIN` 默认 1，`AVATAR_PG_POOL_MAX` 默认 10，`AVATAR_PG_POOL_TIMEOUT` 默认 30 秒。通过运行监控的连接申请等待和写锁等待指标判断瓶颈。
 
-## 旧版迁移
+## 历史版本
 
-使用 v0.1.0 或 v0.1.1 的部署，先在独立数据副本上用原版 1.1.0（`eda041e`）的 `Database(副本目录).initialize()` 离线升级 SQLite 结构，再把升级后的副本交给迁移器。
+v1.5.0 直接使用已完成迁移的 PostgreSQL 与账户文件布局。已退役的 SQLite、Chroma 和 EverOS 导入工具及其操作说明保存在 Git 标签 `v1.4.5`。保留旧文件备份供恢复演练。
+首次启动在同一事务中升级 PostgreSQL。先按下节备份并停写，再为缓存生成 `byte_size`、安装外键前导索引、回填历史文件有效期。建索引和计算存量缓存大小需要时间与磁盘余量；事务提交后，后续启动跳过这次数据回填。
 
-1. 确认聊天、索引和 Soul 构建结束，暂停所有应用写入和后台 worker，保持 PostgreSQL 在线。用户级 systemd 部署可执行 `systemctl --user stop personal-avatar`，其余部署停止对应应用进程。
-2. 在项目外受保护的位置保存旧版代码标识、私有配置、主密钥、原件、EverOS 记忆文件和完整身份材料。冻结旧 `data` 的文件副本，保留 SQLite 主文件和 WAL、Chroma 元数据与全部 HNSW 段、EverOS 队列与 LanceDB 段；对于已经使用 PostgreSQL 的部署，按下文逻辑备份步骤保存同批主库。文件备份排除正在运行的 `data/pgsql`。保留一份原始快照用于恢复。
-3. 如果旧版业务主库已使用 PostgreSQL，用它的隔离恢复副本先演练。如果业务主库仍是 `avatar.sqlite3`，先用 `scripts/migrate_sqlite_to_postgres.py SOURCE --backup BACKUP` 将数据库导入空 PostgreSQL schema。`SOURCE` 为冻结副本内的主库，`BACKUP` 为新建的私有备份文件。`--dry-run` 可先校验源表并检查目标为空。已有业务表的生产主库跳过这项旧主库导入。
-4. 切到与目标版本对应的源码，在停写状态下导入本地存储。`DATABASE_URL` 必须指向已包含原账户和业务清单的目标库。`--snapshot` 指向冻结的 `data` 目录副本本身，账户归属由目标业务库确定。旧 Chroma 读取依赖通过 `legacy-migration` 安装。
-
-```bash
-uv sync --locked --extra legacy-migration
-.venv/bin/python scripts/migrate_local_stores.py --snapshot /secure/avatar-backup/data
-```
-
-5. 核对导入报告中的系统 AIP 任务数、资料向量数、EverOS 行数和当前 RAG 发布引用数。工具在一个 PostgreSQL 事务内导入并核验引用。失败时保留快照，修正缺件、归属或配置后重新执行。索引迁移复用已有向量，不调用模型。
-6. 隔离验证登录、资料授权与引用、Soul 记忆树、原件读取、AIP 旧回执和健康端点。正式切换也需在停写后对最终快照执行同样步骤。旧数据文件在确认迁移和恢复演练完成前应完整保留。
-
-数据库已经导入 PostgreSQL 时，升级到取消旧索引读取分支的版本前，暂停应用写入并保持 PostgreSQL 在线。加载部署环境后，从新版本源码执行：
-
-```bash
-.venv/bin/python scripts/migrate_local_stores.py --postgres-only
-```
-
-命令在同一事务转换旧发布清单和词法记录，校验向量引用，按兼容签名转换现有索引。重复运行不会重复生成向量或调用模型。旧部署仍使用全局原件目录时，在启动应用前运行同一脚本的 `--storage-layout`。旧正式 ACS 缓存使用 `scripts/wit_identity.py` 的 `migrate-acs` 命令迁到 `acs.json`。迁移成功后启动应用。
 
 ## 备份与恢复
 
@@ -65,7 +46,7 @@ pg_restore --exit-on-error --single-transaction --dbname=avatar_restore /secure/
 
 ```bash
 export TEST_POSTGRES_URL='postgresql:///avatar_test'
-.venv/bin/python scripts/run_tests.py --jobs 4 unit -q
+.venv/bin/python scripts/run_tests.py --jobs 4 all -q
 (cd frontend && npm run test:browser)
 ```
 

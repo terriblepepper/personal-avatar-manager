@@ -1,5 +1,6 @@
 """Serve the built Vue app without turning API or asset errors into HTML."""
 from pathlib import Path
+from avatar.api.middleware import SHELL_CSP
 import re
 from fastapi import HTTPException
 from fastapi.responses import FileResponse, RedirectResponse
@@ -57,5 +58,5 @@ def mount_frontend(app, dist: Path):
             raise HTTPException(503, '缺少 Vue 构建产物，请在 frontend 目录执行 npm ci 和 npm run build')
         return FileResponse(index, headers={
             'Cache-Control': 'no-cache', 'Referrer-Policy': 'no-referrer',
-            'Content-Security-Policy': "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; font-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; frame-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+            'Content-Security-Policy': SHELL_CSP,
         })

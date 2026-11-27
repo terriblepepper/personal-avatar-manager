@@ -1,8 +1,10 @@
 """Per-account daily admission limits for public town conversations."""
+import time
 from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from avatar.core.db import now
 from avatar.protocols.tasks.store import ManagementTaskError
 
 
@@ -45,3 +47,17 @@ def check_quota(db, owner, visitor, day):
             or (total_limit is not None and usage['total']>=total_limit)):
         raise ManagementTaskError(-32010, '今日公开对话额度已用完')
 
+
+
+def charge_visitor(db, owner, aic, scope_peer, visitor):
+    timestamp = now()
+    check_quota(db, owner, visitor, timestamp[:10])
+    if visitor_busy(db, aic, scope_peer):
+        raise ManagementTaskError(-32010, '该访客已有请求正在处理')
+    db.execute('INSERT INTO town_visitor_requests VALUES(?,?,?)', (owner, visitor, timestamp))
+
+
+def visitor_busy(db, aic, peer):
+    return db.execute("""SELECT 1 FROM avatar_aip_tasks WHERE local_aic=? AND peer_aic=?
+        AND (document::jsonb->'status'->>'state')='working' AND deadline>? LIMIT 1""",
+        (aic,peer,time.time())).fetchone() is not None

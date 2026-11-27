@@ -5,10 +5,12 @@ import uuid
 from datetime import datetime,timezone
 from zoneinfo import ZoneInfo
 from fastapi import HTTPException
+from avatar.core.execution import run_blocking
 from avatar.core.db import dump,event,now
 from avatar.models.model_config import require_complete
 from avatar.models.embedding import EmbeddingSettings,require_embedding
 from avatar.knowledge.style_traits import extract_style,style_evidence,StyleTraits,contextual_document
+from avatar.knowledge.soul_document import approved_style, FIELDS
 
 
 def auto_style_advance(db, owner, previous, checksum, current):
@@ -57,19 +59,19 @@ class StyleLearning:
             self.conversation(db,user['id'],identifier)
             can_enable=self.active_build(db,user['id']) is not None
             setting=db.execute('SELECT * FROM style_learning_settings WHERE conversation_id=? AND user_id=?',(identifier,user['id'])).fetchone()
-            last=db.execute("SELECT b.id,b.status,b.stage,b.error,b.updated_at FROM style_learning_runs r JOIN soul_builds b ON b.id=r.build_id,json_each(r.sources) s WHERE r.user_id=? AND json_extract(s.value,'$.conversation_id')=? ORDER BY r.created_at DESC LIMIT 1",(user['id'],identifier)).fetchone()
+            last=db.execute("SELECT b.id,b.status,b.stage,b.error,b.updated_at FROM style_learning_runs r JOIN soul_builds b ON b.id=r.build_id,json_each(r.sources) s WHERE r.user_id=? AND (s.value::jsonb->>'conversation_id')=? ORDER BY r.created_at DESC LIMIT 1",(user['id'],identifier)).fetchone()
             memory=db.execute('SELECT updated_at FROM style_learning_memory WHERE user_id=?',(user['id'],)).fetchone()
         return {'enabled':can_enable and bool(setting and setting['enabled']),'can_enable':can_enable,'last':dict(last) if last else None,'learned_at':memory[0] if memory else None}
 
     def configure(self,user,identifier,enabled):
-        with self.database.connect(write=True) as db:
+        with self.database.connect(write=True,account_scope=user['id']) as db:
             self.conversation(db,user['id'],identifier)
             if enabled and not self.active_build(db,user['id']):
                 raise HTTPException(409,NEEDS_ACTIVE_SOUL)
             db.execute('INSERT INTO style_learning_settings VALUES(?,?,?,0,?) ON CONFLICT(conversation_id) DO UPDATE SET enabled=excluded.enabled,updated_at=excluded.updated_at',
                 (identifier,user['id'],int(enabled),now()))
             if not enabled:
-                ids=[r[0] for r in db.execute("SELECT r.build_id FROM style_learning_runs r,json_each(r.sources) s WHERE r.user_id=? AND r.mode='auto' AND json_extract(s.value,'$.conversation_id')=?",(user['id'],identifier))]
+                ids=[r[0] for r in db.execute("SELECT r.build_id FROM style_learning_runs r,json_each(r.sources) s WHERE r.user_id=? AND r.mode='auto' AND (s.value::jsonb->>'conversation_id')=?",(user['id'],identifier))]
                 for build_id in ids:
                     if db.execute("UPDATE soul_builds SET status='canceled',stage='已停用自动学习',updated_at=? WHERE id=? AND status IN ('queued','running')",(now(),build_id)).rowcount:
                         db.execute("UPDATE style_learning_runs SET samples='[]' WHERE build_id=?",(build_id,))
@@ -78,7 +80,7 @@ class StyleLearning:
 
     def queue(self,user,identifier=None,automatic=False,day=None,conversation_ids=None):
         day=day or datetime.now(timezone.utc).astimezone(ZoneInfo('Asia/Shanghai')).date().isoformat()
-        with self.database.connect(write=True) as db:
+        with self.database.connect(write=True,account_scope=user['id']) as db:
             if identifier:self.conversation(db,user['id'],identifier)
             for cid in conversation_ids or ():self.conversation(db,user['id'],cid)
             parent=self.active_build(db,user['id'])
@@ -92,7 +94,7 @@ class StyleLearning:
             if identifier:
                 db.execute('INSERT OR IGNORE INTO style_learning_settings VALUES(?,?,0,0,?)',(identifier,user['id'],now()))
             clauses=['c.user_id=?','s.user_id=c.user_id',"c.caller_id=c.user_id", "c.platform='web'",'c.parent_id IS NULL',"c.channel IN ('avatar','assistant')",
-                "m.user_id=c.user_id","m.role='user'","m.channel IN ('avatar','assistant')",'m.id>s.last_message_id',"json_extract(m.task_event,'$.kind') IS NULL"]
+                "m.user_id=c.user_id","m.role='user'","m.channel IN ('avatar','assistant')",'m.id>s.last_message_id',"(m.task_event::jsonb->>'kind') IS NULL"]
             args=[user['id']]
             if automatic:clauses.append('s.enabled=1')
             elif conversation_ids:clauses.append('c.id IN (SELECT value FROM json_each(?))');args.append(dump(conversation_ids))
@@ -140,9 +142,7 @@ class StyleLearning:
             try:self.queue(user,automatic=True,day=day)
             except HTTPException:continue
 
-    async def process(self,row,config,key,worker):
-        from avatar.knowledge.soul_document import FIELDS,approved_style
-        k=worker
+    def _inputs(self,row):
         with self.database.connect() as db:
             parent=self.active_build(db,row['user_id'])
             if not parent:raise HTTPException(409,NEEDS_ACTIVE_SOUL)
@@ -151,6 +151,11 @@ class StyleLearning:
             if not run:raise HTTPException(409,'学习任务不存在')
             samples=json.loads(run['samples']);memory=db.execute('SELECT document FROM style_learning_memory WHERE user_id=?',(row['user_id'],)).fetchone()
             previous=json.loads(memory[0]) if memory else None;active=approved_style(db,row['user_id'])
+        return parent,run,samples,previous,active
+
+    async def process(self,row,config,key,worker):
+        k=worker
+        parent,run,samples,previous,active=await run_blocking(self._inputs,row)
         observations=[];chunks=[];chunk=[];size=0
         for sample in samples:
             text=sample['text']
@@ -169,7 +174,10 @@ class StyleLearning:
         # 只接纳封闭标签，最终表达也由标签确定；原始聊天不进入第二次自由生成。
         document=contextual_document(traits,active or previous)
         if not isinstance(document,dict) or set(document)!=set(FIELDS) or any(not isinstance(v,str) for v in document.values()) or sum(map(len,document.values()))>12000 or not document['voice'].strip():raise HTTPException(502,'学习结果格式无效，未修改已生效风格')
-        with self.database.connect(write=True) as db:
+        await run_blocking(self._publish,row,parent,run,len(samples),document,traits)
+
+    def _publish(self,row,parent,run,sample_count,document,traits):
+        with self.database.connect(write=True,account_scope=row['user_id']) as db:
             state=db.execute('SELECT status FROM soul_builds WHERE id=?',(row['id'],)).fetchone()
             if not state or state[0]!='running':return
             latest=self.active_build(db,row['user_id'])
@@ -177,13 +185,13 @@ class StyleLearning:
             if latest!=parent or not account or account[0]!='active':raise HTTPException(409,'生效版本或账户状态已变化，未覆盖新版本')
             inherited=db.execute('SELECT asset_ids,asset_captions,notes FROM soul_builds WHERE id=? AND user_id=?',(latest,row['user_id'])).fetchone()
             if inherited:db.execute('UPDATE soul_builds SET asset_ids=?,asset_captions=? WHERE id=?',(inherited['asset_ids'],inherited['asset_captions'],row['id']))
-            stamp=now();notes=[{'filename':'本人对话用户气泡','coverage':f'本次 {len(samples)} 条；未使用助手、其他用户、任务或访客气泡'}]
+            stamp=now();notes=[{'filename':'本人对话用户气泡','coverage':f'本次 {sample_count} 条；未使用助手、其他用户、任务或访客气泡'}]
             if inherited:notes=[*json.loads(inherited['notes']),*notes]
             db.execute("UPDATE soul_builds SET status='approved',phase='draft',progress=100,stage='学习完成，已自动更新风格',document=?,notes=?,reason='本人已授权对话风格学习自动通过',reviewed_at=?,updated_at=? WHERE id=?",(dump(document),dump(notes),stamp,stamp,row['id']))
             db.execute('INSERT INTO active_souls VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET build_id=excluded.build_id',(row['user_id'],row['id']))
             db.execute('UPDATE soul_builds SET observations=? WHERE id=?',(dump(traits),row['id']))
             db.execute('INSERT INTO style_learning_memory VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET document=excluded.document,updated_at=excluded.updated_at',(row['user_id'],dump(document),stamp))
             for source in json.loads(run['sources']):
-                db.execute('UPDATE style_learning_settings SET last_message_id=MAX(last_message_id,?),updated_at=? WHERE conversation_id=? AND user_id=?',(source['through'],stamp,source['conversation_id'],row['user_id']))
+                db.execute('UPDATE style_learning_settings SET last_message_id=GREATEST(last_message_id,?),updated_at=? WHERE conversation_id=? AND user_id=?',(source['through'],stamp,source['conversation_id'],row['user_id']))
             db.execute("UPDATE style_learning_runs SET samples='[]' WHERE build_id=?",(row['id'],))
             event(db,row['user_id'],'system','soul 持续学习自动通过',row['id'])

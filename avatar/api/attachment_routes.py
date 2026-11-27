@@ -1,4 +1,7 @@
 import asyncio
+import base64
+from tempfile import TemporaryFile
+from urllib.parse import unquote
 from fastapi import APIRouter
 from fastapi import Depends
 from fastapi import Request
@@ -13,13 +16,15 @@ from avatar.files.library.folders import rename_folder
 from avatar.files.library.folders import rename_file
 from avatar.core.artifact_limits import MAX_SOURCE_BYTES
 from avatar.files.uploads.batches import batch_id as upload_batch_id
-from avatar.files.uploads.batches import UploadComplete
+from avatar.files.uploads.batches import UploadComplete, complete
 from avatar.core.revisions import ModifiedAt
-from avatar.files.library.attachments import ARTIFACT_SUFFIXES
+from avatar.files.uploads.validation import ARTIFACT_SUFFIXES
 from avatar.files.library.attachments import AttachmentDescriptionRequest
 import avatar.accounts.auth as auth
-from avatar.files.library.batch import BatchRequest
+from avatar.files.library.batch import BatchRequest, apply
 from avatar.api.dependencies import admin
+from avatar.files.uploads.buffer import upload_buffer, upload_work
+from fastapi import HTTPException
 
 
 router = APIRouter()
@@ -57,24 +62,17 @@ def delete_material_folder(body:FolderRequest,request:Request,user=Depends(auth.
 
 @router.post('/me/attachments', status_code=201)
 async def upload_attachment(request: Request, filename: str | None = Query(default=None, min_length=1, max_length=200), last_modified_at: ModifiedAt | None = Query(default=None), user=Depends(auth.current_user)):
-    from urllib.parse import unquote
-    import base64
     encoded = request.headers.get('x-attachment-caption-base64')
     try:
         # UTF-8 Base64 避免长中文说明的百分号编码超过常见 HTTP 头大小上限。
         caption = (base64.b64decode(encoded, validate=True).decode('utf-8') if encoded is not None
                    else unquote(request.headers.get('x-attachment-caption', ''))).strip()
     except (ValueError, UnicodeError):
-        from fastapi import HTTPException
         raise HTTPException(422, '资料说明编码无效')
     if len(caption) > 2000:
-        from fastapi import HTTPException
         raise HTTPException(422, '资料说明最多 2000 字')
     if filename is None:
         filename = unquote(request.headers.get("x-attachment-filename", ""))
-    from tempfile import TemporaryFile
-    from avatar.files.uploads.buffer import upload_buffer, upload_work
-    from fastapi import HTTPException
     files = request.app.state.service.attachments
     def read_quota():
         with files.database.connect() as db:
@@ -157,11 +155,9 @@ def update_attachment_description(attachment_id: str, body: AttachmentDescriptio
 
 @router.post('/me/attachments/batch')
 def batch_attachments(body:BatchRequest,request:Request,user=Depends(auth.current_user)):
-    from avatar.files.library.batch import apply
     return apply(request.app.state.service.attachments,user,body)
 
 
 @router.post('/me/upload-batches/{batch_id}/complete')
 def complete_upload(batch_id:str,body:UploadComplete,request:Request,user=Depends(auth.current_user)):
-    from avatar.files.uploads.batches import complete
     return complete(request.app.state.database,user,batch_id,body)

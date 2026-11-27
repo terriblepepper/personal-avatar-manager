@@ -47,6 +47,7 @@ it('keeps paged messages after generation and discards late history when switchi
     expect(pages()[1]?.[3].aborted).toBe(true)
     page(); await flushPromises()
     expect(ids()).toEqual(rows(201).map(r=>r.id))
+    expect(request.mock.calls.some(([path]) => path === '/me')).toBe(false)
     expect(notifyError).not.toHaveBeenCalled()
   } finally { view.unmount(); route.query.conversation='A' }
 })

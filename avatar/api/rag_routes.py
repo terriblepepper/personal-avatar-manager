@@ -1,6 +1,6 @@
 from typing import Literal
 from fastapi import APIRouter,Depends,Request
-from avatar.api.knowledge_routes import owner
+from avatar.api.dependencies import owner
 
 router=APIRouter(prefix='/api/me/file-index',tags=['资料 RAG'])
 

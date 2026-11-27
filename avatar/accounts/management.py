@@ -19,30 +19,33 @@ class AccountManagement:
     # 职责：按条件分页检索管理后台账户列表。
     # 输入：actor 为当前管理员；search 搜索本地/Keycloak 用户名、身份及联系方式，role 过滤角色，offset 为分页偏移。
     # 结果与约束：返回 items、total 和分页信息；转义 LIKE 通配符，每页最多 10 条，不返回密码。
-    def list(self, actor, search='', role='all', offset=0):
+    def list(self, actor, search='', role='all', offset=0, *, db=None):
         require_admin(actor)
+        if db is None:
+            with self.database.connect() as reader:
+                reader.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY')
+                return self.list(actor, search, role, offset, db=reader)
         clauses, values = [], []
         if search:
             pattern = '%'+search.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%'
-            clauses.append("(u.username ILIKE ? ESCAPE '\\' OR u.email ILIKE ? ESCAPE '\\' OR u.phone ILIKE ? ESCAPE '\\' OR u.student_id ILIKE ? ESCAPE '\\' OR json_extract(p.draft,'$.employee_id') ILIKE ? ESCAPE '\\' OR json_extract(p.draft,'$.name') ILIKE ? ESCAPE '\\' OR i.username ILIKE ? ESCAPE '\\')")
+            clauses.append("(u.username ILIKE ? ESCAPE '\\' OR u.email ILIKE ? ESCAPE '\\' OR u.phone ILIKE ? ESCAPE '\\' OR u.student_id ILIKE ? ESCAPE '\\' OR (p.draft::jsonb->>'employee_id') ILIKE ? ESCAPE '\\' OR (p.draft::jsonb->>'name') ILIKE ? ESCAPE '\\' OR i.username ILIKE ? ESCAPE '\\')")
             values.extend([pattern]*7)
         if role != 'all':
             clauses.append('u.role=?');values.append(role)
         where = ' WHERE '+' AND '.join(clauses) if clauses else ''
         join = ' FROM users u LEFT JOIN profile_records p ON p.user_id=u.id LEFT JOIN avatar_records a ON a.user_id=u.id LEFT JOIN oidc_identities i ON i.user_id=u.id'
-        with self.database.connect() as db:
-            total = db.execute('SELECT COUNT(*)'+join+where,values).fetchone()[0]
-            rows = db.execute("SELECT u.id,u.username,u.role,u.is_root,u.person_type,u.student_id,u.teacher_id,u.account_status,u.email,u.phone,u.created_at,json_extract(p.draft,'$.name') name,json_extract(p.draft,'$.employee_id') employee_id,a.aic,i.username identity_username"+join+where+' ORDER BY u.is_root DESC,u.created_at DESC,u.id LIMIT 10 OFFSET ?',[*values,offset]).fetchall()
+        total = db.execute('SELECT COUNT(*)'+join+where,values).fetchone()[0]
+        rows = db.execute("SELECT u.id,u.username,u.role,u.is_root,u.person_type,u.student_id,u.teacher_id,u.account_status,u.email,u.phone,u.created_at,(p.draft::jsonb->>'name') name,(p.draft::jsonb->>'employee_id') employee_id,a.aic,i.username identity_username"+join+where+' ORDER BY u.is_root DESC,u.created_at DESC,u.id LIMIT 10 OFFSET ?',[*values,offset]).fetchall()
         return {'items':[dict(row) for row in rows],'total':total,'offset':offset,'limit':10}
 
     def profile(self,actor,target_id):
         """注册已通过账户的登记信息和最新审核快照，不返回未审核草稿或模型凭据。"""
         require_admin(actor)
         with self.database.connect() as db:
-            db.execute('BEGIN')
+            db.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY')
             current=db.execute('SELECT role FROM users WHERE id=?',(actor['id'],)).fetchone()
             require_admin(current if current else {'role':'user'})
-            account=db.execute("SELECT u.id,u.username,u.person_type,u.student_id,u.teacher_id,u.email,u.phone,u.account_status,u.created_at,i.username identity_username,COALESCE(json_extract(p.draft,'$.name'),'') name FROM users u LEFT JOIN oidc_identities i ON i.user_id=u.id LEFT JOIN profile_records p ON p.user_id=u.id WHERE u.id=?",(target_id,)).fetchone()
+            account=db.execute("SELECT u.id,u.username,u.person_type,u.student_id,u.teacher_id,u.email,u.phone,u.account_status,u.created_at,i.username identity_username,COALESCE((p.draft::jsonb->>'name'),'') name FROM users u LEFT JOIN oidc_identities i ON i.user_id=u.id LEFT JOIN profile_records p ON p.user_id=u.id WHERE u.id=?",(target_id,)).fetchone()
             if not account:raise HTTPException(404,'账户不存在')
             if account['account_status']!='active':raise HTTPException(409,'账户未激活')
             approved=db.execute("SELECT snapshot,reviewed_at FROM profile_submissions WHERE user_id=? AND status='approved' ORDER BY reviewed_at DESC,submitted_at DESC,id DESC LIMIT 1",(target_id,)).fetchone()

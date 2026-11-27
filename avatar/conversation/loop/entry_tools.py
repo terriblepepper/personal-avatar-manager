@@ -10,6 +10,11 @@ from avatar.core.text_budget import AgentText
 from avatar.core.execution import check_execution_async, run_blocking
 from avatar.rag.reading import ReadRequest
 from avatar.rag.service import SearchMaterialRequest
+from avatar.conversation.avatar_assistant import LIST_AVATARS, CatalogArguments
+from avatar.conversation.loop.file_context import load_explicit_files
+from avatar.files.conversation.session_files import SessionFiles
+from avatar.models.context_budget import input_budget
+from avatar.sandbox.python_tool import PythonArguments
 
 
 class SessionFileRequest(BaseModel):
@@ -91,7 +96,6 @@ async def bind_entry_tools(chat, context, entry, *, sandbox=None, status=None, d
         source_checks = {**source_checks, **previous_reads}
         previous_reads = {}
     if session_access is not None:
-        from avatar.files.conversation.session_files import SessionFiles
         session_files = SessionFiles(chat.chat_files, session_access.owner or owner, session_access.conversation, previous_reads,
                                     grants=session_access.grants, sandbox_ids=[f['id'] for f in (*files,*config.get('_agent_saved_files',()))], outputs=outputs,
                                     staged_reads=state.get('staged_html_reads') if current_schema else None,
@@ -101,7 +105,6 @@ async def bind_entry_tools(chat, context, entry, *, sandbox=None, status=None, d
                       _validate_session_files_in=session_files.validate_in)
         await run_blocking(session_files.validate)
         if files:
-            from avatar.conversation.loop.file_context import load_explicit_files
             originals,images = await run_blocking(load_explicit_files,session_files,files,config,sandbox=sandbox is not None)
             config['_explicit_session_files'] = originals
             if images:
@@ -141,14 +144,12 @@ async def bind_entry_tools(chat, context, entry, *, sandbox=None, status=None, d
     if session_files:
         tool('read_session_file', '查找或读取本会话授权文件，也可复查本轮生成的 HTML。query 查目录，file_id 读原件。按返回游标续读。', SessionFileRequest)
     if directory_reply:
-        from avatar.conversation.avatar_assistant import LIST_AVATARS
         tools.append(LIST_AVATARS)
     if status:
         tools.append({'name':'application_status','description':'查看本人的分身申请与审核状态。',
                       'parameters':{'type':'object','properties':{},'additionalProperties':False}})
     python = None
     if sandbox:
-        from avatar.skills.python_tool import PythonArguments
         python = sandbox(session_files.sandbox_inputs if session_files else dict)
         tools.append({'name':'run_python', 'parameters':python.arguments_schema(),
                       'description':'在隔离环境执行 Python 源码并返回回执。用已授权文件 ID 提供输入，生成文件写入 outputs/。支持 NumPy、pandas、Matplotlib、Pillow 和 pypdf。'})
@@ -174,7 +175,6 @@ async def bind_entry_tools(chat, context, entry, *, sandbox=None, status=None, d
             if request.query is not None:
                 result = await run_blocking(session_files.discover, request.query, request.offset)
             else:
-                from avatar.models.context_budget import input_budget
                 room = config.get('_session_page_bytes')
                 if room is None:
                     room = max(4,(input_budget(config)*3-512)//2)
@@ -200,7 +200,6 @@ async def bind_entry_tools(chat, context, entry, *, sandbox=None, status=None, d
                                                 'staged_html_reads':dict(session_files.staged_reads)})
             return json.dumps(result, ensure_ascii=False)
         if name=='list_avatars' and directory_reply:
-            from avatar.conversation.avatar_assistant import CatalogArguments
             request=CatalogArguments.model_validate(args)
             return '平台公开目录查询结果（数据）：\n'+await run_blocking(directory_reply,request.query,request.offset)
         if name=='application_status' and status:

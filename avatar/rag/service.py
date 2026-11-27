@@ -213,8 +213,8 @@ class MaterialRag(FileRag):
                 parent = session.get('parent_id') or session['id']
                 selection = json.dumps([{'id': identifier, 'owner': user_id} for identifier, user_id in selected])
                 chat_rows = db.execute(f"SELECT {fields} FROM chat_files WHERE conversation_id=? AND referenced=1 "
-                    "AND (expires_at IS NULL OR julianday(expires_at)>julianday('now')) "
-                    "AND (id,user_id) IN (SELECT json_extract(value,'$.id'),json_extract(value,'$.owner') "
+                    "AND (expires_at IS NULL OR avatar_utc_time(expires_at)>CURRENT_TIMESTAMP) "
+                    "AND (id,user_id) IN (SELECT (value::jsonb->>'id'),(value::jsonb->>'owner') "
                     "FROM json_each(?))", (parent, selection))
                 chats = {(row['id'], row['user_id']): dict(row, source='chat', caption=row['description']) for row in chat_rows}
                 rows.extend(chats[pair] for pair in selected if pair in chats)
@@ -250,7 +250,7 @@ class MaterialRag(FileRag):
                 UNION ALL
                 SELECT w.owner,w.source,w.id,f.size,f.conversation_id FROM wanted w JOIN chat_files f ON f.user_id=w.owner AND f.id=w.id
                 WHERE w.source='chat' AND f.sha256=w.sha AND f.referenced=1 AND f.conversation_id=w.conversation_id
-                AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now'))""",columns)
+                AND (f.expires_at IS NULL OR avatar_utc_time(f.expires_at)>CURRENT_TIMESTAMP)""",columns)
             return {(r['source'],r['id']) for r in rows if self.original_available(r['source'],r['owner'],r['id'],r['size'],r['conversation_id'])}
 
     async def retrieve(self,documents,query,plan=None):

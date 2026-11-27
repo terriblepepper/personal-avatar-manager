@@ -8,30 +8,11 @@ from fastapi import HTTPException
 
 from avatar.conversation.jobs.pipeline import current_generation, validate_authorization
 from avatar.conversation.jobs.store import GenerationStore
+from avatar.conversation.pause_state import available_outputs, checked, pending, settle_run_usage
 from avatar.core.db import dump, now
-
-
-def pending(db, user_id, parent_id):
-    row = db.execute("""SELECT p.document FROM chat_agent_pauses p JOIN chat_conversations c
-        ON c.id=p.conversation_id WHERE c.user_id=? AND c.id=?""", (user_id,parent_id)).fetchone()
-    return json.loads(row['document']) if row else None
-
-
-def checked(db, user_id, request):
-    task = pending(db,user_id,request.conversation_id)
-    if request.agent_control:
-        if not task or task['snapshot']['agent_pause_id'] != request.agent_pause_id:
-            raise HTTPException(409,'原暂停状态已改变，请刷新会话')
-        question = task['snapshot'].get('user_question')
-        if request.question_id and (not question or request.question_id != question['id']):
-            raise HTTPException(409,'分身提问已改变，请刷新后回答')
-        if question and request.agent_control=='continue' and not request.message.strip():
-            raise HTTPException(422,'请填写对分身提问的回答')
-        if request.agent_control=='retry' and not task['snapshot'].get('stream_retryable'):
-            raise HTTPException(409,'该任务需要补充信息才能继续')
-    elif task:
-        raise HTTPException(409,'分身已暂停，请刷新后继续任务')
-    return task
+from avatar.conversation.loop.personal import validate_sources_in, run_id_for
+from avatar.conversation.loop.store import RunStore
+from avatar.conversation.tools.activity import memory_evidence
 
 
 def merged_work(request, task):
@@ -39,42 +20,6 @@ def merged_work(request, task):
     objective = task['objective'] + ('\n\n用户补充：' + supplement if supplement else '')
     files = list(dict.fromkeys([*task.get('attachment_ids',()), *request.attachment_ids]))
     return request.model_copy(update={'message':objective,'attachment_ids':files})
-
-
-_PUBLIC_ACTIONS = frozenset("""find_material send_material search_materials read_material
-    find_public_material send_public_material create_html edit_html append_html_draft
-    list_avatars contact_avatar read_session_file read_step_receipt require_conversation_tool
-    run_python ask_user get_current_time wait_for_user end_task send_message enable_tools""".split())
-
-
-def public_event(event):
-    if event.get('type','tool') != 'tool':
-        return event
-    public={key:event[key] for key in ('type','id','group','name','phase','status','started_at','finished_at')
-            if key in event}
-    if event.get('group') in ('model_io','tool_io'):
-        # Projected at the model boundary according to the executing owner's scope; never include transport fields.
-        for section, fields in (('input', ('message','message_chars','history_turns','tools','tool_count','attempt','tool','arguments')),
-                                ('output', ('text','text_chars','kind','received_bytes','tool_calls','finish_reason','reason','status_code','attempt','result'))):
-            data = event.get(section)
-            if isinstance(data, dict):
-                public[section] = {key:data[key] for key in fields if key in data}
-        return public
-    for section in ('input','output'):
-        data=event.get(section)
-        if not isinstance(data,dict):continue
-        fields={k:data[k] for k in ('goal_no','iteration','planned_steps','file_count','count','accepted_bytes')
-                if type(data.get(k)) is int}
-        for key,allowed in (('tool',_PUBLIC_ACTIONS),('action',_PUBLIC_ACTIONS),('stage',('route','resume_route')),
-                            ('operation',('check_file_receipt','select_materials')),('mode',('read','search','answer')),
-                            ('file_access',('directory','content'))):
-            if isinstance(data.get(key),str) and data[key] in allowed:
-                fields[key]=data[key]
-        for key in ('tools','tool_names'):
-            if isinstance(data.get(key),list):
-                fields[key]=[tool for tool in data[key] if isinstance(tool,str) and tool in _PUBLIC_ACTIONS]
-        if fields:public[section]=fields
-    return public
 
 
 def continue_task(chat, user, request, parent, task):
@@ -85,7 +30,6 @@ def continue_task(chat, user, request, parent, task):
             AND (id=? OR parent_id=?)""",(task['session_id'],user['id'],parent['id'],parent['id'])).fetchone()
         if not task.get('sources'):
             raise HTTPException(409,'原任务缺少可核验的来源，请结束任务后重新提交')
-        from avatar.conversation.loop.personal import validate_sources_in
         validate_sources_in(db,user['id'],parent['id'],task,task['sources'])
         artifacts = available_outputs(chat,db,user['id'],parent['id'],task['outputs'])
     if not target or not session:raise HTTPException(409,'原分身或会话已变更，无法继续此任务')
@@ -104,33 +48,11 @@ def continue_task(chat, user, request, parent, task):
         background=json.loads(raw)
         background['last_clarification']=task['snapshot']['reply']
         system=prefix+' last_clarification 是上一轮你向用户提出的问题，只用于理解本轮补充。\n'+dump(background)
-    from avatar.conversation.tools.activity import memory_evidence
     evidence = memory_evidence(task.get('activity', []))
     if evidence:
         history = [*history, {'role':'assistant','content':evidence}]
     context=({**cfg,'_resume_history':history,'_agent_checkpoint':task['checkpoint'],'_agent_saved_files':artifacts,'_agent_persisted_file_ids':task['outputs']},key,system,history)
     return overview,context,dict(session),work
-
-
-def available_outputs(chat, db, user_id, parent_id, ids):
-    if not ids:return []
-    files=[dict(row) for row in db.execute("""SELECT id,filename,size,sha256,animation_metadata::jsonb->>'html_mode' AS html_mode FROM chat_files WHERE user_id=? AND
-        conversation_id=? AND generated_message_id IS NULL AND origin='generated' AND
-        (expires_at IS NULL OR julianday(expires_at)>julianday('now')) AND id IN ("""+
-        ','.join('?' for _ in ids)+')',(user_id,parent_id,*ids))]
-    from avatar.files.conversation.resources import original_hashes
-    available=[]
-    for item in files:
-        path=chat.chat_files.directory.path(user_id,parent_id,item['id']+'.blob')
-        expected=item.pop('sha256')
-        try:
-            digest,_=original_hashes(path,item['size'])
-        except FileNotFoundError:
-            continue
-        if expected and digest!=expected:
-            raise HTTPException(409,'已保存作品的原件校验失败')
-        available.append({**item,'origin':'generated','download_url':f"/api/conversations/{parent_id}/files/{item['id']}"})
-    return available
 
 
 def update_waiters(db, user_id, parent_id, pause_id, state, result):
@@ -145,7 +67,7 @@ def update_waiters(db, user_id, parent_id, pause_id, state, result):
         changes['user_question'] = result['user_question']
     db.execute("""UPDATE chat_generation_jobs SET state=?,snapshot=((snapshot::jsonb - 'user_question') || ?::jsonb)::text,updated_at=?
         WHERE user_id=? AND conversation_id=? AND state='awaiting_input'
-        AND json_extract(snapshot,'$.agent_pause_id')=?""",(state,dump(changes),time.time(),user_id,parent_id,pause_id))
+        AND (snapshot::jsonb->>'agent_pause_id')=?""",(state,dump(changes),time.time(),user_id,parent_id,pause_id))
 
 
 def finish(chat, db, user_id, parent_id, pause_id, message_id, *, ending=False):
@@ -153,8 +75,6 @@ def finish(chat, db, user_id, parent_id, pause_id, message_id, *, ending=False):
     task=pending(db,user_id,parent_id)
     if not task or task['snapshot']['agent_pause_id']!=pause_id:
         raise HTTPException(409,'原暂停状态已改变，请刷新会话')
-    from avatar.conversation.loop.personal import validate_sources_in
-    from avatar.conversation.loop.store import RunStore
     try:
         if task.get('sources'):
             validate_sources_in(db,user_id,parent_id,task,task['sources'])
@@ -192,8 +112,6 @@ def pause(chat, user, request, work, parent, session, overview, error, previous,
                 (user['id'],session['channel'],'user',request.message,now(),owner.get('last_modified_at',''),session['id'])).lastrowid
             for file_id in overview.get('_attachment_ids',[]):
                 db.execute('INSERT OR IGNORE INTO chat_file_usages(message_id,file_id) VALUES(?,?)',(message_id,file_id))
-        from avatar.conversation.loop.personal import run_id_for
-        from avatar.conversation.loop.store import RunStore
         run_id=run_id_for(job,previous,request)
         store=overview.get('_run_store')
         if store:
@@ -228,22 +146,6 @@ def pause(chat, user, request, work, parent, session, overview, error, previous,
         update_waiters(db,user['id'],parent['id'],request.agent_pause_id,'awaiting_input',result)
         if job:GenerationStore.finish_in(db,user['id'],job['request_id'],'awaiting_input',result)
     return result
-
-
-def settle_run_usage(db,user_id,parent_id,run_id):
-    from avatar.conversation.loop.store import RunStore
-    key=(user_id,'chat',parent_id,run_id)
-    state=RunStore.inspect_in(db,*key) or {}
-    binding=state.get('binding',{})
-    if state.get('usage') and binding.get('provider') and binding.get('model'):
-        db.execute("""INSERT INTO model_calls(user_id,provider,model,usage,created_at,caller_id,conversation_id)
-            VALUES(?,?,?,?,?,?,?)""",(binding['owner'],binding['provider'],binding['model'],dump(state['usage']),
-                                     now(),user_id,binding['session_id']))
-        RunStore.mark_usage_recorded_for_in(db,*key)
-
-
-def settle_terminal_usage(db,row,run_id):
-    settle_run_usage(db,row['user_id'],row['conversation_id'],run_id)
 
 
 def end_task(chat, user, parent, request):

@@ -32,10 +32,10 @@ class AvatarService:
     # 职责：判断个人 ACS 是否采用本体继承的正式模式。
     # 输入：user_id 可指定既有正式分身账户。
     # 结果与约束：正式派生注册器或既有正式 AIC 均启用继承；不依据浏览器声明改变正式技能。
-    def inherited_acs(self, user_id=None):
+    def inherited_acs(self, user_id=None, db=None):
         if getattr(self.provider,'mode','demo')=='acps-direct':return False
         if user_id:
-            with self.database.connect() as db:
+            with (nullcontext(db) if db is not None else self.database.connect()) as db:
                 row = db.execute('SELECT aic FROM avatar_records WHERE user_id=?', (user_id,)).fetchone()
             return bool(row and not row['aic'].startswith('DEMO-'))
         return False
@@ -46,7 +46,7 @@ class AvatarService:
             return personal_input(stored,profile)
         return resolve_input(stored,profile)
 
-    def deployment_acs(self, document, user_id, db=None):
+    def deployment_acs(self, document, user_id, db=None, *, allocate=True):
         """草稿即保留固定端口；正式监听仍须审核和证书核验。"""
         settings=getattr(getattr(self.provider,'runner',None),'settings',None)
         if getattr(self.provider,'mode','demo')!='acps-direct' or settings is None:
@@ -61,7 +61,7 @@ class AvatarService:
                     with self.database.connect(write=True) as writer:
                         endpoint = entity_endpoint(settings, user_id, db=writer)
             else:
-                endpoint = entity_endpoint(settings, user_id, db=db)
+                endpoint = entity_endpoint(settings, user_id, db=db, allocate=allocate)
         except RegistrationFailure as exc:
             raise HTTPException(409, str(exc)) from None
         document={**document,'endPoints':[endpoint] if endpoint else []}
@@ -87,14 +87,17 @@ class AvatarService:
             bindings=db.execute('SELECT platform,account_id,created_at FROM platform_bindings WHERE user_id=?',(user_id,)).fetchall()
             from avatar.models.embedding import EmbeddingSettings
             embedding_configured=EmbeddingSettings.configured(db,user_id)
-        profile = dict(p) if p else {"draft": "{}", "last_modified_at": "", "status": "draft", "reason": ""}
-        with self.database.connect() as db:
+            model_settings = self.models.get(user_id, db)
+            files = self.attachments.inventory(user_id, db=db)
+            by_id = {item['id']: item for item in files}
+            files_modified_at = self.attachments.collection_date(user_id, db)
+            base = public_base_url(db) if not p or not json.loads(p['acs_document']) else None
             job=db.execute('SELECT j.registration_phase,j.error,j.status FROM provision_jobs j JOIN profile_submissions s ON s.id=j.submission_id WHERE s.user_id=? ORDER BY j.updated_at DESC LIMIT 1',(user_id,)).fetchone()
+        profile = dict(p) if p else {"draft": "{}", "last_modified_at": "", "status": "draft", "reason": ""}
         profile['registration'] = dict(job) if job else None
         profile["draft"] = json.loads(profile["draft"])
         # 当前公开策略覆盖历史私密标记，仅规范化返回副本，不篡改旧草稿及审核记录。
         profile['draft']['visibility'] = {**profile['draft'].get('visibility', {}), **{key: 'public' for key in FIXED_PUBLIC_FIELDS}}
-        model_settings = self.models.get(user_id)
         profile["model_config"] = model_settings['model_config']
         stored_input = json.loads(profile.get('acs_input', '{}'))
         content = self.personal_acs(stored_input, profile['draft'])
@@ -110,7 +113,7 @@ class AvatarService:
         profile['acs_editing'] = bool(profile['acs_online'] and profile['status']!='active' and
             (profile.get('reuse_signed_acs')==0 or (profile.get('reuse_signed_acs') is None and
              profile['acs_active_input'].get('name')!=content.name and stored_input.get('name'))))
-        inherited = self.inherited_acs(user_id)
+        inherited = bool(agent and getattr(self.provider,'mode','demo')!='acps-direct' and not agent['aic'].startswith('DEMO-'))
         visible_input = profile['acs_active_input'] if profile['acs_online'] and not profile['acs_editing'] else profile['acs_input']
         if visible_input and visible_input.get('name') and not inherited:
             profile['draft']['avatar_name'] = visible_input['name']
@@ -123,8 +126,7 @@ class AvatarService:
         deployment_errors=[]
         document = json.loads(profile.get('acs_document', '{}'))
         if not document:
-            with self.database.connect() as db:
-                document = build_acs(content, user_id, public_base_url(db), agent['aic'] if agent else '', profile.get('updated_at'))
+            document = build_acs(content, user_id, base, agent['aic'] if agent else '', profile.get('updated_at'))
         if p:
             try:
                 document = self.deployment_acs(document, user_id)
@@ -142,15 +144,15 @@ class AvatarService:
                 template = {}
             formal = json.loads(agent['acs_document']) if agent and not agent['aic'].startswith('DEMO-') else {}
             profile['acs_inheritance'] = {'enabled': True, 'document': formal or template, 'registered': bool(formal)}
-        profile['attachments'] = self.attachments.metadata(user_id, profile['draft'].get('attachments', []))
-        profile['files'] = self.attachments.inventory(user_id)
+        profile['attachments'] = self.attachments.resolve_refs(by_id, profile['draft'].get('attachments', []))
+        profile['files'] = files
         profile['acs_validation'] = {'valid': not (content.errors()+deployment_errors), 'errors': content.errors()+deployment_errors}
         agent_view = self.decode_agent(agent)
         if agent_view is not None:
             agent_view.update(model_config=model_settings['model_config'], attachments=profile['files'])
         return {"profile": profile, "agent": agent_view, 'model_settings':model_settings,'embedding_configured':embedding_configured,
-                "files":profile['files'],"files_modified_at":self.attachments.collection_date(user_id),
-                "history": [self._submission(s) for s in history],
+                "files":profile['files'],"files_modified_at":files_modified_at,
+                "history": [self._submission(s, by_id=by_id) for s in history],
                 "events": [dict(e) for e in events],
                 "model_calls": [{**dict(c), "usage": json.loads(c["usage"])} for c in calls],
                 'platform_bindings':[dict(r) for r in bindings]}
@@ -195,7 +197,9 @@ class AvatarService:
     # 输入：user 为当前账户，request 含资料日期及 Profile。
     # 结果与约束：检查状态及修改日期，允许本人选择资料身份；姓名和分身名称固定公开且文字可编辑，既有学号不自动合并；加密 Key 后更新草稿，返回最新概览。
     def save_draft(self, user, request):
-        with self.database.connect(write=True) as db:
+        # 固定端口池跨账户分配，需要与其他分配者串行。
+        scope = None if getattr(self.provider, 'mode', 'demo') == 'acps-direct' else user['id']
+        with self.database.connect(write=True, account_scope=scope) as db:
             p = db.execute("SELECT * FROM profile_records WHERE user_id=?", (user["id"],)).fetchone()
             if not p:
                 raise HTTPException(409, "账户资料尚未初始化，请联系管理员")
@@ -250,7 +254,9 @@ class AvatarService:
     def submit(self, user, last_modified_at):
         if user["account_status"] != "active":
             raise HTTPException(403, "当前账户无法提交分身申请")
-        with self.database.connect(write=True) as db:
+        # 固定端口池跨账户分配，需要与其他分配者串行。
+        scope = None if getattr(self.provider, 'mode', 'demo') == 'acps-direct' else user['id']
+        with self.database.connect(write=True, account_scope=scope) as db:
             p = db.execute("SELECT * FROM profile_records WHERE user_id=?", (user["id"],)).fetchone()
             if not p:
                 raise HTTPException(403, "管理员不能申请分身")
@@ -265,7 +271,7 @@ class AvatarService:
             if getattr(self.provider,'mode','demo')=='acps-direct':
                 from avatar.protocols.registration.direct import require_profile
                 require_profile(validated.model_dump())
-            if content.errors() and not self.inherited_acs(user['id']):
+            if content.errors() and not self.inherited_acs(user['id'], db):
                 raise HTTPException(422, '；'.join(content.errors()))
             current = db.execute('SELECT * FROM avatar_records WHERE user_id=?', (user['id'],)).fetchone()
             document = build_acs(content, user['id'], public_base_url(db), current['aic'] if current else '')
@@ -301,7 +307,7 @@ class AvatarService:
                 raise HTTPException(409, "该申请已审核")
             if decision.approve:
                 content = self.personal_acs(json.loads(s['acs_input']), json.loads(s['snapshot']))
-                if content.errors() and not self.inherited_acs(s['user_id']):
+                if content.errors() and not self.inherited_acs(s['user_id'], db):
                     raise HTTPException(422, '；'.join(content.errors()))
 
             status = "approved" if decision.approve else "rejected"
@@ -335,7 +341,7 @@ class AvatarService:
     # 输入：user 为管理员，user_id 为分身所有人，路由负责授权。
     # 结果与约束：保存更新后的证书和事件并返回证书；Demo 元数据可同步续期；正式证书拒绝此同步接口，必须使用独立配置的 wit 工具。
     def renew(self, user, user_id):
-        with self.database.connect(write=True) as db:
+        with self.database.connect(write=True, account_scope=user_id) as db:
             row = db.execute("SELECT * FROM avatar_records WHERE user_id=?", (user_id,)).fetchone()
             if not row:
                 raise HTTPException(404, "分身不存在")
@@ -360,7 +366,7 @@ class AvatarService:
     # 输入：user 为已认证账户，request 包含 ACS 内容与当前资料修改日期。
     # 结果与约束：修改日期变化返回 409，无写入、注册或模型调用；返回完整候选及可展示必填错误。
     def preview_acs(self, user, request):
-        with self.database.connect(write=True) as db:
+        with self.database.connect() as db:
             profile = db.execute('SELECT last_modified_at,draft FROM profile_records WHERE user_id=?', (user['id'],)).fetchone()
             if not profile or profile['last_modified_at'] != request.last_modified_at:
                 raise HTTPException(409, '资料已变更，请刷新后重新预览')
@@ -378,7 +384,7 @@ class AvatarService:
                 if value is not None:values['visibility']={**values.get('visibility',{}),key:value}
             content = self.personal_acs(request.acs_input.model_dump(), values)
             document = build_acs(content, user['id'], public_base_url(db), agent['aic'] if agent else '')
-            document=self.deployment_acs(document,user['id'],db)
+            document=self.deployment_acs(document,user['id'],db,allocate=False)
         errors = content.errors()
         return {'document': document,'generated_description':self.personal_acs({},values).description, 'validation': {'valid': not errors, 'errors': errors}, 'mode': getattr(self.provider, 'mode', 'demo')}
 
@@ -408,7 +414,20 @@ class AvatarService:
     # 职责：把审核快照中的附件引用解析为可查看摘要。
     # 输入：row 为不可变申请行，admin 选择管理下载路由。
     # 结果与约束：只查询该快照指定的文件，不混入后续草稿附件或修改原件内容。
-    def _submission(self, row, admin=False):
+    def _submission(self, row, admin=False, by_id=None):
         data = self.decode_submission(row)
-        data['attachments'] = self.attachments.metadata(row['user_id'], data['snapshot'].get('attachments', []), admin)
+        refs = data['snapshot'].get('attachments', [])
+        data['attachments'] = (self.attachments.resolve_refs(by_id, refs) if by_id is not None
+                               else self.attachments.metadata(row['user_id'], refs, admin))
         return data
+
+    def submission_page(self, db, rows, admin):
+        by_owner = {}
+        ids = {ref['id'] for row in rows for ref in json.loads(row['snapshot']).get('attachments', [])}
+        if ids:
+            owners = list({row['user_id'] for row in rows})
+            for file in db.execute('SELECT user_id,' + self.attachments.summary_fields
+                    + ' FROM attachments WHERE id=ANY(?::text[]) AND user_id=ANY(?::text[])', (list(ids), owners)):
+                summary = self.attachments._summary(file, admin)
+                by_owner.setdefault(summary.pop('user_id'), {})[file['id']] = summary
+        return [self._submission(row, admin, by_owner.get(row['user_id'], {})) for row in rows]

@@ -19,7 +19,6 @@ class ManagementTaskError(ValueError):
 
 TASK_COLUMNS = ('local_aic','peer_aic','group_id','session_key','session_id','task_id','command_id','document','deadline')
 TASK_FIELDS = ','.join(TASK_COLUMNS)
-TASK_MIGRATION = 'system_management_tasks_postgres_v1'
 
 
 def initialize_system_tasks(db):
@@ -36,11 +35,9 @@ class SystemTaskStore:
     def __init__(self, database):
         self.database = database
 
-    def initialize(self, legacy_present=False):
+    def initialize(self):
         with self.database.connect(write=True) as db:
             initialize_system_tasks(db)
-            if legacy_present and not db.execute('SELECT 1 FROM data_migrations WHERE name=?',(TASK_MIGRATION,)).fetchone():
-                raise ValueError('系统 AIP 任务账本尚未导入 PostgreSQL，已保留原回执并停止监听')
 
     # 职责：原子处理已认证管理任务的提交、查询和完成/取消确认。
     # 输入：command 为已验证的 TaskCommand，context 为可信 AipContext，management 为只读业务。

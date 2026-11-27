@@ -6,31 +6,33 @@ import logging
 from fastapi import HTTPException
 from avatar.models.effort import with_chat_effort
 from avatar.conversation import pauses
+from avatar.conversation.tools.activity import public_event
 from avatar.conversation.tools.reply_artifacts import is_html_output
 from avatar.conversation.tools.activity import ToolActivity
 from avatar.core.execution import AgentNeedsInput, run_blocking
 from avatar.core.execution import authorization, check_execution_async, current_generation
+from avatar.conversation.loop import personal
 
 
 # 职责：以异步事件流生成回答、状态和最终保存结果。
 # 输入：user 和 request 为已认证账户与本轮请求；消费者须正确关闭异步生成器。
 # 结果与约束：依次 yield 状态、文本、用量和 done；失败转换为脱敏 error，未完成片段不保存，退出始终释放租约与上游资源。
 async def stream_chat(chat, user, request):
-    lock = chat.locks.setdefault(request.conversation_id or user['id'], asyncio.Lock())
     job = current_generation.get()
     acquired = None
     overview = context = session = prepared = None
     failure_stage='lookup'
     try:
+        yield {'type':'status','stage':'lookup','message':'读取本人公开与私密资料' if request.personal else ('查询已审核个人资料' if request.channel == 'avatar' else '识别请求并查找目标分身')}
+        parent = await asyncio.to_thread(chat.session,user['id'],request.channel,request.conversation_id,personal=request.personal)
+        lock = chat.locks.setdefault(parent['id'], asyncio.Lock())
         if lock.locked():
             raise HTTPException(409, '上一条消息仍在生成，请等待完成后再发送')
         async with lock:
-            yield {'type':'status','stage':'lookup','message':'读取本人公开与私密资料' if request.personal else ('查询已审核个人资料' if request.channel == 'avatar' else '识别请求并查找目标分身')}
-            parent = await asyncio.to_thread(chat.session,user['id'],request.channel,request.conversation_id,personal=request.personal)
             request=request.model_copy(update={'channel':parent['channel']})
             def take_lease():
                 nonlocal acquired
-                acquired = chat.memory.acquire(parent['id'])
+                acquired = chat.memory.acquire(parent['id'], owner=parent['user_id'])
             await run_blocking(take_lease)
             request=request.model_copy(update={'conversation_id':parent['id']})
             original=request
@@ -41,7 +43,6 @@ async def stream_chat(chat, user, request):
             if request.agent_control=='end':
                 yield {'type':'done',**await run_blocking(pauses.end_task,chat,user,parent,request)}
                 return
-            from avatar.conversation.loop import personal
             durable = parent['platform']=='web'
             run_id = personal.run_id_for(job,held,original)
             previous = await asyncio.to_thread(personal.inspect,chat,user['id'],parent['id'],run_id,job) if durable else None
@@ -69,7 +70,7 @@ async def stream_chat(chat, user, request):
                     overview,context,session,local_reply=await chat.dispatch(user,request,parent)
                 overview['_tool_events'] = route_records
                 for event in route_events:
-                    yield pauses.public_event(event)
+                    yield public_event(event)
             if context:
                 config = context[0]
                 if overview['agent']['user_id'] == user['id']:
@@ -86,7 +87,6 @@ async def stream_chat(chat, user, request):
                 yield {'type':'status','stage':'routing','message':'已调用分身：'+overview['_target']['name'],'target':overview['_target']}
             text, usage = [], None
             if context:
-                from avatar.core.execution import check_execution_async
                 events = asyncio.Queue()
                 async def answer_with_events():
                     nonlocal prepared
@@ -125,7 +125,7 @@ async def stream_chat(chat, user, request):
                                 continue  # Delivery text and its file cards become visible together after commit.
                         elif event['type'] == 'usage':
                             usage = event['usage']
-                        yield pauses.public_event(event)
+                        yield public_event(event)
                     await generation
                 finally:
                     if not generation.done():
@@ -180,4 +180,4 @@ async def stream_chat(chat, user, request):
                 if not job and (overview or {}).get('_run_store'):
                     await run_blocking(personal.discard_unpaused,overview['_run_store'],acquired)
             finally:
-                await run_blocking(chat.memory.release,parent['id'],acquired)
+                await run_blocking(chat.memory.release,parent['id'],acquired,owner=parent['user_id'])

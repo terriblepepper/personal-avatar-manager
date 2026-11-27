@@ -3,11 +3,11 @@ import asyncio
 import json
 import os
 import re
-import sqlite3
 import uuid
 import zipfile
 from contextlib import contextmanager
 from io import BytesIO
+from types import SimpleNamespace
 from urllib.parse import quote
 
 import httpx
@@ -21,8 +21,6 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from avatar.accounts.auth import hash_password
 from avatar.api.app import create_app
 from avatar.core.config import Settings
-from scripts.migrations.rag_publications import migrate_rag_publications
-from scripts.migrations.sqlite_schema import SOURCE_SCHEMA
 from avatar.models.client import ModelClient
 
 
@@ -84,19 +82,6 @@ def isolated_schema():
             control.execute(sql.SQL('DROP SCHEMA {} CASCADE').format(identifier))
 
 
-# 旧库快照
-
-@pytest.fixture
-def legacy_sqlite(tmp_path):
-    source = tmp_path / 'legacy.sqlite3'
-    with sqlite3.connect(source) as db:
-        for ddl in sorted(SOURCE_SCHEMA.values(), key=lambda sql: not sql.startswith('CREATE TABLE')):
-            db.execute(ddl)
-        # The historical SQLite lexical index also contains FTS5 objects.
-        migrate_rag_publications(db)
-    return source
-
-
 # 账户与模型
 
 PROFILE = {"student_id": "20260001", "name": "测试用户", "avatar_name": "测试分身", "bio": "从事智能体研究", "contact": "tester@example.com", "specialty": "智能体协作"}
@@ -105,7 +90,7 @@ MODEL = {"provider": "deepseek", "model": "test-model", "api_key": "test-user-ke
 
 
 async def fake_dns(host, port):
-    return "203.0.113.10"
+    return "8.8.8.8"  # Requests using this resolver use MockTransport.
 
 
 def modified_at(client):
@@ -150,14 +135,25 @@ def context(tmp_path,monkeypatch,request,postgres_url):
 
 
 @pytest.fixture
-def previously_installed_skill(context, monkeypatch):
+def previously_installed_skill(context):
+    from avatar.core.db import now
+    from avatar.core.user_storage import user_root
+
     app, user, _ = context
+    database = app.state.database
     uid = user.get('/api/auth/me').json()['user']['id']
-    with monkeypatch.context() as before_pause:
-        before_pause.setattr('avatar.skills.policy.SKILLS_PAUSED', False)
-        return app.state.chat.skills.install(
-            uid, 'SKILL.md', b'---\nname: archived-skill\ndescription: Archived skill\n---\nOld instructions.\n'
-        )
+    identifier = uuid.uuid4().hex
+    body = b'Old instructions.\n'
+    directory = user_root(database.data_dir, uid) / 'skills' / identifier
+    directory.mkdir(parents=True)
+    (directory / 'SKILL.md').write_bytes(body)
+    stamp = now()
+    manifest = json.dumps([{'path': 'SKILL.md', 'size': len(body)}])
+    with database.connect(write=True) as db:
+        db.execute('INSERT INTO agent_skills(id,user_id,name,description,instructions,manifest,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)',
+                   (identifier, uid, 'archived-skill', 'Archived skill', body.decode(), manifest, 1, stamp, stamp))
+        db.execute('INSERT INTO agent_skill_collections(user_id,updated_at) VALUES(?,?)', (uid, stamp))
+    return identifier
 
 
 def login(client, username, password):
@@ -218,6 +214,11 @@ class DelayedStream(httpx.AsyncByteStream):
 
 
 def completion(request):
+    if request.url.path.endswith('/embeddings'):
+        inputs = json.loads(request.content)['input']
+        return httpx.Response(200, json={'data': [
+            {'index': index, 'embedding': [1.0] + [0.0] * 63} for index in range(len(inputs))
+        ]})
     if request.method == 'GET':
         return httpx.Response(200, json={'data':[]})
     body=json.loads(request.content)
@@ -234,17 +235,32 @@ def completion(request):
 
 
 def setup(app):
+    from avatar.knowledge.soul_document import FIELDS
+
     with app.state.database.connect(write=True) as db:
         db.execute("UPDATE users SET password=? WHERE is_root=1", (hash_password('browser-admin-password'),))
     admin=TestClient(app, base_url='http://127.0.0.1:18081')
     user=TestClient(app, base_url='http://127.0.0.1:18081')
     login(admin, 'admin', 'browser-admin-password')
-    response=user.post('/api/auth/register',json={'username':'browser-user','password':'browser-user-password','student_id':'20260001','email':'browser@example.test'})
-    if response.status_code!=201:raise RuntimeError(response.text)
-    login(user, 'browser-user', 'browser-user-password')
-    user.post('/api/me/onboarding/done').raise_for_status()
-    submission=submit(user, PROFILE)
-    approve(admin, submission)
+    for username, student_id in [('browser-user', '20260001'), ('browser-style', '20260002')]:
+        email = username + '@example.test'
+        password = username + '-password'
+        user.post('/api/auth/register', json={'username': username, 'password': password,
+                  'student_id': student_id, 'email': email}).raise_for_status()
+        login(user, username, password)
+        user.post('/api/me/onboarding/done').raise_for_status()
+        approve(admin, submit(user, {**PROFILE, 'student_id': student_id, 'contact': email}))
+    user.put('/api/me/embedding-settings', json={'provider': 'siliconflow', 'model': 'BAAI/bge-m3',
+             'dimensions': 64, 'api_key': 'embedding-fixture-key'}).raise_for_status()
+    uid = user.get('/api/auth/me').json()['user']['id']
+    stamp = user.get('/api/me').json()['profile']['last_modified_at']
+    build = 'browser-style-soul'
+    document = json.dumps(dict.fromkeys(FIELDS, '') | {'voice': '简洁回答'}, ensure_ascii=False)
+    with app.state.database.connect(write=True) as db:
+        db.execute("""INSERT INTO soul_builds(id,user_id,prompt,asset_ids,profile_snapshot,profile_revision,status,progress,stage,created_at,updated_at,document)
+                      VALUES(?,?,?,'[]','{}',?,'approved',100,'审核通过',?,?,?)""",
+                   (build, uid, '简洁回答', stamp, stamp, stamp, document))
+        db.execute('INSERT INTO active_souls(user_id,build_id) VALUES(?,?)', (uid, build))
     admin.close();user.close()
 
 
@@ -270,3 +286,23 @@ def upload(user, name, path=''):
     response = user.post('/api/me/attachments', content=name.encode(), headers={'X-Attachment-Filename': name, 'X-Attachment-Relative-Path': path or name})
     assert response.status_code == 201, response.text
     return response.json()
+
+
+def _react_probe_definition(name):
+    return {'name':name, 'description':name, 'parameters':{'type':'object'}}
+
+
+def _react_probe_call(identifier, name, args):
+    return {'id':identifier,'name':name,'arguments':args}
+
+
+def _react_probe_receipt(*calls, reason='tool_calls', partial=False):
+    return {'type':'usage','usage':{'input_tokens':2,'output_tokens':1,'total_tokens':3},
+            'finish_reason':reason,'partial_tool_calls' if partial else 'tool_calls':list(calls)}
+
+
+async def _run_react_probe(stream, config, **kwargs):
+    from avatar.conversation.agent_loop import run_agent
+
+    rag=SimpleNamespace(chat=SimpleNamespace(model_client=SimpleNamespace(stream=stream)),validate=lambda _:None)
+    return await run_agent(rag,(config,'fixture-key','测试',[]),'请完成操作',**kwargs)

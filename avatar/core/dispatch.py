@@ -6,7 +6,7 @@ import logging
 from collections import defaultdict
 from contextlib import contextmanager
 
-from psycopg import AsyncConnection, Error
+from psycopg import AsyncConnection, Error, sql
 from redis.asyncio import Redis
 from redis.backoff import NoBackoff
 from redis.exceptions import RedisError
@@ -44,8 +44,9 @@ class Changes:
         self.kafka_bootstrap = kafka_bootstrap
         self.invalidate_reviews = invalidate_reviews
         self.watchers = defaultdict(set)
-        self.work = {key: asyncio.Event() for key in QUEUE_NAMES}
+        self.work = {key: asyncio.Event() for key in (*QUEUE_NAMES, 'topology')}
         self.health = {'postgres': False, 'redis': False, 'kafka': False}
+        self.namespace_ready = asyncio.Event()
         self.namespace = None
         self.kafka = None
         self.loop = None
@@ -102,13 +103,12 @@ class Changes:
             except (TypeError, ValueError):
                 continue
             if topic == 'work' and len(keys) == 1 and isinstance(keys[0], str) and keys[0] in self.work:
-                if self.kafka and self.can_dispatch:
+                self.wake(keys[0])
+                if keys[0] != 'topology' and self.kafka and self.can_dispatch:
                     deliveries.append(self.kafka.publish(keys[0]))
-                else:
-                    self.wake(keys[0])
             elif topic in ('inbox', 'dialogue', 'generation', 'reviews', 'overview') and all(keys):
                 updates.append(payload)
-        if updates and self.redis is not None:
+        if updates and self.health['redis']:
             try:
                 async with self.redis.pipeline(transaction=False) as pipe:
                     for payload in updates:
@@ -117,12 +117,16 @@ class Changes:
             except RedisError:
                 self.set_ready('redis', False)
         if deliveries:
-            await asyncio.gather(*deliveries)
+            try:
+                await asyncio.wait_for(asyncio.gather(*deliveries), 5)
+            except TimeoutError:
+                # Work is durable and already signaled locally, even if Kafka drops its callbacks.
+                self.set_ready('kafka', False)
 
     async def _listen_postgres(self):
         async with await AsyncConnection.connect(self.dsn, autocommit=True, connect_timeout=2) as conn:
-            db, schema, locked = await (await conn.execute("""
-                SELECT current_database(), current_schema(),
+            db, schema, channel, locked = await (await conn.execute("""
+                SELECT current_database(), current_schema(), 'avatar_dispatch_' || md5(current_schema()::text),
                     pg_try_advisory_lock(hashtextextended('avatar.dispatch:' || current_schema(), 0))
             """)).fetchone()
             if not locked:
@@ -130,6 +134,8 @@ class Changes:
                 return
             self.namespace = 'avatar.v1.' + hashlib.sha256(
                 json.dumps((conn.info.host, conn.info.port, db, schema)).encode()).hexdigest()[:32]
+            await conn.execute(sql.SQL('LISTEN {}').format(sql.Identifier(channel)))
+            self.namespace_ready.set()
             self.set_ready('postgres', True)
             while True:
                 loop = asyncio.get_running_loop()
@@ -138,7 +144,10 @@ class Changes:
                     'SELECT id, payload FROM avatar_dispatch_events ORDER BY id LIMIT 128')).fetchall()
                 record_duration('dispatch_poll', loop.time() - start)
                 if not rows:
-                    await asyncio.sleep(.2)
+                    # LISTEN precedes the scan, so a commit during the scan remains buffered.
+                    # Periodic reconciliation also covers a broken or missed wake-up.
+                    async for _ in conn.notifies(timeout=8, stop_after=1):
+                        pass
                     continue
                 await self._forward(dict.fromkeys(payload for _, payload in rows))
                 # Each business ledger is independently scanned if its wake-up is lost.
@@ -146,8 +155,7 @@ class Changes:
                                    ([identifier for identifier, _ in rows],))
 
     async def _listen_redis(self):
-        while self.namespace is None:
-            await asyncio.sleep(.1)
+        await self.namespace_ready.wait()
         async with self.redis.pubsub() as sub:
             await sub.subscribe(self.namespace)
             while True:
@@ -171,8 +179,7 @@ class Changes:
                 self.mark(key)
 
     async def _listen_kafka(self):
-        while self.namespace is None:
-            await asyncio.sleep(.1)
+        await self.namespace_ready.wait()
         try:
             self.kafka = KafkaWakeups(self.kafka_bootstrap, self.namespace, QUEUE_BYTES, self.wake,
                                       lambda ready: self.set_ready('kafka', ready))
@@ -185,14 +192,18 @@ class Changes:
             self.kafka = None
 
     async def _retry(self, name, run):
+        delay = 1.
         while True:
             try:
                 await run()
             except (Error, RedisError, OSError) as error:
                 logger.warning('Change listener %s reconnecting (%s)', name, type(error).__name__)
             finally:
+                if self.health[name]:
+                    delay = 1.
                 self.set_ready(name, False)
-            await asyncio.sleep(1.)
+            await asyncio.sleep(delay)
+            delay = min(8., delay * 2)
 
     async def run(self):
         self.loop = asyncio.get_running_loop()
@@ -226,7 +237,7 @@ def begin_work(database, key):
 
 async def wait_work(latch, fallback, *, reconcile=5.):
     changes, event = latch
-    if changes is None or not changes.kafka_bootstrap:
+    if changes is None:
         await asyncio.sleep(fallback)
     else:
-        await wait_change(event, reconcile if changes.can_dispatch else fallback)
+        await wait_change(event, reconcile if changes.health['postgres'] else fallback)

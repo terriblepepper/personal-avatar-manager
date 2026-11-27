@@ -5,9 +5,13 @@ from pathlib import Path
 
 from fastapi import HTTPException
 
+from avatar.core.execution import run_blocking
 from avatar.core.db import dump, event, now
 from avatar.models.artifact_cache import fingerprint
 from avatar.models.embedding import EmbeddingSettings, index_identity, require_embedding
+from avatar.files.word_pdfs import read_word_pdf
+from avatar.knowledge.everos_storage import project_for_build
+from avatar.knowledge.media import document_visuals
 
 ORIGIN = 'model_refresh'
 
@@ -24,11 +28,10 @@ def target(embedding):
 
 
 def snapshot(source, refresh):
-    from avatar.knowledge.everos_memory import EverOSMemory
     return {**dict(source), 'origin':ORIGIN, 'parent_build':source['id'], 'status':'queued',
             'stage':'等待重构原有 Soul 索引', 'phase':'draft', 'progress':0,
             'memory_context':'{}', 'memory_fingerprint':'',
-            'memory_tree':dump({'source_project':EverOSMemory.project(dict(source)), 'refresh':refresh}),
+            'memory_tree':dump({'source_project':project_for_build(dict(source)), 'refresh':refresh}),
             'error':'', 'reviewer':None, 'reviewed_at':None, 'reason':'', 'updated_at':now()}
 
 
@@ -83,20 +86,26 @@ def rebase(db, row):
     return {**dict(row),**changes}
 
 
-async def has_visual_input(service,row):
-    from avatar.knowledge.media import document_visuals
+def _word_has_visuals(path):
+    try:
+        pdf,vector=read_word_pdf(path)
+    except ValueError as error:
+        raise HTTPException(422,str(error)) from None
+    return bool(document_visuals(pdf,vector=vector))
 
+
+async def has_visual_input(service,row):
     notes={item['id']:item for item in row['notes'] if item.get('id')}
     for identifier in row['asset_ids']:
-        asset=service.asset(row['user_id'],identifier)
+        asset=await run_blocking(service.asset,row['user_id'],identifier)
         if asset['mime'].startswith('image/'):return True
         suffix=Path(asset['filename']).suffix.lower()
         if suffix in ('.doc','.docx'):
             known=notes.get(identifier,{}).get('visual')
             if known is True:return True
             if known is None:
-                path,_=service.file(row['user_id'],identifier)
-                result=await service.chat.rag.work.execute(row['user_id'],'parse',document_visuals,path,suffix)
+                path,_=await run_blocking(service.file,row['user_id'],identifier)
+                result=await service.chat.rag.work.execute(row['user_id'],'parse',_word_has_visuals,path)
                 if result:return True
     return False
 
@@ -106,13 +115,16 @@ async def rebuild(worker,row,model,key,embedding):
     if target(embedding)!=refresh['target']:
         raise HTTPException(409,'模型索引配置已变化，已保留当前 Soul')
     if not (refresh['embedding'] or refresh['manual']) and not await has_visual_input(worker.workspace,row):
-        with worker.database.connect(write=True) as db:
-            db.execute("UPDATE soul_builds SET status='canceled',progress=100,stage='原输入未使用图片，跳过重构',updated_at=? WHERE id=? AND status='running'",(now(),row['id']))
+        await run_blocking(worker.update_build,row,"UPDATE soul_builds SET status='canceled',progress=100,stage='原输入未使用图片，跳过重构',updated_at=? WHERE id=? AND status='running'",(now(),row['id']))
         return
     worker.percent,worker.stage=50,'重构已获批的 Soul 索引'
     async with worker.chat.rag.work.slot(row['user_id']):
         await worker.memory.compile(row,model,key,{},worker=worker)
-    with worker.database.connect(write=True) as db:
+    await run_blocking(_publish,worker.database,row,refresh)
+
+
+def _publish(database,row,refresh):
+    with database.connect(write=True,account_scope=row['user_id']) as db:
         current=active(db,row['user_id'])
         if not current or current['id']!=row['parent_build']:
             raise HTTPException(409,'当前 Soul 已变化，未替换已生效版本')

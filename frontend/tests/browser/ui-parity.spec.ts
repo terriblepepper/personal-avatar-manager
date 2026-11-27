@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import manifest from '../../package.json' with { type:'json' }
 import { mkdirSync } from 'node:fs'
 import { resolve } from 'node:path'
 
@@ -243,10 +244,9 @@ test('peer conversation opens as a window with task controls and wrapped message
   await dialog.locator('summary').filter({hasText:'工具'}).click()
   await expect(dialog.getByText('示例工具', {exact:true})).toBeVisible()
   await capture(page,'peer-tools')
-  await dialog.locator('summary').filter({hasText:'技能'}).click()
-  await expect(dialog.getByText('示例工具', {exact:true})).toBeHidden()
-  await dialog.locator('summary').filter({hasText:'技能'}).click()
+  await expect(dialog.locator('summary').filter({hasText:'技能'})).toHaveCount(0)
   await dialog.locator('summary').filter({hasText:'文件'}).click()
+  await expect(dialog.getByText('示例工具', {exact:true})).toBeHidden()
   await checkLibraryPicker(page,'peer-fixture-files')
   const close = dialog.getByRole('button', {name:'关闭', exact:true})
   await close.hover()
@@ -502,8 +502,7 @@ test('create task opens an editable form with an empty composer', async ({ page 
   let confirmation: Record<string, unknown> | undefined
   let cancelled = false
   await page.route('**/api/agent-sessions?**', route => route.fulfill({ json: { items:[{session_id:'task-session',peer_name:'任务分身'}],total:1,offset:0 } }))
-  await page.route('**/api/agent-sessions/task-session', route => route.fulfill({ json: { peer_name:'任务分身',resource_conversation_id:'',messages:[],tasks:[],has_more:false } }))
-  await page.route('**/api/agent-sessions/task-session/tasks?**', route => route.fulfill({ json: { items:[],total:0,offset:0 } }))
+  await page.route('**/api/agent-sessions/task-session', route => route.fulfill({ json: { peer_name:'任务分身',resource_conversation_id:'',messages:[],task_page:{items:[],total:0,offset:0},has_more:false } }))
   await page.route('**/api/agent-sessions/task-session/task-draft', route => {
     draftBody = route.request().postDataJSON()
     return route.fulfill({ json: { id:'draft-1', conversation_id:'draft-workspace', target_query:'任务分身', target_aic:'peer-demo', objective:'',shared_content:'',delivery_mode:'negotiation' } })
@@ -514,7 +513,7 @@ test('create task opens an editable form with an empty composer', async ({ page 
     return route.fulfill({ json: { id:'task-created', session_id:'task-session' } })
   })
   await page.route('**/api/agent-dialogues/task-created', route => route.fulfill({
-    json: { peer_name:'任务分身',resource_conversation_id:'',messages:[],tasks:[],has_more:false,
+    json: { peer_name:'任务分身',resource_conversation_id:'',messages:[],task_page:{items:[],total:0,offset:0},has_more:false,
       task:{id:'task-created',objective:'整理三条会议行动项',status:'running',rounds_done:0,round_limit:10} },
   }))
   await page.route('**/api/agent-intents/draft-1/cancel', route => { cancelled = true; return route.fulfill({ json: {} }) })
@@ -600,7 +599,7 @@ test('Mermaid renders a completed fenced diagram in a chat bubble', async ({page
   await more.click()
   await capture(page,'chat-mermaid')
   await diagram.frameLocator('iframe').locator('svg').click()
-  const preview = page.getByRole('dialog', {name:'Mermaid 图表.png'})
+  const preview = page.getByRole('dialog', {name:'Mermaid 图表.svg'})
   await expect(preview.getByRole('img')).toBeVisible()
   const zoom = preview.getByRole('group', {name:'预览缩放'})
   await zoom.getByRole('button',{name:'100%',exact:true}).click()
@@ -621,8 +620,11 @@ test('Mermaid renders a completed fenced diagram in a chat bubble', async ({page
 
 test('personal composer keeps session tools and style settings separate', async ({page}) => {
   let toggled:unknown
-  await page.route('**/api/conversations?**', route=>route.fulfill({json:{items:[{id:'ui-chat-1',title:'测试会话',message_count:1}],default_id:'ui-chat-1'}}))
-  await page.route('**/api/conversations/ui-chat-1/style-learning', route=>route.fulfill({json:{enabled:false}}))
+  await page.route('**/api/conversations?**', route=>route.fulfill({json:{items:[{id:'ui-chat-1',title:'测试会话',message_count:1}],default_id:'ui-chat-1',embedding_configured:true}}))
+  await page.route('**/api/conversations/ui-chat-1/style-learning', route=>route.fulfill({json:{enabled:false,can_enable:true}}))
+  await page.route('**/api/conversations/ui-chat-1/reasoning-effort', route=>route.fulfill({
+    json:{model:'测试模型',selected:null,default:null,levels:[]},
+  }))
   await page.route('**/api/conversations/ui-chat-1/files', route=>route.fulfill({json:[]}))
   await page.route('**/api/conversations/ui-chat-1/tools', route=>{
     if(route.request().method()==='PATCH')toggled=route.request().postDataJSON()
@@ -632,7 +634,8 @@ test('personal composer keeps session tools and style settings separate', async 
   await login(page)
   await page.goto('/chat')
   const bar=page.getByRole('group',{name:'聊天工具栏'})
-  await expect(bar.locator('summary > span:not([aria-hidden]):not(.app-icon)')).toHaveText(['文件','工具'])
+  await expect(bar.locator('.composer-tool:not(.effort-picker) > summary > span:not([aria-hidden]):not(.app-icon)')).toHaveText(['文件','工具'])
+  await expect(bar.locator('.effort-picker > summary')).toContainText('测试模型')
   const card=page.locator('#personal-chat-card')
   const box=await card.boundingBox(), select=await card.locator('.chat-session-select').boundingBox()
   expect(select!.width).toBeLessThan(box!.width/2)
@@ -713,7 +716,7 @@ test('admin and model records use compact search and jump controls and omit cert
   await filter.press('End')
   await filter.press('Enter')
   await expect(options).toBeHidden()
-  await expect(filter).toHaveValue('admin')
+  await expect(filter).toHaveValue('super_admin')
   await filter.click()
   await filter.press('Escape')
   await expect(options).toBeHidden()
@@ -837,14 +840,13 @@ test('peer task swaps content without clearing the sidebar and renders reference
   const gate=new Promise<void>(resume=>{releaseTask=resume})
   await page.route('**/api/agent-sessions?**',route=>route.fulfill({json:{items:[{session_id:sessionId,peer_name:'示例同事',messages:[]}],total:1,offset:0}}))
   await page.route(url=>url.pathname==='/api/agent-sessions/test-peer-task',route=>route.fulfill({json:{
-    peer_name:'示例同事',resource_conversation_id:'',has_more:false,messages:[{turn:1,dialogue_id:'main',speaker_name:'示例同事',speaker_role:'agent',content:'主会话一直可见。',is_own:false}],
+    peer_name:'示例同事',resource_conversation_id:'',task_page:{items:[task],total:1,offset:0},has_more:false,messages:[{turn:1,dialogue_id:'main',speaker_name:'示例同事',speaker_role:'agent',content:'主会话一直可见。',is_own:false}],
   }}))
-  await page.route('**/api/agent-sessions/test-peer-task/tasks?**',route=>route.fulfill({json:{items:[task],total:1,offset:0}}))
   await page.route(url=>url.pathname==='/api/agent-dialogues/peer-d1',async route=>{
     await gate
-    return route.fulfill({json:{peer_name:'示例同事',resource_conversation_id:'',has_more:false,task,current_transport_mode:'acps',messages:[{
-      turn:1,dialogue_id:task.id,speaker_name:'示例同事',speaker_role:'agent',state:'awaiting_input',
-      content:'已整理交流事项。\n\n```mermaid\nflowchart LR\nA --> B\n```\n\n> 引用来源：\n> 测试资料.txt · RAG  \n\n[等待用户] 请确认下一步。',
+    return route.fulfill({json:{peer_name:'示例同事',resource_conversation_id:'',task_page:{items:[task],total:1,offset:0},has_more:false,task,current_transport_mode:'acps',messages:[{
+      turn:1,dialogue_id:task.id,speaker_name:'示例同事',speaker_role:'agent',state:'awaiting_input',state_detail:'请确认下一步。',
+      content:'已整理交流事项。\n\n```mermaid\nflowchart LR\nA --> B\n```\n\n> 引用来源：\n> 测试资料.txt · RAG',
     }]}})
   })
   await login(page)
@@ -863,9 +865,10 @@ test('peer task swaps content without clearing the sidebar and renders reference
   await expect(dialog.locator('.dialogue-state')).toContainText('3/10 轮 · ACPS')
   await expect(dialog.getByRole('status',{name:'平台提示'})).toContainText('请确认下一步。')
   await expect(dialog.getByRole('button',{name:'还原小窗'})).toBeVisible()
-  const sources = dialog.getByRole('button',{name:'2 份资料'})
+  const sources = dialog.getByRole('button',{name:'1 份文件'})
   await sources.click()
-  await expect(dialog.getByRole('dialog',{name:'引用来源'})).toContainText('测试资料.txt')
+  await expect(dialog.getByRole('dialog',{name:'交付文件'})).toContainText('对方报告.csv')
+  await expect(dialog.getByText('测试资料.txt')).toHaveCount(0)
   const attachment = dialog.getByRole('button',{name:/对方报告.csv/})
   await attachment.click({button:'right'})
   const menu = dialog.getByRole('menu',{name:'附件操作'})
@@ -916,9 +919,8 @@ test('document popup uses the same search and numeric pager as record lists', as
 test('login displays the running app version and question filters stay compact', async ({page}) => {
   await page.goto('/')
   const config = await (await page.request.get('/api/auth/config')).json()
-  const {info} = await (await page.request.get('/api/openapi.json')).json()
-  expect(config.version).toBe(info.version)
-  await expect(page.locator('.pill')).toContainText(info.version)
+  expect(config.version).toBe(manifest.version)
+  await expect(page.locator('.pill')).toContainText(config.version)
   await page.route('**/api/admin/soul-question-bank?**', route => route.fulfill({json:{
     categories:[{id:'goals',name:'目标',available:1,total:1,active:true}],offset:0,total:1,
     items:[{id:'fixture',prompt:'请描述近期的一次目标选择。',category_id:'goals',category_name:'目标',active:true,source:{license:'示例'}}],
@@ -1018,7 +1020,7 @@ test('工作台键盘入口与表单字体跟随主题', async ({ page }) => {
 
 test('sidebars animate both directions and honor reduced motion', async ({page}) => {
   await page.route('**/api/agent-sessions/slide/tasks?**',r=>r.fulfill({json:{items:[],total:0,offset:0}}))
-  await page.route('**/api/agent-sessions/slide',r=>r.fulfill({json:{peer_name:'示例',messages:[],tasks:[],has_more:false}}))
+  await page.route('**/api/agent-sessions/slide',r=>r.fulfill({json:{peer_name:'示例',messages:[],task_page:{items:[],total:0,offset:0},has_more:false}}))
   await login(page)
   await page.goto('/dialogues?session=slide')
   const window=page.getByRole('dialog',{name:'分身间会话'})

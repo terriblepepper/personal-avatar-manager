@@ -1,5 +1,4 @@
 import { defineConfig, type Connect } from 'vite'
-import { fileURLToPath } from 'node:url'
 import { pages } from './src/router/pages'
 import vue from '@vitejs/plugin-vue'
 import tailwindcss from '@tailwindcss/vite'
@@ -14,12 +13,7 @@ const consoleHistory: Connect.NextHandleFunction = (request, _response, next) =>
   next()
 }
 
-export default defineConfig(({ mode }) => mode === 'ops' ? {
-  root: fileURLToPath(new URL('../admin-frontend/', import.meta.url)),
-  base: '/ops/',
-  plugins: [vue()],
-  resolve: { alias: { vue: fileURLToPath(new URL('./node_modules/vue/dist/vue.esm-bundler.js', import.meta.url)) } },
-} : {
+export default defineConfig({
   appType: 'mpa',
   plugins: [vue(), tailwindcss(), {
     name: 'console-history',
@@ -31,13 +25,6 @@ export default defineConfig(({ mode }) => mode === 'ops' ? {
     strictPort: true,
     proxy: {
       '/api': { target: process.env.AVATAR_API_TARGET || 'http://127.0.0.1:8000', changeOrigin: false, ws: true },
-    },
-  },
-  build: {
-    rolldownOptions: {
-      input: { app: 'index.html', renderer: 'static/preview/render.js' },
-      // The opaque-origin frame loads a classic script in both Vite and FastAPI.
-      output: { entryFileNames: chunk => chunk.name === 'renderer' ? 'static/preview/render.js' : 'assets/[name]-[hash].js' },
     },
   },
 })

@@ -1,10 +1,24 @@
 """PostgreSQL storage for the EverOS bridge; workers never receive its DSN."""
+from datetime import datetime, timezone
+import hashlib
+import heapq
 import json
 import math
 import re
 import time
 
+from collections import Counter
+
+import numpy as np
+from psycopg.rows import dict_row
+
 from avatar.core.postgres import Connection, lock_schema_transaction
+
+
+def project_for_build(row):
+    value=row.get('memory_tree') or {}
+    if isinstance(value,str):value=json.loads(value)
+    return value.get('project') or ('learning' if row['origin']=='learning' else 'build-'+hashlib.sha256(row['id'].encode()).hexdigest()[:32])
 
 
 DDL = (
@@ -89,7 +103,6 @@ def _scope(scope):
 
 
 def _stamp():
-    from datetime import datetime,timezone
     return datetime.now(timezone.utc).isoformat()
 
 
@@ -191,7 +204,6 @@ def _record_values(record):
 
 
 def _sha256(payload):
-    import hashlib
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -251,18 +263,16 @@ def existing_vectors(conn,scope,project,md_path=None,*,include_embeddings=True):
 
 def copy_vectors(conn,scope,source,target):
     owner_hash,index_signature=_scope(scope)
-    rows=existing_vectors(conn,scope,source)
-    for row in rows:
-        row['embedding']=row.get('embedding');row['subject_embedding']=row.get('subject_embedding')
-        values=_record_values(row)
-        conn.execute("""INSERT INTO everos_vectors(owner_hash,index_signature,project_id,kind,record_id,entry_id,md_path,content_sha256,group_name,title,summary,content,tokens,metadata,embedding,subject_embedding,updated_at)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,CAST(? AS jsonb),CAST(? AS real[]),CAST(? AS real[]),?)
-          ON CONFLICT(owner_hash,index_signature,project_id,record_id) DO UPDATE SET
-            kind=excluded.kind,entry_id=excluded.entry_id,md_path=excluded.md_path,content_sha256=excluded.content_sha256,
-            group_name=excluded.group_name,title=excluded.title,summary=excluded.summary,content=excluded.content,
-            tokens=excluded.tokens,metadata=excluded.metadata,embedding=excluded.embedding,subject_embedding=excluded.subject_embedding,updated_at=excluded.updated_at""",
-          (owner_hash,index_signature,target,*values,time.time()))
-    return len(rows)
+    result=conn.execute("""INSERT INTO everos_vectors(owner_hash,index_signature,project_id,kind,record_id,entry_id,md_path,content_sha256,group_name,title,summary,content,tokens,metadata,embedding,subject_embedding,updated_at)
+      SELECT owner_hash,index_signature,?,kind,record_id,entry_id,md_path,content_sha256,group_name,title,summary,content,tokens,metadata,embedding,subject_embedding,?
+      FROM everos_vectors WHERE owner_hash=? AND index_signature=? AND project_id=?
+      ON CONFLICT(owner_hash,index_signature,project_id,record_id) DO UPDATE SET
+        kind=excluded.kind,entry_id=excluded.entry_id,md_path=excluded.md_path,content_sha256=excluded.content_sha256,
+        group_name=excluded.group_name,title=excluded.title,summary=excluded.summary,content=excluded.content,
+        tokens=excluded.tokens,metadata=excluded.metadata,embedding=excluded.embedding,subject_embedding=excluded.subject_embedding,updated_at=excluded.updated_at""",
+      (target,time.time(),owner_hash,index_signature,source))
+    return result.rowcount
+
 
 
 def upsert_file_vectors(conn,scope,project,md_path,records):
@@ -348,10 +358,19 @@ def _tokens(value):
     return set(re.findall(r'[a-z0-9_]+|[\u4e00-\u9fff]',str(value).casefold()))
 
 
-def _cosine(left,right):
-    if not left or not right or len(left)!=len(right):return -1.0
-    dot=sum(a*b for a,b in zip(left,right,strict=True));ln=sum(a*a for a in left)**.5;rn=sum(b*b for b in right)**.5
-    return dot/(ln*rn) if ln and rn else 0.0
+def _dense_scores(rows, query):
+    scores = np.full(len(rows), -1.0)
+    query_norm = np.linalg.norm(query)
+    for column in ('embedding', 'subject_embedding'):
+        values = [row.pop(column) for row in rows]
+        indices = [i for i, value in enumerate(values) if value and len(value) == len(query)]
+        if indices:
+            matrix = np.asarray([values[i] for i in indices], dtype=np.float64)
+            norms = np.linalg.norm(matrix, axis=1) * query_norm
+            dots = np.einsum('ij,j->i', matrix, query)
+            cosines = np.divide(dots, norms, out=np.zeros_like(dots), where=norms != 0)
+            scores[indices] = np.maximum(scores[indices], cosines)
+    return scores
 
 
 def _public_row(row):
@@ -361,27 +380,48 @@ def _public_row(row):
 
 
 def search_vectors(conn,scope,project,query,method='keyword',embedding=None,limit=6,include_profile=False,query_tokens=None):
+    if method not in ('keyword','hybrid','vector'):raise ValueError('Invalid EverOS search method')
+    owner_hash,index_signature=_scope(scope)
     use_vectors=method in ('vector','hybrid') and embedding is not None
-    rows=existing_vectors(conn,scope,project,include_embeddings=use_vectors)
-    if not include_profile:rows=[row for row in rows if row['kind']!='user_profile']
+    limit=max(1,min(int(limit),50))
+    if method=='vector' and not use_vectors:return []
+    columns='kind,record_id,entry_id,md_path,content_sha256,group_name,title,summary,content,tokens,metadata'
+    if use_vectors:columns+=',embedding,subject_embedding'
+    sql=f'SELECT {columns} FROM everos_vectors WHERE owner_hash=%s AND index_signature=%s AND project_id=%s'
+    if not include_profile:sql+=" AND kind!='user_profile'"
     terms=set(query_tokens) if query_tokens else _tokens(query)
-    documents=[]
-    for row in rows:
-        tokens=str(row.get('tokens','')).split()
-        documents.append(tokens or list(_tokens(' '.join((row.get('title',''),row.get('summary',''),row.get('content',''))))))
-    total=len(documents);avg_length=sum(len(tokens) for tokens in documents)/max(1,total);document_frequency={term:sum(term in tokens for tokens in documents) for term in terms}
-    keyword=[];vector=[]
-    for row,tokens in zip(rows,documents,strict=True):
-        frequencies={term:tokens.count(term) for term in terms};score=0.0
-        for term,frequency in frequencies.items():
-            if not frequency:continue
+    query_vector=np.asarray(embedding,dtype=np.float64) if use_vectors else None
+    order=lambda item:(-item[0],item[1])
+    document_frequency=Counter()
+    total=length_sum=0
+    matches=[];vector=[]
+    # A server cursor keeps one PG snapshot and transfers at most one vector batch at a time.
+    with conn.raw.cursor(name='everos_search',row_factory=dict_row,binary=True) as cursor:
+        cursor.execute(sql,(owner_hash,index_signature,project))
+        while rows:=cursor.fetchmany(64):
+            if use_vectors:
+                dense=_dense_scores(rows,query_vector)
+                vector.extend((score,row['record_id'],row) for score,row in zip(dense,rows,strict=True) if score>=0)
+                if method=='vector':
+                    vector=heapq.nsmallest(limit,vector,key=order)
+                    continue
+            for row in rows:
+                tokens=row['tokens'].split() or _tokens(' '.join((row['title'],row['summary'],row['content'])))
+                length=len(tokens)
+                total+=1;length_sum+=length
+                counts=Counter(token for token in tokens if token in terms)
+                if counts:
+                    document_frequency.update(counts.keys())
+                    matches.append((row,length,counts))
+    avg_length=max(1,length_sum/max(1,total))
+    keyword=[]
+    for row,length,counts in matches:
+        score=0.0
+        for term,frequency in sorted(counts.items()):
             df=document_frequency[term];inverse=math.log(1+(total-df+.5)/(df+.5))
-            score+=inverse*frequency*2.2/(frequency+1.2*(.25+.75*len(tokens)/max(1,avg_length)))
-        if score:keyword.append((score,row['record_id'],row))
-        if use_vectors:
-            dense=max(_cosine(embedding,row.get('embedding') or []),_cosine(embedding,row.get('subject_embedding') or []))
-            if dense>=0:vector.append((dense,row['record_id'],row))
-    keyword.sort(key=lambda item:(-item[0],item[1]));vector.sort(key=lambda item:(-item[0],item[1]))
+            score+=inverse*frequency*2.2/(frequency+1.2*(.25+.75*length/avg_length))
+        keyword.append((score,row['record_id'],row))
+    keyword.sort(key=order);vector.sort(key=order)
     if method=='keyword':ranked=[(score,row) for score,_,row in keyword]
     elif method=='vector':ranked=[(score,row) for score,_,row in vector]
     elif method=='hybrid':
@@ -390,8 +430,7 @@ def search_vectors(conn,scope,project,query,method='keyword',embedding=None,limi
             for rank,(_,record_id,row) in enumerate(items,1):scores.setdefault(record_id,[0.0,row])[0]+=factor/(60+rank)
         ranked=[(score,row) for score,row in scores.values()]
         ranked.sort(key=lambda item:(-item[0],item[1]['record_id']))
-    else:raise ValueError('Invalid EverOS search method')
-    return [{'score':float(score),**_public_row(row)} for score,row in ranked[:max(1,min(int(limit),50))]]
+    return [{'score':float(score),**_public_row(row)} for score,row in ranked[:limit]]
 
 
 def get_profile(conn,scope,project):

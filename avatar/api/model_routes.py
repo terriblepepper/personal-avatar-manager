@@ -5,7 +5,10 @@ from fastapi import Request
 from fastapi import Query
 from fastapi import HTTPException
 from typing import Literal
-from avatar.models.model_settings import ModelSettingsRequest
+from avatar.models.effort import levels
+from avatar.models.model_settings import ModelSettingsRequest, verify_api
+from avatar.models.capabilities import detect, remember
+from avatar.models.discovery import discover
 from avatar.rag.invalidation import index_status
 import avatar.accounts.auth as auth
 from avatar.models.model_config import catalog
@@ -26,7 +29,6 @@ def model_providers(user=Depends(auth.current_user)):
 @router.get("/model-providers/effort-levels")
 def model_effort_levels(provider: str, api_format: Literal['openai','anthropic','gemini'],
                         model: str = Query(max_length=160), user=Depends(auth.current_user)):
-    from avatar.models.effort import levels
     return levels({'provider': provider, 'api_format': api_format, 'model': model})
 
 
@@ -53,11 +55,12 @@ async def save_model_settings(body: ModelSettingsRequest, request: Request, user
             config=service.vault.resolve(body.model_config_input,service.models.current(db,user['id']))
         return baseline,config
     baseline,config=await asyncio.to_thread(prepare)
-    from avatar.models.model_settings import verify_api
     await verify_api(request.app.state.chat.model_client,config,service.vault)
     saved=await asyncio.to_thread(service.models.save,user,body,validated=config,baseline=baseline)
-    from avatar.models.capabilities import detect
-    asyncio.create_task(detect(service.database,user['id'],config,request.app.state.chat.model_client,service.vault,on_change=service.models.on_change),name='avatar-model-capability-detect')
+    request.app.state.capability_probes.start(
+        detect(service.database, user['id'], config, request.app.state.chat.model_client,
+               service.vault, on_change=service.models.on_change),
+        name='avatar-model-capability-detect')
     return await asyncio.to_thread(index_status, service.database, user['id'], saved)
 
 
@@ -65,8 +68,6 @@ async def save_model_settings(body: ModelSettingsRequest, request: Request, user
 # 结果与约束：只有平台、格式、地址与已存配置一致才沿用空白 Key；网络请求复用生成客户端防护。
 @router.post('/me/model-options')
 async def own_model_options(body: ModelConfigInput, request: Request, user=Depends(auth.current_user)):
-    from fastapi import HTTPException
-    from avatar.models.discovery import discover
     service=request.app.state.service
     def prepare():
         with service.database.connect() as db:previous=service.models.current(db,user['id'])
@@ -74,6 +75,5 @@ async def own_model_options(body: ModelConfigInput, request: Request, user=Depen
     config=await asyncio.to_thread(prepare)
     if not config.get('encrypted_key'):raise HTTPException(422,'请填写此 Base URL 对应的 API Key 后获取模型')
     result=await discover(request.app.state.chat.model_client,config,service.vault.decrypt(config['encrypted_key']))
-    from avatar.models.capabilities import remember
     await asyncio.to_thread(remember,service.database,user['id'],config,result['models'],on_change=service.models.on_change)
     return result

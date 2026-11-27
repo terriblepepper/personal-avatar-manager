@@ -19,7 +19,7 @@ sdist/
 .eggs/
 pip-wheel-metadata/
 
-# 注意：根目录的 wit_framework-*.whl 与 acps_sdk-*.whl 是内网依赖的安装源，
+# 注意：vendor/wheels/ 下的锁定依赖是离线构建的输入，
 # 必须随仓库分发，因此这里不要用通配的 *.whl。
 
 # ---------- 虚拟环境 ----------
@@ -62,6 +62,7 @@ node_modules/
 /kafka/data/
 /kafka/logs/
 /kafka/kafka.lock
+/frontend/dist/
 /admin-frontend/dist/
 *.sqlite3
 *.sqlite
@@ -104,3 +105,5 @@ superpowers/
 docs/superpowers/
 .brooks-lint*
 
+
+/tools/question_bank/cleaning-report.json

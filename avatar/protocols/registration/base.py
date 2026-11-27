@@ -76,10 +76,10 @@ class DemoRegistrationProvider:
 # 职责：按启动配置选择已支持的注册适配器。
 # 输入：name 为 demo 或 acps-direct；正式模式还需要 settings 提供服务器配置。
 # 结果与约束：按显式开关返回 Demo 或派生适配器；未知模式拒绝启动，正式模式不会自动替换历史 Demo AIC。
-def build_provider(name, settings=None):
+def build_provider(name, settings, database):
     if name == 'demo':
         return DemoRegistrationProvider()
     if name == 'acps-direct' and settings is not None:
         from avatar.protocols.registration.direct import DirectRegistrationProvider
-        return DirectRegistrationProvider(settings)
+        return DirectRegistrationProvider(settings, database)
     raise RuntimeError('注册适配器只支持 demo 或 acps-direct；正式模式需要完整 Settings')

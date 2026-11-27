@@ -33,7 +33,7 @@ async def check_execution_async(validate=None):
         def check():
             if guard: guard()
             if validate: validate()
-        await asyncio.to_thread(check)
+        await run_blocking(check)
 
 
 async def run_blocking(function, *args, **kwargs):

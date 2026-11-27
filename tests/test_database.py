@@ -1,9 +1,7 @@
 """PostgreSQL 初始化、运行、隔离、协议存储及迁移。"""
 import json
-import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
-from hashlib import sha256
 from types import SimpleNamespace
 
 import psycopg
@@ -13,16 +11,6 @@ from avatar.core.db import Database
 from avatar.runtime.schema import install_schema
 from avatar.protocols.tasks.management import SystemManagementService
 from avatar.protocols.tasks.store import ManagementTaskError, SystemTaskStore
-from scripts.migrations.system_tasks import import_system_tasks
-from scripts.migrate_sqlite_to_postgres import (
-    create_snapshot,
-    dependency_order,
-    validate_schema,
-    validate_source,
-)
-from tests.support import legacy_sqlite
-
-
 # All test writes require a schema owned by the current test process
 
 def test_unsafe_test_database_is_rejected_before_connecting(monkeypatch, postgres_schema):
@@ -91,7 +79,8 @@ def test_schema_initializes_and_rejects_cross_account_owner(postgres_url):
             install_schema(conn)
             indexes = {row[0] for row in conn.execute("""SELECT indexname FROM pg_indexes
                 WHERE schemaname=current_schema() AND tablename='avatar_aip_tasks'""")}
-            assert {'avatar_aip_working_deadline', 'avatar_aip_guest_sent_at'} <= indexes
+            assert {'aip_active_deadline', 'aip_guest_sent'} <= indexes
+            assert indexes.isdisjoint({'avatar_aip_working_deadline', 'avatar_aip_guest_sent_at'})
             conn.execute("INSERT INTO users(id,username,password,role,created_at) VALUES ('schema-u','schema-u','x','user','x')")
             conn.execute("INSERT INTO users(id,username,password,role,created_at) VALUES ('schema-v','schema-v','x','user','x')")
             conn.execute("INSERT INTO knowledge_assets(id,user_id,filename,mime,size,sha256,kind,caption,created_at,relative_path) VALUES ('schema-a','schema-u','x','x',1,'x','x','x','x','x')")
@@ -111,6 +100,7 @@ def test_existing_account_stays_out_of_first_run_on_upgrade(postgres_url):
 
 # postgres runtime
 
+@pytest.mark.quick
 def test_postgres_transactions_and_rows(pg_database):
     with pg_database.connect(write=True) as db:
         db.execute("INSERT OR REPLACE INTO settings VALUES(?,?)", ('runtime_test', 'first'))
@@ -129,26 +119,74 @@ def test_postgres_transactions_and_rows(pg_database):
 
 def test_literal_placeholders_and_json_projection(pg_database):
     with pg_database.connect() as db:
-        row = db.execute("SELECT '?' AS literal, json_extract(?, '$.name') AS name, instr(?, ?) AS pos", ('{\"name\":\"A\"}', 'abc', 'b')).fetchone()
+        row = db.execute("SELECT '?' AS literal, (?::jsonb->>'name') AS name, strpos(?, ?) AS pos", ('{\"name\":\"A\"}', 'abc', 'b')).fetchone()
         assert tuple(row) == ('?', 'A', 2)
         assert db.execute("SELECT value FROM json_each(?)", ('[\"a\",\"b\"]',)).fetchall()[0][0] == 'a'
 
 
 
-def test_postgres_rowid_identity_and_reinitialization(pg_database):
-    pg_database.initialize()
-    with pg_database.connect() as db:
-        assert db.execute('SELECT count(*) FROM avatar_schema_version').fetchone()[0] == 1
-    with pg_database.connect(write=True) as db:
-        db.execute("INSERT INTO users(id,username,password,role,created_at) VALUES(?,?,?,?,?)", ('rowid-user', 'rowid-user', 'hash', 'user', '2026'))
-        db.execute("INSERT INTO model_artifact_cache VALUES(?,?,?,?,?,?,?)", ('rowid-user', 'test', 's', 'd', 'h', '{}', '2026'))
-        row = db.execute("SELECT rowid,* FROM model_artifact_cache WHERE kind=?", ('test',)).fetchone()
-        assert isinstance(row['rowid'], int)
-        assert 'rowid' not in db.execute("SELECT * FROM model_artifact_cache WHERE kind=?", ('test',)).fetchone().keys()
-        db.execute('DELETE FROM model_artifact_cache WHERE rowid=?', (row['rowid'],))
-        cursor = db.execute("INSERT INTO audit_events(user_id,actor,action,detail,created_at) VALUES(?,?,?,?,?)", (None, 'test', 'test', '', '2026'))
-        assert isinstance(cursor.lastrowid, int)
-        assert db.execute('SELECT action FROM audit_events WHERE id=?', (cursor.lastrowid,)).fetchone()[0] == 'test'
+def test_postgres_business_keys_and_cache_lru(pg_database, monkeypatch):
+    from avatar.models import artifact_cache
+    db = pg_database
+    db.initialize()
+    with db.connect(write=True) as tx:
+        assert tx.execute("SELECT count(*) FROM avatar_schema_version").fetchone()[0] == 1
+        assert tx.execute("""SELECT count(*) FROM information_schema.columns
+            WHERE table_schema=current_schema() AND column_name='_rowid'""").fetchone()[0] == 0
+        tx.execute("INSERT INTO users(id,username,password,role,created_at) VALUES('cache-user','cache-user','hash','user','2026')")
+        cursor = tx.execute("INSERT INTO audit_events(user_id,actor,action,detail,created_at) VALUES(NULL,'test','test','','2026')")
+        assert tx.execute('SELECT action FROM audit_events WHERE id=?', (cursor.lastrowid,)).fetchone()[0] == 'test'
+    cache = artifact_cache.ArtifactCache(db)
+    monkeypatch.setattr(artifact_cache, 'MAX_ITEMS', 2)
+    for key in ('a', 'b'):
+        cache.put('cache-user', 'test', 's', key, '你好')
+    assert cache.get('cache-user', 'test', 's', 'a') == '你好'
+    cache.put('cache-user', 'test', 's', 'c', 3)
+    assert cache.get('cache-user', 'test', 's', 'b') is None
+    with db.connect() as tx:
+        assert tx.execute("""SELECT bool_and(byte_size=octet_length(value)), count(*)
+            FROM model_artifact_cache WHERE user_id='cache-user'""").fetchone()[:] == (True, 2)
+    monkeypatch.setattr(artifact_cache, 'MAX_BYTES', 2)
+    cache.put('cache-user', 'test', 's', 'd', 42)
+    assert cache.get('cache-user', 'test', 's', 'a') is None
+    assert cache.get('cache-user', 'test', 's', 'd') == 42
+
+
+def test_upgrade_preserves_protocol_file_and_checkpoint_keys(pg_database):
+    db = pg_database
+    with db.pool.connection() as raw:
+        raw.execute("INSERT INTO users(id,username,password,role,created_at) VALUES('owner','owner','hash','user','2025')")
+        key = raw.execute("""INSERT INTO avatar_aip_tasks(local_aic,peer_aic,group_id,session_id,task_id,command_id,document)
+            VALUES('a','b','g','s','t','cmd','{"id":"existing","file_token":"keep"}') RETURNING task_number""").fetchone()[0]
+        raw.execute("""INSERT INTO agent_loop_runs(owner,scope,scope_id,run_id,writer)
+            VALUES('owner','protocol',%s,'run','writer')""",(str(key),))
+        raw.execute("ALTER TABLE avatar_aip_tasks RENAME COLUMN task_number TO _rowid")
+        raw.execute("DELETE FROM data_migrations WHERE name='personal-task-message-ids-v1'")
+    db.initialize()
+    db.initialize()
+    with db.pool.connection() as raw:
+        assert raw.execute("""SELECT t.task_number, t.document::jsonb->>'id',t.document::jsonb->>'file_token',
+            t.document::jsonb->>'sentAt' IS NOT NULL FROM avatar_aip_tasks t
+            JOIN agent_loop_runs r ON r.protocol_id=t.task_number""").fetchone() == (key,'existing','keep',True)
+        next_key = raw.execute("""INSERT INTO avatar_aip_tasks(local_aic,peer_aic,group_id,session_id,task_id,command_id,document)
+            VALUES('a','b','g','s','next','other','{}') RETURNING task_number""").fetchone()[0]
+        assert next_key > key
+
+
+def test_scoped_writers_share_only_the_schema_barrier(postgres_url):
+    from avatar.core.postgres import WRITE_LOCK, lock_schema_transaction
+    with psycopg.connect(postgres_url) as owner, psycopg.connect(postgres_url) as other:
+        lock_schema_transaction(owner,WRITE_LOCK,account_scope='one',dispatch=True)
+        assert owner.execute("SELECT current_setting('avatar.dispatch_enabled')").fetchone() == ('on',)
+        lock_schema_transaction(other,WRITE_LOCK,account_scope='two')
+        other.rollback()
+        for scope in ('one',None):
+            with pytest.raises(psycopg.errors.LockNotAvailable), other.transaction():
+                other.execute("SET LOCAL lock_timeout='100ms'")
+                lock_schema_transaction(other,WRITE_LOCK,account_scope=scope)
+        owner.commit()
+        lock_schema_transaction(other,WRITE_LOCK)
+
 
 def test_postgres_lexical_search_and_contains(pg_database):
     from avatar.rag.stores.lexical import LexicalStore
@@ -409,46 +447,6 @@ def test_pg_system_receipt_concurrency_scope_and_expiry(pg_database):
     assert call(command='complete',taskId='expires')==expired
 
 
-def test_system_ledger_import_checks_each_of_eleven_receipts_and_rolls_back(pg_database,postgres_url,tmp_path):
-    import psycopg
-    path=tmp_path/'legacy.sqlite3'
-    schema="""CREATE TABLE system_management_tasks(
-        local_aic TEXT NOT NULL, peer_aic TEXT NOT NULL, group_id TEXT NOT NULL,
-        session_key TEXT NOT NULL, session_id TEXT NOT NULL, task_id TEXT NOT NULL,
-        command_id TEXT NOT NULL,document TEXT NOT NULL, deadline REAL,
-        PRIMARY KEY(local_aic,peer_aic,group_id,session_key,task_id),
-        UNIQUE(local_aic,peer_aic,group_id,session_key,command_id))"""
-    rows=[('system','peer','','','session',f'{i:02}',str(i),
-           json.dumps({'id':str(i),'status':{'state':'completed' if i%2 else 'awaiting-completion'}},indent=1),
-           None if i%2 else 1700000000.123456+i) for i in range(11)]
-    with closing(sqlite3.connect(path)) as db, db:
-        db.execute(schema)
-        db.execute('PRAGMA user_version=1')
-        db.executemany('INSERT INTO system_management_tasks VALUES(?,?,?,?,?,?,?,?,?)',rows)
-    expected=sha256()
-    for row in rows:
-        expected.update(sha256(json.dumps(row,ensure_ascii=False,separators=(',',':')).encode()).digest())
-    before=sha256(path.read_bytes()).digest()
-    with psycopg.connect(postgres_url,autocommit=True) as raw, pytest.raises(ValueError,match='事务'):
-        import_system_tasks(raw,path)
-    with pytest.raises(ValueError,match='尚未导入'):
-        SystemTaskStore(pg_database).initialize(legacy_present=True)
-    with pg_database.connect(write=True) as target:
-        report=import_system_tasks(target.raw,path)
-    SystemTaskStore(pg_database).initialize(legacy_present=True)
-    assert report=={'count':11,'sha256':expected.hexdigest()}
-    with pg_database.connect(write=True) as target:
-        assert import_system_tasks(target.raw,path)==report
-    assert sha256(path.read_bytes()).digest()==before
-    with pg_database.connect(write=True) as db:
-        db.execute("DELETE FROM system_management_tasks WHERE task_id='00'")
-        db.execute("UPDATE system_management_tasks SET document='{}' WHERE task_id='10'")
-    with pytest.raises(ValueError, match='不一致'), pg_database.connect(write=True) as target:
-        import_system_tasks(target.raw,path)
-    with pg_database.connect() as db:
-        assert db.execute('SELECT count(*) FROM system_management_tasks').fetchone()[0]==10
-
-
 # The application must reject missing PostgreSQL before touching identity files
 
 def test_explicit_settings_require_postgres_before_migrating_identities(tmp_path, monkeypatch):
@@ -461,147 +459,6 @@ def test_explicit_settings_require_postgres_before_migrating_identities(tmp_path
         create_app(Settings(data_dir=tmp_path, database_url=''), run_worker=False)
 
 
-def test_frozen_sources_require_unambiguous_ownership(tmp_path):
-    import hashlib
-    from scripts.migrate_local_stores import sources
-
-    user = 'owner'
-    shared = tmp_path/'users'/user/'file_rag'
-    shared.mkdir(parents=True)
-    (shared/'chroma.sqlite3').touch()
-    (tmp_path/'system_identity').mkdir()
-    (tmp_path/'system_identity'/'aip-tasks.sqlite3').touch()
-    assert {kind for kind, _, _ in sources(tmp_path, [user])} == {'chroma','aip'}
-    with pytest.raises(ValueError, match='owner'):
-        sources(tmp_path, [])
-    historical = tmp_path/'file_rag'/hashlib.sha256(user.encode()).hexdigest()
-    historical.mkdir(parents=True)
-    (historical/'chroma.sqlite3').touch()
-    with pytest.raises(ValueError, match='ambiguous'):
-        sources(tmp_path, [user])
-    (historical/'chroma.sqlite3').unlink()
-    historical.rmdir()
-    historical.symlink_to(shared, target_is_directory=True)
-    with pytest.raises(ValueError, match='symlink'):
-        sources(tmp_path, [user])
-
-
 # postgres migration
 
-def test_rejects_foreign_key_violations(tmp_path):
-    source = tmp_path / 'invalid.sqlite3'
-    with sqlite3.connect(source) as db:
-        db.execute('CREATE TABLE parents(id INTEGER PRIMARY KEY)')
-        db.execute('CREATE TABLE children(parent_id INTEGER REFERENCES parents(id))')
-        db.execute('INSERT INTO children VALUES(9)')
-        with pytest.raises(ValueError, match='foreign key'):
-            validate_source(db)
-
-
-def test_dependency_order_handles_self_references_and_rejects_cycle(tmp_path):
-    with sqlite3.connect(tmp_path / 'db.sqlite3') as db:
-        db.execute('CREATE TABLE parent(id INTEGER PRIMARY KEY, ancestor INTEGER REFERENCES parent(id))')
-        db.execute('CREATE TABLE child(parent INTEGER REFERENCES parent(id))')
-        assert dependency_order(db, ['child', 'parent']) == ['parent', 'child']
-        db.execute('CREATE TABLE a(id INTEGER PRIMARY KEY, b INTEGER REFERENCES b(id))')
-        db.execute('CREATE TABLE b(id INTEGER PRIMARY KEY, a INTEGER REFERENCES a(id))')
-        with pytest.raises(ValueError, match='cycle'):
-            dependency_order(db, ['a', 'b'])
-
-
-def test_schema_preflight_rejects_unexpected_table(legacy_sqlite):
-    with sqlite3.connect(legacy_sqlite) as db:
-        validate_schema(db)
-        db.execute('CREATE TABLE unexpected (secret TEXT)')
-        with pytest.raises(ValueError, match='schema'):
-            validate_schema(db)
-
-
-def test_schema_check_normalizes_only_historical_column_order(legacy_sqlite):
-    with sqlite3.connect(legacy_sqlite) as db:
-        db.execute('DROP TABLE protocol_message_versions')
-        validate_schema(db)
-        db.execute('CREATE TABLE protocol_message_versions(version INTEGER NOT NULL,kind TEXT PRIMARY KEY)')
-        validate_schema(db)
-        db.execute('DROP INDEX rag_nodes_record')
-        with pytest.raises(ValueError, match='schema'):
-            validate_schema(db)
-
-
-def test_blob_columns_normalize_sqlite_text_values():
-    from scripts.migrate_sqlite_to_postgres import canonical_row, normalize_value
-    assert normalize_value('{"id": "model"}', 'BLOB') == b'{"id": "model"}'
-    assert normalize_value(memoryview(b'raw'), 'BLOB') == b'raw'
-    assert normalize_value('note', 'TEXT') == 'note'
-    assert canonical_row(('a', 'b', memoryview(b'c')), ['TEXT', 'BLOB', 'BLOB']) == ('a', b'b', b'c')
-
-
-def test_legacy_asset_import_records_only_the_owners_matching_attachment(legacy_sqlite, postgres_url, tmp_path):
-    import hashlib
-    from contextlib import closing
-
-    import psycopg
-    from scripts.migrate_sqlite_to_postgres import migrate
-
-    with closing(sqlite3.connect(legacy_sqlite)) as source, source:
-        source.execute('ALTER TABLE knowledge_assets DROP COLUMN source_attachment_id')
-        for owner in ('a', 'b', 'c'):
-            source.execute("INSERT INTO users(id,username,password,role,created_at) VALUES(?,?,'x','user','2026')",
-                           (owner, owner))
-            source.execute("""INSERT INTO knowledge_assets(id,user_id,filename,mime,size,sha256,kind,caption,created_at)
-                VALUES(?,?,'copy.txt','text/plain',4,'same','text','','2026')""", ('copy-' + owner, owner))
-            if owner != 'c':
-                source.execute("""INSERT INTO attachments(id,user_id,filename,content_type,size,sha256,extraction_status,created_at)
-                    VALUES(?,?,'source.txt','text/plain',4,'same','ok','2026')""", ('source-' + owner, owner))
-    original = hashlib.sha256(legacy_sqlite.read_bytes()).digest()
-    migrate(legacy_sqlite, tmp_path / 'backup.sqlite3', postgres_url)
-    assert hashlib.sha256(legacy_sqlite.read_bytes()).digest() == original
-    with psycopg.connect(postgres_url) as db:
-        assert db.execute('SELECT user_id,source_attachment_id FROM knowledge_assets ORDER BY user_id').fetchall() == [
-            ('a', 'source-a'), ('b', 'source-b'), ('c', '')]
-
-
 # sqlite snapshot
-
-def test_snapshot_includes_uncheckpointed_wal_and_does_not_replace_existing(tmp_path):
-    source = tmp_path / 'source.sqlite3'
-    backup = tmp_path / 'backup.sqlite3'
-    with sqlite3.connect(source) as db:
-        db.execute('PRAGMA journal_mode=WAL')
-        db.execute('PRAGMA wal_autocheckpoint=0')
-        db.execute('CREATE TABLE data (value TEXT)')
-        db.commit()
-        db.execute('INSERT INTO data VALUES (?)', ('uncheckpointed',))
-        db.commit()
-        create_snapshot(source, backup)
-        with sqlite3.connect(backup) as copied:
-            assert copied.execute('SELECT value FROM data').fetchone() == ('uncheckpointed',)
-        with pytest.raises(FileExistsError):
-            create_snapshot(source, backup)
-        with sqlite3.connect(backup) as copied:
-            assert copied.execute('SELECT value FROM data').fetchone() == ('uncheckpointed',)
-
-
-def test_snapshot_rejects_missing_source_without_creating_it(tmp_path):
-    source = tmp_path / 'missing.sqlite3'
-    with pytest.raises((FileNotFoundError, sqlite3.OperationalError)):
-        create_snapshot(source, tmp_path / 'backup.sqlite3')
-    assert not source.exists()
-
-
-def test_snapshot_removes_incomplete_copy_if_integrity_check_fails(tmp_path):
-    source = tmp_path / 'corrupt.sqlite3'
-    destination = tmp_path / 'backup.sqlite3'
-    source.write_bytes(b'not a database')
-    with pytest.raises(sqlite3.DatabaseError):
-        create_snapshot(source, destination)
-    assert not destination.exists()
-    assert source.read_bytes() == b'not a database'
-
-
-def test_snapshot_is_private(tmp_path):
-    source = tmp_path / 'source.sqlite3'
-    with sqlite3.connect(source) as db:
-        db.execute('CREATE TABLE data (value TEXT)')
-    destination = create_snapshot(source, tmp_path / 'backup.sqlite3')
-    assert destination.stat().st_mode & 0o077 == 0

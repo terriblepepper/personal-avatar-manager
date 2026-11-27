@@ -2,18 +2,18 @@
 import asyncio
 import json
 import logging
-import re
 import time
 import uuid
+from weakref import WeakValueDictionary
 from contextlib import ExitStack
 from datetime import datetime, timezone
 from fastapi import HTTPException
+from avatar.accounts.auth import prune_auth_limits
 from avatar.core.text_budget import fits_text_budget
 from avatar.core.db import dump, now
-from avatar.conversation.schemas import ChatRequest
-from avatar.core.execution import AgentNeedsInput, execution_guard, run_blocking
+from avatar.core.execution import AgentNeedsInput, execution_guard, finish_on_cancel, run_blocking
 from avatar.conversation.loop.runtime import prepare_checkpoint, resume_safe
-from avatar.conversation.tools.reply_artifacts import reply_with_artifacts, without_source_footer
+from avatar.conversation.tools.reply_artifacts import without_source_footer
 from avatar.conversation.loop.store import RunConflict, RunStore
 from avatar.protocols.identity.ontology import AVATAR_SKILL_IDS
 from avatar.protocols.tasks import personal_turns as turns
@@ -21,83 +21,13 @@ from avatar.protocols.tasks.store import ManagementTaskError
 from avatar.protocols.tasks.town_auth import TownUserAuthorization
 from avatar.protocols.tasks.town_public import TownPublicAuthorization
 from avatar.protocols.tasks.town_files import TownFiles
-from avatar.protocols.tasks.visitor_quota import check_quota
+from avatar.protocols.tasks.visitor_quota import charge_visitor, visitor_busy
+from avatar.protocols.tasks.guest_maintenance import expire_guests, expired_guest
+from avatar.protocols.tasks.town_answer import answer_town
+from avatar.protocols.tasks.town_progress import PROGRESS_INTERVAL, WORKING_TIMEOUT, WorkingProgress
 
 
-WORKING_TIMEOUT = 480
-PROGRESS_INTERVAL = 8
 log = logging.getLogger('uvicorn.error.' + __name__)
-PUBLIC_STAGES = {
-    'memory': '读取会话上下文', 'compressing': '整理会话上下文',
-    'intent_analysis': '判断任务目标', 'thinking': '分析任务和已有信息',
-    'tool_selection': '判断所需工具', 'rag_retrieving': '检索相关资料',
-    'material_reading': '读取相关资料', 'tool_catalog': '查询候选资料',
-    'tool_action': '执行已选择的操作',
-    'result_writing': '整理最终答复', 'model_stream': '模型响应流已连接',
-}
-
-
-class WorkingProgress:
-    def __init__(self, result, run):
-        self.result_id = result['id']
-        self.ids = result['taskId'], result['sessionId'], run['run_id']
-        self.run = run
-        self.streaming = False
-        self.started = time.monotonic()
-        self.message = '任务已接收，等待可用执行资源'
-        self.revision = 0
-        self.snapshot_key = None
-        self.envelope = {}
-
-    def update(self, event):
-        if event.get('group') == 'model_io':
-            status = event['status']
-            if status not in ('completed','error','interrupted'):
-                return
-            attempt = event['input']['attempt']
-            output = event['output']
-            log.info('Personal AIP model taskId=%r sessionId=%r run_id=%s purpose=%s attempt=%d status=%s interrupted=%s elapsed_ms=%d',
-                     *self.ids, event['purpose'], attempt, status, output.get('stream_interrupted', False),
-                     round(1000*(time.monotonic()-self.started)))
-            stage = (f"模型响应流中断，正在进行第 {output['retry']}/{output['retry_limit']} 次重试"
-                     if output.get('retry') else None)
-        elif event.get('type') == 'status':
-            stage = PUBLIC_STAGES.get(event.get('stage'))
-        else:
-            return
-        if stage and stage != self.message:
-            self.message = stage
-            self.revision += 1
-
-    def stream_state(self, active):
-        now_at = time.time()
-        if active == self.streaming or (active and self.run['work_until'] <= now_at):
-            return
-        self.streaming = active
-        # A recovered stream starts with a full waiting budget after it closes again.
-        self.run['work_until'] = now_at+WORKING_TIMEOUT
-        if active:
-            self.update({'type':'status','stage':'model_stream'})
-
-    def deadline(self):
-        now_at = time.time()
-        if self.streaming:
-            return now_at+WORKING_TIMEOUT
-        until = self.run['work_until']
-        if until <= now_at:
-            raise turns.WorkDeadlineExceeded
-        return until
-
-    def view(self, result):
-        # Progress is a new message, while the ledger retains the working ID used by finish().
-        elapsed = max(0, int(time.monotonic()-self.started))
-        key = (self.revision, elapsed//PROGRESS_INTERVAL)
-        if self.snapshot_key != key:
-            self.snapshot_key = key
-            self.envelope = {'id':uuid.uuid4().hex, 'sentAt':now(),
-                             'status':{**result['status'], 'dataItems':[
-                                 {'type':'text','text':f'{self.message}（已等待 {elapsed} 秒）'}]}}
-        return {**result, **self.envelope}
 
 
 # 职责：在固定个人 AIC 作用域处理 ACPs 完整问答和任务确认。
@@ -110,6 +40,9 @@ class PersonalTaskService:
     def __init__(self, chat, settings):
         self.chat, self.database = chat, chat.service.database
         self.limit = asyncio.Semaphore(8)
+        self.admission_locks = WeakValueDictionary()
+        self.accepting = set()
+        self.running = set()
         self.pending = {}
         self.progress = {}
         self.authorization = TownUserAuthorization(self.database, settings)
@@ -120,40 +53,29 @@ class PersonalTaskService:
     def download(self, rowid, token, identifier):
         return self.files.download(rowid, token, identifier)
 
-    def expire_guests(self):
-        from datetime import datetime,timedelta,timezone
-        cutoff=(datetime.now(timezone.utc)-timedelta(hours=24)).isoformat()
-        expired = "instr(peer_aic,'#guest:')>0 AND json_extract(document,'$.sentAt')<? AND (deadline IS NULL OR deadline<?)"
-        limits = (cutoff, time.time())
-        with self.database.connect() as db:
-            has_expired = db.execute("SELECT 1 FROM avatar_aip_tasks WHERE " + expired + " LIMIT 1", limits).fetchone()
-            stale=db.execute("SELECT id FROM chat_conversations WHERE platform='town-guest' AND updated_at<? AND lease_until<? LIMIT 100",(cutoff,time.time())).fetchall()
-        for row in stale:
-            try:self.chat.memory.remove(row['id'])
-            except HTTPException as exc:
-                if exc.status_code!=409:raise
-        if has_expired:
-            with self.database.connect(write=True) as db:
-                db.execute("DELETE FROM avatar_aip_tasks WHERE " + expired, limits)
+    def expire_guests(self, batch_size=100):
+        expire_guests(self.database, self.chat.memory, batch_size)
+
+    async def maintenance(self):
+        while True:
+            for action, args in ((prune_auth_limits, (self.database,)), (self.expire_guests, ())):
+                try:
+                    await run_blocking(action, *args)
+                except Exception:
+                    log.exception('Background retention failed for %s', action.__name__)
+            await asyncio.sleep(60)
 
     # 职责：恢复上次进程未完成的模型任务。
     # 输入：应用启动时调用一次。
     # 结果与约束：只回收过期执行权，等原调用者重新鉴权后续跑。
     def recover(self):
-        self.expire_guests()
         if getattr(self,'peer_dialogues',None):self.peer_dialogues.recover()
         with self.database.connect(write=True) as db:
-            db.execute('CREATE TABLE IF NOT EXISTS protocol_message_versions(kind TEXT PRIMARY KEY,version INTEGER NOT NULL)')
-            upgrade=not db.execute("SELECT 1 FROM protocol_message_versions WHERE kind='personal-task' AND version>=1").fetchone()
-            if upgrade:
-                for old in db.execute('SELECT rowid,document FROM avatar_aip_tasks').fetchall():
-                    document=json.loads(old['document']);document['id']=uuid.uuid4().hex;document['sentAt']=now()
-                    db.execute('UPDATE avatar_aip_tasks SET document=? WHERE rowid=?',(dump(document),old['rowid']))
-                db.execute("INSERT OR REPLACE INTO protocol_message_versions VALUES('personal-task',1)")
-            for row in db.execute("""SELECT rowid,document FROM avatar_aip_tasks
-                WHERE json_extract(document,'$.status.state')='working' AND (deadline IS NULL OR deadline<=?)""",
+            for row in db.execute("""SELECT task_number,peer_aic,document,deadline FROM avatar_aip_tasks
+                WHERE (document::jsonb->'status'->>'state')='working' AND (deadline IS NULL OR deadline<=?)""",
                 (time.time(),)).fetchall():
-                turns.interrupt_in(db, row, json.loads(row['document']))
+                if not expired_guest(row):
+                    turns.interrupt_in(db, row, json.loads(row['document']))
 
     # 职责：校验固定端点仍对应已激活的正式个人分身。
     # 输入：user_id/AIC 由已接纳监听器固定，不能从提问或 metadata 覆盖。
@@ -205,13 +127,17 @@ class PersonalTaskService:
         return skills
 
     @staticmethod
-    def task_row(db, scope):
+    def task_row(db, scope, *, replace_expired=False):
         aic, peer, group, session, task = scope
-        rows = db.execute("""SELECT rowid,* FROM avatar_aip_tasks WHERE local_aic=? AND peer_aic=? AND group_id=? AND task_id=?
-                             AND (session_id=? OR (session_id='' AND json_extract(document,'$.sessionId')=?))""",
+        rows = db.execute("""SELECT * FROM avatar_aip_tasks WHERE local_aic=? AND peer_aic=? AND group_id=? AND task_id=?
+                             AND (session_id=? OR (session_id='' AND (document::jsonb->>'sessionId')=?))""",
                           (aic, peer, group, task, session, session)).fetchall()
         if len(rows) > 1:
             raise ManagementTaskError(-32602, '请提供原任务会话标识')
+        if rows and expired_guest(rows[0]):
+            if replace_expired:
+                db.execute('DELETE FROM avatar_aip_tasks WHERE task_number=?', (rows[0]['task_number'],))
+            return None
         return rows[0] if rows else None
 
     def working_view(self, scope, result):
@@ -243,17 +169,16 @@ class PersonalTaskService:
         return result
 
     async def _handle(self, command, context, user_id, aic):
-        target = self.target(user_id, aic)
+        target = await run_blocking(self.target, user_id, aic)
         headers={k.lower():v for k,v in getattr(context,'headers',{}).items()}
         public = headers.get('x-avatar-access')=='public' or not headers.get('authorization')
-        if headers.get('x-avatar-access')!='public' and (command.get('dataItems') == [{'type':'data','data':{'peerDialogueTask':command.get('taskId')}}] or command.get('command') in ('get','complete','cancel') and self.is_peer_task(command)):
+        if headers.get('x-avatar-access')!='public' and (command.get('dataItems') == [{'type':'data','data':{'peerDialogueTask':command.get('taskId')}}] or command.get('command') in ('get','complete','cancel') and await run_blocking(self.is_peer_task, command)):
             handler=getattr(self,'peer_dialogues',None)
             if handler is None:raise ManagementTaskError(-32009,'分身委派入口未启用')
             return await handler.handle(command,context,user_id)
         principal = await self.public_authorization.authorize(context) if public else None
         if not public:
             await self.authorization.authorize(context, user_id)
-        if principal and principal.get('anonymous'):self.expire_guests()
         scope_peer = context.peer_aic + ('#guest:' if principal.get('anonymous') else '#public:') + principal['visitor_id'] if public else context.peer_aic
         operation = command.get('command')
         session = command.get('sessionId') or ''
@@ -264,6 +189,70 @@ class PersonalTaskService:
             audit = log.info if operation == 'cancel' else log.debug
             audit('Personal AIP control operation=%s taskId=%r sessionId=%r commandId=%r entry=%s',
                   operation, scope[-1], session, command['id'], 'town-http' if context.peer_aic == 'town-http' else 'direct')
+        accepted = await finish_on_cancel(self._accept(
+            command, context, user_id, aic, target, principal, public, scope, operation, session))
+        if isinstance(accepted, dict):
+            return accepted
+        task, progress, result, scope = accepted
+        try:return await asyncio.wait_for(asyncio.shield(task),timeout=1)
+        except TimeoutError:return progress.view(result)
+        except asyncio.CancelledError:
+            if not task.cancelled() or asyncio.current_task().cancelling():
+                raise
+            return await run_blocking(self._public_result, scope)
+
+    def _public_result(self, scope):
+        with self.database.connect() as db:
+            row = self.task_row(db,scope)
+            if not row:
+                raise ManagementTaskError(-32001,'原任务已删除')
+            return turns.public_result(json.loads(row['document']))
+
+    async def _accept(self, command, context, user_id, aic, target, principal, public, scope, operation, session):
+        accepting = asyncio.current_task()
+        self.accepting.add(accepting)
+        # The receipt may use an assigned session ID. Both spellings share this lock.
+        key = (*scope[:3], scope[-1])
+        lock = self.admission_locks.setdefault(key, asyncio.Lock())
+        try:
+            async with lock:
+                action, scope, payload = await run_blocking(
+                    self._admit, command, context, user_id, aic, target, principal, public, scope, operation, session)
+                return self._after_commit(action, scope, payload, context, principal)
+        finally:
+            self.accepting.discard(accepting)
+
+    def _after_commit(self, action, scope, payload, context, principal):
+        if action == 'view':
+            return self.working_view(scope, payload)
+        if action == 'cancel':
+            writer, result = payload
+            progress = self.progress.get(scope)
+            if progress and progress.result_id == writer and scope in self.pending:
+                self.pending[scope].cancel()
+            return result
+        # Return a status before a slow model outlives the caller's HTTP timeout.
+        rowid, result, run, restarting = payload
+        if restarting and scope in self.pending:
+            self.pending[scope].cancel()
+        progress = WorkingProgress(result,run)
+        self.progress[scope] = progress
+        task=asyncio.create_task(self.generate(scope,rowid,result,context,principal,run,progress))
+        self.pending[scope]=task
+        self.running.add(task)
+        def done(job):
+            self.running.discard(job)
+            if self.pending.get(scope) is job:
+                self.pending.pop(scope,None)
+                self.progress.pop(scope,None)
+            if not job.cancelled() and job.exception():
+                log.error('Personal AIP worker taskId=%r sessionId=%r run_id=%s error=%s',
+                          *progress.ids, type(job.exception()).__name__)
+        task.add_done_callback(done)
+        return task, progress, result, scope
+
+    def _admit(self, command, context, user_id, aic, target, principal, public, scope, operation, session):
+        scope_peer = scope[1]
         if operation == 'get':
             with self.database.connect() as db:
                 row = self.task_row(db, scope)
@@ -275,9 +264,9 @@ class PersonalTaskService:
                 deadline = row['deadline']
                 lease_valid = deadline > time.time() if deadline is not None else not working
                 if lease_valid and not (saved.get('restart') or saved.get('user_question')):
-                    return self.working_view((*scope[:3],row['session_id'],scope[4]),turns.public_result(document))
-        with ExitStack() as cleanup, self.database.connect(write=True) as db:
-            row = self.task_row(db, scope)
+                    return 'view', (*scope[:3], row['session_id'], scope[4]), turns.public_result(document)
+        with ExitStack() as cleanup, self.database.connect(write=True, account_scope=user_id) as db:
+            row = self.task_row(db, scope, replace_expired=(operation == 'start'))
             run = {}
             deliveries = []
             restarting = False
@@ -289,7 +278,7 @@ class PersonalTaskService:
                 deliveries = document.get('_file_deliveries',[])
                 if deliveries and (expired or operation=='cancel'
                                    or operation=='complete' and state=='awaiting-completion'):
-                    cleanup.callback(self.files.discard_previous,row['rowid'],deliveries)
+                    cleanup.callback(self.files.discard_previous,row['task_number'],deliveries)
                 # The lease holder can have newer model progress than the last persisted checkpoint.
                 if state == 'working' and (expired or row['deadline'] is None) and operation != 'cancel':
                     turns.interrupt_in(db, row, document)
@@ -299,25 +288,24 @@ class PersonalTaskService:
                         or operation == 'complete' and state == 'awaiting-completion'
                         or expired and state == 'awaiting-completion'):
                     final = 'canceled' if operation == 'cancel' else 'failed' if expired else 'completed'
+                    writer = document.get('id')
                     result = turns.close_in(db,row,document,final,reason='confirmation_timeout' if final=='failed' else None)
-                    job = self.pending.get(scope)
-                    if job: job.cancel()
-                    return result
+                    return 'cancel', scope, (writer, result)
                 if state == 'awaiting-input' and run.get('user_question'):
-                    return turns.close_in(db,row,document,'failed',turns.QUESTION_UNAVAILABLE,reason='interactive_question_disabled')
+                    return 'view', scope, turns.close_in(db,row,document,'failed',turns.QUESTION_UNAVAILABLE,reason='interactive_question_disabled')
                 restarting = operation == 'get' and state == 'awaiting-input' and run.get('restart')
                 if restarting:
                     if turns.work_expired(document):
-                        return turns.expire_in(db,row,document)
-                    if public and self.visitor_busy(db,aic,scope_peer):
-                        return turns.public_result(document)
+                        return 'view', scope, turns.expire_in(db,row,document)
+                    if public and visitor_busy(db,aic,scope_peer):
+                        return 'view', scope, turns.public_result(document)
                 if not restarting:
                     if operation != 'continue':
-                        return self.working_view(scope,turns.public_result(document))
+                        return 'view', scope, turns.public_result(document)
                     seen=db.execute('SELECT task_id FROM avatar_aip_task_commands WHERE local_aic=? AND peer_aic=? AND group_id=? AND session_id=? AND command_id=?',(*scope[:4],command['id'])).fetchone()
                     if seen:
                         if seen['task_id']!=scope[-1]:raise ManagementTaskError(-32602,'命令 id 已用于其他任务')
-                        return self.working_view(scope,turns.public_result(document))
+                        return 'view', scope, turns.public_result(document)
                     if state not in ('awaiting-input','awaiting-completion'):
                         raise ManagementTaskError(-32009,'任务正在处理，请先查询状态' if state=='working' else '任务已结束，请使用新 taskId 并沿用 sessionId 继续对话')
                 session=document['sessionId']
@@ -325,7 +313,7 @@ class PersonalTaskService:
                 raise ManagementTaskError(-32001, '当前调用者和会话中没有该任务')
             revision = turns.source_revision(db, user_id, aic)
             if run.get('sources') and (run['sources'] != revision or run['owner'] != user_id):
-                return turns.close_in(db,row,document,'failed','原任务的资料或授权已改变，请重新发起任务')
+                return 'view', scope, turns.close_in(db,row,document,'failed','原任务的资料或授权已改变，请重新发起任务')
             if not restarting:
                 if db.execute('SELECT 1 FROM avatar_aip_task_commands WHERE local_aic=? AND peer_aic=? AND group_id=? AND session_id=? AND command_id=?',(*scope[:4],command['id'])).fetchone():
                     raise ManagementTaskError(-32602,'命令 id 已用于其他任务')
@@ -340,7 +328,7 @@ class PersonalTaskService:
                 if sum(len(text) + 8 for text in inputs) > 16000:
                     raise ManagementTaskError(-32602,'本任务补充内容已达上限，请结束后使用新任务整理要求')
                 if public:
-                    self.charge_visitor(db, user_id, aic, scope_peer, principal['visitor_id'])
+                    charge_visitor(db, user_id, aic, scope_peer, principal['visitor_id'])
                 run.update(run_id=run.get('run_id') or uuid.uuid4().hex, owner=user_id, sources=revision, skills=selected,
                            inputs=inputs, input_id=command['id'], supplement=question if len(inputs)>1 else '')
             accepted_at = time.time()
@@ -358,59 +346,21 @@ class PersonalTaskService:
             stored = dump({**result, '_agent_resume':run, **({'_file_deliveries':deliveries} if deliveries else {})})
             deadline = accepted_at+turns.LEASE_SECONDS
             if row:
-                rowid = row['rowid']
-                db.execute('UPDATE avatar_aip_tasks SET command_id=?,document=?,deadline=? WHERE rowid=?',
+                rowid = row['task_number']
+                db.execute('UPDATE avatar_aip_tasks SET command_id=?,document=?,deadline=? WHERE task_number=?',
                            (row['command_id'] if restarting else command['id'],stored,deadline,rowid))
             else:
-                db.execute('INSERT INTO avatar_aip_tasks VALUES(?,?,?,?,?,?,?,?)', (*scope, command['id'], stored, deadline))
-                rowid = self.task_row(db, scope)['rowid']
+                db.execute('INSERT INTO avatar_aip_tasks(local_aic,peer_aic,group_id,session_id,task_id,command_id,document,deadline) VALUES(?,?,?,?,?,?,?,?)', (*scope, command['id'], stored, deadline))
+                rowid = self.task_row(db, scope)['task_number']
             if not restarting:
                 db.execute('INSERT INTO avatar_aip_task_commands VALUES(?,?,?,?,?,?)',(*scope,command['id']))
-        # Return a status before a slow model outlives the caller's HTTP timeout.
-        if restarting and scope in self.pending:
-            self.pending[scope].cancel()
-        progress = WorkingProgress(result,run)
-        self.progress[scope] = progress
-        task=asyncio.create_task(self.generate(scope,rowid,result,context,principal,run,progress))
-        self.pending[scope]=task
-        def done(job):
-            if self.pending.get(scope) is job:
-                self.pending.pop(scope,None)
-                self.progress.pop(scope,None)
-            if not job.cancelled() and job.exception():
-                log.error('Personal AIP worker taskId=%r sessionId=%r run_id=%s error=%s',
-                          *progress.ids, type(job.exception()).__name__)
-        task.add_done_callback(done)
-        try:return await asyncio.wait_for(asyncio.shield(task),timeout=1)
-        except TimeoutError:return progress.view(result)
-        except asyncio.CancelledError:
-            if not task.cancelled() or asyncio.current_task().cancelling():
-                raise
-            with self.database.connect() as db:
-                row = self.task_row(db,scope)
-                if not row:
-                    raise ManagementTaskError(-32001,'原任务已删除')
-                return turns.public_result(json.loads(row['document']))
-
-    def charge_visitor(self, db, owner, aic, scope_peer, visitor):
-        from datetime import timedelta
-        timestamp = now()
-        check_quota(db,owner,visitor,timestamp[:10])
-        if self.visitor_busy(db, aic, scope_peer):
-            raise ManagementTaskError(-32010, '该访客已有请求正在处理')
-        cutoff = (datetime.fromisoformat(timestamp)-timedelta(days=7)).isoformat()
-        db.execute('DELETE FROM town_visitor_requests WHERE created_at<?', (cutoff,))
-        db.execute('INSERT INTO town_visitor_requests VALUES(?,?,?)', (owner,visitor,timestamp))
-
-    @staticmethod
-    def visitor_busy(db, aic, peer):
-        return db.execute("""SELECT 1 FROM avatar_aip_tasks WHERE local_aic=? AND peer_aic=?
-            AND json_extract(document,'$.status.state')='working' AND deadline>? LIMIT 1""",
-            (aic,peer,time.time())).fetchone() is not None
+        return 'start', scope, (rowid, result, run, restarting)
 
     async def stop(self):
         if getattr(self,'peer_dialogues',None):await self.peer_dialogues.stop()
-        tasks=list(self.pending.values())
+        if self.accepting:
+            await asyncio.gather(*tuple(self.accepting), return_exceptions=True)
+        tasks = tuple(self.running)
         for task in tasks:task.cancel()
         await asyncio.gather(*tasks,return_exceptions=True)
 
@@ -454,7 +404,7 @@ class PersonalTaskService:
                 if not resume_safe(state, initial=not run.get('claimed'), automatic=run['automatic'], allow_question=False):
                     raise HTTPException(409,'上次操作尚无确定回执，请核对已有结果后重新发起任务')
                 await run_blocking(prepare_checkpoint, store, state, automatic=run['automatic'], allow_question=False)
-                active = self.target(owner, scope[0])
+                active = await run_blocking(self.target, owner, scope[0])
                 self.approved_skills(active,run['skills'])
                 with execution_guard(guard):
                     return await self.answer(active,context,result['sessionId'],principal=principal,
@@ -468,33 +418,35 @@ class PersonalTaskService:
                 remaining = progress.deadline()-time.time()
                 completed, _ = await asyncio.wait((task,),timeout=min(remaining,turns.RENEW_INTERVAL))
                 if not completed:
-                    renew()
+                    await run_blocking(renew)
             task.result()
             if committed is None:
                 raise RunConflict('缺少本次回答的提交回执')
             return committed
         except AgentNeedsInput as exc:
             state, message = pause_result(exc)
-            return turns.finish(self.database,rowid,result,run,state,message)
+            return await run_blocking(turns.finish, self.database,rowid,result,run,state,message)
         except asyncio.CancelledError:
             # Fence the writer before draining an interrupted provider or a blocking tool.
-            with self.database.connect(write=True) as db:
-                row = self.task_row(db,scope)
-                if row:
-                    doc = json.loads(row['document'])
-                    if doc['id']==writer and doc['status']['state']=='working':
-                        turns.interrupt_in(db,row,doc)
+            def interrupt():
+                with self.database.connect(write=True) as db:
+                    row = self.task_row(db,scope)
+                    if row:
+                        doc = json.loads(row['document'])
+                        if doc['id']==writer and doc['status']['state']=='working':
+                            turns.interrupt_in(db,row,doc)
+            await run_blocking(interrupt)
             raise
         except turns.WorkDeadlineExceeded:
-            return turns.finish(self.database,rowid,result,run,'failed',turns.TIMEOUT_MESSAGE,reason='working_timeout')
+            return await run_blocking(turns.finish, self.database,rowid,result,run,'failed',turns.TIMEOUT_MESSAGE,reason='working_timeout')
         except (RunConflict, TimeoutError, HTTPException, ManagementTaskError) as exc:
             message = (str(exc.detail) if isinstance(exc,HTTPException) else
                        '此次模型或工具调用超时，请重新发起任务' if isinstance(exc,TimeoutError) else str(exc))
-            return turns.finish(self.database,rowid,result,run,'failed',message,reason=type(exc).__name__)
+            return await run_blocking(turns.finish, self.database,rowid,result,run,'failed',message,reason=type(exc).__name__)
         except Exception as exc:
             log.error('Personal AIP generation taskId=%r sessionId=%r run_id=%s error=%s',
                       *progress.ids, type(exc).__name__)
-            return turns.finish(self.database,rowid,result,run,'failed','模型问答失败，请检查目标分身的模型配置或稍后再试')
+            return await run_blocking(turns.finish, self.database,rowid,result,run,'failed','模型问答失败，请检查目标分身的模型配置或稍后再试')
         finally:
             if not task.done():
                 task.cancel()
@@ -507,84 +459,5 @@ class PersonalTaskService:
         with self.database.connect() as db:
             return bool(db.execute('SELECT 1 FROM agent_dialogues WHERE id=? AND session_id=?',(command.get('taskId'),command.get('sessionId'))).fetchone())
 
-    # 职责：使用已通过本人鉴权的所有者资料和模型配置生成个人回答。
-    # 输入：target 为服务端固定目标，context 是认证 peer/group，session 来自协议会话。
-    # 结果与约束：不创建或绑定小镇用户账号；协议会话不混入 Web 历史，计费和压缩费用归目标所有者。
-    async def answer(self, target, context, session, *, principal=None, resume, store, progress, commit, stream_state, claim):
-        user = {'id': target['user_id'], 'username': target['username'], 'account_status': target['account_status']}
-        question = '\n\n用户补充：'.join(resume['inputs'])
-        request = ChatRequest(channel='avatar', message=question)
-        overview, model = self.chat.context(user, request, target, private_access=False)
-        config, key, system, history = model
-        config = {**config, '_aip_stream_state':stream_state, '_omit_source_citations':True}
-        if not config.get('_direct_chat'):
-            config = {**config, '_avatar_agent':True, '_allow_user_questions':False,
-                      '_agent_checkpoint':resume.get('checkpoint',{}),
-                      '_run_store':store, '_run_input_id':resume['input_id'], '_run_supplement':resume['supplement'],
-                      '_auto_recover':resume['automatic']}
-            prefix, raw = system.split('\n', 1)
-            background = json.loads(raw)
-            for name in ('available_skills', '_skills_revision'):
-                background.pop(name, None)
-            prefix += (' 当前为小镇临时会话，可检索和读取公开资料，按用户需求生成和交付文件。'
-                       '文件随协议回复交付，正文写结果和必要说明，不列 RAG 或源文件引用，不贴生成源码或虚构链接。'
-                       '工具按需使用，工作区只含本次任务文件，Python 和 HTML 预览均离线。'
-                       '无法中途提问；缺少信息时，在最终答复中说明缺口。')
-            if resume.get('clarification'):
-                background['last_clarification'] = resume['clarification']
-                prefix += ' last_clarification 是上一轮你向用户提出的问题，只用于理解本轮补充。'
-            system = prefix+'\n'+json.dumps(background,ensure_ascii=False)
-        model = (config, key, system, history)
-        caller = context.peer_aic if principal is None else 'visitor:' + principal['visitor_id']
-        platform = 'acps-direct' if principal is None else 'town-guest' if principal.get('anonymous') else 'town-public'
-        conversation_id = str(uuid.uuid5(uuid.NAMESPACE_URL, dump(['acps-direct', target['aic'], caller, context.group_id or '', session] if principal is None else [platform, target['aic'], context.peer_aic, caller, context.group_id or '', session])))
-        memory = self.chat.memory
-        conversation = memory.scope(user['id'], 'acps', target['aic'], conversation_id,
-                                    caller_id=caller, platform=platform, title='小镇公开访客对话' if principal else '小镇分身对话', create=True)
-        claim(conversation_id)
-        try:
-            from avatar.models.trace import model_io_scope
-            with model_io_scope(progress,private=False):
-                if config.get('_direct_chat'):
-                    progress({'type':'status','stage':'result_writing'})
-                    model = await self.chat.prepare_direct(model, conversation, question)
-                    result = await self.chat.model_client.generate(*model, question)
-                else:
-                    model = await memory.prepare(conversation, overview['agent']['last_modified_at'], model, question,
-                                                 self.chat.model_client, user['id'], progress=progress)
-                    from avatar.conversation.loop.town import bind_town_tools
-                    previous = await run_blocking(self.files.files_from_previous,int(store.scope_id),
-                                                  resume.get('previous_deliveries',()))
-                    async with self.files.workspace() as path:
-                        model = await bind_town_tools(self.chat,model,{**user,'aic':target['aic']},caller,
-                            conversation,path,store,progress,previous)
-                        result = await self.chat.rag.answer(model, question, progress=progress)
-            if not result.text.strip():
-                raise HTTPException(502, '模型未返回有效回答')
-            validate_sandbox = model[0].get('_validate_sandbox')
-            if validate_sandbox:
-                validate_sandbox()
-            outputs = model[0].get('_generated_files',())
-            originals = model[0].get('_react_public_files',())
-            reply = without_source_footer(result.text)
-            if not config.get('_direct_chat'):
-                attempted = model[0].get('_agent_checkpoint',{}).get('sandbox_attempted')
-                events = [{'group':'sandbox'}] if attempted else ()
-                reply = reply_with_artifacts(reply, outputs, events)
-                reply = re.sub(r'\[\[attachment:[^\]\r\n]+\]\]', '', reply).strip()
-            if not reply and (outputs or originals):
-                reply = '文件已随本轮答复交付。'
-            overview['_target'] = {'aic': target['aic'], 'name': overview['agent']['profile']['avatar_name']}
-            async with self.files.prepare(int(store.scope_id), outputs, originals) as delivery:
-                self.chat.save(user, request.model_copy(update={'channel': 'acps', 'conversation_id': conversation_id}),
-                               overview, reply, result.usage, caller_id=caller,
-                               commit_in=lambda db:commit(db,reply,files=delivery) if delivery else commit(db,reply))
-            return reply
-        except AgentNeedsInput as exc:
-            with self.database.connect(write=True) as db:
-                store.check_in(db)
-                if exc.usage:
-                    config = overview['agent']['model_config']
-                    db.execute('INSERT INTO model_calls(user_id,provider,model,usage,created_at,caller_id,conversation_id) VALUES(?,?,?,?,?,?,?)',
-                               (user['id'], config['provider'], config['model'], dump(exc.usage), now(), caller, conversation_id))
-                commit(db,exc.question or str(exc),pause=exc)
+    async def answer(self, target, context, session, **options):
+        return await answer_town(self.chat, self.files, target, context, session, **options)

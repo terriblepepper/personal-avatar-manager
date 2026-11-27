@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException
 
+from avatar.core.execution import run_blocking
 from avatar.core.db import dump, event, now
 from avatar.protocols.identity.atr_config import read_atr_config
 from avatar.protocols.identity.document import LocalEntityDirectory, identity_json
@@ -65,12 +66,14 @@ class PlatformCertificate:
             event(db, None, actor, '平台证书续签已排队')
 
     async def request(self, fingerprint, actor):
-        status = await asyncio.to_thread(self.status)
+        status = await run_blocking(self.status)
         current = status['certificate']
         if not current or current['id'] != fingerprint:
             raise HTTPException(409, '平台证书状态已变化或不可用，请刷新')
-        await asyncio.to_thread(self.queue, current, actor)
-        self.wake.set()
+        try:
+            await run_blocking(self.queue, current, actor)
+        finally:
+            self.wake.set()
 
     def claim(self):
         with self.database.connect(write=True) as db:
@@ -87,39 +90,45 @@ class PlatformCertificate:
             event(db, None, job['actor'], '平台证书续签结果', state)
 
     async def check(self):
-        config, current = await asyncio.to_thread(self.snapshot)
+        config, current = await run_blocking(self.snapshot)
         if current and datetime.fromisoformat(current['expires_at']) <= datetime.now(timezone.utc) + timedelta(days=1):
-            await asyncio.to_thread(self.queue, current, 'system', automatic=True)
-        job = await asyncio.to_thread(self.claim)
+            await run_blocking(self.queue, current, 'system', automatic=True)
+        job = await run_blocking(self.claim)
         if not job:
             return
         if not current or current['id'] != job['id']:
-            await asyncio.to_thread(self.finish, job, 'changed')
+            await run_blocking(self.finish, job, 'changed')
             return
         try:
             async with asyncio.timeout(self.settings.system_atr_call_timeout):
                 await maintain_registered(config, current['aic'], 'renew', expected_certificate=current['id'])
-                _, renewed = await asyncio.to_thread(self.snapshot)
+                _, renewed = await run_blocking(self.snapshot)
                 if (not renewed or renewed['aic'] != current['aic'] or renewed['id'] == current['id']
                         or datetime.fromisoformat(renewed['expires_at']) <= datetime.fromisoformat(current['expires_at'])):
                     raise ValueError('未读回有效的新证书')
-        except Exception:
-            await asyncio.to_thread(self.finish, job, 'unconfirmed')
+        except (Exception, asyncio.CancelledError):
+            await run_blocking(self.finish, job, 'unconfirmed')
             raise
-        await asyncio.to_thread(self.finish, job, 'done')
+        await run_blocking(self.finish, job, 'done')
 
-    async def run(self):
+    def recover(self):
         with self.database.connect(write=True) as db:
             job = self.job(db)
             if job.get('state') == 'running':
                 self.save(db, {**job, 'state':'unconfirmed', 'updated_at':now()})
+
+    async def run(self):
+        recovered = False
         while True:
             self.wake.clear()
             try:
+                if not recovered:
+                    await run_blocking(self.recover)
+                    recovered = True
                 await self.check()
             except Exception as error:
                 log.warning('平台证书检查未完成（%s）', type(error).__name__)
             try:
-                await asyncio.wait_for(self.wake.wait(), timeout=RENEWAL_SCAN_SECONDS)
+                await asyncio.wait_for(self.wake.wait(), timeout=RENEWAL_SCAN_SECONDS if recovered else 5)
             except TimeoutError:
                 pass

@@ -1,6 +1,7 @@
 import hashlib
 import json
 import asyncio
+from avatar.api.middleware import client_address
 from fastapi import APIRouter
 from fastapi import Depends
 from fastapi import Request
@@ -14,6 +15,7 @@ from avatar.accounts.schemas import PasswordChangeRequest
 from avatar.accounts.schemas import ContactChangeRequest
 from avatar.accounts.schemas import RegistrationRequest
 from avatar.accounts.schemas import PlatformEntryRequest
+from urllib.parse import urlencode
 
 
 router = APIRouter()
@@ -25,7 +27,6 @@ router = APIRouter()
 @router.post("/auth/register", status_code=201)
 def register(body: RegistrationRequest, request: Request, response: Response):
     if request.app.state.settings.oidc_enabled:
-        from fastapi import HTTPException
         raise HTTPException(403, '请通过 Keycloak 注册并登录')
     user_id=auth.create_user(request.app.state.database, body)
     if body.platform_entry_token:
@@ -71,11 +72,11 @@ def platform_binding(request: Request, user=Depends(auth.current_user)):
 
 
 # 职责：验证登录标识和密码并设置完整会话 Cookie。
-# 输入：body 为 LoginRequest，request.client.host 用于限流，response 写 Cookie。
+# 输入：body 为 LoginRequest，client_address(request) 用于限流，response 写 Cookie。
 # 结果与约束：成功返回账户和 CSRF，Cookie 有效 12 小时且 HttpOnly；失败与限流由认证服务处理。
 def password_session(body, request, response, *, ops_only=False):
     settings = request.app.state.settings
-    token, csrf, user = auth.login(request.app.state.database, body, request.client.host,
+    token, csrf, user = auth.login(request.app.state.database, body, client_address(request),
                                   root_only=settings.oidc_enabled, ops_only=ops_only)
     response.set_cookie("avatar_session", token, httponly=True, samesite="strict",
                         secure=settings.secure_cookie, max_age=43200)
@@ -122,7 +123,6 @@ async def logout(request: Request, response: Response, user=Depends(auth.current
     response.delete_cookie("avatar_session")
     result = {'message': '已退出'}
     if user.get('auth_source') == 'oidc':
-        from urllib.parse import urlencode
         settings = request.app.state.settings
         try:
             endpoint = (await request.app.state.oidc.discovery()).get('end_session_endpoint')
@@ -134,14 +134,13 @@ async def logout(request: Request, response: Response, user=Depends(auth.current
 
 
 # 职责：提供按注册邮箱或手机号匹配的 Demo 找回接口。
-# 输入：body 为规范化联系人与新密码，request.client.host 用于限流。
+# 输入：body 为规范化联系人与新密码，client_address(request) 用于限流。
 # 结果与约束：无需旧会话，统一返回匹配提示；身份强度受 Demo 简化要求限制，实际重置和撤销由认证服务完成。
 @router.post("/auth/recover-password")
 def recover_password(body: RecoveryRequest, request: Request):
     if request.app.state.settings.oidc_enabled:
-        from fastapi import HTTPException
         raise HTTPException(403, '请在 Keycloak 账户中心找回登录凭据；根管理员由本地运维恢复')
-    return auth.recover_password(request.app.state.database, body, request.client.host)
+    return auth.recover_password(request.app.state.database, body, client_address(request))
 
 
 # 职责：修改登录账户密码并清除当前 Cookie。

@@ -13,7 +13,7 @@ class BuildPlatform(build_py):
         frontend = root / 'frontend' / 'dist'
         ops = root / 'admin-frontend' / 'dist'
         if not self.editable_mode and any(not (site / 'index.html').is_file() for site in (frontend, ops)):
-            raise RuntimeError('缺少 Vue 构建产物；请先 cd frontend && npm ci && npm run build')
+            raise RuntimeError('缺少 Vue 构建产物；请先 cd frontend && npm ci --offline && npm run build')
         if resources.exists():
             rmtree(resources)  # Drop generated files from earlier builds before assembling the wheel.
         if frontend.is_dir():

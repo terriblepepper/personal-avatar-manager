@@ -7,7 +7,7 @@ from pathlib import Path, PurePosixPath
 import uuid
 from fastapi import HTTPException
 from avatar.core.db import now
-from avatar.files.library.attachments import TYPES, chat_file_limit
+from avatar.files.uploads.validation import TYPES, chat_file_limit
 from avatar.core.artifact_limits import MAX_SOURCE_BYTES
 from avatar.files.uploads.buffer import upload_buffer, upload_work
 from avatar.files.word_pdfs import WORD_SUFFIXES, link_word_pdf, prepare_word_pdf
@@ -38,7 +38,7 @@ def original_hashes(path, size, destination=None):
 def reference_count(db, conversation_id):
     return db.execute("""SELECT count(*) FROM chat_files
         WHERE conversation_id=? AND referenced=1 AND origin!='attachment'
-        AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))""",(conversation_id,)).fetchone()[0]
+        AND (expires_at IS NULL OR avatar_utc_time(expires_at)>CURRENT_TIMESTAMP)""",(conversation_id,)).fetchone()[0]
 
 
 # 职责：校验沙箱回传的新文件，路径只用于命名，宿主保存路径始终由服务端 UUID 决定。
@@ -62,7 +62,7 @@ class ConversationResources:
         with self.database.connect() as db:
             self.session(db,user_id,conversation_id)
             rows=[dict(row) for row in db.execute("""SELECT a.id,a.filename,a.relative_path,a.sha256,a.content_type,a.animation_metadata,a.size,a.caption AS description,a.created_at,'profile' AS source,
-                     EXISTS(SELECT 1 FROM chat_files f WHERE f.conversation_id=? AND f.sha256=a.sha256 AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now'))) AS already_referenced
+                     EXISTS(SELECT 1 FROM chat_files f WHERE f.conversation_id=? AND f.sha256=a.sha256 AND (f.expires_at IS NULL OR avatar_utc_time(f.expires_at)>CURRENT_TIMESTAMP)) AS already_referenced
                      FROM attachments a WHERE a.user_id=? ORDER BY a.created_at DESC,a.id""",(conversation_id,user_id))]
             folders={row['path']:row['caption'] for row in db.execute('SELECT path,caption FROM material_folders WHERE user_id=? ORDER BY path',(user_id,))}
         for row in rows:

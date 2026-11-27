@@ -8,8 +8,10 @@ import tempfile
 from pathlib import Path
 from fastapi import HTTPException
 from avatar.core.config import ROOT
-from avatar.files.library.attachments import AttachmentService, TYPES
+from avatar.files.uploads.validation import TYPES, inspect_file
 from avatar.files.parsing.images import jpeg_bytes
+from avatar.files.word_pdfs import WORD_SUFFIXES, read_word_pdf
+from avatar.models.model_config import require_complete
 
 MAX_ASSET = 10 * 1024 ** 3
 SOUL_FORMATS = 'Soul 仅支持 PNG、JPEG、WebP、GIF、BMP 图片及 MD、TXT、DOC、DOCX 文档'
@@ -60,12 +62,11 @@ def validate(filename, data, *, max_size=MAX_ASSET):
         raise HTTPException(422,'文件名无效')
     if not data or len(data)>max_size:raise HTTPException(413,'素材不能为空，Soul 上传总大小最多 10 GiB')
     require_asset_format(filename)
-    AttachmentService.inspect_file(filename,data,max_size=max_size)
+    inspect_file(filename,data,max_size=max_size)
     return ext,TYPES[ext],'image' if TYPES[ext].startswith('image/') else 'document'
 
 
 def require_media_model(config, types, *, credentials=False):
-    from avatar.models.model_config import require_complete
     if credentials:
         try:require_complete(config)
         except HTTPException:raise HTTPException(409,'上传 Soul 音视频前，请先配置可解析该素材的多模态模型及 API Key') from None
@@ -110,7 +111,6 @@ def extract(path, filename, kind, config):
                  'images':[{'mime_type':'image/jpeg','data':image}]}], '图片原件经有界缩放后分析'
     if kind=='document':
         extension=Path(filename).suffix.lower()
-        from avatar.files.word_pdfs import WORD_SUFFIXES, read_word_pdf
         if extension in WORD_SUFFIXES:
             try:
                 pdf, vector = read_word_pdf(path)

@@ -26,17 +26,17 @@ async def manage(args, settings, database):
         from avatar.protocols.registration.entity import staged_entity_metadata
         with database.connect() as db:
             rows = db.execute('SELECT user_id,aic FROM avatar_records ORDER BY user_id').fetchall()
-        for row in rows:
-            if args.user_id and row['user_id'] != args.user_id:
-                continue
-            if args.all_demo and not row['aic'].startswith('DEMO-'):
-                continue
-            endpoint = entity_endpoint(settings,row['user_id'],allocate=False)
-            staged = staged_entity_metadata(settings.data_dir, row['user_id']) or {}
-            print(json.dumps({'user_id': row['user_id'], 'current_aic': row['aic'],
-                              'staged_aic': staged.get('aic'), 'endpoint': endpoint,
-                              'entityMeta': entity_oidc_identity(settings, row['user_id']),
-                              'notice': '只读规划；未分配端口仅展示当前可用候选，执行注册时在事务内固定端口'}, ensure_ascii=False))
+            for row in rows:
+                if args.user_id and row['user_id'] != args.user_id:
+                    continue
+                if args.all_demo and not row['aic'].startswith('DEMO-'):
+                    continue
+                endpoint = entity_endpoint(settings,row['user_id'],allocate=False,db=db)
+                staged = staged_entity_metadata(settings.data_dir, row['user_id']) or {}
+                print(json.dumps({'user_id': row['user_id'], 'current_aic': row['aic'],
+                                  'staged_aic': staged.get('aic'), 'endpoint': endpoint,
+                                  'entityMeta': entity_oidc_identity(settings, row['user_id'], db=db),
+                                  'notice': '只读规划；未分配端口仅展示当前可用候选，执行注册时在事务内固定端口'}, ensure_ascii=False))
         return
     service = EntityLifecycleService(database, settings)
     with database.connect() as db:

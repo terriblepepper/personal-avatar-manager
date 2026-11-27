@@ -1,5 +1,6 @@
 """经过真实 mTLS 认证的本平台分身任务；不借用最终用户令牌，不开放任意跨账户调用。"""
 import asyncio
+from weakref import WeakValueDictionary
 import hashlib
 import json
 import uuid
@@ -12,7 +13,7 @@ from avatar.conversation.collaboration.tools import task_tool_result
 from avatar.conversation.loop.peer import PeerTurn, speaker as turn_speaker, wire_id
 from avatar.conversation.loop.store import RunStore
 from avatar.core.db import now,dump
-from avatar.core.execution import AgentNeedsInput
+from avatar.core.execution import AgentNeedsInput, run_blocking, finish_on_cancel
 from avatar.protocols.tasks.store import ManagementTaskError
 from avatar.protocols.transport.endpoints import entity_oidc_identity
 
@@ -21,6 +22,7 @@ from avatar.protocols.transport.endpoints import entity_oidc_identity
 class PeerDialogueTasks:
     def __init__(self,dialogues,settings=None):
         self.dialogues=dialogues;self.database=dialogues.database;self.running={}
+        self.scope_locks = WeakValueDictionary()
         self.settings=settings or dialogues.transport.acps.runtime.settings
 
     def scope(self,command,context,user_id,db):
@@ -57,7 +59,7 @@ class PeerDialogueTasks:
     def latest(db, scope):
         return db.execute(
             'SELECT command_id,state,document FROM agent_wire_results '
-            'WHERE local_aic=? AND peer_aic=? AND task_id=? AND session_id=? ORDER BY rowid DESC LIMIT 1', scope
+            'WHERE local_aic=? AND peer_aic=? AND task_id=? AND session_id=? ORDER BY result_number DESC LIMIT 1', scope
         ).fetchone()
 
     @staticmethod
@@ -98,20 +100,39 @@ class PeerDialogueTasks:
             raise ManagementTaskError(-32602,'不支持的分身任务命令')
         key = (context.local_aic,context.peer_aic,command['id'])
         scope = (*key[:2],command['taskId'],command['sessionId'])
-        if operation == 'get':
-            with self.database.connect() as db:
-                task = self.scope(command,context,user_id,db)
-                latest = self.latest(db,scope)
-                self.validate_delivery(db,task,user_id)
-                if (latest and latest['state'] == 'working' and scope not in self.running
-                        and task.get('status') == 'running' and task.get('id') and turn_speaker(task)==user_id
-                        and latest['command_id']==wire_id(db,task,user_id)
-                        and PeerTurn.recoverable(self.dialogues.executor,db,task)):
-                    self.schedule(task,user_id,command,context,scope,(*key[:2],latest['command_id']))
-            if not latest:
-                raise ManagementTaskError(-32001,'该方向没有已受理的任务')
-            return json.loads(latest['document'])
+        async with self.scope_locks.setdefault(scope, asyncio.Lock()):
+            # Once a command commits, schedule its generation or cancellation even if the RPC disconnects.
+            return await finish_on_cancel(self.handle_locked(command,context,user_id,operation,key,scope))
 
+    async def handle_locked(self,command,context,user_id,operation,key,scope):
+        if operation == 'get':
+            result, task, resume = await run_blocking(self.read_command, command, context, user_id, scope, key, scope not in self.running)
+            if resume:
+                self.schedule(task, user_id, command, context, scope, resume)
+        else:
+            result, task, fresh = await run_blocking(self.accept_command, command, context, user_id, scope, key, operation)
+            if fresh and operation == 'cancel' and (active := self.running.get(scope)):
+                active.cancel()
+            elif fresh and result['status']['state'] == 'working':
+                self.schedule(task, user_id, command, context, scope, key)
+        return result
+
+    def read_command(self, command, context, user_id, scope, key, idle):
+        resume = None
+        with self.database.connect() as db:
+            task = self.scope(command,context,user_id,db)
+            latest = self.latest(db,scope)
+            self.validate_delivery(db,task,user_id)
+            if (latest and latest['state'] == 'working' and idle
+                    and task.get('status') == 'running' and task.get('id') and turn_speaker(task)==user_id
+                    and latest['command_id']==wire_id(db,task,user_id)
+                    and PeerTurn.recoverable(self.dialogues.executor,db,task)):
+                resume = (*key[:2],latest['command_id'])
+        if not latest:
+            raise ManagementTaskError(-32001,'该方向没有已受理的任务')
+        return json.loads(latest['document']), task, resume
+
+    def accept_command(self, command, context, user_id, scope, key, operation):
         semantic = {field: command.get(field) for field in
                     ('command','taskId','sessionId','groupId','commandParams','dataItems','mentions')}
         digest = hashlib.sha256(json.dumps(semantic,sort_keys=True,separators=(',',':')).encode()).hexdigest()
@@ -124,12 +145,12 @@ class PeerDialogueTasks:
                 if receipt['fingerprint'] != digest:
                     raise ManagementTaskError(-32602,'命令 ID 已用于其他请求')
                 if receipt['document'] is not None:
-                    return json.loads(receipt['document'])
+                    return json.loads(receipt['document']), task, False
             prior = db.execute('SELECT * FROM agent_wire_results WHERE local_aic=? AND peer_aic=? AND command_id=?',key).fetchone()
             if prior:
                 if receipt is None or is_control or (prior['task_id'],prior['session_id']) != scope[2:]:
                     raise ManagementTaskError(-32602,'命令 ID 已用于其他请求')
-                return json.loads(prior['document'])
+                return json.loads(prior['document']), task, False
             latest = self.latest(db,scope)
             if is_control:
                 result = self.control(db,operation,latest,key)
@@ -155,14 +176,7 @@ class PeerDialogueTasks:
                            (command['id'],*key[:2],command['sessionId'],command['taskId'],state,dump(result)))
             db.execute('INSERT INTO agent_wire_receipts(local_aic,peer_aic,command_id,fingerprint,document) VALUES(?,?,?,?,?)',
                        (*key,digest,dump(result) if is_control else None))
-        if is_control:
-            # 先持久化终态，再取消本进程的调用；迟到的回写必须仍匹配 working。
-            if operation == 'cancel' and (active := self.running.get(scope)):
-                active.cancel()
-            return result
-        if result['status']['state']=='awaiting-completion':return result
-        self.schedule(task,user_id,command,context,scope,key)
-        return result
+        return result, task, True
 
     def schedule(self,task,user_id,command,context,scope,key):
         task = {**task, '_wire_key':key}
@@ -218,8 +232,9 @@ class PeerDialogueTasks:
             result['status']['dataItems']=[{'type':'data','data':{'peerReplyTimedOut':True}}]
         except Exception:
             result=self.result(command,context,'failed','接收方生成失败，请检查模型配置；未自动重新调用')
-        finally:
-            if self.running.get(scope) is asyncio.current_task():self.running.pop(scope,None)
+        return await run_blocking(self.save_result, result, task, user_id, command, context, key)
+
+    def save_result(self, result, task, user_id, command, context, key):
         with self.database.connect(write=True) as db:
             if result['status']['state'] in ('awaiting-completion','awaiting-input') and task.get('id'):
                 try:

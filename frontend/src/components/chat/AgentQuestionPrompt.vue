@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, useId, watch } from 'vue'
 import AppDialog from '../AppDialog.vue'
-import { chatTextFits } from '../../chatTextBudget'
+import { chatTextFits } from '../../utils/chatTextBudget'
 import type { AgentQuestion, QuestionReply } from '../../types'
 import { requestId } from '../../utils/requestId'
 

@@ -1,5 +1,6 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, expect, it, vi } from 'vitest'
+import { marked } from 'marked'
 import FilePreview from '../src/components/FilePreview.vue'
 import MarkdownContent from '../src/components/MarkdownContent.vue'
 import MermaidDiagram from '../src/components/MermaidDiagram.vue'
@@ -42,10 +43,11 @@ it('opens the authorized manual by chapter and navigates by accessible contents 
 })
 
 it.each(['txt', 'pdf'])('cycles matching %s pages forwards and backwards, including wraparound', async ext => {
+  const reads = vi.fn()
   pdfPage.mockImplementation(async (number: number) => ({
     getViewport: () => ({ width: 100, height: 100 }),
     render: () => ({ promise: Promise.resolve(), cancel() {} }),
-    getTextContent: async () => ({ items: number === 2 ? [{ str: 'other' }] : [{ str: 'a' }, { str: 'BC' }] }),
+    getTextContent: async () => { reads(number); return { items: number === 2 ? [{ str: 'other' }] : [{ str: 'a' }, { str: 'BC' }] } },
   }))
   vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(null)
   const content = 'aBC'.padEnd(12000, '.') + 'other'.padEnd(12000, '.') + 'aBC'
@@ -67,6 +69,7 @@ it.each(['txt', 'pdf'])('cycles matching %s pages forwards and backwards, includ
   await search.setValue('missing')
   await enter()
   expect(wrapper.text()).toContain('未找到匹配内容')
+  if (ext === 'pdf') expect(reads.mock.calls.flat().sort()).toEqual([1, 2, 3])
   wrapper.unmount()
 })
 
@@ -83,6 +86,21 @@ it('keeps code and tables while removing active HTML and external tracking image
   expect(view.find('img').exists()).toBe(false)
   expect(view.find('[onerror]').exists()).toBe(false)
   expect(view.find('a[href^="javascript:"]').exists()).toBe(false)
+})
+
+it('reuses completed prose while resolving later reference links and replacing edited snapshots', async () => {
+  const lexer = vi.spyOn(marked, 'lexer')
+  const prefix = '已完成 **第一段**。\n\n'
+  const view = mount(MarkdownContent, {props:{source:prefix + '[网址]', streaming:true}})
+  const paragraph = view.get('p').element
+  lexer.mockClear()
+  await view.setProps({source:prefix + '[网址]\n\n[网址]: https://example.com'})
+  expect(lexer.mock.calls.at(-1)?.[0]).not.toContain('第一段')
+  expect(view.get('p').element).toBe(paragraph)
+  expect(view.get('a').attributes('href')).toBe('https://example.com/')
+  await view.setProps({source:'改写', streaming:false})
+  expect(view.text()).toBe('改写')
+  view.unmount()
 })
 
 it('zooms the isolated diagram while preserving its layout height', async () => {

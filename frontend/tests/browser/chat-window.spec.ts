@@ -15,10 +15,10 @@ const content = (id: number) => {
   return `第 ${id} 条工作记录。已整理讨论结果并更新会话。\n\n本轮资料已复核。`
 }
 
-async function login(page: Page) {
+async function login(page: Page, username: string) {
   await page.goto('/')
-  await page.locator('input[name=username]').fill('browser-user')
-  await page.locator('input[name=password]').fill('browser-user-password')
+  await page.locator('input[name=username]').fill(username)
+  await page.locator('input[name=password]').fill(username + '-password')
   await page.getByRole('button', { name: /登录工作台/ }).click()
   await expect(page.locator('.shell')).toBeVisible()
 }
@@ -74,9 +74,11 @@ async function desktopPanels(page: Page, scope: Locator) {
   const more = scope.locator('summary[aria-label="会话操作"]')
   await more.click()
   await scope.getByText('表达风格学习', { exact: true }).click()
+  await expect(scope.getByRole('checkbox', {name:'自动学习本人表达'})).toBeEnabled()
   await inspect('表达风格学习', scope.locator('.chat-menu-subpanel'))
   await more.click()
-  for (const name of ['常用提问', '技能', '文件', '工具']) {
+  await expect(scope.locator('.composer-tool > summary').filter({hasText:'技能'})).toHaveCount(0)
+  for (const name of ['常用提问', '文件', '工具']) {
     const trigger = scope.locator('.chat-compose-actions .composer-tool > summary').filter({ hasText: name })
     await trigger.click()
     await inspect(name, trigger.locator('..').locator(':scope > .composer-popover'))
@@ -198,15 +200,21 @@ for (const mobile of [false, true]) {
     for (const peer of [false, true]) {
       const view = peer ? 'peer' : 'personal'
       test(`${view} window controls and anchored history`, async ({ page }, info) => {
-        await login(page)
+        const styleEnabled = !peer && !mobile
+        await login(page, styleEnabled ? 'browser-style' : 'browser-user')
         const conversations = await page.request.get('/api/conversations?channel=assistant&personal=true')
         expect(conversations.ok()).toBe(true)
-        const resource = (await conversations.json()).default_id
+        const {default_id: resource, embedding_configured} = await conversations.json()
+        expect(embedding_configured).toBe(styleEnabled)
         expect(resource).toBeTruthy()
         const pages = await history(page, peer, resource)
         try {
           await page.goto(peer ? '/dialogues?session=' + session : '/chat')
           const scope = peer ? page.getByRole('dialog', { name: '分身间会话' }) : page.locator('#personal-chat-card')
+          if (!peer && !styleEnabled) {
+            await expect(scope.getByText('请配置嵌入模型', {exact: true})).toBeVisible()
+            await expect(scope.getByText('表达风格学习', {exact: true})).toHaveCount(0)
+          }
           const log = scope.getByRole('log')
           const rows = log.locator('[data-history-message]')
           const size = peer ? 10 : 20

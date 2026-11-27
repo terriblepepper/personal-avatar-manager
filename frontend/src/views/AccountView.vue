@@ -5,11 +5,106 @@ import { request, notifyError } from '../api/client'
 import { useSessionStore } from '../stores/session'
 import TownAccessLimits from '../components/TownAccessLimits.vue'
 import { isAdministrator } from '../utils/accountRole'
-const session=useSessionStore(), contacts=reactive({email:'',phone:'',current_password:''}), password=reactive({current_password:'',new_password:'',confirm_password:''})
+const session = useSessionStore(),
+  contacts = reactive({
+    email: '',
+    phone: '',
+    current_password: ''
+  }),
+  password = reactive({
+    current_password: '',
+    new_password: '',
+    confirm_password: ''
+  })
 const user=computed(()=>session.user)
 watch(user, value=>{contacts.email=value?.email||'';contacts.phone=value?.phone||''},{immediate:true})
-async function saveContacts(){try{await request('/auth/contacts','PUT',contacts);contacts.current_password='';await session.refresh();ElMessage.success('登录联系方式已保存')}catch(e){notifyError(e)}}
-async function demote(){if(!user.value || user.value.is_root)return;try{await ElMessageBox.confirm('确认将自己降级为普通用户？管理权限会立即撤销。','确认降级');await request('/admin/accounts/'+encodeURIComponent(user.value.id)+'/role','PUT',{role:'user'});await session.refresh();ElMessage.success('已降级为普通用户')}catch(e){if(e!=='cancel'&&e!=='close')notifyError(e)}}
-async function savePassword(){if(password.new_password!==password.confirm_password){ElMessage.error('两次新密码输入不一致');return}try{await request('/auth/change-password','POST',{current_password:password.current_password,new_password:password.new_password});session.clear();ElMessage.success('密码已修改，请重新登录')}catch(e){notifyError(e)}}
+async function saveContacts() {
+  try {
+    await request('/auth/contacts', 'PUT', contacts);
+    contacts.current_password = '';
+    await session.refresh();
+    ElMessage.success('登录联系方式已保存')
+  } catch (e) {
+    notifyError(e)
+  }
+}
+async function demote() {
+  if (!user.value || user.value.is_root) return;
+  try {
+    await ElMessageBox.confirm('确认将自己降级为普通用户？管理权限会立即撤销。', '确认降级');
+    await request('/admin/accounts/' + encodeURIComponent(user.value.id) + '/role', 'PUT', {
+      role: 'user'
+    });
+    await session.refresh();
+    ElMessage.success('已降级为普通用户')
+  } catch (e) {
+    if (e !== 'cancel' && e !== 'close') notifyError(e)
+  }
+}
+async function savePassword() {
+  if (password.new_password !== password.confirm_password) {
+    ElMessage.error('两次新密码输入不一致');
+    return
+  }
+  try {
+    await request('/auth/change-password', 'POST', {
+      current_password: password.current_password,
+      new_password: password.new_password
+    });
+    session.clear();
+    ElMessage.success('密码已修改，请重新登录')
+  } catch (e) {
+    notifyError(e)
+  }
+}
 </script>
-<template><div class="pagehead"><h1>账户设置</h1><p class="sub">{{ user?.auth_source==='oidc' ? '登录身份由 Keycloak 管理，个人资料与登录联系方式分别保存。' : '管理本地账户密码。' }}</p></div><TownAccessLimits v-if="user && user.access_scope!=='profile'"/><section v-if="user && isAdministrator(user)" class="card"><h2>管理权限</h2><p class="sub">{{ user.is_root ? '根管理员 admin 保留管理权限。可通过页面右上角切换个人中心与管理控制台。' : '管理员和超级管理员均可管理平台。本人可取消管理权限并恢复为普通用户。' }}</p><el-button v-if="!user.is_root" class="danger" @click="demote">将自己降级为普通用户</el-button></section><section v-if="user?.auth_source==='oidc'" class="card"><h2>统一认证账户</h2><p>密码和恢复联系方式由认证平台管理。</p><a v-if="session.authConfig?.account_url" class="button small" :href="session.authConfig.account_url" rel="noreferrer">打开账户中心</a></section><template v-else><section v-if="!user?.is_root" class="card"><h2>登录联系方式</h2><form @submit.prevent="saveContacts"><div class="formgrid"><label class="field">登录邮箱 *<el-input placeholder=" " v-model="contacts.email" type="email" required maxlength="160"/></label><label class="field">登录手机号（选填）<el-input placeholder=" " v-model="contacts.phone" maxlength="40"/></label><label class="field">当前密码<el-input placeholder=" " v-model="contacts.current_password" type="password" required minlength="8" maxlength="128"/></label></div><el-button type="primary" native-type="submit">保存登录联系方式</el-button></form></section><section v-else class="card"><h2>本地根管理员</h2><p>根管理员不绑定手机号，不关联 Keycloak；本地密码只用于本系统。</p></section><section class="card"><h2>修改密码</h2><form @submit.prevent="savePassword"><div class="formgrid"><label class="field">当前密码<el-input placeholder=" " v-model="password.current_password" type="password" required minlength="8" maxlength="128"/></label><label class="field">新密码<el-input placeholder=" " v-model="password.new_password" type="password" required minlength="8" maxlength="128"/></label><label class="field">确认新密码<el-input placeholder=" " v-model="password.confirm_password" type="password" required minlength="8" maxlength="128"/></label></div><p>修改成功后所有登录会话失效，请重新登录。</p><el-button type="primary" native-type="submit">修改密码</el-button></form></section></template></template>
+<template>
+  <div class="pagehead">
+    <h1>账户设置</h1>
+    <p class="sub">{{ user?.auth_source==='oidc' ? '登录身份由 Keycloak 管理，个人资料与登录联系方式分别保存。' : '管理本地账户密码。' }}</p>
+  </div>
+  <TownAccessLimits v-if="user && user.access_scope!=='profile'" />
+  <section v-if="user && isAdministrator(user)" class="card">
+    <h2>管理权限</h2>
+    <p class="sub">{{ user.is_root ? '根管理员 admin 保留管理权限。可通过页面右上角切换个人中心与管理控制台。' : '管理员和超级管理员均可管理平台。本人可取消管理权限并恢复为普通用户。' }}</p>
+    <el-button v-if="!user.is_root" class="danger" @click="demote">将自己降级为普通用户</el-button>
+  </section>
+  <section v-if="user?.auth_source==='oidc'" class="card">
+    <h2>统一认证账户</h2>
+    <p>密码和恢复联系方式由认证平台管理。</p>
+    <a v-if="session.authConfig?.account_url" class="button small" :href="session.authConfig.account_url" rel="noreferrer">
+      打开账户中心</a>
+  </section>
+  <template v-else>
+    <section v-if="!user?.is_root" class="card">
+      <h2>登录联系方式</h2>
+      <form @submit.prevent="saveContacts">
+        <div class="formgrid">
+          <label class="field">登录邮箱 *<el-input placeholder=" " v-model="contacts.email" type="email" required
+              maxlength="160" /></label>
+          <label class="field">登录手机号（选填）<el-input placeholder=" " v-model="contacts.phone" maxlength="40" /></label>
+          <label class="field">当前密码<el-input placeholder=" " v-model="contacts.current_password" type="password" required
+              minlength="8" maxlength="128" /></label>
+        </div><el-button type="primary" native-type="submit">保存登录联系方式</el-button>
+      </form>
+    </section>
+    <section v-else class="card">
+      <h2>本地根管理员</h2>
+      <p>根管理员不绑定手机号，不关联 Keycloak；本地密码只用于本系统。</p>
+    </section>
+    <section class="card">
+      <h2>修改密码</h2>
+      <form @submit.prevent="savePassword">
+        <div class="formgrid">
+          <label class="field">当前密码<el-input placeholder=" " v-model="password.current_password" type="password" required
+              minlength="8" maxlength="128" /></label>
+          <label class="field">新密码<el-input placeholder=" " v-model="password.new_password" type="password" required
+              minlength="8" maxlength="128" /></label>
+          <label class="field">确认新密码<el-input placeholder=" " v-model="password.confirm_password" type="password" required
+              minlength="8" maxlength="128" /></label>
+        </div>
+        <p>修改成功后所有登录会话失效，请重新登录。</p><el-button type="primary" native-type="submit">修改密码</el-button>
+      </form>
+    </section>
+  </template>
+</template>

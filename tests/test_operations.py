@@ -222,7 +222,8 @@ def service_workspace(tmp_path):
             ' out.write(json.dumps([Path(sys.argv[0]).name,*sys.argv[1:]])+"\\n")\n')
         executable.chmod(0o755)
     env = {**os.environ, 'PATH': str(binaries) + os.pathsep + os.environ['PATH'],
-           'XDG_CONFIG_HOME': str(root / 'config'), 'AVATAR_TEST_COMMANDS': str(commands)}
+           'XDG_CONFIG_HOME': str(root / 'config'), 'AVATAR_TEST_COMMANDS': str(commands),
+           'AVATAR_SANDBOX_RUNTIME': ''}
     def call(*args):
         return subprocess.run(['bash', str(root / 'service.sh'), *args], cwd=root,
                               env=env, capture_output=True, text=True, timeout=10)
@@ -328,6 +329,7 @@ def test_service_install_preserves_path_and_starts_systemd_once(service_workspac
     assert result.returncode == 0, result.stderr
     unit = workspace.root / 'config/systemd/user/personal-avatar.service'
     text = unit.read_text()
+    assert 'ExecStopPost=' not in text
     assert f'WorkingDirectory={workspace.root}\n' in text, 'Template substitution must preserve & and |'
     assert f'ExecStart="{workspace.root}/run.sh"\n' in text, 'The foreground entry point must remain stable'
     assert workspace.calls() == [
@@ -340,7 +342,7 @@ def test_service_install_preserves_path_and_starts_systemd_once(service_workspac
     assert workspace.calls()[-1] == ['systemctl', '--user', 'stop', 'personal-avatar.service']
 
 
-def test_postgres_lifecycle_follows_service_start_and_stop(service_workspace):
+def test_application_stop_leaves_postgres_running(service_workspace):
     workspace = service_workspace
     pg_home = workspace.root / 'pg-home'
     binaries = pg_home / 'usr/lib/postgresql/16/bin'
@@ -376,10 +378,8 @@ def test_postgres_lifecycle_follows_service_start_and_stop(service_workspace):
             ['pg_ctl', '-D', str(data / 'pgsql'), 'status'],
             ['pg_ctl', '-D', str(data / 'pgsql'), '-l', str(data / 'pgsql.startup.log'), '-w', 'start'],
             ['curl', '-fsS', '--max-time', '2', 'http://127.0.0.1:18443/api/health'],
-            ['pg_ctl', '-D', str(data / 'pgsql'), 'status'],
-            ['pg_ctl', '-D', str(data / 'pgsql'), '-m', 'fast', 'stop'],
-        ], 'The database must start before the app and stop after it'
-        assert not (data / 'pg-state').exists(), 'Stop must shut the database down'
+        ], 'Only startup may access PostgreSQL'
+        assert (data / 'pg-state').exists(), 'PostgreSQL stays available to other clients'
     finally:
         pid_file = data / 'avatar.pid'
         if pid_file.exists():
@@ -404,13 +404,18 @@ def test_optional_cache_with_no_installed_server(tmp_path):
     assert degraded.returncode == 0 and 'Redis' in degraded.stderr
     assert not (cache / 'redis.sock').exists()
 
+@pytest.mark.quick
 def test_release_contains_locked_cache_client_and_only_public_files(tmp_path):
     import tomllib
     import hashlib
-    from scripts.build_release import copy_redis
+    from scripts.build_release import copy_release_dependencies
 
     (tmp_path / 'dependencies').mkdir()
-    copy_redis(tmp_path)
+    copy_release_dependencies(tmp_path)
+    assert {f.name for f in (tmp_path / 'kafka').iterdir()} == {'broker.env', 'service.sh'}
+    wheels = {f.name for f in (tmp_path / 'dependencies').iterdir()}
+    assert wheels == {f.name for f in (ROOT / 'vendor/wheels').glob('*.whl')}
+    assert len(wheels) == 5
     assert {f.name for f in (tmp_path / 'redis').iterdir()} == {'redis.conf', 'service.sh'}
     assert os.access(tmp_path / 'redis' / 'service.sh', os.X_OK)
     package = next(p for p in tomllib.loads((ROOT / 'uv.lock').read_text())['package'] if p['name'] == 'redis')
@@ -442,7 +447,9 @@ def test_spa_refresh_keeps_api_static_and_unknown_paths_distinct(tmp_path):
     (dist / 'assets' / 'app-123.js').write_text('export const app = 1')
     (dist / 'static').mkdir()
     (dist / 'static' / 'system-avatar.svg').write_text('<svg/>')
+    from avatar.api.middleware import SecurityMiddleware
     app = FastAPI()
+    app.add_middleware(SecurityMiddleware, public_url='https://app.example')
 
     @app.get('/api/me')
     def me():
@@ -450,6 +457,9 @@ def test_spa_refresh_keeps_api_static_and_unknown_paths_distinct(tmp_path):
 
     mount_frontend(app, dist)
     client = TestClient(app)
+    for path in ('/', '/chat', '/admin'):
+        assert "worker-src 'self' blob:" in client.get(path).headers['content-security-policy']
+    assert "worker-src 'none'" in client.get('/static/preview/html.html').headers['content-security-policy']
     assert 'Vue' in client.get('/chat').text
     assert 'Vue' in client.get('/admin/reviews').text
     assert 'Vue' in client.get('/admin/custom-section').text
@@ -571,3 +581,224 @@ def test_generation_and_rag_share_the_execution_authorization_context():
     with generation_scope({'authorization': json.dumps(scope)}):
         assert authorization() == scope
     assert authorization() is None
+
+
+def test_asgi_guard_checks_chunked_body_before_dispatch_and_static_origin():
+    import asyncio
+    import httpx
+    from avatar.api.middleware import SecurityMiddleware
+
+    writes = []
+    async def write(scope, receive, send):
+        writes.append(scope['path'])
+        await send({'type':'http.response.start','status':204,'headers':[]})
+        await send({'type':'http.response.body','body':b''})
+
+    async def chunks(size):
+        yield b'x' * 65535
+        yield b'x' * (size - 65535)
+
+    async def check():
+        app = SecurityMiddleware(write, public_url='https://APP.example:443/platform')
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='https://host.example') as client:
+            assert (await client.post('/api/write', content=chunks(65537))).status_code == 413
+            assert (await client.post('/api/write', headers={'origin':'https://host.example'})).status_code == 403
+            assert (await client.post('/api/write', content=chunks(65536), headers={'origin':'https://app.example'})).status_code == 204
+        assert writes == ['/api/write']
+    asyncio.run(check())
+
+
+def test_pool_pressure_preserves_busy_leases():
+    import asyncio
+    import httpx
+    from avatar.core.http_pool import HttpTransportPool
+
+    async def check():
+        pool = HttpTransportPool()
+        pool.capacity = 1
+        created = []
+        async def connect(url):
+            created.append(url.host)
+            return (url.host,), httpx.MockTransport(lambda req: httpx.Response(200))
+        first, other = httpx.URL('https://a.example'), httpx.URL('https://b.example')
+        async with pool.lifespan():
+            async with pool.session(first, connect, 1):
+                async with pool.session(other, connect, 1):
+                    pass
+                async with pool.session(first, connect, 1) as (_, client):
+                    assert (await client.get(first)).status_code == 200
+            assert created == ['a.example', 'b.example']
+    asyncio.run(check())
+
+
+def test_rate_limit_client_uses_only_trusted_proxy_chain(monkeypatch):
+    from starlette.requests import Request
+    from avatar.api.middleware import client_address
+    from avatar.core.config import Settings
+    monkeypatch.setenv('AVATAR_TRUSTED_PROXIES','192.168.80.0/24')
+    app = SimpleNamespace(state=SimpleNamespace(settings=Settings()))
+    def request(peer, forwarded):
+        return Request({'type':'http','app':app,'client':(peer,1) if peer else None,
+                        'headers':[(b'x-forwarded-for',forwarded.encode())]})
+    assert client_address(request(None, '8.8.8.8')) == 'unknown'
+    assert client_address(request('192.168.81.1','8.8.8.8')) == '192.168.81.1'
+    assert client_address(request('192.168.80.1','1.1.1.1, 8.8.8.8, 192.168.80.2')) == '8.8.8.8'
+    assert client_address(request('192.168.80.1','8.8.8.8, invalid')) == '192.168.80.1'
+
+
+def test_sandbox_input_refuses_nonpublic_dns_before_fetch(monkeypatch):
+    import asyncio
+    import socket
+    from avatar.sandbox.https_inputs import fetch_inputs
+    monkeypatch.setenv('AVATAR_SANDBOX_HTTPS_RESOURCES','{"sample":"https://fixture.example/data"}')
+    monkeypatch.setattr(socket,'getaddrinfo',lambda *args,**kwargs: [
+        (socket.AF_INET,socket.SOCK_STREAM,6,'',(ip,443)) for ip in ('8.8.8.8','127.0.0.1')])
+    import httpx
+    def reject_network(*args,**kwargs):
+        pytest.fail('client opened before validating DNS')
+    monkeypatch.setattr(httpx,'AsyncClient',reject_network)
+    with pytest.raises(ValueError):
+        asyncio.run(fetch_inputs(['sample']))
+
+
+def test_list_query_bounds_are_checked_before_service_calls():
+    from avatar.accounts.auth import current_user
+    from avatar.api.collaboration_routes import router
+
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[current_user] = lambda: {'id':'owner'}
+    client = TestClient(app, raise_server_exceptions=False)
+    for query in ({'offset':'-1'}, {'offset':str(2**31)}, {'search':'a'*201}):
+        assert client.get('/api/agent-sessions',params=query).status_code == 422
+
+
+def test_background_capability_probes_drain_errors_and_cancellation(caplog):
+    import asyncio
+    from avatar.models.probes import CapabilityProbes
+
+    async def run():
+        probes = CapabilityProbes()
+        started, stopped = asyncio.Event(), asyncio.Event()
+
+        async def long_probe():
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                stopped.set()
+
+        async def broken_probe():
+            raise RuntimeError('probe failure')
+
+        probes.start(broken_probe(), name='failing-probe')
+        probes.start(long_probe(), name='pending-probe')
+        await started.wait()
+        await probes.close()
+        assert stopped.is_set()
+
+    asyncio.run(run())
+    assert 'failing-probe' in caplog.text and 'probe failure' in caplog.text
+
+
+def test_sandbox_resource_uses_pinned_tls_and_ignores_proxies(monkeypatch):
+    import asyncio
+    import socket
+    import httpx
+    from avatar.sandbox import https_inputs
+    monkeypatch.setenv('AVATAR_SANDBOX_HTTPS_RESOURCES','{"sample":"https://fixture.example/data"}')
+    monkeypatch.setattr(socket, 'getaddrinfo', lambda *args, **kwargs: [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('8.8.8.8', 443))])
+    original = httpx.AsyncClient
+    class RawFixture(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'resource'
+    def local_client(*, transport, trust_env, follow_redirects):
+        backend = transport._pool._network_backend
+        assert backend.ips == ['8.8.8.8'] and backend.hostname == 'fixture.example'
+        assert trust_env is False and follow_redirects is False
+        def respond(request):
+            assert request.url.host == 'fixture.example'
+            return httpx.Response(200, stream=RawFixture())
+        return original(transport=httpx.MockTransport(respond), trust_env=False)
+    monkeypatch.setattr(httpx,'AsyncClient',local_client)
+    assert asyncio.run(https_inputs.fetch_inputs(['sample'])) == {'https/sample':b'resource'}
+
+
+def test_streaming_upload_stops_at_limit_before_store(monkeypatch):
+    import asyncio
+    import httpx
+    from starlette.requests import Request
+    from avatar.api import middleware
+    monkeypatch.setattr(middleware, 'MAX_STORED_SIZE', 16)
+    stored = []
+    async def store(scope, receive, send):
+        stored.append(await Request(scope, receive).body())
+        await send({'type':'http.response.start','status':201,'headers':[]})
+        await send({'type':'http.response.body','body':b''})
+    async def pieces(last):
+        yield b'a' * 15
+        yield last
+    async def check():
+        app = middleware.SecurityMiddleware(store, public_url='https://app.example')
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='https://app.example') as client:
+            assert (await client.post('/api/me/attachments',content=pieces(b'bc'))).status_code == 413
+            assert (await client.post('/api/me/attachments',content=pieces(b'b'))).status_code == 201
+        assert stored == [b'a' * 15 + b'b']
+    asyncio.run(check())
+
+
+def test_api_docs_require_explicit_setting(monkeypatch):
+    from avatar.api import app as entry
+    from avatar.core.config import Settings
+    from avatar.core.http_metrics import HttpMetrics
+    def configure(state, *_):
+        state.monitor = SimpleNamespace(http=HttpMetrics())
+    monkeypatch.setattr(entry, 'configure', configure)
+    for value, status in [('0', 404), ('1', 200)]:
+        monkeypatch.setenv('AVATAR_ENABLE_API_DOCS', value)
+        client = TestClient(entry.create_app(Settings()))
+        assert client.get('/api/docs').status_code == status
+        assert client.get('/api/openapi.json').status_code == status
+
+
+def test_private_model_discovery_pins_socket_and_redacts_http_log(monkeypatch, caplog):
+    import asyncio
+    import logging
+    import httpx
+    from avatar.models.client import ModelClient
+    from avatar.models.discovery import discover
+
+    ip = '192.168.82.19'
+    monkeypatch.setenv('AVATAR_MODEL_HTTP_ALLOWLIST', ip + ':8001')
+    url = httpx.URL('http://' + ip + ':8001/v1')
+    async def check():
+        addresses, transport = await ModelClient()._connection(url)
+        try:
+            assert addresses == (ip,) and transport._pool._network_backend.ips == [ip]
+        finally:
+            await transport.aclose()
+        def respond(request):
+            assert request.headers['host'] == ip + ':8001'
+            return httpx.Response(200, json={'data':[]})
+        client = ModelClient(transport=httpx.MockTransport(respond))
+        await discover(client, {'provider':'custom','api_format':'openai','base_url':str(url)}, 'test')
+    with caplog.at_level(logging.INFO, logger='httpx'):
+        asyncio.run(check())
+    assert 'HTTP Request' in caplog.text and ip not in caplog.text
+
+
+def test_town_guest_cookie_uses_deployment_tls_setting(monkeypatch):
+    from avatar.api import town_routes
+    app = FastAPI()
+    async def handle(*args):
+        return {}
+    app.state.personal_aip = SimpleNamespace(tasks=SimpleNamespace(handle=handle))
+    app.state.settings = SimpleNamespace(town_public_enabled=True, secure_cookie=True)
+    monkeypatch.setattr(town_routes, 'target_row', lambda *_: {'aic':'sample', 'user_id':'guest'})
+    app.include_router(town_routes.router)
+    client = TestClient(app, base_url='http://proxy.example')
+    result = client.post('/api/town/avatars/sample/tasks', json={'command_id':'c', 'task_id':'t'})
+    assert result.status_code == 200
+    cookie = result.headers['set-cookie']
+    assert 'avatar_visitor=' in cookie and 'Secure' in cookie and 'HttpOnly' in cookie

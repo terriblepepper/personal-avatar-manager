@@ -14,6 +14,7 @@ from threading import Lock
 
 from fastapi import HTTPException
 
+from avatar.protocols.tasks.guest_maintenance import expired_guest
 from avatar.core.execution import run_blocking
 from avatar.files.conversation.resources import validate_output
 from avatar.files.library.public import PublicMaterials
@@ -167,8 +168,8 @@ class TownFiles:
 
     @staticmethod
     def live(db, rowid, token):
-        row = db.execute('SELECT document,deadline FROM avatar_aip_tasks WHERE rowid=?',(rowid,)).fetchone()
-        if not row:
+        row = db.execute('SELECT peer_aic,document,deadline FROM avatar_aip_tasks WHERE task_number=?',(rowid,)).fetchone()
+        if not row or expired_guest(row):
             return None
         document = json.loads(row['document'])
         state = document['status']['state']
@@ -194,7 +195,7 @@ class TownFiles:
             delivery = self.live(db, rowid, token)
             if delivery and not db.execute("""SELECT 1 FROM avatar_aip_tasks t JOIN avatar_records a
                 ON a.aic=t.local_aic JOIN users u ON u.id=a.user_id
-                WHERE t.rowid=? AND u.id=? AND u.account_status='active' AND a.identity_status='active'""",
+                WHERE t.task_number=? AND u.id=? AND u.account_status='active' AND a.identity_status='active'""",
                 (rowid,delivery['owner'])).fetchone():
                 delivery = None
             item = next((file for file in delivery['files'] if file['id']==identifier), None) if delivery else None

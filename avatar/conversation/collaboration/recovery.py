@@ -1,4 +1,6 @@
 """Schedule peer turns and reconcile interrupted protocol work."""
+import httpx
+import traceback
 import asyncio
 from avatar.core.dispatch import begin_work, wait_work
 import json
@@ -7,16 +9,31 @@ import time
 from pathlib import Path
 from contextlib import ExitStack
 from fastapi import HTTPException
+from psycopg import OperationalError
 from avatar.core.db import now, dump
-from avatar.conversation.loop.peer import PeerTurn, speaker as turn_speaker
+from avatar.conversation.loop.peer import PeerTurn, speaker as turn_speaker, wire_id
 from avatar.conversation.loop.store import RunStore
-from avatar.conversation.collaboration.results import reply_status
 from avatar.core.execution import run_blocking
+from avatar.conversation.collaboration.transport import PeerEndpointUnavailable
 
 
 logger = logging.getLogger(__name__)
 RETRY_WINDOW=300
 RETRY_TIMEOUT='通信入口自动重试已超时，本请求已停止自动尝试；可重新编辑并发送'
+
+
+DB_RETRY_DELAY = 1.
+
+
+async def retry_database(operation, *args):
+    delay = DB_RETRY_DELAY
+    while True:
+        try:
+            return await run_blocking(operation, *args)
+        except OperationalError as error:
+            logger.warning('Peer database unavailable: operation=%s type=%s',operation.__name__,type(error).__name__)
+            await asyncio.sleep(delay)
+            delay = min(15., 2 * delay)
 
 
 class PeerRecovery:
@@ -33,47 +50,68 @@ class PeerRecovery:
         self.resources.cleanup()
         with ExitStack() as resources, self.database.connect(write=True) as db:
             RunStore.prune_in(db)
-            # 修复旧版本已输出明确结束状态却被继续排队的任务，不重放模型。
-            stale=db.execute('''SELECT d.id,m.content,m.id AS message_id FROM agent_dialogues d JOIN agent_dialogue_messages m ON m.id=(SELECT MAX(id) FROM agent_dialogue_messages WHERE dialogue_id=d.id) WHERE d.delivery_mode!='message' AND d.status IN ('queued','paused','awaiting_identity') AND m.speaker_role='agent' AND m.task_action='' AND NOT EXISTS(SELECT 1 FROM agent_pending_inputs WHERE task_id=d.id AND applied=0)''').fetchall()
-            for row in stale:
-                _,state,reason,_=reply_status(row['content'],0)
-                if state=='ended':
-                    db.execute("UPDATE agent_dialogue_messages SET state='ended',state_detail=? WHERE id=?",(reason,row['message_id']))
-                    self.close_record(db,row['id'],reason or '分身已声明任务完成')
             # 未发送的独立任务草稿七天后回收；已创建任务的工作区不在此删除。
-            stale=db.execute("SELECT c.id,c.user_id FROM chat_conversations c JOIN agent_intents i ON i.conversation_id=c.id WHERE i.task_id IS NULL AND json_extract(i.document,'$.origin')='peer_task_draft' AND julianday(i.created_at)<julianday('now','-7 days') AND NOT EXISTS(SELECT 1 FROM agent_task_members WHERE resource_conversation_id=c.id) AND NOT EXISTS(SELECT 1 FROM agent_session_members WHERE resource_conversation_id=c.id)").fetchall()
+            stale=db.execute("SELECT c.id,c.user_id FROM chat_conversations c JOIN agent_intents i ON i.conversation_id=c.id WHERE i.task_id IS NULL AND (i.document::jsonb->>'origin')='peer_task_draft' AND avatar_utc_time(i.created_at)<(CURRENT_TIMESTAMP + interval '-7 days') AND NOT EXISTS(SELECT 1 FROM agent_task_members WHERE resource_conversation_id=c.id) AND NOT EXISTS(SELECT 1 FROM agent_session_members WHERE resource_conversation_id=c.id)").fetchall()
             self.resources.release_workspaces(db,resources,[(row['user_id'],row['id']) for row in stale])
             # 已保存到气泡的调用状态须保留，否则刷新后会丢失取消/确认结果。
-            db.execute("DELETE FROM agent_intents WHERE julianday(created_at)<julianday('now','-1 day') AND message_id IS NULL AND status='pending'")
+            db.execute("DELETE FROM agent_intents WHERE avatar_utc_time(created_at)<(CURRENT_TIMESTAMP + interval '-1 day') AND message_id IS NULL AND status='pending'")
             db.execute('''DELETE FROM agent_dialogue_messages WHERE id IN (SELECT m.id FROM agent_dialogue_messages m JOIN agent_dialogues d ON d.id=m.dialogue_id
               WHERE (d.delivery_mode='message' AND m.id <= (SELECT MIN(cleared_through) FROM agent_session_members WHERE session_id=d.session_id))
               OR (d.status='ended' AND 2=(SELECT COUNT(*) FROM agent_task_members WHERE task_id=d.id AND hidden=1)))''')
 
-    def claim(self):
+    def claim_record(self, receipt, select, *args):
         with self.database.connect(write=True) as db:
-            # 旧等待记录首次调度时建立截止时间；重启或轮询不会延长它。
-            db.execute("UPDATE agent_dialogues SET retry_until=? WHERE status='awaiting_identity' AND retry_until=0",(time.time()+RETRY_WINDOW,))
-            db.execute("UPDATE agent_dialogues SET status='failed',active_speaker='',error=?,updated_at=? WHERE status='awaiting_identity' AND retry_until<=?",(RETRY_TIMEOUT,now(),time.time()))
-            row=db.execute("""SELECT d.* FROM agent_dialogues d JOIN agent_peer_sessions s ON s.id=d.session_id
-              WHERE (d.status='queued' OR (d.status='awaiting_identity' AND julianday(d.updated_at)<=julianday('now','-30 seconds'))) AND (d.accepted=1 OR d.delivery_mode='message') AND NOT EXISTS(SELECT 1 FROM agent_dialogues other WHERE other.session_id=d.session_id AND other.status='running')
-              ORDER BY d.updated_at,d.created_at,d.id LIMIT 1""").fetchone()
-            if not row:return None
-            if row['id'] in self.calls:return None
-            db.execute("UPDATE agent_dialogues SET status='running',updated_at=? WHERE id=?",(now(),row['id']))
-            return dict(row)
+            if receipt:
+                xid, row = receipt
+                # COMMIT may have succeeded before the socket dropped. Only dispatch a confirmed claim.
+                status = db.execute('SELECT pg_xact_status(?::xid8)',(xid,)).fetchone()[0]
+                if status == 'committed':
+                    return row
+                if status != 'aborted':
+                    raise OperationalError('Peer claim commit is not yet confirmed')
+                receipt.clear()
+            row = select(db, *args)
+            if row:
+                xid = db.execute('SELECT pg_current_xact_id()::text').fetchone()[0]
+                receipt.extend((xid,row))
+            return row
+
+    def claim(self, receipt=None):
+        return self.claim_record([] if receipt is None else receipt, self.select_job)
+
+    def select_job(self, db):
+        # 旧等待记录首次调度时建立截止时间；重启或轮询不会延长它。
+        db.execute("UPDATE agent_dialogues SET retry_until=? WHERE status='awaiting_identity' AND retry_until=0",(time.time()+RETRY_WINDOW,))
+        db.execute("UPDATE agent_dialogues SET status='failed',active_speaker='',error=?,updated_at=? WHERE status='awaiting_identity' AND retry_until<=?",(RETRY_TIMEOUT,now(),time.time()))
+        row=db.execute("""SELECT d.* FROM agent_dialogues d JOIN agent_peer_sessions s ON s.id=d.session_id
+          WHERE (d.status='queued' OR (d.status='awaiting_identity' AND avatar_utc_time(d.updated_at)<=(CURRENT_TIMESTAMP + interval '-30 seconds'))) AND (d.accepted=1 OR d.delivery_mode='message') AND NOT EXISTS(SELECT 1 FROM agent_dialogues other WHERE other.session_id=d.session_id AND other.status='running')
+          ORDER BY d.updated_at,d.created_at,d.id LIMIT 1""").fetchone()
+        if not row:return None
+        if row['id'] in self.calls:return None
+        db.execute("UPDATE agent_dialogues SET status='running',updated_at=? WHERE id=?",(now(),row['id']))
+        return dict(row)
 
     async def once(self):
-        job=await run_blocking(self.claim)
+        job = None
+        receipt = []
+        def claim():
+            nonlocal job
+            job = self.claim(receipt)
+        try:
+            await retry_database(claim)
+        except asyncio.CancelledError:
+            if job:
+                try:
+                    await run_blocking(self.record_failure, job, job['status'], job['error'], job['retry_until'])
+                except OperationalError:
+                    logger.warning('Peer task claim will be reconciled on startup')
+            raise
         if not job:return False
         task=asyncio.create_task(self.executor.turn(job));self.calls[job['id']]=task
         try:await task
         except (asyncio.CancelledError,Exception) as exc:
             if isinstance(exc,asyncio.CancelledError) and asyncio.current_task().cancelling():
                 raise
-            from avatar.conversation.collaboration.transport import PeerEndpointUnavailable
-            import httpx
-            import logging
-            import traceback
             frames=[(Path(frame.filename).name,frame.lineno,frame.name) for frame in traceback.extract_tb(exc.__traceback__)]
             logging.getLogger(__name__).warning('Peer invocation failed: task=%s type=%s frames=%s',job['id'],type(exc).__name__,frames)
             deadline=job['retry_until'];error=str(exc.detail) if isinstance(exc,HTTPException) else 'ACPS 调用未完成，未自动重放；请核对证书、对端状态及任务结果'
@@ -88,27 +126,59 @@ class PeerRecovery:
                 status='failed'
                 deadline=time.time() if isinstance(exc,(TimeoutError,httpx.TimeoutException)) or isinstance(exc,HTTPException) and exc.status_code==504 else 0
                 if deadline:error+='；本次调用已超时，未自动重放，可重新编辑并发送'
-            with self.database.connect(write=True) as db:
-                db.execute("UPDATE agent_dialogues SET status=?,active_speaker='',error=?,retry_until=?,updated_at=? WHERE id=? AND status='running' AND revision=?",(status,error,deadline,now(),job['id'],job['revision']))
+            await retry_database(self.record_failure, job, status, error, deadline)
         finally:self.calls.pop(job['id'],None)
         return True
 
+    def record_failure(self, job, status, error, deadline):
+        with self.database.connect(write=True) as db:
+            db.execute("UPDATE agent_dialogues SET status=?,active_speaker='',error=?,retry_until=?,updated_at=? WHERE id=? AND status='running' AND revision=?",(status,error,deadline,now(),job['id'],job['revision']))
+
     # 完成/取消确认独立持久重试；仅重发幂等 ACPS 控制命令，不重新运行模型。
     async def flush_controls(self,identifier=None):
-        with self.database.connect(write=True) as db:
-            row=db.execute("SELECT c.*,d.* FROM agent_protocol_controls c JOIN agent_dialogues d ON d.id=c.task_id WHERE c.status='queued' AND c.next_attempt<=?"+(' AND c.task_id=?' if identifier else '')+' LIMIT 1',(time.time(),identifier) if identifier else (time.time(),)).fetchone()
-            if not row:return False
-            db.execute("UPDATE agent_protocol_controls SET status='running' WHERE task_id=?",(row['task_id'],))
+        row = None
+        acknowledged = False
+        receipt = []
+        def claim():
+            nonlocal row
+            row = self.claim_control(identifier,receipt)
         try:
+            await retry_database(claim)
+            if not row:return False
             transport = self.transport()
             if transport is None:raise HTTPException(503,'ACPS 入口未就绪')
             method=getattr(transport,row['action'])
             await method(dict(row),row['user_id'],row['target_user_id'])
-            with self.database.connect(write=True) as db:db.execute("UPDATE agent_protocol_controls SET status='done',error='' WHERE task_id=?",(row['task_id'],))
-        except BaseException as error:
-            with self.database.connect(write=True) as db:db.execute("UPDATE agent_protocol_controls SET status='queued',next_attempt=?,error=? WHERE task_id=?",(time.time()+30,type(error).__name__,row['task_id']))
-            if isinstance(error,asyncio.CancelledError):raise
+            acknowledged = True
+            await retry_database(self.finish_control, row['task_id'])
+        except asyncio.CancelledError:
+            if row:
+                try:
+                    await run_blocking(self.finish_control, row['task_id'], None if acknowledged else 'CancelledError')
+                except OperationalError:
+                    logger.warning('Peer control claim will be reconciled on startup')
+            raise
+        except Exception as error:
+            if row is None or acknowledged:
+                raise
+            await retry_database(self.finish_control, row['task_id'], type(error).__name__)
         return True
+
+    def claim_control(self, identifier, receipt=None):
+        return self.claim_record([] if receipt is None else receipt, self.select_control, identifier)
+
+    def select_control(self, db, identifier):
+        row=db.execute("SELECT c.*,d.* FROM agent_protocol_controls c JOIN agent_dialogues d ON d.id=c.task_id WHERE c.status='queued' AND c.next_attempt<=?"+(' AND c.task_id=?' if identifier else '')+' LIMIT 1',(time.time(),identifier) if identifier else (time.time(),)).fetchone()
+        if not row:return None
+        db.execute("UPDATE agent_protocol_controls SET status='running' WHERE task_id=?",(row['task_id'],))
+        return dict(row)
+
+    def finish_control(self, task_id, error=None):
+        with self.database.connect(write=True) as db:
+            if error is None:
+                db.execute("UPDATE agent_protocol_controls SET status='done',error='' WHERE task_id=?", (task_id,))
+            else:
+                db.execute("UPDATE agent_protocol_controls SET status='queued',next_attempt=?,error=? WHERE task_id=? AND status='running'", (time.time()+30,error,task_id))
 
     async def control_loop(self):
         while True:
@@ -127,19 +197,29 @@ class PeerRecovery:
     async def cleanup_loop(self):
         while True:
             try:
-                await asyncio.to_thread(self.cleanup)
+                await run_blocking(self.cleanup)
             except Exception as exc:
                 logger.error('Peer cleanup failed: type=%s sqlstate=%s',type(exc).__name__,getattr(exc,'sqlstate',None))
             await asyncio.sleep(60)
 
     def recover(self):
         with self.database.connect(write=True) as db:
+            # 结构化升级后的未结任务沿用正式收尾流程，包括工作区、回执和双方通知。
+            changed = db.execute("""INSERT INTO data_migrations(name,applied_at)
+                VALUES ('peer-structured-terminal-recovery-v1',?) ON CONFLICT DO NOTHING RETURNING name""",(now(),)).fetchone()
+            if changed:
+                stale = db.execute("""SELECT d.id,m.state_detail FROM agent_dialogues d
+                    JOIN agent_dialogue_messages m ON m.id=(SELECT max(id) FROM agent_dialogue_messages WHERE dialogue_id=d.id)
+                    WHERE d.delivery_mode<>'message' AND d.status IN ('queued','paused','awaiting_identity')
+                      AND m.legacy_display_content IS NOT NULL AND m.state='ended' AND m.task_action='end_task'
+                      AND NOT EXISTS(SELECT 1 FROM agent_pending_inputs WHERE task_id=d.id AND applied=0)""").fetchall()
+                for row in stale:
+                    self.close_record(db, row['id'], row['state_detail'] or '分身已声明任务完成')
             for raw in db.execute("SELECT * FROM agent_dialogues WHERE status='running'").fetchall():
                 task = dict(raw)
                 safe = PeerTurn.recoverable(self.executor,db,task)
                 checkpoint = json.loads(task['agent_checkpoint'] or '{}')
                 if task['transport_mode']=='acps':
-                    from avatar.conversation.loop.peer import wire_id
                     command=wire_id(db,task,turn_speaker(task))
                     checkpoint.update(speaker_id=turn_speaker(task))
                     checkpoint['resume_wire' if safe else 'unconfirmed_wire']=command
@@ -151,7 +231,7 @@ class PeerRecovery:
             db.execute("UPDATE agent_protocol_controls SET status='queued' WHERE status='running'")
 
     async def run(self):
-        await run_blocking(self.recover)
+        await retry_database(self.recover)
         tasks=[asyncio.create_task(self.worker()) for _ in range(4)]+[asyncio.create_task(self.cleanup_loop()),asyncio.create_task(self.control_loop())]
         try:await asyncio.gather(*tasks)
         finally:

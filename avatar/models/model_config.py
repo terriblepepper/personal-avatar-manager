@@ -70,7 +70,7 @@ class SecretVault:
         if not path.exists():
             with database.connect() as db:
                 existing = db.execute("SELECT 1 FROM model_settings WHERE model_config LIKE '%encrypted_key%' LIMIT 1").fetchone()
-                if not existing and db.execute("SELECT 1 FROM sqlite_master WHERE name='embedding_settings'").fetchone():
+                if not existing and db.execute("SELECT 1 WHERE to_regclass(format('%I.embedding_settings',current_schema())) IS NOT NULL").fetchone():
                     existing=db.execute("SELECT 1 FROM embedding_settings WHERE config LIKE '%encrypted_key%' LIMIT 1").fetchone()
             if existing:
                 raise RuntimeError("模型加密主密钥缺失，请恢复 data/model-secrets.key，禁止生成新密钥覆盖")
