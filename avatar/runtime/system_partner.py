@@ -1,4 +1,5 @@
 # 模块说明：WIT 系统 Direct Partner；监听组件负责 mTLS，框架校验协议，应用保存任务状态，绝不转入 Web 问答。
+from avatar.core.execution import run_blocking
 from wit.acps.aip.direct import BaseDirectPartnerComponent, DirectRpcError
 from wit.acps.identity import current_local_entity
 from avatar.protocols.tasks.store import SystemTaskStore, ManagementTaskError
@@ -19,18 +20,20 @@ class SystemPartnerHandler(BaseDirectPartnerComponent):
         self.management = management
         self.admission_directory=admission_directory
         self.tasks = SystemTaskStore(management.database)
-        self.legacy_path = identity_dir / 'aip-tasks.sqlite3'
-        self.diagnostics=RpcDiagnostics(identity_dir/'rpc-diagnostics.jsonl')
+        self.diagnostics_path = identity_dir / 'rpc-diagnostics.jsonl'
+        self.diagnostics = None
 
     async def _teardown(self,ctx):
-        self.diagnostics.close()
+        if self.diagnostics is not None:
+            await run_blocking(self.diagnostics.close)
         await super()._teardown(ctx)
 
     # 职责：在 Partner 激活时初始化系统专用任务存储。
     # 输入：ctx 是框架激活上下文。
-    # 结果与约束：旧任务库存在时须先完成导入；启动不读取旧回执或模型凭据。
+    # 结果与约束：初始化 PostgreSQL 回执表。
     async def _setup(self, ctx):
-        self.tasks.initialize(legacy_present=self.legacy_path.exists() or self.legacy_path.is_symlink())
+        await run_blocking(self.tasks.initialize)
+        self.diagnostics = await run_blocking(RpcDiagnostics, self.diagnostics_path)
 
     # 职责：执行可信 AipContext 约束的完整管理请求。
     # 输入：command 与 keyword-only context 遵循 WIT Direct 的 _handle 契约。
@@ -45,10 +48,10 @@ class SystemPartnerHandler(BaseDirectPartnerComponent):
                     raise ValueError('本地身份已在接入后更新')
             except Exception:raise DirectRpcError({'code':-32003,'message':'当前证书状态未能核验，请稍后重试'}) from None
         try:
-            self.diagnostics.write(event='request',peer_aic=context.peer_aic,request=command,header_names=list(context.headers))
-            result=self.tasks.handle(command,context,self.management)
-            self.diagnostics.write(event='response',peer_aic=context.peer_aic,response=result)
+            await run_blocking(self.diagnostics.write, event='request',peer_aic=context.peer_aic,request=command,header_names=list(context.headers))
+            result = await run_blocking(self.tasks.handle, command, context, self.management)
+            await run_blocking(self.diagnostics.write, event='response',peer_aic=context.peer_aic,response=result)
             return result
         except ManagementTaskError as exc:
-            self.diagnostics.write(event='error',peer_aic=context.peer_aic,code=exc.code,message=exc.message)
+            await run_blocking(self.diagnostics.write, event='error',peer_aic=context.peer_aic,code=exc.code,message=exc.message)
             raise DirectRpcError({'code': exc.code, 'message': exc.message}) from None

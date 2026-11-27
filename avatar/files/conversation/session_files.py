@@ -39,7 +39,7 @@ class SessionFiles:
         slots = ','.join('?' for _ in ids)
         rows = db.execute(f"""SELECT id,filename,sha256,size,content_type,animation_metadata,origin,'chat' AS source
             FROM chat_files WHERE id IN ({slots}) AND user_id=? AND conversation_id=?
-            AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))"""
+            AND (expires_at IS NULL OR avatar_utc_time(expires_at)>CURRENT_TIMESTAMP)"""
             + (' ORDER BY id FOR SHARE' if lock else ''), (*ids, storage_owner, self.conversation))
         result = {row['id']: dict(row) for row in rows}
         if storage_owner!=self.owner:

@@ -1,55 +1,21 @@
 from avatar.core.user_storage import ConversationBlobs, UserBlobs
-from avatar.files.uploads.buffer import upload_work, write_original
+from avatar.files.uploads.buffer import clean_removed, staged_removals, upload_work, write_original
 # 模块说明：独立资料文件存储、归属、说明和隐私；用户保存立即生效，原件不进入公开静态目录。
 import asyncio
 import json
 import uuid
-import zipfile
-from io import BytesIO
 from contextlib import nullcontext
-from pathlib import Path
 from typing import Literal
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 from avatar.accounts.roles import ADMIN_ROLES
 from avatar.core.db import now, dump, event
-from avatar.core.artifact_limits import MAX_SOURCE_BYTES
-from avatar.files.parsing.media_types import MEDIA,validate_media
 from avatar.core.revisions import next_modified_at
 from avatar.core.revisions import ModifiedAt
 
-# Model and sandbox outputs retain a separate per-file processing bound.
-MAX_FILE = 10 * 1024 * 1024
+from avatar.files.uploads.validation import TYPES, inspect_file
+
 MAX_STORED_SIZE = 10 * 1024 ** 3
-TYPES = {'.txt': 'text/plain', '.md': 'text/markdown', '.mmd': 'text/x-mermaid', '.html': 'text/html', '.htm': 'text/html', '.csv': 'text/csv', '.json': 'application/json',
-         '.log': 'text/plain', '.tsv': 'text/tab-separated-values',
-         '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
-         '.webp': 'image/webp', '.gif': 'image/gif', '.bmp': 'image/bmp', '.pdf': 'application/pdf',
-         '.doc': 'application/msword', '.ppt': 'application/vnd.ms-powerpoint',
-         '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-         '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',**MEDIA}
-
-
-ARTIFACT_SUFFIXES = ('.html', '.htm')
-
-
-def chat_file_limit(filename):
-    return MAX_SOURCE_BYTES if (filename or '').lower().endswith(ARTIFACT_SUFFIXES) else MAX_FILE
-
-
-class OfficeDirectory:
-    """Storage examines only ZIP directory metadata. Parsers bound expanded document data separately."""
-
-    def __init__(self, stream, length):
-        self.stream, self.length = stream, length
-        self.seek, self.tell = stream.seek, stream.tell
-
-    def read(self, size=-1):
-        if size < 0:
-            size = max(0,self.length - self.tell())
-        if size > 16 * 1024**2:
-            raise ValueError('Office ZIP 目录过大')
-        return self.stream.read(size)
 
 
 # 职责：定义个人资料中一个附件的关联与可见性。
@@ -80,57 +46,15 @@ class AttachmentService:
     # 职责：配置当前数据目录下的受保护原件位置。
     # 输入：database 为 Database 实例。
     # 结果与约束：仅建立服务依赖和解析并发限制，实际写入时创建 0700 目录。
-    def __init__(self, database):
+    def __init__(self, database, *, recover=True):
         self.database = database
         self.directory = UserBlobs(database,'attachments','attachments')
         self.parsing = asyncio.Semaphore(2)
         from avatar.files.uploads.buffer import recover_removed
-        recover_removed(database,self.directory,'attachments')
+        if recover:
+            recover_removed(database,self.directory,'attachments')
 
-    # 职责：校验上传名称、扩展名和基础文件结构。
-    # 输入：filename 为客户端文件名，data 为已经限长的原件字节。
-    # 结果与约束：名称不参与存储路径；拒绝空文件、不支持类型、扩展名伪装及宏文件/超限压缩包。
-    @staticmethod
-    def inspect_file(filename, data, *, max_size=None, generated=False):
-        if not filename or len(filename) > 200 or any(ord(c) < 32 for c in filename) or '/' in filename or '\\' in filename:
-            raise HTTPException(422, '文件名无效')
-        extension = Path(filename).suffix.lower()
-        if extension not in TYPES and not (generated and extension=='.zip'):
-            raise HTTPException(415, '支持文本、图片、音频、视频、CSV/TSV/XLSX、PDF、Word 和 PPT；旧 XLS 请先另存为 XLSX/CSV')
-        if not data:
-            raise HTTPException(422, '不能上传空文件')
-        if extension in ARTIFACT_SUFFIXES and len(data) > MAX_SOURCE_BYTES:
-            raise HTTPException(413, 'HTML 文件不能超过 100 MiB')
-        if max_size is not None and len(data) > max_size:
-            raise HTTPException(413, '文件超过上传大小限制')
-        if extension in ('.zip','.docx','.pptx','.xlsx'):
-            archive_source = data if hasattr(data, 'seek') else BytesIO(data)
-        if extension=='.zip' and not zipfile.is_zipfile(archive_source):
-            raise HTTPException(415,'ZIP 文件格式无效')
-        if extension in MEDIA:validate_media(extension,data[:32])
-        if extension in ('.docx', '.pptx', '.xlsx'):
-            try:
-                if data[:4] != b'PK\x03\x04':
-                    raise ValueError('Office 文件头无效')
-                with zipfile.ZipFile(OfficeDirectory(archive_source, len(data))) as archive:
-                    items = archive.infolist()
-                    required = {'.docx':'word/document.xml','.pptx':'ppt/presentation.xml','.xlsx':'xl/workbook.xml'}[extension]
-                    if required not in archive.namelist() or len(items) > 5000:
-                        raise ValueError()
-                    if any('vbaproject' in item.filename.lower() for item in items):
-                        raise ValueError()
-            except (zipfile.BadZipFile, ValueError):
-                raise HTTPException(415, 'Office 文件格式无效、包含宏或目录超限，请使用普通 DOCX/PPTX')
-        signatures = {'.pdf': b'%PDF-', '.png': b'\x89PNG\r\n\x1a\n', '.jpg': b'\xff\xd8', '.jpeg': b'\xff\xd8',
-                      '.gif': b'GIF8', '.bmp': b'BM', '.doc': b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1',
-                      '.ppt': b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1'}
-        if extension in signatures and data[:len(signatures[extension])] != signatures[extension]:
-            raise HTTPException(415, '文件内容与扩展名不匹配')
-        if extension == '.webp' and not (data[:4] == b'RIFF' and data[8:12] == b'WEBP'):
-            raise HTTPException(415, 'WebP 文件格式无效')
-        if extension in ('.txt', '.md', '.mmd', '.csv', '.tsv', '.json', '.log', '.html', '.htm') and data.find(b'\x00') >= 0 and not data[:4].startswith((b'\xff\xfe',b'\xfe\xff',b'\x00\x00\xfe\xff')):
-            raise HTTPException(415, '文本文件包含二进制内容')
-        return extension
+    inspect_file = staticmethod(inspect_file)
 
     # 职责：读取账户文件集合的独立修改日期。
     # 输入：user_id 为已授权文件所有人。
@@ -197,7 +121,7 @@ class AttachmentService:
         checksum = write_original(path,data,extension=extension)
         try:
             extracted,status='','rag_pending'
-            with self.database.connect(write=True) as db:
+            with self.database.connect(write=True, account_scope=user['id']) as db:
                 self.editable(db,user['id'],last_modified_at)
                 if deduplicate and db.execute('SELECT 1 FROM attachments WHERE user_id=? AND sha256=?',(user['id'],checksum)).fetchone():raise HTTPException(409,'相同内容已在资料库中，不能重复转存')
                 quota = self.quota(db,user['id'])
@@ -233,6 +157,10 @@ class AttachmentService:
             rows = db.execute('SELECT '+self.summary_fields+' FROM attachments WHERE user_id=? AND id=ANY(?::text[])',
                               (user_id, list({ref['id'] for ref in references})))
             by_id = {row['id']: self._summary(row, admin) for row in rows}
+        return self.resolve_refs(by_id, references)
+
+    @staticmethod
+    def resolve_refs(by_id, references):
         return [{**by_id[ref['id']], 'visibility': ref.get('visibility','private'), 'caption': ref.get('caption','')}
                 for ref in references if ref['id'] in by_id]
 
@@ -257,8 +185,8 @@ class AttachmentService:
     # 职责：列出本人独立管理的所有文件。
     # 输入：user_id 为当前认证账户，文件设置来自附件表而非审核快照。
     # 结果与约束：包含暂存和已保存文件、说明、可见性和并发日期，不暴露路径或他人内容。
-    def inventory(self, user_id, admin=False):
-        with self.database.connect() as db:
+    def inventory(self, user_id, admin=False, db=None):
+        with (nullcontext(db) if db is not None else self.database.connect()) as db:
             return [self._summary(row,admin) for row in db.execute(
                 'SELECT '+self.summary_fields+' FROM attachments WHERE user_id=? ORDER BY created_at DESC,id',(user_id,))]
 
@@ -266,7 +194,7 @@ class AttachmentService:
     # 输入：user 为所有人，identifier 为文件 ID，request 含选填说明、可选可见性及文件并发日期。
     # 结果与约束：无需审核，空说明允许保存；只修改独立文件设置，不改变个人资料日期或申请状态；私密设置立即撤销公开访问并排除旧记忆。
     def update_description(self, user, identifier, request):
-        with self.database.connect(write=True) as db:
+        with self.database.connect(write=True, account_scope=user['id']) as db:
             row=db.execute('SELECT * FROM attachments WHERE id=? AND user_id=?',(identifier,user['id'])).fetchone()
             if not row:
                 raise HTTPException(404,'附件不存在')
@@ -286,31 +214,32 @@ class AttachmentService:
             row = db.execute('SELECT * FROM attachments WHERE id=?', (identifier,)).fetchone()
         if not row or (row['user_id'] != user['id'] and not (admin and user['role'] in ADMIN_ROLES)):
             raise HTTPException(404, '附件不存在')
-        path = self.directory / (row['id'] + '.blob')
-        if not path.is_file():
+        return self._original(row)
+
+    def _original(self, row):
+        if not self.directory.available(row['user_id'], row['id']):
             raise HTTPException(404, '附件原件缺失，请联系管理员恢复备份')
-        return path, dict(row)
+        return self.directory.new(row['user_id'], row['id'] + '.blob'), dict(row)
 
     # 职责：确认公开下载链接仍对应所有人当前已保存公开文件。
     # 输入：aic 为已生效分身身份，identifier 为具体附件 ID。
     # 结果与约束：暂存文件不开放下载；独立保存为私密或删除后旧公开链接立即失效；不依赖仅凭随机 ID 的公开访问。
     def public_file(self, aic, identifier):
         with self.database.connect() as db:
-            agent = db.execute('SELECT user_id,profile FROM avatar_records WHERE aic=?', (aic,)).fetchone()
-        with self.database.connect() as db:
-            public=db.execute("SELECT 1 FROM attachments WHERE id=? AND user_id=? AND visibility='public'",(identifier,agent['user_id'] if agent else '')).fetchone()
-        if not agent or not public:
+            row = db.execute("""SELECT f.* FROM attachments f JOIN avatar_records a ON a.user_id=f.user_id
+                WHERE a.aic=? AND f.id=? AND f.visibility='public' AND f.saved_at IS NOT NULL""",
+                (aic, identifier)).fetchone()
+        if not row:
             raise HTTPException(404,'公开附件不存在')
-        return self.file_for({'id': agent['user_id'], 'role': 'user'}, identifier)
+        return self._original(row)
 
     # 职责：彻底删除本人文件及所有资料/审核快照中的引用和说明。
     # 输入：user 为所有人，identifier 为文件 ID，last_modified_at 可选核对此前文件集合日期。
     # 结果与约束：历史文件也立即物理删除；撤销公开链接并推进独立文件日期排除旧记忆，删除失败回滚引用和原件，其他资料及聊天原文保留。
     def remove(self,user,identifier=None,last_modified_at=None,*,folder_path=None,recursive=False,selection=None):
-        originals=[]
         reference_paths=[]
-        try:
-            with self.database.connect(write=True) as db:
+        with staged_removals() as stage:
+            with self.database.connect(write=True, account_scope=user['id']) as db:
                 self.editable(db,user['id'],last_modified_at)
                 if selection is not None:
                     from avatar.files.library.batch import select
@@ -335,11 +264,14 @@ class AttachmentService:
                 if any(ref['id'] in identifiers for ref in draft.get('attachments',[])):
                     draft['attachments']=[ref for ref in draft['attachments'] if ref['id'] not in identifiers]
                     db.execute('UPDATE profile_records SET draft=? WHERE user_id=?',(dump(draft),user['id']))
-                for snapshot in db.execute('SELECT id,snapshot FROM profile_submissions WHERE user_id=?',(user['id'],)).fetchall():
-                    content=json.loads(snapshot['snapshot'])
-                    if any(ref['id'] in identifiers for ref in content.get('attachments',[])):
-                        content['attachments']=[ref for ref in content['attachments'] if ref['id'] not in identifiers]
-                        db.execute('UPDATE profile_submissions SET snapshot=? WHERE id=?',(dump(content),snapshot['id']))
+                if identifiers:
+                    db.execute("""UPDATE profile_submissions s
+                        SET snapshot=jsonb_set(s.snapshot::jsonb,'{attachments}', COALESCE((
+                            SELECT jsonb_agg(item ORDER BY pos) FROM
+                                jsonb_array_elements(s.snapshot::jsonb->'attachments') WITH ORDINALITY AS refs(item,pos)
+                            WHERE NOT (item->>'id'=ANY(?::text[]))), '[]'::jsonb))::text
+                        WHERE s.user_id=? AND EXISTS (SELECT 1 FROM jsonb_array_elements(s.snapshot::jsonb->'attachments') item
+                            WHERE item->>'id'=ANY(?::text[]))""", (list(identifiers),user['id'],list(identifiers)))
                 agent=db.execute('SELECT profile FROM avatar_records WHERE user_id=?',(user['id'],)).fetchone()
                 if agent:
                     content=json.loads(agent['profile'])
@@ -355,14 +287,7 @@ class AttachmentService:
                 event(db,user['id'],user['username'],'删除资料文件夹及全部内容' if folder_path is not None else '删除资料文件及全部说明',folder_path if folder_path is not None else identifier or str(len(identifiers)),actor_id=user['id'])
                 # 原件只在磁盘暂存；提交失败原路恢复，避免大文件回滚占用内存。
                 for item in sorted(identifiers):
-                    path=self.directory/(item+'.blob')
-                    if path.exists():
-                        staged=path.with_name('.removed-'+item+'-'+uuid.uuid4().hex)
-                        path.replace(staged);originals.append((path,staged))
-        except BaseException:
-            for path,staged in originals:staged.replace(path)
-            raise
-        from avatar.files.uploads.buffer import clean_removed
-        clean_removed(originals)
+                    path=self.directory.new(user['id'],item+'.blob')
+                    stage(path)
         clean_removed((None,path) for path in reference_paths)
         return {'changed_count':len(identifiers),'retained':False,'deleted':True,'last_modified_at':modified,'updated_at':modified}

@@ -1,5 +1,6 @@
 """小镇负责注册/登录流程；本模块仅校验请求令牌及目标访问权限，不引导登录或创建账户。"""
 from fastapi import HTTPException
+from avatar.core.execution import run_blocking
 from avatar.accounts.oidc import OidcService
 from avatar.protocols.transport.endpoints import entity_oidc_identity
 from avatar.protocols.tasks.store import ManagementTaskError
@@ -11,7 +12,7 @@ from avatar.protocols.tasks.store import ManagementTaskError
 class TownUserAuthorization:
     # 保存固定 issuer 与 OIDC 客户端；构造不联网、不创建本地登录会话。
     def __init__(self, database, settings):
-        self.settings = settings
+        self.database, self.settings = database, settings
         self.oidc = OidcService(database, settings)
 
     # 在任务与模型调用前验证 Bearer；网络故障和认证失败分别返回，不输出 Token。
@@ -30,7 +31,10 @@ class TownUserAuthorization:
             code = -32008 if exc.status_code == 401 else -32603
             message = 'Keycloak access token 无效或已过期' if code == -32008 else '统一认证服务暂不可用'
             raise ManagementTaskError(code, message) from None
-        expected = entity_oidc_identity(self.settings, user_id)
+        def owner_identity():
+            with self.database.connect() as db:
+                return entity_oidc_identity(self.settings, user_id, db=db)
+        expected = await run_blocking(owner_identity)
         if identity.get('sub') != expected['keycloakSubject']:
             raise ManagementTaskError(-32009, '当前 Keycloak 账户无权访问此分身')
         return expected

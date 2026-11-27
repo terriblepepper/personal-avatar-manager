@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from fastapi import HTTPException
 from avatar.core.db import now
 from avatar.files.conversation.resources import original_hashes, reference_count
-from avatar.files.library.attachments import MAX_FILE
+from avatar.files.uploads.validation import MAX_FILE
 from avatar.files.word_pdfs import WORD_PDF_SUFFIXES, link_word_pdf
 
 
@@ -30,6 +30,7 @@ class PeerResources:
     """配对消息与独立任务各有共享原件，工具设置仍属于参与者。"""
     def __init__(self,dialogues):
         """复用分身领域服务及现有文件存储，不另建解析器或下载通道。"""
+        self.orphan_scan = None
         self.dialogues=dialogues;self.files=dialogues.chat.chat_files;self.database=dialogues.database
 
     def new_workspace(self,db,user_id,title,*,files=True):
@@ -87,7 +88,7 @@ class PeerResources:
         scope="d.id=? AND d.delivery_mode<>'message'" if task_id else "d.session_id=? AND d.delivery_mode='message'"
         rows=db.execute(f"""SELECT f.*,a.task_id,a.source_user_id,a.source_file_id,a.message_id
             FROM agent_task_files a JOIN agent_dialogues d ON d.id=a.task_id JOIN chat_files f ON f.id=a.file_id
-            WHERE {scope} AND f.conversation_id<>? AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now'))
+            WHERE {scope} AND f.conversation_id<>? AND (f.expires_at IS NULL OR avatar_utc_time(f.expires_at)>CURRENT_TIMESTAMP)
             ORDER BY (f.user_id=a.source_user_id) DESC,f.created_at,f.id""",(task_id or session_id,workspace)).fetchall()
         originals={}
         for file in rows:
@@ -230,7 +231,7 @@ class PeerResources:
                 else:
                     existing=db.execute("""SELECT f.id FROM chat_files f
                         WHERE f.conversation_id=? AND f.filename=? AND f.sha256=? AND f.sha256<>''
-                          AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now'))
+                          AND (f.expires_at IS NULL OR avatar_utc_time(f.expires_at)>CURRENT_TIMESTAMP)
                         ORDER BY f.created_at,f.id LIMIT 1""",(workspace,row['filename'],row['sha256'])).fetchone()
                     if existing and self.files.directory.available_in(owner,workspace,existing[0],row['size']):
                         original=self.files.directory.path(row['user_id'],source,identifier+'.blob')
@@ -263,12 +264,12 @@ class PeerResources:
             if not db.execute("SELECT 1 FROM agent_task_members WHERE task_id=? AND user_id=? AND hidden=0",(task_id,user_id)).fetchone():
                 return []
             return [dict(row) for row in db.execute("""SELECT f.* FROM chat_files f
-                WHERE f.conversation_id=? AND f.referenced=1 AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now'))
+                WHERE f.conversation_id=? AND f.referenced=1 AND (f.expires_at IS NULL OR avatar_utc_time(f.expires_at)>CURRENT_TIMESTAMP)
                   AND (f.origin<>'attachment' OR EXISTS(SELECT 1 FROM agent_task_files a WHERE a.file_id=f.id AND a.task_id=?))
                   AND (f.origin<>'generated' OR EXISTS(SELECT 1 FROM agent_task_files a WHERE a.file_id=f.id))
                 ORDER BY CASE WHEN f.origin='attachment' THEN 0 ELSE 1 END,f.created_at DESC,f.id LIMIT 5""",(shared,task_id))]
         return [dict(row) for row in db.execute('''SELECT f.* FROM chat_files f JOIN agent_dialogues current ON current.id=?
-          WHERE f.user_id=? AND f.referenced=1 AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now'))
+          WHERE f.user_id=? AND f.referenced=1 AND (f.expires_at IS NULL OR avatar_utc_time(f.expires_at)>CURRENT_TIMESTAMP)
           AND EXISTS (SELECT 1 FROM agent_task_files a JOIN agent_dialogues prior ON prior.id=a.task_id
               WHERE a.file_id=f.id AND (a.task_id=current.id OR (f.origin!='attachment' AND current.delivery_mode='message'
                   AND prior.delivery_mode='message' AND prior.session_id=current.session_id)))
@@ -292,7 +293,7 @@ class PeerResources:
         selected=self.model_files(db,task['id'],owner)
         if self.shared_for_task(db,task['id'])==workspace:
             available=db.execute("""SELECT f.id,f.sha256,f.size FROM chat_files f
-                WHERE f.conversation_id=? AND f.sha256<>'' AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now'))
+                WHERE f.conversation_id=? AND f.sha256<>'' AND (f.expires_at IS NULL OR avatar_utc_time(f.expires_at)>CURRENT_TIMESTAMP)
                 AND (f.origin NOT IN ('attachment','generated') OR EXISTS(
                     SELECT 1 FROM agent_task_files a WHERE a.file_id=f.id AND (a.task_id=? OR a.message_id IS NOT NULL)))""",
                 (workspace,task['id']))
@@ -304,7 +305,7 @@ class PeerResources:
         if ids and held.get('source_revision')==self.dialogues.executor.output_revision(db,current,owner,selected,style=held.get('peer_style')):
             rows=db.execute("""SELECT id,sha256,size FROM chat_files WHERE user_id=? AND conversation_id=?
                 AND origin='generated' AND id=ANY(?::text[])
-                AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))""",(storage_owner,workspace,list(ids)))
+                AND (expires_at IS NULL OR avatar_utc_time(expires_at)>CURRENT_TIMESTAMP)""",(storage_owner,workspace,list(ids)))
             grants.update((row['id'],row['sha256']) for row in rows if row['sha256'] and
                           self.files.directory.available_in(storage_owner,workspace,row['id'],row['size']))
         return grants
@@ -315,22 +316,46 @@ class PeerResources:
                             grants=lambda conn:self.session_file_grants(conn,task,owner,workspace))
         reader.validate_in(db,lock=lock)
 
-    def metadata(self,task_id,user_id,*,expired=False):
-        """只返回该查看者已获得的文件名称、下载地址和到期日期。"""
-
-        with self.database.connect() as db:
-            if expired:
-                return self.expired_cards(db,task_id,user_id)
-            shared=self.shared_for_task(db,task_id)
-            rows=db.execute(f"""SELECT f.id,f.user_id,f.conversation_id,f.filename,f.content_type,f.size,f.animation_metadata,
-                f.expires_at,(SELECT id FROM attachments WHERE id=f.promoted_id AND user_id=?) AS promoted_id,a.source_user_id,a.message_id,
+    def metadata_many(self, db, tasks, user_id):
+        cards = {task['id']: [] for task in tasks}
+        expired = {task['id'] for task in tasks if workspace_expired(task)}
+        live = list(cards.keys() - expired)
+        shared = """LEFT JOIN agent_shared_workspaces w ON w.scope=CASE WHEN d.delivery_mode='message' THEN 'session' ELSE 'task' END
+            AND w.scope_id=CASE WHEN d.delivery_mode='message' THEN d.session_id ELSE d.id END"""
+        if live:
+            rows = db.execute(f"""SELECT a.task_id,f.id,f.user_id,f.conversation_id,f.filename,f.content_type,f.size,
+                f.animation_metadata,f.expires_at,p.id AS promoted_id,a.source_user_id,a.message_id,
                 CASE WHEN {GENERATED_FILE} THEN 'generated' ELSE f.origin END AS display_origin
-                FROM chat_files f JOIN agent_task_files a ON a.file_id=f.id
-                WHERE a.task_id=? AND ((?::text IS NULL AND f.user_id=?) OR f.conversation_id=?)
-                  AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now'))
-                ORDER BY f.created_at,f.id""",(user_id,task_id,shared,user_id,shared)).fetchall()
-        return [{'id':r['id'],'sender_user_id':r['source_user_id'],'message_id':r['message_id'],'origin':r['display_origin'],'promoted_id':r['promoted_id'],'filename':r['filename'],'content_type':r['content_type'],'size':r['size'],**json.loads(r['animation_metadata']),'expires_at':r['expires_at'],'download_url':'/api/conversations/'+r['conversation_id']+'/files/'+r['id']} for r in rows
-                if self.files.directory.available_in(r['user_id'],r['conversation_id'],r['id'],r['size'])]
+                FROM agent_task_files a JOIN chat_files f ON f.id=a.file_id JOIN agent_dialogues d ON d.id=a.task_id
+                {shared} LEFT JOIN attachments p ON p.id=f.promoted_id AND p.user_id=?
+                WHERE a.task_id=ANY(?::text[]) AND ((w.conversation_id IS NULL AND f.user_id=?) OR f.conversation_id=w.conversation_id)
+                  AND (f.expires_at IS NULL OR avatar_utc_time(f.expires_at)>CURRENT_TIMESTAMP)
+                ORDER BY f.created_at,f.id""", (user_id,live,user_id))
+            for row in rows:
+                if self.files.directory.available_in(row['user_id'],row['conversation_id'],row['id'],row['size']):
+                    cards[row['task_id']].append({
+                        **{key:row[key] for key in ('id','message_id','promoted_id','filename','content_type','size','expires_at')},
+                        'sender_user_id':row['source_user_id'], 'origin':row['display_origin'], **json.loads(row['animation_metadata']),
+                        'download_url':'/api/conversations/'+row['conversation_id']+'/files/'+row['id']})
+        if expired:
+            missing = []
+            for row in db.execute("""SELECT task_id,expired_files FROM agent_task_members
+                WHERE user_id=? AND hidden=0 AND task_id=ANY(?::text[])""", (user_id,list(expired))):
+                cards[row['task_id']] = json.loads(row['expired_files'])
+                if not cards[row['task_id']]:
+                    missing.append(row['task_id'])
+            if missing:
+                rows = db.execute(f"""SELECT a.task_id,coalesce(a.source_file_id,f.id) AS id,f.filename,f.content_type,f.size,
+                    a.source_user_id AS sender_user_id,a.message_id,'generated' AS origin,true AS expired
+                    FROM agent_task_members m JOIN agent_task_files a ON a.task_id=m.task_id JOIN chat_files f ON f.id=a.file_id
+                    JOIN agent_dialogues d ON d.id=a.task_id {shared}
+                    WHERE m.task_id=ANY(?::text[]) AND m.user_id=? AND m.hidden=0 AND {GENERATED_FILE}
+                      AND a.message_id IS NOT NULL AND f.conversation_id=coalesce(w.conversation_id,m.resource_conversation_id)
+                    ORDER BY f.created_at,f.id""",(missing,user_id))
+                for row in rows:
+                    item = dict(row)
+                    cards[item.pop('task_id')].append(item)
+        return cards
 
     def cleanup(self):
         """每分钟回收过期原件、预览、解析及授权行，转存的资料副本独立保留。"""
@@ -341,8 +366,8 @@ class PeerResources:
                     shared=db.execute("""SELECT c.user_id,c.id,d.id AS task_id FROM agent_shared_workspaces w
                         JOIN agent_dialogues d ON w.scope='task' AND w.scope_id=d.id
                         JOIN chat_conversations c ON c.id=w.conversation_id
-                        WHERE d.status='ended' AND julianday(d.expires_at)<=julianday('now')
-                        ORDER BY d.expires_at LIMIT 10""").fetchall()
+                        WHERE d.status='ended' AND avatar_utc_time(d.expires_at)<=CURRENT_TIMESTAMP
+                        ORDER BY avatar_utc_time(d.expires_at) LIMIT 10""").fetchall()
                     for scope in shared:
                         for member in db.execute("SELECT user_id FROM agent_task_members WHERE task_id=? AND hidden=0",(scope['task_id'],)):
                             cards=self.expired_cards(db,scope['task_id'],member['user_id'])
@@ -353,40 +378,61 @@ class PeerResources:
                         FROM agent_task_members m JOIN agent_dialogues d ON d.id=m.task_id
                         JOIN chat_conversations c ON c.id=m.resource_conversation_id AND c.user_id=m.user_id AND c.channel='peer'
                         WHERE d.delivery_mode<>'message' AND d.status='ended' AND d.expires_at IS NOT NULL
-                          AND d.expires_at<=to_char(CURRENT_TIMESTAMP AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+                          AND avatar_utc_time(d.expires_at)<=CURRENT_TIMESTAMP
                           AND NOT EXISTS(SELECT 1 FROM agent_session_members s WHERE s.resource_conversation_id=c.id)
                           AND NOT EXISTS(SELECT 1 FROM agent_task_members other
                             JOIN agent_dialogues sibling ON sibling.id=other.task_id
                             WHERE other.resource_conversation_id=m.resource_conversation_id
                               AND other.user_id=m.user_id AND other.task_id<>m.task_id
-                              AND (sibling.expires_at IS NULL OR julianday(sibling.expires_at)>julianday('now')))
-                        ORDER BY d.expires_at LIMIT 10""").fetchall()
+                              AND (sibling.expires_at IS NULL OR avatar_utc_time(sibling.expires_at)>CURRENT_TIMESTAMP))
+                        ORDER BY avatar_utc_time(d.expires_at) LIMIT 10""").fetchall()
                     for scope in expired:
                         cards=self.expired_cards(db,scope['task_id'],scope['user_id'])
                         db.execute('UPDATE agent_task_members SET expired_files=? WHERE task_id=? AND user_id=?',
                                    (json.dumps(cards,ensure_ascii=False),scope['task_id'],scope['user_id']))
                     self.release_workspaces(db,stack,[(row['user_id'],row['resource_conversation_id']) for row in expired])
-                    rows=db.execute("SELECT * FROM chat_files WHERE expires_at IS NOT NULL AND julianday(expires_at)<=julianday('now') LIMIT 10").fetchall()
+                    rows=db.execute("SELECT * FROM chat_files WHERE expires_at IS NOT NULL AND avatar_utc_time(expires_at)<=CURRENT_TIMESTAMP LIMIT 10").fetchall()
                     stack.enter_context(self.files.deleting(db,rows))
-                    db.execute("DELETE FROM conversation_diagrams WHERE expires_at IS NOT NULL AND julianday(expires_at)<=julianday('now')")
+                    db.execute("DELETE FROM conversation_diagrams WHERE expires_at IS NOT NULL AND avatar_utc_time(expires_at)<=CURRENT_TIMESTAMP")
             if len(rows)<10 and len(expired)<10 and len(shared)<10:break
-        # 异常断电可能留下已写文件而未提交元数据的孤儿；最多七天后同样回收。
-        with self.database.connect() as db:
-            for path in self.files.directory.glob():
-                if path.is_symlink() or (path.suffix not in ('.blob','.jpg') and not path.name.endswith(WORD_PDF_SUFFIXES)):continue
-                try:modified=path.stat().st_mtime
-                except FileNotFoundError:continue
-                if modified>time.time()-7*86400:continue
-                identifier=path.name.partition('.')[0]
-                try:uuid.UUID(identifier)
-                except ValueError:continue
-                if not db.execute('SELECT 1 FROM chat_files WHERE id=?',(identifier,)).fetchone():
+        # 异常断电可能留下孤儿。每次推进同一扫描游标，限制单轮磁盘和数据库开销。
+        self.cleanup_orphans()
+
+    def cleanup_orphans(self):
+        from itertools import islice
+        if self.orphan_scan is None:
+            self.orphan_scan = iter(self.files.directory.glob())
+        paths = list(islice(self.orphan_scan, 128))
+        if len(paths) < 128:
+            self.orphan_scan = None
+        candidates = []
+        cutoff = time.time() - 7*86400
+        for path in paths:
+            if path.is_symlink() or (path.suffix not in ('.blob','.jpg') and not path.name.endswith(WORD_PDF_SUFFIXES)):
+                continue
+            try:
+                identifier = path.name.partition('.')[0]
+                uuid.UUID(identifier)
+                if path.stat().st_mtime <= cutoff:
+                    candidates.append((identifier,path))
+            except (FileNotFoundError,ValueError):
+                continue
+        if not candidates:
+            return
+        with self.database.connect(write=True) as db:
+            known = {row[0] for row in db.execute('SELECT id FROM chat_files WHERE id=ANY(?::text[])',
+                                                   ([identifier for identifier,_ in candidates],))}
+            empty = set()
+            for identifier,path in candidates:
+                if identifier not in known:
                     path.unlink(missing_ok=True)
-                    parent=path.parent
-                    if parent.name != 'chat_attachments':
-                        owner=parent.parent.parent.name
-                        if not db.execute('SELECT 1 FROM chat_conversations WHERE id=? AND user_id=?',(parent.name,owner)).fetchone():
-                            self.files.directory.remove_workspace(owner,parent.name)
+                    if path.parent.name != 'chat_attachments':
+                        empty.add((path.parent.parent.parent.name,path.parent.name))
+            if empty:
+                existing = {tuple(row) for row in db.execute('SELECT user_id,id FROM chat_conversations WHERE id=ANY(?::text[])',
+                                                             ([workspace for _,workspace in empty],))}
+                for owner,workspace in empty - existing:
+                    self.files.directory.remove_workspace(owner,workspace)
 
     def localize(self,db,text,task_id,user_id,message_id,*,expired=False):
         """按本条发言的授权将附件标记、历史下载链接映射到查看者的独立副本。"""
@@ -396,7 +442,7 @@ class PeerResources:
         rows=db.execute("""SELECT f.id,f.user_id,f.size,f.conversation_id,a.source_file_id FROM agent_task_files a
             JOIN chat_files f ON f.id=a.file_id WHERE a.task_id=? AND a.message_id=?
             AND ((?::text IS NULL AND f.user_id=?) OR f.conversation_id=?)
-            AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now'))""",(task_id,message_id,shared,user_id,shared)).fetchall()
+            AND (f.expires_at IS NULL OR avatar_utc_time(f.expires_at)>CURRENT_TIMESTAMP)""",(task_id,message_id,shared,user_id,shared)).fetchall()
         markers={row['source_file_id']:row['id'] for row in rows if row['source_file_id'] and
                  self.files.directory.available_in(row['user_id'],row['conversation_id'],row['id'],row['size'])}
         if expired:
@@ -412,7 +458,7 @@ class PeerResources:
                 AND ((?::text IS NULL AND local.user_id=?) OR local.conversation_id=?)
                 AND ((a.source_file_id IS NOT NULL AND b.source_file_id=a.source_file_id) OR
                      (a.source_file_id IS NULL AND source.sha256<>'' AND local.sha256=source.sha256 AND local.filename=source.filename))
-                AND (local.expires_at IS NULL OR julianday(local.expires_at)>julianday('now'))""",(task_id,message_id,shared,user_id,shared))
+                AND (local.expires_at IS NULL OR avatar_utc_time(local.expires_at)>CURRENT_TIMESTAMP)""",(task_id,message_id,shared,user_id,shared))
             urls={}
             for row in links:
                 if not self.files.directory.available_in(row['local_owner'],row['local_conversation'],row['local_id'],row['local_size']):continue

@@ -27,10 +27,6 @@ def install_task_workspaces(connection):
           RETURN NEW;
         END $body$""")
     connection.execute("ALTER TABLE agent_task_members ADD COLUMN IF NOT EXISTS expired_files TEXT NOT NULL DEFAULT '[]'")
-    connection.execute("""CREATE INDEX IF NOT EXISTS agent_task_members_workspace
-        ON agent_task_members(resource_conversation_id,user_id) WHERE resource_conversation_id IS NOT NULL""")
-    connection.execute("""CREATE INDEX IF NOT EXISTS completed_task_workspace_expiry
-        ON agent_dialogues(expires_at) WHERE delivery_mode<>'message' AND status='ended' AND expires_at IS NOT NULL""")
     connection.execute("""CREATE OR REPLACE FUNCTION avatar_task_workspace_expiry() RETURNS trigger
         LANGUAGE plpgsql AS $body$
         DECLARE

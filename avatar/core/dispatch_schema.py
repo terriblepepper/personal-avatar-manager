@@ -47,6 +47,26 @@ TRIGGERS = (
     ('overview_avatar', 'avatar_records', 'INSERT OR UPDATE OF aic,profile,identity_status OR DELETE', """
         PERFORM avatar_emit('overview', CASE WHEN TG_OP='DELETE' THEN OLD.user_id ELSE NEW.user_id END);
     """),
+    ('topology_avatar', 'avatar_records', 'INSERT OR UPDATE OF aic,identity_status OR DELETE', """
+        IF TG_OP != 'UPDATE' OR OLD.aic IS DISTINCT FROM NEW.aic
+                OR OLD.identity_status IS DISTINCT FROM NEW.identity_status THEN
+            PERFORM avatar_emit('work', 'topology');
+        END IF;
+    """),
+    ('topology_account', 'users', 'UPDATE OF account_status', """
+        IF OLD.account_status IS DISTINCT FROM NEW.account_status THEN
+            PERFORM avatar_emit('work', 'topology');
+        END IF;
+    """),
+    ('topology_port', 'avatar_entity_ports', 'INSERT OR UPDATE OR DELETE', """
+        PERFORM avatar_emit('work', 'topology');
+    """),
+    ('topology_oidc', 'oidc_identities', 'INSERT OR UPDATE OR DELETE', """
+        PERFORM avatar_emit('work', 'topology');
+    """),
+    ('topology_link', 'oidc_identity_links', 'INSERT OR UPDATE OR DELETE', """
+        PERFORM avatar_emit('work', 'topology');
+    """),
     ('identity', 'avatar_identity_jobs', 'INSERT OR UPDATE OF status,next_attempt_at', """
         IF NEW.status IN ('queued','waiting') THEN
             PERFORM avatar_emit('work', 'identity');
@@ -75,10 +95,13 @@ def install_dispatch(connection):
         id BIGSERIAL PRIMARY KEY, payload TEXT NOT NULL)''')
     connection.execute("""
         CREATE OR REPLACE FUNCTION avatar_emit(VARIADIC keys text[]) RETURNS void
-        LANGUAGE sql AS $$
-            INSERT INTO avatar_dispatch_events(payload)
-            SELECT array_to_json(keys)::text
-            WHERE current_setting('avatar.dispatch_enabled', true) = 'on'
+        LANGUAGE plpgsql AS $$
+        BEGIN
+            IF current_setting('avatar.dispatch_enabled', true) = 'on' THEN
+                INSERT INTO avatar_dispatch_events(payload) VALUES (array_to_json(keys)::text);
+                PERFORM pg_notify('avatar_dispatch_' || md5(current_schema()::text), '');
+            END IF;
+        END
         $$
     """)
     for key, table, operation, body in TRIGGERS:

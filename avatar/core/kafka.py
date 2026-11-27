@@ -54,7 +54,7 @@ class KafkaWakeups:
         try:
             while True:
                 try:
-                    batch = await finish_on_cancel(asyncio.to_thread(self.consumer.consume, 64, .05))
+                    batch = await finish_on_cancel(asyncio.to_thread(self.consumer.consume, 64, .5))
                     self.producer.poll(0)
                     for message in batch:
                         if message.error():

@@ -15,10 +15,13 @@ RASTER = ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tif', '.tiff', '.webp')
 
 
 def pdf_image(path,page):
-    with tempfile.TemporaryDirectory(prefix='avatar-rag-') as directory:
-        output=Path(directory)/'page'
-        subprocess.run(['pdftoppm','-f',str(page),'-l',str(page),'-singlefile','-scale-to','1600','-jpeg',str(path),str(output)],capture_output=True,timeout=30,check=True)
-        return (output.with_suffix('.jpg')).read_bytes()
+    return _render_page(path,page,1600)
+
+
+def _render_page(path, page, size):
+    result=subprocess.run(['pdftoppm','-f',str(page),'-l',str(page),'-singlefile',
+        '-scale-to',str(size),'-jpeg',str(path)],stdin=subprocess.DEVNULL,capture_output=True,check=True,timeout=30)
+    return result.stdout
 
 
 def office_runtime():
@@ -106,12 +109,7 @@ def pdf_images(path, pages=None, *, vector=True):
         raise ValueError('PDF 已加密，无法解析图片')
     for number in pdf_visual_pages(reader, vector=vector, pages=pages):
         # Render the page as well: vector plots, masks and nested forms are visual evidence too.
-        with tempfile.TemporaryDirectory(prefix='avatar-document-page-') as directory:
-            target = Path(directory) / 'page'
-            subprocess.run(['pdftoppm', '-f', str(number), '-l', str(number), '-singlefile',
-                '-scale-to', '2400', '-jpeg', str(path), str(target)],
-                stdin=subprocess.DEVNULL, capture_output=True, check=True, timeout=30)
-            yield {'id':f'page-{number}', 'page':number, 'label':f'第 {number} 页完整画面（含图表、矢量图及布局）', 'data':target.with_suffix('.jpg').read_bytes()}
+        yield {'id':f'page-{number}', 'page':number, 'label':f'第 {number} 页完整画面（含图表、矢量图及布局）', 'data':_render_page(path,number,2400)}
         try:
             images = reader.pages[number-1].images
             for index in range(len(images)):

@@ -7,11 +7,13 @@ import json
 import os
 import time
 import uuid
+from weakref import WeakValueDictionary
 from contextlib import contextmanager
 from fastapi import HTTPException
 from avatar.core.db import now
 from avatar.core.execution import finish_on_cancel
-from avatar.files.library.attachments import AttachmentService, TYPES
+from avatar.files.library.attachments import AttachmentService
+from avatar.files.uploads.validation import TYPES, inspect_file
 from avatar.files.conversation.resources import ConversationResources, reference_count
 from avatar.files.uploads.buffer import upload_buffer, upload_work, write_original
 
@@ -25,9 +27,9 @@ class ChatFiles(ConversationResources):
     # 结果与约束：构造不创建原件，不扫描其他账户。
     def __init__(self, database, attachments=None):
         self.database=database
-        self.attachments=attachments or AttachmentService(database)
+        self.attachments=attachments or AttachmentService(database, recover=False)
         self.directory=ConversationBlobs(database)
-        self.promotion_locks={}
+        self.promotion_locks=WeakValueDictionary()
 
     # 职责：确认会话属于当前用户且为可见的 Web 父会话。
     # 输入：db 为当前事务，conversation_id 来自页面选择。
@@ -56,7 +58,7 @@ class ChatFiles(ConversationResources):
         else:
             task=None
         if task and task['status']=='ended':
-            if task['expires_at'] and db.execute("SELECT julianday(?)<=julianday('now')",(task['expires_at'],)).fetchone()[0]:
+            if task['expires_at'] and db.execute("SELECT avatar_utc_time(?)<=CURRENT_TIMESTAMP",(task['expires_at'],)).fetchone()[0]:
                 raise HTTPException(410,'任务工作区已过期')
             if editable:raise HTTPException(409,'已结束任务的工作区仅可查看或转存')
         return row
@@ -68,7 +70,7 @@ class ChatFiles(ConversationResources):
         while len(cards) < 20:
             rows = db.execute("""SELECT id,filename,filename AS relative_path,left(description,300) AS description,
                 content_type,animation_metadata,'chat' AS source,origin,size FROM chat_files
-                WHERE user_id=? AND conversation_id=? AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))
+                WHERE user_id=? AND conversation_id=? AND (expires_at IS NULL OR avatar_utc_time(expires_at)>CURRENT_TIMESTAMP)
                 ORDER BY created_at DESC,id LIMIT 20 OFFSET ?""",(owner,conversation,offset)).fetchall()
             cards.extend(dict(row) for row in rows if self.directory.available_in(owner,conversation,row['id'],row['size']))
             if len(rows)<20:
@@ -81,7 +83,7 @@ class ChatFiles(ConversationResources):
         chat_rows="""SELECT id,filename,left(description,300) AS description,content_type,
                    animation_metadata::jsonb->>'title' AS title,origin,'chat' AS source,created_at AS stamp,size
             FROM chat_files WHERE user_id=? AND conversation_id=?
-              AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))"""
+              AND (expires_at IS NULL OR avatar_utc_time(expires_at)>CURRENT_TIMESTAMP)"""
         shared_rows=""" UNION ALL
             SELECT a.id,a.filename,left(a.caption,300),a.content_type,a.animation_metadata::jsonb->>'title',
                    'material','profile',links.stamp,a.size
@@ -151,7 +153,7 @@ class ChatFiles(ConversationResources):
                 coalesce((SELECT id FROM attachments WHERE id=f.promoted_id AND user_id=?),(SELECT a.id FROM attachments a WHERE a.user_id=?
                         AND a.sha256=f.sha256 AND f.sha256<>'' ORDER BY a.created_at,a.id LIMIT 1)) AS promoted_id
                 FROM chat_files f WHERE f.user_id=? AND f.conversation_id=?
-                  AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now')) ORDER BY f.created_at,f.id""",
+                  AND (f.expires_at IS NULL OR avatar_utc_time(f.expires_at)>CURRENT_TIMESTAMP) ORDER BY f.created_at,f.id""",
                 (user_id,user_id,storage_owner,conversation_id))
             items = []
             for row in rows:
@@ -171,7 +173,7 @@ class ChatFiles(ConversationResources):
     # 结果与约束：复用个人文件格式校验与解析并发限制，不执行脚本或宏；解析时不持有数据库写锁。
     async def upload(self, user, conversation_id, filename, data, *, origin='upload', description='', source_label='本地上传',temporary=False,html_mode=None):
         async with self.attachments.parsing:
-            extension = await upload_work(self.attachments.inspect_file,filename,data)
+            extension = await upload_work(inspect_file,filename,data)
             return await upload_work(self._store,user,conversation_id,filename,data,extension,origin,description,source_label,temporary,html_mode)
 
     # 职责：保存会话原件并解析文字，图片生成有尺寸限制的 JPEG 视觉输入副本。
@@ -196,10 +198,10 @@ class ChatFiles(ConversationResources):
                 with os.fdopen(os.open(preview,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'wb') as stream:stream.write(encoded)
                 status='vision_ready'
             md5=hashlib.md5(data,usedforsecurity=False).hexdigest()
-            with self.database.connect(write=True) as db:
+            with self.database.connect(write=True, account_scope=storage_owner) as db:
                 if self.session(db,user['id'],conversation_id,editable=True)['user_id']!=storage_owner:
                     raise HTTPException(409,'文件工作区已改变，请重试')
-                candidates=db.execute("SELECT id,sha256,md5 FROM chat_files WHERE user_id=? AND conversation_id=? AND (sha256=? OR sha256='') AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))",(storage_owner,conversation_id,sha)).fetchall()
+                candidates=db.execute("SELECT id,sha256,md5 FROM chat_files WHERE user_id=? AND conversation_id=? AND (sha256=? OR sha256='') AND (expires_at IS NULL OR avatar_utc_time(expires_at)>CURRENT_TIMESTAMP)",(storage_owner,conversation_id,sha)).fetchall()
                 for candidate in candidates:
                     old_md5=candidate['md5']
                     if not old_md5 or not candidate['sha256'] or old_md5!=md5:
@@ -237,7 +239,7 @@ class ChatFiles(ConversationResources):
         owner = self.session(db,user_id,conversation_id)['user_id']
         rows = {row['id']: row for row in db.execute("""SELECT * FROM chat_files
             WHERE id=ANY(?::text[]) AND user_id=? AND conversation_id=?
-            AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))""",
+            AND (expires_at IS NULL OR avatar_utc_time(expires_at)>CURRENT_TIMESTAMP)""",
             (identifiers,owner,conversation_id))}
         result = []
         for identifier in identifiers:
@@ -303,7 +305,8 @@ class ChatFiles(ConversationResources):
                     await finish_on_cancel(store_original())
                 def mark_promoted():
                     nonlocal linked
-                    with self.database.connect(write=True) as db:
+                    scope = user['id'] if row['user_id'] == user['id'] else None
+                    with self.database.connect(write=True, account_scope=scope) as db:
                         self.owned(db,user['id'],conversation_id,file_id)
                         if row['content_type'] == 'text/html' and json.loads(row['animation_metadata']).get('html_mode') in ('2d','3d'):
                             db.execute('UPDATE attachments SET animation_metadata=? WHERE id=? AND user_id=?',
@@ -326,17 +329,25 @@ class ChatFiles(ConversationResources):
             current=[self.owned(db,user_id,parent,identifier) for identifier in dict.fromkeys(selected)]
             if any(not row['referenced'] or row['origin']=='attachment' for row in current):raise HTTPException(409,'文件引用已关闭，请刷新会话后重新发送')
             if persistent:
-                return [dict(row) for row in db.execute("SELECT * FROM chat_files WHERE user_id=? AND conversation_id=? AND referenced=1 AND origin!='attachment' AND (expires_at IS NULL OR julianday(expires_at)>julianday('now')) ORDER BY created_at,id LIMIT 5",(user_id,parent)) if self.directory.available_in(user_id,row['conversation_id'],row['id'],row['size'])]
+                return [dict(row) for row in db.execute("SELECT * FROM chat_files WHERE user_id=? AND conversation_id=? AND referenced=1 AND origin!='attachment' AND (expires_at IS NULL OR avatar_utc_time(expires_at)>CURRENT_TIMESTAMP) ORDER BY created_at,id LIMIT 5",(user_id,parent)) if self.directory.available_in(user_id,row['conversation_id'],row['id'],row['size'])]
             history=db.execute('''SELECT f.* FROM chat_files f WHERE f.user_id=? AND f.conversation_id=? AND (
                 EXISTS(SELECT 1 FROM chat_file_usages u JOIN chat_messages m ON m.id=u.message_id WHERE u.file_id=f.id AND m.conversation_id=?)
                 OR EXISTS(SELECT 1 FROM chat_messages m WHERE m.id=f.generated_message_id AND m.conversation_id=?))
-                AND f.referenced=1 AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now')) ORDER BY f.created_at DESC LIMIT 5''',(user_id,parent,session['id'],session['id'])).fetchall()
+                AND f.referenced=1 AND (f.expires_at IS NULL OR avatar_utc_time(f.expires_at)>CURRENT_TIMESTAMP) ORDER BY f.created_at DESC LIMIT 5''',(user_id,parent,session['id'],session['id'])).fetchall()
         return (current+[dict(row) for row in history if row['id'] not in selected and self.directory.available_in(user_id,row['conversation_id'],row['id'],row['size'])])[:5]
+
+    @contextmanager
+    def edit_session(self, user_id, conversation_id):
+        with self.database.connect() as db:
+            owner = self.session(db,user_id,conversation_id,editable=True)['user_id']
+        with self.database.connect(write=True, account_scope=owner) as db:
+            if self.session(db,user_id,conversation_id,editable=True)['user_id'] != owner:
+                raise HTTPException(409,'文件工作区已改变，请重试')
+            yield db
 
     # 职责：保存本人文件的引用开关；发送成功不修改此字段，刷新或再次登录后仍保持用户选择。
     def reference_enabled(self,user_id,conversation_id,file_id,enabled):
-        with self.database.connect(write=True) as db:
-            self.session(db,user_id,conversation_id,editable=True)
+        with self.edit_session(user_id,conversation_id) as db:
             row=self.owned(db,user_id,conversation_id,file_id)
             if row['origin']=='attachment':raise HTTPException(409,'发送附件不能设置为持续引用，请先转存到资料库')
             if enabled and not row['referenced'] and reference_count(db,conversation_id)>=5:
@@ -348,8 +359,8 @@ class ChatFiles(ConversationResources):
     # 输入：已认证账户、父会话、附件及最多两千字说明。
     # 结果与约束：归属和租约再次校验，不宣称说明代表文件真实内容，不改个人资料副本。
     def describe(self,user_id,conversation_id,file_id,description):
-        with self.database.connect(write=True) as db:
-            self.session(db,user_id,conversation_id,editable=True);self.owned(db,user_id,conversation_id,file_id)
+        with self.edit_session(user_id,conversation_id) as db:
+            self.owned(db,user_id,conversation_id,file_id)
             db.execute('UPDATE chat_files SET description=? WHERE id=?',(description,file_id))
         return self.list(user_id,conversation_id)
 

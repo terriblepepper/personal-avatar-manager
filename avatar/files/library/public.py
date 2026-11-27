@@ -28,7 +28,7 @@ class PublicMaterials:
                 if not row:raise HTTPException(404,'指定公开资料不存在或已取消公开')
                 existing=db.execute("""SELECT f.id FROM chat_files f WHERE f.user_id=? AND f.conversation_id=?
                     AND f.origin='reference' AND f.source_label='公开资料原件' AND f.filename=? AND f.sha256=?
-                    AND (f.expires_at IS NULL OR julianday(f.expires_at)>julianday('now')) AND NOT EXISTS
+                    AND (f.expires_at IS NULL OR avatar_utc_time(f.expires_at)>CURRENT_TIMESTAMP) AND NOT EXISTS
                     (SELECT 1 FROM agent_task_files a WHERE a.task_id=? AND a.file_id=f.id)
                     ORDER BY f.created_at,f.id LIMIT 1""",(storage_owner,workspace,row['filename'],row['sha256'],task_id)).fetchone() if workspace else None
                 if existing and (existing['id'] in reserved or any(item['id']==existing['id'] for item in outputs)):

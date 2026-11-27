@@ -130,7 +130,10 @@ class PlatformMonitor:
             except (Error, OSError):
                 pass
             else:
-                self.history.extend(previous)
+                if previous:
+                    # The upsert and the in-memory history must select the same minute.
+                    replacing = {key for key, _ in rows}
+                    self.history.extend(row for row in previous if row[0] not in replacing)
                 self.history.extend(rows)
                 if rows:
                     self.pending_until = rows[-1][0]

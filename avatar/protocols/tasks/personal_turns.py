@@ -62,7 +62,7 @@ def lease_release(db, run):
 
 def clear_run(db, row, run):
     if run.get('run_id'):
-        RunStore.clear_in(db, run['owner'], 'protocol', str(row['rowid']), run['run_id'])
+        RunStore.clear_in(db, run['owner'], 'protocol', str(row['task_number']), run['run_id'])
 
 
 def close_in(db, row, document, state, message=None, *, reason=None):
@@ -76,7 +76,7 @@ def close_in(db, row, document, state, message=None, *, reason=None):
     if message:
         status['dataItems']=[{'type':'text','text':message}]
     document.update(id=uuid.uuid4().hex,sentAt=now(),status=status)
-    db.execute('UPDATE avatar_aip_tasks SET document=?,deadline=NULL WHERE rowid=?',(dump(document),row['rowid']))
+    db.execute('UPDATE avatar_aip_tasks SET document=?,deadline=NULL WHERE task_number=?',(dump(document),row['task_number']))
     audit_outcome(document, run, reason or state, previous_run=previous_run)
     return public_result(document)
 
@@ -91,7 +91,7 @@ def interrupt_in(db, row, document):
     run = document.pop('_agent_resume', {})
     started = run.get('claimed', False)
     lease_release(db, run)
-    saved = RunStore.inspect_in(db, run['owner'], 'protocol', str(row['rowid']), run['run_id']) if run.get('run_id') else None
+    saved = RunStore.inspect_in(db, run['owner'], 'protocol', str(row['task_number']), run['run_id']) if run.get('run_id') else None
     if run.get('run_id') and resume_safe(saved or {}, automatic=True, initial=not started, allow_question=False):
         run['restart'] = True
         document['_agent_resume'] = run
@@ -105,12 +105,12 @@ def interrupt_in(db, row, document):
         state, message = 'failed', '上一次操作缺少可安全恢复的回执，请核对已有结果后重新发起任务'
     document.update(id=uuid.uuid4().hex, sentAt=now(), status={'state':state, 'stateChangedAt':now(),
                     'dataItems':[{'type':'text','text':message}]})
-    db.execute('UPDATE avatar_aip_tasks SET document=?,deadline=NULL WHERE rowid=?', (dump(document), row['rowid']))
+    db.execute('UPDATE avatar_aip_tasks SET document=?,deadline=NULL WHERE task_number=?', (dump(document), row['task_number']))
     audit_outcome(document, run, 'writer_interrupted')
 
 
 def current_in(db, rowid, writer, run):
-    row = db.execute('SELECT document FROM avatar_aip_tasks WHERE rowid=?',(rowid,)).fetchone()
+    row = db.execute('SELECT document FROM avatar_aip_tasks WHERE task_number=?',(rowid,)).fetchone()
     if row:
         doc = json.loads(row['document'])
         if (doc['status']['state']=='working' and doc['id']==writer and
@@ -137,14 +137,14 @@ def renew(database, rowid, writer, run, conversation_id=None, *, work_until):
                 raise RunConflict('原任务的会话执行权已变更')
         if conversation_id:
             saved.update(lease=[conversation_id,until],claimed=True)
-        db.execute('UPDATE avatar_aip_tasks SET document=?,deadline=? WHERE rowid=?',(dump(doc),until,rowid))
+        db.execute('UPDATE avatar_aip_tasks SET document=?,deadline=? WHERE task_number=?',(dump(doc),until,rowid))
 
 # 职责：保存当前任务结果，保留并发取消或超时的终态。
 # 输入：rowid 和当前 working 消息 ID 固定执行者，message 为产品或状态说明。
 # 结果与约束：只更新原任务，不覆盖已取消结果；成功等待 Leader 确认最多 300 秒。
 
 def finish_in(db, rowid, result, run, state, message, *, reason=None, delivery=None, files=()):
-    row = db.execute('SELECT rowid,document FROM avatar_aip_tasks WHERE rowid=?',(rowid,)).fetchone()
+    row = db.execute('SELECT task_number,document FROM avatar_aip_tasks WHERE task_number=?',(rowid,)).fetchone()
     if not row:
         raise RunConflict('原任务已删除')
     current = json.loads(row['document'])
@@ -166,7 +166,7 @@ def finish_in(db, rowid, result, run, state, message, *, reason=None, delivery=N
             document['_file_deliveries'] = current['_file_deliveries']
     else:
         clear_run(db,row,run)
-    db.execute('UPDATE avatar_aip_tasks SET document=?,deadline=? WHERE rowid=?',
+    db.execute('UPDATE avatar_aip_tasks SET document=?,deadline=? WHERE task_number=?',
                (dump(document),time.time()+300 if state=='awaiting-completion' else None,rowid))
     audit_outcome(document, run, reason or state)
     return public_result(document)

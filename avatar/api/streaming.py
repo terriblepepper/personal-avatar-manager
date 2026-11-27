@@ -13,24 +13,25 @@ def submit_generation(database, user, body):
     return GenerationStore(database).submit(user, body)
 
 
-def chat_response(chat, user, body, database):
+def chat_response(request, user, body, database):
     body = body.model_copy(update={'request_id': body.request_id or uuid.uuid4().hex})
     submit_generation(database, user, body)
     store = GenerationStore(database)
 
     changes = getattr(database, 'changes', None)
+    snapshots_only = request.headers.get('x-avatar-stream') == 'snapshots'
 
     async def stream(wakeup):
         previous = None
         delivered = ''
-        while True:
+        while not await request.is_disconnected():
             if wakeup is not None:
                 wakeup.take()
             snapshot = await asyncio.to_thread(store.get,user['id'],body.request_id)
             if snapshot != previous:
                 event = {'type': 'snapshot', 'snapshot': snapshot}
                 yield 'event: snapshot\ndata: ' + json.dumps(event, ensure_ascii=False) + '\n\n'
-                if snapshot:
+                if snapshot and not snapshots_only:
                     text=snapshot.get('reply','')
                     if text.startswith(delivered) and text!=delivered:
                         event={'type':'delta','text':text[len(delivered):]}
