@@ -4,6 +4,7 @@ import ssl
 
 import httpx
 from fastapi import HTTPException
+from avatar.models.tools import invalid_tool_call
 
 PURPOSES={'react':'分身模型调用','agent_intent':'会话意图分析','html_generation':'HTML 作品生成',
           'memory':'记忆压缩','file_embedding':'向量嵌入','file_search':'资料判断/检索',
@@ -36,7 +37,6 @@ def check_terminal(reason, usage, *, native=False):
     if native and terminal == 'error':
         tag = identifier(reason) or '未知'
         if tag.lower() in ('malformed_function_call','unexpected_tool_call'):
-            from avatar.models.tools import invalid_tool_call
             error = invalid_tool_call('上游未生成可执行的工具调用（'+tag+'）', None)
         else:
             cause = '上游模型拒绝或拦截了本次响应' if tag.lower() in _REFUSALS else '上游模型未正常完成响应'

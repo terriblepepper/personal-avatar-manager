@@ -96,8 +96,18 @@ def install_dispatch(connection):
     connection.execute("""
         CREATE OR REPLACE FUNCTION avatar_emit(VARIADIC keys text[]) RETURNS void
         LANGUAGE plpgsql AS $$
+        DECLARE
+            mode text := current_setting('avatar.dispatch_enabled', true);
         BEGIN
-            IF current_setting('avatar.dispatch_enabled', true) = 'on' THEN
+            IF mode = 'detect' THEN
+                -- Probe once per external write transaction. If no relay owns the schema,
+                -- hold a shared lock so its first scan follows this transaction's commit.
+                mode := CASE WHEN pg_try_advisory_xact_lock_shared(
+                    hashtextextended('avatar.dispatch:' || current_schema(), 0))
+                    THEN 'off' ELSE 'on' END;
+                PERFORM set_config('avatar.dispatch_enabled', mode, true);
+            END IF;
+            IF mode = 'on' THEN
                 INSERT INTO avatar_dispatch_events(payload) VALUES (array_to_json(keys)::text);
                 PERFORM pg_notify('avatar_dispatch_' || md5(current_schema()::text), '');
             END IF;

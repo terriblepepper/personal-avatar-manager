@@ -1,4 +1,5 @@
 """Read and authorize paired conversations and their task history."""
+from contextlib import contextmanager
 import hashlib
 import json
 import time
@@ -47,7 +48,7 @@ class PeerSessions:
 
     def auto_accept(self,user,session_id,enabled):
         owner=user['id']
-        with self.database.connect(write=True) as db:
+        with self.database.connect(write=True, account_scope=owner) as db:
             session=self.member(db,user,session_id,hidden=True)
             peer=session['right_user_id'] if session['left_user_id']==owner else session['left_user_id']
             if enabled:
@@ -154,6 +155,19 @@ class PeerSessions:
         with self.database.connect() as db:row=self.owned(db,user,identifier)
         return {**self.session(user,row['session_id'],before,after,task_id=identifier,task_paging=task_paging),'task':self.view(row,user),'id':identifier}
 
+    @contextmanager
+    def workspace_transaction(self, owner, scope, shared):
+        if all(shared.values()):
+            with self.database.connect(write=True, account_scope=owner) as db:
+                mappings = db.execute("""SELECT scope_id,conversation_id FROM agent_shared_workspaces
+                    WHERE scope=? AND scope_id=ANY(?::text[]) FOR SHARE""",(scope,list(shared)))
+                if dict(tuple(row) for row in mappings) == shared:
+                    yield db
+                    return
+        # Creating a shared workspace also imports files from both participants.
+        with self.database.connect(write=True) as db:
+            yield db
+
     def session(self,user,identifier,before=None,after=None,task_id=None,*,task_paging=None):
         if before is not None and after is not None or any(v is not None and not 0<=v<=2**63-1 for v in [before,after]):raise HTTPException(422,'消息游标无效')
         with self.database.connect() as db:
@@ -166,7 +180,8 @@ class PeerSessions:
         if separate and workspace_expired(task):
             workspace=settings_id=None
         elif not workspace or not settings_id and not (separate and task['status']=='ended'):
-            with self.database.connect(write=True) as db:
+            scope, key = ('task',task_id) if separate else ('session',identifier)
+            with self.workspace_transaction(user['id'],scope,{key:workspace}) as db:
                 self.member(db,user,identifier,hidden=separate)
                 current=self.owned(db,user,task_id) if separate else None
                 if not workspace_expired(current):
@@ -281,7 +296,8 @@ class PeerSessions:
             items = full_page(self,db,user,[r['id'] for r in rows])
         missing = [item for item in items if not item['resource_conversation_id'] or not item['settings_conversation_id']]
         if missing:
-            with self.database.connect(write=True) as db:
+            shared = {item['id']: item['resource_conversation_id'] for item in missing}
+            with self.workspace_transaction(user['id'],'session',shared) as db:
                 for item in missing:
                     self.member(db,user,item['id'])
                     item['resource_conversation_id'] = self.resources.workspace(db,user['id'],item['id'])

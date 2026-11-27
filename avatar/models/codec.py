@@ -2,8 +2,18 @@
 from dataclasses import dataclass, field
 from fastapi import HTTPException
 
-from avatar.models.diagnostics import check_terminal, stop_reason
+from avatar.models.diagnostics import check_terminal, stop_reason, provider_error, contextual, empty_response
 from avatar.models.effort import apply_effort
+from avatar.models.limits import check_context, limits
+from avatar.models.tools import (
+    identify_calls,
+    raw_tool_calls,
+    invalid_tool_call,
+    parse_native_calls,
+    parse_tools,
+    wire_messages,
+    configure_tools,
+)
 
 
 # 职责：表示不同模型平台统一后的完整回答结果。
@@ -43,7 +53,6 @@ def parse_response(fmt, data, *, config=None, request_id=None, api_key=''):
     retain = native or config.get('_retain_turn_fragments', False)
     separator = '' if retain else '\n'
     if data.get('error'):
-        from avatar.models.diagnostics import provider_error,contextual
         raise contextual(provider_error(200,data['error'],request_id,api_key),config or {})
     if fmt == "openai":
         openai_message=(data.get('choices') or [{}])[0].get('message') or {}
@@ -71,7 +80,6 @@ def parse_response(fmt, data, *, config=None, request_id=None, api_key=''):
     terminal = stop_reason(reason)
     check_terminal(reason, model_usage, native=native)
     if terminal == 'output_limit':
-        from avatar.models.tools import identify_calls, raw_tool_calls
         try:
             fragments = raw_tool_calls(fmt, data)
             if native:
@@ -101,7 +109,6 @@ def parse_response(fmt, data, *, config=None, request_id=None, api_key=''):
     tools = config.get('_tools') or ()
     replay = None
     if tools or retain:
-        from avatar.models.tools import invalid_tool_call, parse_native_calls, parse_tools
         try:
             if native:
                 calls, replay = parse_native_calls(fmt, data)
@@ -118,7 +125,6 @@ def parse_response(fmt, data, *, config=None, request_id=None, api_key=''):
                 error.invalid_tool_call = False
             raise
     if not calls and (not isinstance(text, str) or not text.strip()):
-        from avatar.models.diagnostics import empty_response
         if fmt=='openai':
             choice=(data.get('choices') or [{}])[0];message=choice.get('message') or {}
             reason=choice.get('finish_reason');thinking=bool(message.get('reasoning_content'));refusal=bool(message.get('refusal')) or refused_part
@@ -150,10 +156,8 @@ def parse_response(fmt, data, *, config=None, request_id=None, api_key=''):
 # 输入：config 决定格式与模型，api_key 仅写鉴权头，system/history/message 构成上下文，streaming 控制流式选项。
 # 结果与约束：返回格式、端点、请求头和请求体四元组；Gemini 模型名进行路径编码，OpenAI 流式请求启用用量汇报。
 def build_request(config, api_key, system, history, message, streaming=True):
-    from avatar.models.limits import check_context
     check_context(config,system,history,message)
     fmt = config["api_format"]
-    from avatar.models.tools import wire_messages
     transcript = history if message is None else [*history, {"role": "user", "content": message}]
     conversation = wire_messages(fmt, transcript)
     images=config.get('_image_inputs',[])
@@ -196,7 +200,6 @@ def build_request(config, api_key, system, history, message, streaming=True):
             body['enable_thinking']=False
             body['chat_template_kwargs']={'enable_thinking':False}
         if config['provider']=='deepseek':
-            from avatar.models.limits import limits
             if limits('deepseek',config['model']):
                 # 平台未提供思考预算配置，显式关闭默认思考，避免吞掉小输出预算而没有可见回答。
                 body['thinking']={'type':'disabled'}
@@ -221,7 +224,6 @@ def build_request(config, api_key, system, history, message, streaming=True):
     if streaming and fmt == "openai":
         body["stream_options"] = {"include_usage": True}
     if config.get('_tools'):
-        from avatar.models.tools import configure_tools
         configure_tools(fmt,body,config['_tools'],required=not config.get('_optional_tools'),
                         batch=bool(config.get('_batch_tools')),native=bool(config.get('_react_tool_calls')))
     return fmt, endpoint, headers, body

@@ -12,6 +12,7 @@ from redis.backoff import NoBackoff
 from redis.exceptions import RedisError
 from redis.asyncio.retry import Retry
 
+from avatar.core.execution import run_blocking
 from avatar.core.kafka import KafkaWakeups
 from avatar.core.performance import record_duration
 
@@ -38,7 +39,7 @@ class Subscription(asyncio.Event):
 
 class Changes:
     def __init__(self, database, redis_socket, kafka_bootstrap, invalidate_reviews):
-        self.dsn = database.pool.conninfo
+        self.database = database
         self.redis = Redis(unix_socket_path=redis_socket, socket_connect_timeout=.2,
                            socket_timeout=2, retry=Retry(NoBackoff(), 0)) if redis_socket else None
         self.kafka_bootstrap = kafka_bootstrap
@@ -61,21 +62,23 @@ class Changes:
 
     @property
     def can_push(self):
-        return self.health['postgres'] and self.health['redis']
+        return self.health['postgres']
 
     @property
     def can_dispatch(self):
-        return self.health['postgres'] and self.health['kafka']
+        return self.health['postgres'] and (not self.kafka_bootstrap or self.health['kafka'])
 
     def set_ready(self, component, ready):
         if self.health[component] == ready:
             return
         self.health[component] = ready
-        for events in self.watchers.values():
-            for event in events:
+        if component == 'postgres':
+            for event in self.work.values():
                 event.set()
-        for event in self.work.values():
-            event.set()
+        if component == 'postgres' or component == 'redis' and not ready:
+            # Refresh snapshots across a disconnect, including a lost Redis delivery.
+            for key in self.watchers:
+                self.mark(key)
 
     def wake(self, key):
         if key in self.work:
@@ -94,6 +97,25 @@ class Changes:
                 if not self.watchers[key]:
                     del self.watchers[key]
 
+    async def _deliver_update(self, key):
+        if key == ('reviews',):
+            await run_blocking(self.invalidate_reviews)
+        self.mark(key)
+
+    async def _forward_updates(self, updates):
+        if self.health['redis']:
+            try:
+                async with self.redis.pipeline(transaction=False) as pipe:
+                    for payload, _ in updates:
+                        pipe.publish(self.namespace, payload)
+                    subscribers = await pipe.execute()
+            except RedisError:
+                self.set_ready('redis', False)
+            else:
+                updates = [update for update, count in zip(updates, subscribers) if not count]
+        for _, key in updates:
+            await self._deliver_update(key)
+
     async def _forward(self, payloads):
         updates = []
         deliveries = []
@@ -106,16 +128,11 @@ class Changes:
                 self.wake(keys[0])
                 if keys[0] != 'topology' and self.kafka and self.can_dispatch:
                     deliveries.append(self.kafka.publish(keys[0]))
-            elif topic in ('inbox', 'dialogue', 'generation', 'reviews', 'overview') and all(keys):
-                updates.append(payload)
-        if updates and self.health['redis']:
-            try:
-                async with self.redis.pipeline(transaction=False) as pipe:
-                    for payload in updates:
-                        pipe.publish(self.namespace, payload)
-                    await pipe.execute()
-            except RedisError:
-                self.set_ready('redis', False)
+            elif topic in ('inbox', 'dialogue', 'generation', 'reviews', 'overview') and all(
+                    isinstance(key, str) and key for key in keys):
+                updates.append((payload, (topic, *keys)))
+        if updates:
+            await self._forward_updates(updates)
         if deliveries:
             try:
                 await asyncio.wait_for(asyncio.gather(*deliveries), 5)
@@ -124,17 +141,16 @@ class Changes:
                 self.set_ready('kafka', False)
 
     async def _listen_postgres(self):
-        async with await AsyncConnection.connect(self.dsn, autocommit=True, connect_timeout=2) as conn:
-            db, schema, channel, locked = await (await conn.execute("""
-                SELECT current_database(), current_schema(), 'avatar_dispatch_' || md5(current_schema()::text),
-                    pg_try_advisory_lock(hashtextextended('avatar.dispatch:' || current_schema(), 0))
+        async with await AsyncConnection.connect(self.database.pool.conninfo, autocommit=True, connect_timeout=2) as conn:
+            db, schema, channel = await (await conn.execute("""
+                SELECT current_database(), current_schema(), 'avatar_dispatch_' || md5(current_schema()::text)
+                FROM pg_advisory_lock(hashtextextended('avatar.dispatch:' || current_schema(), 0))
             """)).fetchone()
-            if not locked:
-                await asyncio.sleep(2)
-                return
             self.namespace = 'avatar.v1.' + hashlib.sha256(
                 json.dumps((conn.info.host, conn.info.port, db, schema)).encode()).hexdigest()[:32]
             await conn.execute(sql.SQL('LISTEN {}').format(sql.Identifier(channel)))
+            if self.namespace_ready.is_set():
+                await run_blocking(self.invalidate_reviews)
             self.namespace_ready.set()
             self.set_ready('postgres', True)
             while True:
@@ -160,13 +176,15 @@ class Changes:
             await sub.subscribe(self.namespace)
             while True:
                 message = await sub.get_message(timeout=1.)
-                if message is None:
+                if message is None or message['type'] == 'subscribe':
+                    if message is not None and self.health['redis']:
+                        # redis-py may resubscribe without surfacing a disconnect.
+                        self.set_ready('redis', False)
                     if not self.health['redis']:
-                        await self.redis.ping()
+                        if message is None:
+                            await self.redis.ping()
+                        await run_blocking(self.invalidate_reviews)
                         self.set_ready('redis', True)
-                    continue
-                if message['type'] == 'subscribe':
-                    self.set_ready('redis', True)
                     continue
                 try:
                     key = tuple(json.loads(message['data']))
@@ -174,9 +192,7 @@ class Changes:
                         continue
                 except (ValueError, TypeError):
                     continue
-                if key == ('reviews',):
-                    await asyncio.to_thread(self.invalidate_reviews)
-                self.mark(key)
+                await self._deliver_update(key)
 
     async def _listen_kafka(self):
         await self.namespace_ready.wait()
@@ -207,6 +223,7 @@ class Changes:
 
     async def run(self):
         self.loop = asyncio.get_running_loop()
+        self.database.dispatch_enabled = True
         try:
             async with asyncio.TaskGroup() as group:
                 group.create_task(self._retry('postgres', self._listen_postgres))
@@ -215,6 +232,7 @@ class Changes:
                 if self.kafka_bootstrap:
                     group.create_task(self._retry('kafka', self._listen_kafka))
         finally:
+            self.database.dispatch_enabled = False
             self.loop = None
             if self.redis is not None:
                 await self.redis.aclose()

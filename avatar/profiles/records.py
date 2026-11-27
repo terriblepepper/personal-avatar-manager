@@ -4,6 +4,8 @@ from fastapi import HTTPException
 from avatar.accounts.auth import require_admin
 from avatar.accounts.roles import ADMIN_ROLES
 from avatar.core.activity_visibility import event_scope
+from avatar.core.db import now
+from avatar.profiles.admin_reads import agent_details
 
 
 # 职责：读取一页历史、日志、调用、审核、任务或协商记录。
@@ -69,7 +71,6 @@ def record_page(state,user,collection,scope='user',offset=0,search='',status='al
         if collection in ('history','submissions'):
             items = service.submission_page(db, rows, admin)
         elif collection == 'agents':
-            from avatar.profiles.admin_reads import agent_details
             items = agent_details(state, db, rows)
         elif collection == 'dialogues':
             items = state.dialogues.session_store.views(db, rows, user)
@@ -80,7 +81,6 @@ def record_page(state,user,collection,scope='user',offset=0,search='',status='al
 
 def dismiss_records(state,user,collection,ids):
     """白名单类别、本人调用记录／管理员维护记录；整批核验后原子隐藏。"""
-    from avatar.core.db import now
     ids=list(dict.fromkeys(ids))
     if not ids or len(ids)>100 or any(not value or len(value)>128 for value in ids):raise HTTPException(422,'请选择最多 100 条记录')
     if collection in ('identity_jobs','jobs'):require_admin(user)
@@ -100,7 +100,6 @@ def dismiss_records(state,user,collection,ids):
 
 def dismiss_all_records(state,user,collection):
     """Hide all eligible records in one transaction, independent of paging/search."""
-    from avatar.core.db import now
     if collection in ('identity_jobs','jobs'):require_admin(user)
     tables={'model_calls':'model_calls','identity_jobs':'avatar_identity_jobs','jobs':'provision_jobs','history':'profile_submissions','events':'audit_events'}
     if collection not in tables:raise HTTPException(404,'不支持删除此类记录')

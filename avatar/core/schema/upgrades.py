@@ -1,5 +1,9 @@
 """Idempotent upgrades for installations predating the current domain schema."""
 from avatar.core.schema.performance import first_migration
+from avatar.core.dispatch_schema import install_dispatch
+from avatar.core.migrations.peer_states import migrate_peer_states
+from avatar.core.migrations.soul import restore_asset_sources
+from avatar.core.migrations.task_workspaces import install_task_workspaces
 
 
 def upgrade(connection):
@@ -67,7 +71,6 @@ def upgrade(connection):
     asset_source = connection.execute("""SELECT 1 FROM information_schema.columns
         WHERE table_schema=current_schema() AND table_name='knowledge_assets' AND column_name='source_attachment_id'""")
     if asset_source.fetchone() is None:
-        from avatar.core.migrations.soul import restore_asset_sources
         connection.execute("ALTER TABLE knowledge_assets ADD COLUMN source_attachment_id TEXT NOT NULL DEFAULT ''")
         restore_asset_sources(connection)
 
@@ -81,9 +84,7 @@ def upgrade(connection):
             ADD CONSTRAINT chat_generation_jobs_state_check CHECK
             (state IN ('queued','running','succeeded','failed','cancelled','indeterminate','awaiting_input'))""")
 
-    from avatar.core.migrations.task_workspaces import install_task_workspaces
     install_task_workspaces(connection)
-    from avatar.core.migrations.peer_states import migrate_peer_states
     migrate_peer_states(connection)
     if first_migration(connection, 'personal-task-message-ids-v1'):
         connection.execute("""UPDATE avatar_aip_tasks SET document=(document::jsonb ||
@@ -102,7 +103,6 @@ def upgrade(connection):
                 AND m.user_id=chat_files.user_id)""")
 
 
-    from avatar.core.dispatch_schema import install_dispatch
     install_dispatch(connection)
     connection.execute('''CREATE TABLE IF NOT EXISTS ops_metric_minutes (
         minute BIGINT PRIMARY KEY, metrics JSONB NOT NULL)''')

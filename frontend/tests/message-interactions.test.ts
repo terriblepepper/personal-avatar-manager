@@ -1,3 +1,4 @@
+import { ElMessageBox } from 'element-plus'
 import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils'
 import { afterEach, expect, it, vi } from 'vitest'
 import ChatView from '../src/views/ChatView.vue'
@@ -7,6 +8,7 @@ import { createNotificationInbox, notificationInboxKey } from '../src/composable
 import NotificationBell from '../src/components/NotificationBell.vue'
 import ChatIntent from '../src/components/collaboration/ChatIntent.vue'
 
+vi.mock('../src/stores/session', () => ({useSessionStore: () => ({user:{id:'viewer',role:'user'}})}))
 const request = vi.hoisted(() => vi.fn())
 vi.mock('../src/api/client', () => ({request, notifyError: vi.fn()}))
 vi.mock('vue-router', async importOriginal => ({ ...await importOriginal<typeof import('vue-router')>(), useRoute: () => ({query:{session:'s'}}), useRouter: () => ({replace:vi.fn(),push:vi.fn()}) }))
@@ -101,7 +103,7 @@ it('marks one notification and confirms deletion from the compact feed', async (
   action('标记已读')!.click()
   await flushPromises()
   expect(request).toHaveBeenCalledWith('/notifications/batch','POST',{ids:[7],action:'read'},expect.any(AbortSignal))
-  const confirm=vi.spyOn(window,'confirm').mockReturnValue(false)
+  const confirm=vi.spyOn(ElMessageBox,'confirm').mockRejectedValue('cancel')
   await row.trigger('keydown',{key:'F10',shiftKey:true})
   await flushPromises()
   action('删除消息')!.click()

@@ -175,7 +175,7 @@ class PostgresFiles:
         dimension = len(vectors[0])
         if not dimension or any(len(vector) != dimension for vector in vectors):
             raise ValueError('Inconsistent embedding dimension')
-        with self.database.connect(write=True) as db:
+        with self.database.connect(write=True, account_scope=user_id) as db:
             previous = db.execute("""SELECT cardinality(embedding) FROM rag_vector_records
                 WHERE user_id=? AND collection=? LIMIT 1""", (user_id, name)).fetchone()
             if previous and previous[0] != dimension:

@@ -14,8 +14,9 @@ from wit.acps.identity.acs import AcsContractError
 from avatar.core.db import now, dump, event
 from avatar.protocols.registration.entity import EntityRegistrationRunner, staged_entity_metadata
 from avatar.protocols.registration.maintenance import RENEWAL_SCAN_SECONDS, maintain_entity, remove_retired_identity
-from avatar.protocols.registration.base import RegistrationPending, RegistrationFailure
+from avatar.protocols.errors import RegistrationPending, RegistrationFailure
 from avatar.protocols.identity.errors import identity_error_detail
+from avatar.protocols.registration.direct import DirectRegistrationRunner
 
 def remap_identity(db,user_id,old,new):
     """原件、聊天及 Soul 仍归属稳定 user_id，仅迁移协议寻址。"""
@@ -41,7 +42,6 @@ class EntityLifecycleService:
     def __init__(self, database, settings, runner=None, maintainer=None):
         self.database, self.settings = database, settings
         if runner is None and settings.provider=='acps-direct':
-            from avatar.protocols.registration.direct import DirectRegistrationRunner
             runner=DirectRegistrationRunner(settings, database)
         self.runner = runner or EntityRegistrationRunner(settings, database)
         self.maintainer = maintainer or maintain_entity
@@ -56,7 +56,8 @@ class EntityLifecycleService:
             raise HTTPException(409,'独立实体须由用户提交最新资料及 ACS，经平台审核后进入 Registry 审核')
         if not self.settings.entity_aip_enabled:
             raise HTTPException(409, '请先配置并启用个人分身协议端点')
-        with self.database.connect(write=True) as db:
+        scope=None if action=='register' else user_id
+        with self.database.connect(write=True,account_scope=scope) as db:
             row = db.execute('SELECT a.*,u.account_status FROM avatar_records a JOIN users u ON u.id=a.user_id WHERE a.user_id=?', (user_id,)).fetchone()
             if not row:
                 raise HTTPException(404, '分身不存在')
@@ -208,7 +209,8 @@ class EntityLifecycleService:
     # 输入：job 是认领记录，before 是远端操作前的分身行，result 是正式身份或证书投影。
     # 结果与约束：迁移只改身份和会话目标引用，保留资料、草稿、附件、Key、账户及原消息正文。
     def commit(self, job, before, result):
-        with self.database.connect(write=True) as db:
+        scope=None if job['action']=='register' else job['user_id']
+        with self.database.connect(write=True,account_scope=scope) as db:
             row = db.execute('SELECT * FROM avatar_records WHERE user_id=?', (job['user_id'],)).fetchone()
             if not row or row['aic'] != before['aic'] or row['updated_at'] != before['updated_at']:
                 raise RegistrationFailure('维护期间分身数据已变化，保留远端状态，请重新核对后重试')
@@ -246,20 +248,26 @@ class EntityLifecycleService:
         db.execute("UPDATE avatar_identity_jobs SET status='done',error='',updated_at=? WHERE id=?", (now(), job['id']))
         event(db, job['user_id'], job['actor'], '个人身份维护完成', job['action'])
 
+    def _recover(self):
+        with self.database.connect(write=True) as db:
+            db.execute("UPDATE avatar_identity_jobs SET status='queued' WHERE status='running' AND action!='renew'")
+            db.execute("UPDATE avatar_identity_jobs SET status='failed',error='续期被中断，请先使用 wit status 核对证书代次，再决定是否重试' WHERE status='running' AND action='renew'")
+
     # 职责：恢复进程中断的维护任务并持续轮询。
     # 输入：由应用单进程生命周期启动。
     # 结果与约束：注册复用原 ATR 状态，注销逐项恢复；已开始的续期中断后要求人工核对，不自动重复签发。
     async def run(self):
-        with self.database.connect(write=True) as db:
-            db.execute("UPDATE avatar_identity_jobs SET status='queued' WHERE status='running' AND action!='renew'")
-            db.execute("UPDATE avatar_identity_jobs SET status='failed',error='续期被中断，请先使用 wit status 核对证书代次，再决定是否重试' WHERE status='running' AND action='renew'")
+        recovered = False
         next_scan = 0.0
         while True:
             latch = begin_work(self.database, 'identity')
             try:
+                if not recovered:
+                    await run_blocking(self._recover)
+                    recovered = True
                 if time.monotonic() >= next_scan:
+                    await run_blocking(self.schedule_renewals)
                     next_scan = time.monotonic() + RENEWAL_SCAN_SECONDS
-                    await asyncio.to_thread(self.schedule_renewals)
                 if not await self.once():
                     await wait_work(latch, 1.)
             except asyncio.CancelledError:

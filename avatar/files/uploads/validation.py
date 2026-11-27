@@ -10,6 +10,10 @@ from avatar.files.parsing.media_types import MEDIA, validate_media
 
 # Model and sandbox outputs retain a separate per-file processing bound.
 MAX_FILE = 10 * 1024 * 1024
+MAX_CHAT_UPLOAD = 100 * 1024**2
+CHAT_UPLOAD_ERROR = '会话附件不能超过 100 MiB'
+
+
 TYPES = {'.txt': 'text/plain', '.md': 'text/markdown', '.mmd': 'text/x-mermaid', '.html': 'text/html', '.htm': 'text/html', '.csv': 'text/csv', '.json': 'application/json',
          '.log': 'text/plain', '.tsv': 'text/tab-separated-values',
          '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
@@ -20,6 +24,11 @@ TYPES = {'.txt': 'text/plain', '.md': 'text/markdown', '.mmd': 'text/x-mermaid',
 
 
 ARTIFACT_SUFFIXES = ('.html', '.htm')
+
+
+def check_chat_upload_size(size):
+    if size > MAX_CHAT_UPLOAD:
+        raise HTTPException(413, CHAT_UPLOAD_ERROR)
 
 
 def html_file_limit(filename):

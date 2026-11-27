@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { useConfirmation } from '../composables/useConfirmation'
 import { defineAsyncComponent, computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElButton, ElMessage } from 'element-plus'
@@ -31,6 +32,7 @@ import WindowClose from '../components/WindowClose.vue'
 import WindowControls from '../components/WindowControls.vue'
 import { requestId } from '../utils/requestId'
 
+const confirmAction = useConfirmation()
 const FilePreview = defineAsyncComponent(() => import('../components/FilePreview.vue'))
 const IntentDialog = defineAsyncComponent(() => import('../components/collaboration/IntentDialog.vue'))
 const copyMenu=ref<InstanceType<typeof MessageCopyMenu>>()
@@ -218,23 +220,31 @@ function send(answer?: QuestionReply) {
 function taskAction(name:string) {
   const target = name === 'cancel' ? runningTask.value?.id || taskId.value : taskId.value
   if (!target || busy.value || switching.value || resourceBusy.value) return
-  if (name==='end' && !confirm('结束当前任务？聊天记录将保留。')) return
   const confirms = name==='accept' || name==='confirm'
   if (confirms && !chatTextFits(message.value)) {
     ElMessage.warning('消息超过 64 KiB（UTF-8），请缩短后发送。')
     return
   }
-  if (confirms && !confirm('确认由分身继续处理本任务？所选文件和补充意图将一并发送。')) return
-  const token = pending ||= id()
-  return action('/agent-dialogues/'+encodeURIComponent(target)+'/'+name, 'POST',
-    confirms ? {message:message.value,file_ids:fileIds.value,request_id:token} : {}, () => { if (confirms) finishMessage(token) })
+  const submit = () => {
+    const token = pending ||= id()
+    return action('/agent-dialogues/'+encodeURIComponent(target)+'/'+name, 'POST',
+      confirms ? {message:message.value,file_ids:fileIds.value,request_id:token} : {},
+      () => { if (confirms) finishMessage(token) })
+  }
+  if (!confirms && name !== 'end') return submit()
+  return confirmAction(confirms ? '确认由分身继续处理本任务？所选文件和补充意图将一并发送。' : '结束当前任务？聊天记录将保留。',
+    '确认任务操作', () => [scope, current.value, taskId.value, commandsDisabled.value, activeTask.value?.status,
+      activeTask.value?.revision, activeTask.value?.needs_confirmation, activeTask.value?.can_accept,
+      confirms ? [message.value, fileIds.value] : null], submit)
 }
 function remove(path:string,text:string,method='POST',close=false) {
-  if (busy.value || switching.value || !confirm(text)) return
-  return action(path,method,{}, () => {
+  if (busy.value || switching.value) return
+  return confirmAction(text, '确认清理记录', () => [
+    scope, current.value, taskId.value, busy.value, switching.value, activeTask.value?.status, activeTask.value?.revision,
+  ], () => action(path,method,{}, () => {
     if (close) closeSession()
     else { resetHistory(); detail.value=null; enterSession(current.value,'') }
-  })
+  }))
 }
 function enterSession(session:string, task:string) {
   if (session === current.value && task === taskId.value && detail.value) return

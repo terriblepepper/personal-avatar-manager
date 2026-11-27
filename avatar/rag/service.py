@@ -1,9 +1,11 @@
 """授权原件读取、PostgreSQL 混合检索与来源复核。"""
 import asyncio
+from avatar.core.execution import run_blocking
 import hashlib
 import json
 import re
 from dataclasses import replace
+from avatar.core import execution
 from contextlib import aclosing
 from fastapi import HTTPException
 from langchain_core.documents import Document
@@ -13,6 +15,7 @@ from avatar.rag.indexing.service import FileRag,revision
 from avatar.rag.invalidation import signature
 from avatar.files.library.catalog import fit_catalog, fit_text_rows
 from avatar.rag.query import FileQuery, file_catalog
+from avatar.files.library.folders import with_folder_captions
 
 
 SearchMaterialRequest = FileQuery
@@ -43,6 +46,10 @@ class MaterialRag(FileRag):
         if not proof:return
         self._validate_revisions(proof['scope'], proof['revisions'], originals=proof.get('originals', False))
 
+    async def validate_async(self, context):
+        if context[0].get('_rag_access'):
+            await run_blocking(self.validate, context)
+
     def _validate_revisions(self, scope, revisions, *, originals=False):
         expected = {tuple(key): value for key, value in revisions}
         rows = self.documents(*scope, file_keys=expected.keys(), revisions_only=True, originals=originals)
@@ -52,7 +59,7 @@ class MaterialRag(FileRag):
 
     async def search_tool(self, scope, arguments):
         plan = SearchMaterialRequest.model_validate(arguments)
-        documents = await asyncio.to_thread(self.documents, *scope, originals=True)
+        documents = await run_blocking(self.documents, *scope, originals=True)
         catalog_filter = plan.model_copy(update={'section':'', 'page_start':None, 'page_end':None})
         catalog = [item for item in file_catalog(documents, plan.query) if catalog_filter.matches(item)]
         keys = {(item['source'], item['file_id']) for item in catalog}
@@ -65,7 +72,7 @@ class MaterialRag(FileRag):
         revisions = [((row['source'], row['id']), revision(row)) for row in documents
                      if (row['source'], row['id']) in keys]
         if revisions:
-            await asyncio.to_thread(self._validate_revisions, scope, revisions, originals=True)
+            await run_blocking(self._validate_revisions, scope, revisions, originals=True)
         sources = {item['file_id']:{'file_id':item['file_id'], 'filename':item['filename'], 'type':'RAG'}
                    for item in evidence if item.get('text', '').strip()}
         return MaterialToolResult({'evidence':evidence, 'catalog':catalog, 'notices':notices},
@@ -73,18 +80,19 @@ class MaterialRag(FileRag):
 
     async def read_tool(self, scope, arguments, *, vision=False, audio=False):
         request = ReadRequest.model_validate(arguments)
-        rows = await asyncio.to_thread(self.documents, *scope,
+        rows = await run_blocking(self.documents, *scope,
                                        file_keys={('profile', request.file_id), ('chat', request.file_id)},
                                        originals=True)
         if not rows:
             raise HTTPException(404, '资料文件不存在或未授权')
         row = rows[0]
         media_type = row.get('content_type', '')
+        path = await run_blocking(self.original_path, row, row['source'])
         result, images, sounds = await read_original_tool(
-            self.original_path(row, row['source']), row['filename'],
+            path, row['filename'],
             media_type, request, vision=vision, audio=audio)
         revisions = [((row['source'], row['id']), revision(row))]
-        await asyncio.to_thread(self._validate_revisions, scope, revisions, originals=True)
+        await run_blocking(self._validate_revisions, scope, revisions, originals=True)
         sources = []
         if read_has_content(result) or images or sounds:
             sources.append({'file_id':row['id'], 'filename':row['filename'], 'type':'源文件'})
@@ -93,7 +101,7 @@ class MaterialRag(FileRag):
         return MaterialToolResult(content, revisions, sources, images, sounds)
 
     async def answer(self,context,message,*,progress=None,on_delta=None):
-        self.validate(context)
+        await self.validate_async(context)
         if progress:
             for notice in dict.fromkeys(context[0].get('_workflow_notices',[])):
                 if not notice.startswith('会话记忆已压缩，'):
@@ -102,7 +110,7 @@ class MaterialRag(FileRag):
             answer = await self.agent_answer(self, context, message, progress=progress, **({'on_delta':on_delta} if on_delta else {}))
         else:
             answer = await self.chat.model_client.generate(*context, message)
-        self.validate(context)
+        await self.validate_async(context)
         if getattr(answer,'contact_draft',None) is not None or answer.finish_reason=='tool_required' or getattr(answer,'material_delivery',None) is not None:
             return answer
         return replace(answer,text=answer.text+self.source_footer(context),material_sources=tuple(context[0].get('_material_sources',[])))
@@ -111,15 +119,15 @@ class MaterialRag(FileRag):
         config = context[0]
         direct = config.get('_direct_chat')
         if not direct:
-            self.validate(context)
+            await self.validate_async(context)
         if direct or not config.get('_avatar_agent'):
             async with aclosing(self.chat.model_client.stream(*context, message)) as source:
                 async for event in source:
                     if not direct:
-                        self.validate(context)
+                        await self.validate_async(context)
                     yield event
             if not direct:
-                self.validate(context)
+                await self.validate_async(context)
                 if footer := self.source_footer(context):
                     yield {'type':'delta', 'text':footer}
             return
@@ -147,7 +155,7 @@ class MaterialRag(FileRag):
 
             try:
                 result = await self.answer(context, message, progress=report, on_delta=emit)
-                self.validate(context)
+                await self.validate_async(context)
                 if progress:
                     progress({'type':'status', 'stage':'result_ready',
                               'message':'需要开启会话工具' if result.finish_reason=='tool_required' else '结果已生成'})
@@ -182,10 +190,8 @@ class MaterialRag(FileRag):
             await asyncio.gather(generator, return_exceptions=True)
 
     def documents(self, owner_id, aic, session, selected, include_private, *, file_keys=None, revisions_only=False, originals=False):
-        from avatar.core.execution import authorization
-        from avatar.files.library.folders import with_folder_captions
 
-        scope = authorization()
+        scope = execution.authorization()
         profile_ids = None if scope is None else set(scope.get('materials', []))
         chat_ids = None if scope is None else set(scope.get('files', []))
         if file_keys is not None:
@@ -222,11 +228,14 @@ class MaterialRag(FileRag):
             return [row for row in rows if self.original_available(row['source'],row['user_id'],row['id'],row['size'],row.get('conversation_id'))]
         return rows
 
-    def _retrieval_indexes(self, owner, documents):
+    def _retrieval_inputs(self, owner, documents):
         """Read each authorized document and its current nodes in one database snapshot."""
         sources = [row['source'] for row in documents]
         ids = [row['id'] for row in documents]
         with self.database.connect() as db:
+            config=EmbeddingSettings.current(db,owner)
+            if not config.get('encrypted_key'):return config,None,{}
+            model=self.chat.service.models.current(db,owner)
             rows = db.execute("""SELECT d.source,d.file_id,d.status,d.revision,d.signature,d.error,d.collection,
                 ARRAY(SELECT n.record_id FROM file_rag_nodes n
                       WHERE n.user_id=d.user_id AND n.source=d.source AND n.file_id=d.file_id
@@ -234,7 +243,7 @@ class MaterialRag(FileRag):
                 FROM unnest(?::text[],?::text[]) AS allowed(source,file_id)
                 JOIN file_rag_documents d ON d.source=allowed.source AND d.file_id=allowed.file_id
                 WHERE d.user_id=?""",(sources,ids,owner))
-            return {(row['source'],row['file_id']):dict(row) for row in rows}
+            return config,model,{(row['source'],row['file_id']):dict(row) for row in rows}
 
     def _live_search_keys(self, documents):
         if not documents:
@@ -259,11 +268,9 @@ class MaterialRag(FileRag):
         snapshots={(row['source'],row['id']):row for row in documents}
         queries=list(dict.fromkeys([query,plan.query,*plan.alternatives]))[:3]
         for uid in sorted({row['user_id'] for row in documents}):
-            with self.database.connect() as db:
-                config=EmbeddingSettings.current(db,uid);model=self.chat.service.models.current(db,uid)
-            if not config.get('encrypted_key'):continue
             owned = [row for row in documents if row['user_id']==uid]
-            indexes = self._retrieval_indexes(uid, owned)
+            config,model,indexes=await run_blocking(self._retrieval_inputs,uid,owned)
+            if not config.get('encrypted_key'):continue
             groups = {}
             token = signature(config,model)
             for row in owned:
@@ -286,7 +293,7 @@ class MaterialRag(FileRag):
                 # 嵌入不可用时继续使用已发布索引的 BM25 分支。
                 vectors=[]
             for collection,identifiers in groups.items():
-                rows=await asyncio.to_thread(self.store.search,uid,collection,identifiers,queries,vectors,plan.model_copy(update={'folder':''}))
+                rows=await run_blocking(self.store.search,uid,collection,identifiers,queries,vectors,plan.model_copy(update={'folder':''}))
                 for row in rows:
                     metadata=row['metadata']
                     identity=(metadata['source'],metadata['file_id'])
@@ -296,6 +303,6 @@ class MaterialRag(FileRag):
                             'filename':snapshot['filename'], 'relative_path':snapshot.get('relative_path') or snapshot['filename']})))
         # Vector and lexical caches know the published chunks; authorization belongs to the current original.
         shown={key for key,_ in candidates}|{key for key,_ in notices}
-        live=await asyncio.to_thread(self._live_search_keys,[snapshots[key] for key in shown])
+        live=await run_blocking(self._live_search_keys,[snapshots[key] for key in shown])
         matches=sorted((item for key,item in candidates if key in live),key=lambda item:item.metadata['score'],reverse=True)
         return matches[:12], list(dict.fromkeys((key, text) for key, text in notices if key in live))

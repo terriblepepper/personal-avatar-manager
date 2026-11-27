@@ -1,5 +1,6 @@
 # 模块说明：会话工具目录、授权设置及模型可见状态；新增工具时在目录注册，不接收客户端代码或工具定义。
 import json
+from contextlib import contextmanager
 from fastapi import HTTPException
 from avatar.core.db import dump, now
 from avatar.models.effort import levels
@@ -33,9 +34,23 @@ class ConversationTools:
             items.append(item)
         return {'items':items,'updated_at':row['tools_updated_at'],'reasoning_effort':saved.get('reasoning_effort'),'agent_enabled':agent_enabled}
 
+    @contextmanager
+    def settings_session(self, user_id, conversation_id, *, write, editable=False):
+        with self.files.database.connect() as db:
+            row = self.files.session(db,user_id,conversation_id,editable=editable)
+            if not write:
+                yield db, row
+                return
+            owner = row['user_id']
+        # A shared workspace owned by the peer combines their stored settings with the viewer's model.
+        with self.files.database.connect(write=True, account_scope=user_id if owner==user_id else None) as db:
+            row = self.files.session(db,user_id,conversation_id,editable=editable)
+            if row['user_id'] != owner:
+                raise HTTPException(409,'文件工作区已改变，请重试')
+            yield db, row
+
     def effort(self, user_id, conversation_id, *, selected=...):
-        with self.files.database.connect(write=selected is not ...) as db:
-            row = self.files.session(db, user_id, conversation_id)
+        with self.settings_session(user_id,conversation_id,write=selected is not ...) as (db,row):
             model = db.execute('SELECT model_config FROM model_settings WHERE user_id=?', (user_id,)).fetchone()
             config = json.loads(model[0]) if model else {}
             available = levels(config)
@@ -53,8 +68,7 @@ class ConversationTools:
     def update(self,user_id,conversation_id,settings):
         if not settings or any(key not in TOOL_CATALOG or type(value) is not bool for key,value in settings.items()):
             raise HTTPException(422,'请选择有效工具和布尔开关')
-        with self.files.database.connect(write=True) as db:
-            row=self.files.session(db,user_id,conversation_id,editable=True)
+        with self.settings_session(user_id,conversation_id,write=True,editable=True) as (db,row):
             agent_enabled=EmbeddingSettings.configured(db,user_id)
             if not agent_enabled and any(settings.values()):
                 raise HTTPException(409,'普通聊天模式下工具不可用，请先配置 Embedding 模型')

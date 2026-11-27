@@ -410,3 +410,89 @@ def test_chat_accepted_job_finishes_without_any_browser_connection(context):
             worker.cancel()
             with suppress(asyncio.CancelledError):await worker
     asyncio.run(check())
+
+
+def test_dispatch_title_and_save_respect_thread_and_account_boundaries(context, monkeypatch):
+    from threading import get_ident
+    from unittest.mock import AsyncMock
+    from avatar.conversation.jobs.titles import generate_title
+
+    app, client, admin = context
+    chat = app.state.chat
+    user = client.get('/api/auth/me').json()['user']
+    peer = admin.get('/api/auth/me').json()['user']['id']
+    cid = client.post('/api/conversations',json={'channel':'assistant'}).json()['id']
+    parent = chat.session(user['id'],'assistant',cid)
+    body = ChatRequest(channel='assistant',conversation_id=cid,message='选分身')
+    original = chat.service.database.connect
+    accesses = []
+    def connect(*args, **kwargs):
+        accesses.append((get_ident(),kwargs.get('write'),kwargs.get('account_scope')))
+        return original(*args,**kwargs)
+    monkeypatch.setattr(chat.service.database,'connect',connect)
+    monkeypatch.setattr(chat.dialogues,'trigger',AsyncMock(return_value={
+        'action':'select_avatar','arguments':{'query':'missing'}}))
+    async def check():
+        await chat.dispatch(user,body,parent)
+        await generate_title(chat,user['id'],cid,'主题','回复')
+    asyncio.run(check())
+    assert accesses and all(thread != get_ident() for thread, _, _ in accesses)
+    assert {scope for _, write, scope in accesses if write} == {user['id']}
+    for owner in (user['id'], peer):
+        accesses.clear()
+        chat.save(user,body,{'_target':{'aic':'example','name':'target'},
+            'agent':{'last_modified_at':'v1','user_id':owner,'model_config':{'provider':'test','model':'test'}}},'reply')
+        assert [scope for _, write, scope in accesses if write] == [user['id'] if owner==user['id'] else None]
+    with pytest.raises(HTTPException) as denied:
+        chat.save({'id':peer},body,{'agent':None},'foreign message')
+    assert denied.value.status_code == 404
+
+
+def test_context_reads_owner_overview_within_repeatable_read(provisioned_context, monkeypatch):
+    app, client, admin = provisioned_context
+    user = client.get('/api/auth/me').json()['user']
+    peer = admin.get('/api/auth/me').json()['user']
+    service = app.state.service
+    original = service.overview
+    def inspect(owner, *, db=None, **kwargs):
+        assert db is not None
+        assert db.execute('SHOW transaction_isolation').fetchone()[0] == 'repeatable read'
+        assert db.execute('SHOW transaction_read_only').fetchone()[0] == 'on'
+        return original(owner,db=db,**kwargs)
+    monkeypatch.setattr(service,'overview',inspect)
+    overview, _ = app.state.chat.context(user,ChatRequest(channel='avatar',message='hello'),private_access=True)
+    assert overview['_private_context']
+    peer_view, peer_context = app.state.chat.context(peer,ChatRequest(channel='avatar',message='hello'),
+                                                     overview['agent'],private_access=True)
+    assert not peer_view['_private_context'] and 'completed_agent_tasks' not in peer_context[2]
+
+
+def test_history_batches_owner_task_cards_and_excludes_foreign_messages(context, monkeypatch):
+    from avatar.core.db import dump, now
+    from avatar.core.postgres import Connection
+
+    app, client, admin = context
+    owner = client.get('/api/auth/me').json()['user']['id']
+    other = admin.get('/api/auth/me').json()['user']['id']
+    cid = client.post('/api/conversations',json={'channel':'assistant'}).json()['id']
+    with app.state.database.connect(write=True) as db:
+        for task, source, peer in [('owned',owner,other),('foreign',other,owner)]:
+            db.execute("""INSERT INTO agent_dialogues(id,user_id,own_aic,target_user_id,target_aic,
+                       objective,request_id,created_at,updated_at,status,error,retry_until)
+                       VALUES(?,?,'a',?,'b','例',?,?,?,'failed',?,1)""",(task,source,peer,task,now(),now(),source))
+        for source, task in [(owner,'owned'),(owner,'owned'),(owner,'foreign'),(other,'foreign')]:
+            db.execute("""INSERT INTO chat_messages(user_id,conversation_id,channel,role,content,created_at,
+                       task_event) VALUES(?,?,'assistant','assistant','',?,?)""",
+                       (source,cid,now(),dump({'kind':'start','task_id':task})))
+    original = Connection.execute
+    task_queries = []
+    def execute(db, sql, params=()):
+        if 'FROM agent_dialogues' in sql:
+            task_queries.append(sql)
+        return original(db,sql,params)
+    monkeypatch.setattr(Connection,'execute',execute)
+    rows = app.state.chat.history(owner,'assistant',cid,personal=True)
+    assert len(task_queries) == 1
+    assert len(rows) == 3 and all(row['user_id']==owner for row in rows)
+    assert [r['task_event'].get('reason') for r in rows] == [owner,owner,None]
+    assert rows[0]['task_event']['can_retry']

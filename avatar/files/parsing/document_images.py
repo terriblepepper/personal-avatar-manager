@@ -10,6 +10,9 @@ import tempfile
 import zipfile
 from xml.etree import ElementTree
 from fastapi import HTTPException
+from avatar.core import config
+from avatar.core.performance import measure
+from avatar.files.parsing.images import jpeg_bytes
 
 RASTER = ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tif', '.tiff', '.webp')
 
@@ -103,7 +106,6 @@ def pdf_visual_pages(reader, *, vector=True, pages=None):
 
 def pdf_images(path, pages=None, *, vector=True):
     from pypdf import PdfReader
-    from avatar.files.parsing.images import jpeg_bytes
     reader = PdfReader(path, strict=False)
     if reader.is_encrypted:
         raise ValueError('PDF 已加密，无法解析图片')
@@ -146,14 +148,12 @@ async def traverse(path, pages=None, *, vector=True):
     import base64
     import json
     import signal
-    from avatar.core.config import ROOT
-    from avatar.core.performance import measure
     with measure('document_image_process_start'):
         process = await asyncio.create_subprocess_exec(
             sys.executable, '-m', 'avatar.files.parsing.document_images', str(path),
             json.dumps(sorted(pages) if pages is not None else None), *([] if vector else ['--images-only']),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-            stdin=asyncio.subprocess.DEVNULL, cwd=ROOT, limit=16*1024*1024, start_new_session=True,
+            stdin=asyncio.subprocess.DEVNULL, cwd=config.ROOT, limit=16*1024*1024, start_new_session=True,
         )
     try:
         while True:

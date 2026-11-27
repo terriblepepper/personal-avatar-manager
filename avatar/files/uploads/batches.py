@@ -28,7 +28,7 @@ class UploadComplete(BaseModel):
 
 def complete(database,user,identifier,body):
     if not re.fullmatch('[0-9a-f]{32}',identifier):raise HTTPException(422,'上传批次标识无效')
-    with database.connect(write=True) as db:
+    with database.connect(write=True, account_scope=user['id']) as db:
         count=db.execute("""SELECT count(*) FROM audit_events WHERE user_id=? AND action=?
             AND json_extract(CASE WHEN json_valid(detail) = 1 THEN detail ELSE '{}' END,'$.upload_batch_id')=?""",
             (user['id'],UPLOADS[body.kind],identifier)).fetchone()[0]

@@ -39,7 +39,6 @@ def read_word_pdf(path):
 
 def prepare_word_pdf(path, extension):
     from fcntl import LOCK_EX, flock
-    from avatar.files.parsing.document_images import converted, word_vectors
 
     with path.open('rb') as original:
         flock(original, LOCK_EX)
@@ -48,6 +47,8 @@ def prepare_word_pdf(path, extension):
             raise FileNotFoundError(path)
         if pdf := _stored_pdf(path):
             return pdf
+        # Keep the optional conversion backend out of the isolated plain-text reader.
+        from avatar.files.parsing.document_images import converted, word_vectors
         vector = word_vectors(path, extension)
         target = path.with_suffix(WORD_PDF_SUFFIXES[vector])
         with converted(path, extension, 'pdf') as pdf, _locked_folder(path.parent):

@@ -5,42 +5,370 @@ import { request, notifyError } from '../api/client'
 import { useSessionStore } from '../stores/session'
 import { date, statusLabel } from '../utils/format'
 import AcsEditor, { type AcsInput } from '../components/profile/AcsEditor.vue'
-interface Field {key:string;label:string;type:string;audience:string;visibility:string;fixed_public:boolean;options?:string[]}
-interface Profile {draft:Record<string,unknown>;last_modified_at:string;status:string;reason?:string;acs_input:AcsInput|null;acs_document:unknown;acs_online:boolean;acs_active_input:AcsInput|null;acs_active_document:unknown;acs_direct:boolean;acs_editing:boolean;acs_inheritance?:{enabled:boolean;registered?:boolean;document:unknown}}
-interface Overview {profile:Profile}
-const session=useSessionStore(), profile=ref<Profile|null>(null), fields=ref<Field[]>([]), values=reactive<Record<string,string>>({}), visibility=reactive<Record<string,string>>({}), original=ref<Record<string,unknown>>({}), kind=ref('student'), tab=ref('basic'), acs=ref<AcsInput|null>(null), acsEdit=ref(false), busy=ref(false)
-const groups:Record<string,string[]>={basic:['name','avatar_name','preferred_name','gender','student_id','employee_id','workstations','bio','organization','specialty','location','email','phone','contact','homepage','current_advisor'],experience:['experience','education','skills','current_projects','projects','certifications','academic_highlights','interests'],teacher:['highest_degree','title','supervisor_qualification','appointments','research_outputs','supervised_students'],supplement:['other','supplementary_text']}
-const locked=computed(()=>!!profile.value&&['pending','updating','creating','failed'].includes(profile.value.status))
-const shownFields=computed(()=>fields.value.filter(f=>groups[tab.value]?.includes(f.key)&&(f.audience==='both'||f.audience===kind.value)))
-function display(value:unknown):string {if(Array.isArray(value))return value.map(x=>typeof x==='object'?JSON.stringify(x,null,2):String(x)).join('\n');return typeof value==='string'?value:''}
-function apply(value:Overview){profile.value=value.profile;original.value=structuredClone(value.profile.draft);kind.value=String(value.profile.draft.person_type||session.user?.person_type||'student');const v=value.profile.draft.visibility;for(const f of fields.value){values[f.key]=display(value.profile.draft[f.key]);visibility[f.key]=typeof v==='object'&&v!==null&&f.key in v?String(v[f.key as keyof typeof v]):f.visibility}const source=value.profile.acs_online && !value.profile.acs_editing?(value.profile.acs_active_input || value.profile.acs_input):value.profile.acs_input;acs.value=source?structuredClone(source):null;acsEdit.value=!!value.profile.acs_editing}
+interface Field {
+  key: string
+  label: string
+  type: string
+  audience: string
+  visibility: string
+  fixed_public: boolean
+  options?: string[]
+}
+interface Profile {
+  draft: Record<string, unknown>
+  last_modified_at: string
+  status: string
+  reason?: string
+  acs_input: AcsInput | null
+  acs_document: unknown
+  acs_online: boolean
+  acs_active_input: AcsInput | null
+  acs_active_document: unknown
+  acs_direct: boolean
+  acs_editing: boolean
+  acs_inheritance?: { enabled: boolean; registered?: boolean; document: unknown }
+}
+interface Overview {
+  profile: Profile
+}
+const session = useSessionStore(),
+  profile = ref<Profile | null>(null),
+  fields = ref<Field[]>([]),
+  values = reactive<Record<string, string>>({}),
+  visibility = reactive<Record<string, string>>({}),
+  original = ref<Record<string, unknown>>({}),
+  kind = ref('student'),
+  tab = ref('basic'),
+  acs = ref<AcsInput | null>(null),
+  acsEdit = ref(false),
+  busy = ref(false)
+const groups: Record<string, string[]> = {
+  basic: [
+    'name',
+    'avatar_name',
+    'preferred_name',
+    'gender',
+    'student_id',
+    'employee_id',
+    'workstations',
+    'bio',
+    'organization',
+    'specialty',
+    'location',
+    'email',
+    'phone',
+    'contact',
+    'homepage',
+    'current_advisor'
+  ],
+  experience: [
+    'experience',
+    'education',
+    'skills',
+    'current_projects',
+    'projects',
+    'certifications',
+    'academic_highlights',
+    'interests'
+  ],
+  teacher: [
+    'highest_degree',
+    'title',
+    'supervisor_qualification',
+    'appointments',
+    'research_outputs',
+    'supervised_students'
+  ],
+  supplement: ['other', 'supplementary_text']
+}
+const locked = computed(
+  () =>
+    !!profile.value && ['pending', 'updating', 'creating', 'failed'].includes(profile.value.status)
+)
+const shownFields = computed(() =>
+  fields.value.filter(
+    (f) =>
+      groups[tab.value]?.includes(f.key) && (f.audience === 'both' || f.audience === kind.value)
+  )
+)
+function display(value: unknown): string {
+  if (Array.isArray(value))
+    return value
+      .map((x) => (typeof x === 'object' ? JSON.stringify(x, null, 2) : String(x)))
+      .join('\n')
+  return typeof value === 'string' ? value : ''
+}
+function apply(value: Overview) {
+  profile.value = value.profile
+  original.value = structuredClone(value.profile.draft)
+  kind.value = String(value.profile.draft.person_type || session.user?.person_type || 'student')
+  const v = value.profile.draft.visibility
+  for (const f of fields.value) {
+    values[f.key] = display(value.profile.draft[f.key])
+    visibility[f.key] =
+      typeof v === 'object' && v !== null && f.key in v
+        ? String(v[f.key as keyof typeof v])
+        : f.visibility
+  }
+  const source =
+    value.profile.acs_online && !value.profile.acs_editing
+      ? value.profile.acs_active_input || value.profile.acs_input
+      : value.profile.acs_input
+  acs.value = source ? structuredClone(source) : null
+  acsEdit.value = !!value.profile.acs_editing
+}
 const avatarName = computed({
-  get: () => profile.value?.acs_inheritance?.enabled ? values.avatar_name || '' : acs.value?.name ?? values.avatar_name ?? '',
+  get: () =>
+    profile.value?.acs_inheritance?.enabled
+      ? values.avatar_name || ''
+      : (acs.value?.name ?? values.avatar_name ?? ''),
   set(name: string) {
     if (acs.value && !profile.value?.acs_inheritance?.enabled) {
       if (profile.value?.acs_online && !acsEdit.value) editAcs(true)
       if (acs.value) acs.value.name = name
     }
     values.avatar_name = name
-  },
-})
-function syncOwner(){
-  const input=acs.value
-  if(!input || profile.value?.acs_inheritance?.enabled || (profile.value?.acs_online && !acsEdit.value))return
-  const name=values.name?.trim() || '该用户', previous=input.template_owner || name
-  if(previous===name)return
-  const description=(owner:string)=>'作为'+owner+'的分身，能根据'+owner+'的资料和语言习惯回答问题。'
-  if(!input.name || input.name===previous+'的分身')avatarName.value=name+'的分身'
-  if(!input.description || input.description===description(previous))input.description=description(name)
-  for(const skill of input.skills){
-    if(skill.description.startsWith(previous+'能够'))skill.description=name+'能够'+skill.description.slice(previous.length+2)
   }
-  input.template_owner=name
+})
+function syncOwner() {
+  const input = acs.value
+  if (
+    !input ||
+    profile.value?.acs_inheritance?.enabled ||
+    (profile.value?.acs_online && !acsEdit.value)
+  )
+    return
+  const name = values.name?.trim() || '该用户',
+    previous = input.template_owner || name
+  if (previous === name) return
+  const description = (owner: string) =>
+    '作为' + owner + '的分身，能根据' + owner + '的资料和语言习惯回答问题。'
+  if (!input.name || input.name === previous + '的分身') avatarName.value = name + '的分身'
+  if (!input.description || input.description === description(previous))
+    input.description = description(name)
+  for (const skill of input.skills) {
+    if (skill.description.startsWith(previous + '能够'))
+      skill.description = name + '能够' + skill.description.slice(previous.length + 2)
+  }
+  input.template_owner = name
 }
-watch(()=>[values.name,acsEdit.value,acs.value],syncOwner)
-async function load(){try{const [catalog,data]=await Promise.all([request<Field[]>('/profile-fields'),request<Overview>('/me')]);fields.value=catalog;apply(data)}catch(e){notifyError(e)}}
-function editAcs(value:boolean){acsEdit.value=value;const source=value?profile.value?.acs_input:profile.value?.acs_active_input || profile.value?.acs_input;if(source)acs.value=structuredClone(toRaw(source))}
-async function save(submit:boolean){if(!profile.value)return;busy.value=true;try{const draft:Record<string,unknown>={...original.value,person_type:kind.value,student_id:kind.value==='teacher'?'':original.value.student_id||'',employee_id:kind.value==='student'?'':original.value.employee_id||'',visibility:{...visibility}};for(const field of fields.value.filter(f=>f.audience==='both'||f.audience===kind.value)){const value=values[field.key]||'';const old=original.value[field.key];draft[field.key]=field.type==='strings'?value.split('\n').map(s=>s.trim()).filter(Boolean):(Array.isArray(old)&&value===display(old)?old:value)}draft.avatar_name=avatarName.value;const editing=acsEdit.value || !!profile.value.acs_editing;let data=await request<Overview>('/me/profile','PUT',{profile:draft,acs_input:profile.value.acs_inheritance?.enabled||profile.value.acs_online&&!editing?null:acs.value,acs_edit:editing,last_modified_at:profile.value.last_modified_at});try{if(submit)data=await request<Overview>('/me/submit','POST',{last_modified_at:data.profile.last_modified_at})}finally{apply(data)}await session.refresh();ElMessage.success(submit?'已提交审核':'草稿已保存')}catch(e){notifyError(e)}finally{busy.value=false}}
+watch(() => [values.name, acsEdit.value, acs.value], syncOwner)
+async function load() {
+  try {
+    const [catalog, data] = await Promise.all([
+      request<Field[]>('/profile-fields'),
+      request<Overview>('/me')
+    ])
+    fields.value = catalog
+    apply(data)
+  } catch (e) {
+    notifyError(e)
+  }
+}
+function editAcs(value: boolean) {
+  acsEdit.value = value
+  const source = value
+    ? profile.value?.acs_input
+    : profile.value?.acs_active_input || profile.value?.acs_input
+  if (source) acs.value = structuredClone(toRaw(source))
+}
+async function save(submit: boolean) {
+  if (!profile.value) return
+  busy.value = true
+  try {
+    const draft: Record<string, unknown> = {
+      ...original.value,
+      person_type: kind.value,
+      student_id: kind.value === 'teacher' ? '' : original.value.student_id || '',
+      employee_id: kind.value === 'student' ? '' : original.value.employee_id || '',
+      visibility: { ...visibility }
+    }
+    for (const field of fields.value.filter(
+      (f) => f.audience === 'both' || f.audience === kind.value
+    )) {
+      const value = values[field.key] || ''
+      const old = original.value[field.key]
+      draft[field.key] =
+        field.type === 'strings'
+          ? value
+              .split('\n')
+              .map((s) => s.trim())
+              .filter(Boolean)
+          : Array.isArray(old) && value === display(old)
+            ? old
+            : value
+    }
+    draft.avatar_name = avatarName.value
+    const editing = acsEdit.value || !!profile.value.acs_editing
+    let data = await request<Overview>('/me/profile', 'PUT', {
+      profile: draft,
+      acs_input:
+        profile.value.acs_inheritance?.enabled || (profile.value.acs_online && !editing)
+          ? null
+          : acs.value,
+      acs_edit: editing,
+      last_modified_at: profile.value.last_modified_at
+    })
+    try {
+      if (submit)
+        data = await request<Overview>('/me/submit', 'POST', {
+          last_modified_at: data.profile.last_modified_at
+        })
+    } finally {
+      apply(data)
+    }
+    await session.refresh()
+    ElMessage.success(submit ? '已提交审核' : '草稿已保存')
+  } catch (e) {
+    notifyError(e)
+  } finally {
+    busy.value = false
+  }
+}
 onMounted(load)
 </script>
-<template><div class="pagehead"><h1>个人资料</h1><p class="sub">参照个人档案与教师导入模板填写。本人分身对话可使用公开及私密资料；对外回答仅使用公开资料。</p></div><section v-if="profile" class="card profile-card"><div class="profile-actionbar"><div><h2>{{ kind==='teacher'?'教师':'学生' }}数字档案</h2><p class="sub">{{ profile.acs_direct?'姓名、分身名称、简介和学校 / 组织必填并公开；':'姓名、分身名称和简介必填；' }}姓名与分身名称固定公开，文字修改须审核。学号、教师工号及资料联系方式选填。</p></div><div class="profile-header-actions"><span class="tag" :class="profile.status">{{ statusLabel(profile.status) }}</span><button type="button" class="button" :disabled="locked||busy" data-guide-target="profile" @click="save(false)">保存草稿</button><button type="button" class="button primary" :disabled="locked||busy" @click="save(true)">保存并提交审核 →</button><span class="profile-modified">上次修改于 {{ date(profile.last_modified_at) }}</span></div></div><p v-if="profile.reason" class="notice error">处理说明：{{ profile.reason }}</p><p v-if="locked" class="notice">申请正在审核或执行中，资料暂时锁定；资料文件可在“我的分身”中保存，模型配置在“我的分身”中独立保存。</p><label class="field">资料身份<select class="form-control" v-model="kind" :disabled="locked"><option value="student">学生</option><option value="teacher">教师</option></select></label><p class="sub">按所选身份填写资料并提交分身申请。</p><nav class="profile-tabs"><button v-for="t in (['basic','experience','teacher','supplement','acs'] as const)" v-show="t!=='teacher'||kind==='teacher'" :key="t" type="button" :aria-selected="tab===t" @click="tab=t">{{ {basic:'基本信息',experience:'经历与能力',teacher:'教师信息',supplement:'补充资料',acs:'ACS 配置'}[t] }}</button></nav><p v-if="tab!=='acs'" class="sub">切换分类会保留当前填写内容；编辑完成后统一保存或提交。资料文件请在侧栏独立管理，保存无需审核。</p><div v-if="tab!=='acs'" class="formgrid"><div v-for="field in shownFields" :key="field.key" class="field"><label>{{ field.label }}<template v-if="['name','avatar_name','bio'].includes(field.key) || (field.key==='organization'&&profile?.acs_direct)"> *</template><select class="form-control" v-if="field.type==='select'" v-model="values[field.key]" :disabled="locked"><option value="">请选择</option><option v-for="option in field.options" :key="option">{{ option }}</option></select><input v-else-if="field.key==='avatar_name'" v-model="avatarName" placeholder=" " class="form-control" maxlength="100" :disabled="locked"><input placeholder=" " class="form-control" v-else-if="field.type==='text'" v-model="values[field.key]" :disabled="locked"><textarea placeholder=" " class="form-control" v-else v-model="values[field.key]" :disabled="locked" rows="4"/></label><small v-if="field.type==='strings'">每行一项</small><label v-if="field.fixed_public" class="privacy">可见性：公开（固定）</label><label v-else class="privacy">可见性<select class="form-control" v-model="visibility[field.key]" :disabled="locked"><option value="public">公开</option><option value="private">私密</option></select></label></div></div><AcsEditor v-else v-model="acs" :document="profile.acs_inheritance?.enabled?profile.acs_inheritance.document:profile.acs_online&&!acsEdit?(profile.acs_active_document || profile.acs_document):profile.acs_document" :modified="profile.last_modified_at" :locked="locked" :online="profile.acs_online" :editing="acsEdit" :inherited="!!profile.acs_inheritance?.enabled" :registered="profile.acs_inheritance?.registered" :direct="profile.acs_direct" :profile="{...values,avatar_name:avatarName,visibility}" @edit="editAcs"/></section></template>
+<template>
+  <div class="pagehead">
+    <h1>个人资料</h1>
+    <p class="sub">
+      参照个人档案与教师导入模板填写。本人分身对话可使用公开及私密资料；对外回答仅使用公开资料。
+    </p>
+  </div>
+  <section v-if="profile" class="card profile-card">
+    <div class="profile-actionbar">
+      <div>
+        <h2>{{ kind === 'teacher' ? '教师' : '学生' }}数字档案</h2>
+        <p class="sub">
+          {{
+            profile.acs_direct
+              ? '姓名、分身名称、简介和学校 / 组织必填并公开；'
+              : '姓名、分身名称和简介必填；'
+          }}姓名与分身名称固定公开，文字修改须审核。学号、教师工号及资料联系方式选填。
+        </p>
+      </div>
+      <div class="profile-header-actions">
+        <span class="tag" :class="profile.status">{{ statusLabel(profile.status) }}</span
+        ><button
+          type="button"
+          class="button"
+          :disabled="locked || busy"
+          data-guide-target="profile"
+          @click="save(false)"
+        >
+          保存草稿</button
+        ><button
+          type="button"
+          class="button primary"
+          :disabled="locked || busy"
+          @click="save(true)"
+        >
+          保存并提交审核 →</button
+        ><span class="profile-modified">上次修改于 {{ date(profile.last_modified_at) }}</span>
+      </div>
+    </div>
+    <p v-if="profile.reason" class="notice error">处理说明：{{ profile.reason }}</p>
+    <p v-if="locked" class="notice">
+      申请正在审核或执行中，资料暂时锁定；资料文件可在“我的分身”中保存，模型配置在“我的分身”中独立保存。
+    </p>
+    <label class="field"
+      >资料身份<select class="form-control" v-model="kind" :disabled="locked">
+        <option value="student">学生</option>
+        <option value="teacher">教师</option>
+      </select></label
+    >
+    <p class="sub">按所选身份填写资料并提交分身申请。</p>
+    <nav class="profile-tabs">
+      <button
+        v-for="t in ['basic', 'experience', 'teacher', 'supplement', 'acs'] as const"
+        v-show="t !== 'teacher' || kind === 'teacher'"
+        :key="t"
+        type="button"
+        :aria-selected="tab === t"
+        @click="tab = t"
+      >
+        {{
+          {
+            basic: '基本信息',
+            experience: '经历与能力',
+            teacher: '教师信息',
+            supplement: '补充资料',
+            acs: 'ACS 配置'
+          }[t]
+        }}
+      </button>
+    </nav>
+    <p v-if="tab !== 'acs'" class="sub">
+      切换分类会保留当前填写内容；编辑完成后统一保存或提交。资料文件请在侧栏独立管理，保存无需审核。
+    </p>
+    <div v-if="tab !== 'acs'" class="formgrid">
+      <div v-for="field in shownFields" :key="field.key" class="field">
+        <label
+          >{{ field.label
+          }}<template
+            v-if="
+              ['name', 'avatar_name', 'bio'].includes(field.key) ||
+              (field.key === 'organization' && profile?.acs_direct)
+            "
+          >
+            *</template
+          ><select
+            class="form-control"
+            v-if="field.type === 'select'"
+            v-model="values[field.key]"
+            :disabled="locked"
+          >
+            <option value="">请选择</option>
+            <option v-for="option in field.options" :key="option">{{ option }}</option></select
+          ><input
+            v-else-if="field.key === 'avatar_name'"
+            v-model="avatarName"
+            placeholder=" "
+            class="form-control"
+            maxlength="100"
+            :disabled="locked"
+          /><input
+            placeholder=" "
+            class="form-control"
+            v-else-if="field.type === 'text'"
+            v-model="values[field.key]"
+            :disabled="locked"
+          /><textarea
+            placeholder=" "
+            class="form-control"
+            v-else
+            v-model="values[field.key]"
+            :disabled="locked"
+            rows="4"
+          /></label
+        ><small v-if="field.type === 'strings'">每行一项</small
+        ><label v-if="field.fixed_public" class="privacy">可见性：公开（固定）</label
+        ><label v-else class="privacy"
+          >可见性<select class="form-control" v-model="visibility[field.key]" :disabled="locked">
+            <option value="public">公开</option>
+            <option value="private">私密</option>
+          </select></label
+        >
+      </div>
+    </div>
+    <AcsEditor
+      v-else
+      v-model="acs"
+      :document="
+        profile.acs_inheritance?.enabled
+          ? profile.acs_inheritance.document
+          : profile.acs_online && !acsEdit
+            ? profile.acs_active_document || profile.acs_document
+            : profile.acs_document
+      "
+      :modified="profile.last_modified_at"
+      :locked="locked"
+      :online="profile.acs_online"
+      :editing="acsEdit"
+      :inherited="!!profile.acs_inheritance?.enabled"
+      :registered="profile.acs_inheritance?.registered"
+      :direct="profile.acs_direct"
+      :profile="{ ...values, avatar_name: avatarName, visibility }"
+      @edit="editAcs"
+    />
+  </section>
+</template>

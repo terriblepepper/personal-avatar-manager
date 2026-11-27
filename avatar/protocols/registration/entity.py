@@ -13,13 +13,19 @@ from wit.acps.atr import TRUSTED_REGISTRATION
 from wit.acps.identity.acs import REGISTRATION_CANDIDATE_LAST_MODIFIED_TIME, validate_registration_candidate_acs, AcsContractError
 from avatar.protocols.identity.atr_config import read_atr_config
 from avatar.protocols.transport.registry import EntityRegistry
-from avatar.protocols.registration.base import RegistrationFailure, RegistrationPending
+from avatar.protocols.errors import RegistrationFailure, RegistrationPending
 from avatar.protocols.identity.system import (system_identity_paths,
                                              private_directory, create_identity_json)
-from avatar.protocols.registration.system import plain_json, publish_identity_document
+from avatar.protocols.identity.document import (
+    plain_json,
+    publish_identity_document,
+    wit_candidate_config,
+    sync_component_acs,
+)
 from avatar.protocols.identity.ontology import avatar_ontology_paths, validate_avatar_ontology
 from avatar.protocols.transport.endpoints import entity_endpoint, entity_oidc_identity
-from avatar.protocols.identity.document import wit_candidate_config, sync_component_acs
+from avatar.core.execution import blocking_context, run_blocking
+from avatar.core.user_storage import user_root
 
 
 # 职责：描述一个派生实体独占的 ACS、注册配置及 wit 状态路径。
@@ -39,7 +45,6 @@ class EntityIdentityPaths:
 def entity_identity_paths(data_dir, user_id):
     if not isinstance(user_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,100}', user_id):
         raise ValueError('实体用户 ID 不允许用作路径')
-    from avatar.core.user_storage import user_root
     root = user_root(data_dir,user_id) / 'identity'
     return EntityIdentityPaths(root, root / 'acs.json', root / 'registration.json', root / 'certificates')
 
@@ -113,6 +118,10 @@ def certificate_projection(material, generation, ontology_aic):
             'public_pem': material.certificate, 'server_public_pem': material.server_certificate}
 
 
+def _entity_component(input_config,config):
+    return registration_component(input_config,registry=EntityRegistry(config))
+
+
 # 职责：用 wit 公开 ATR 状态机推进一个派生实体，恢复时复用原候选和目录。
 # 输入：settings 提供显式服务配置及 Registry 凭据；不接收浏览器提供的本体 AIC 或证书路径。
 # 结果与约束：本体未就绪只等待；实体注册无需逐个人工审核，仍须通过 Registry/CA 实际核验；不自动批准本体。
@@ -127,6 +136,29 @@ class EntityRegistrationRunner:
     # 输入：内部 user_id、已审核 profile；父目录只允许个人能力本体。
     # 结果与约束：候选只首次创建，重试不因个人资料变化而改变指纹；父身份异常不新建子身份。
     async def configuration(self, user_id, profile):
+        settings=self.settings
+        parent_paths,paths,parent=await run_blocking(self._parent_config,user_id)
+        try:
+            # ontology 不提供 ACTIVE_IDENTITY，也不能调用 read_active_snapshot 当作运行实体。
+            # 这里只读恢复状态和正式能力；子实体 up() 会自行读取并再次核验父证书及 CA 状态。
+            async with blocking_context(wit_candidate_config(parent)) as parent_input:
+                component = await run_blocking(registration_component,parent_input)
+                agent = WitAgent(metadata={'application': 'personal-avatar-manager', 'entry': 'ontology-read'})
+                agent.install(component, required=True)
+                async with agent:
+                    status = await agent.context.get(TRUSTED_REGISTRATION).refresh_certificate_status()
+                    if str(status.phase) != 'active' or component.final_acs is None:
+                        raise RegistrationPending('等待本体审核及证书就绪', settings.system_atr_poll_interval)
+                    ontology = plain_json(component.final_acs)
+        except RegistrationPending:
+            raise
+        except FileNotFoundError:
+            raise RegistrationFailure('个人分身本体注册材料缺失，请恢复原 ACS 和 ATR 状态；不要重新申请本体') from None
+        except (OSError, RuntimeError, ValueError, LookupError):
+            raise RegistrationPending('等待本体审核、证书和 CA 状态核验就绪；不会重新申请本体', settings.system_atr_poll_interval) from None
+        return await run_blocking(self._freeze,user_id,profile,parent_paths,paths,parent,ontology)
+
+    def _parent_config(self,user_id):
         settings = self.settings
         parent_paths = avatar_ontology_paths(settings.data_dir)
         paths = entity_identity_paths(settings.data_dir, user_id)
@@ -146,24 +178,10 @@ class EntityRegistrationRunner:
         if (not parent.endpoints.registry_entity_mtls_url
                 or urlsplit(parent.endpoints.registry_entity_mtls_url).scheme != 'https'):
             raise RegistrationFailure('派生注册需要配置 Registry 9002 的 HTTPS mTLS 根地址及可信 CA')
-        try:
-            # ontology 不提供 ACTIVE_IDENTITY，也不能调用 read_active_snapshot 当作运行实体。
-            # 这里只读恢复状态和正式能力；子实体 up() 会自行读取并再次核验父证书及 CA 状态。
-            with wit_candidate_config(parent) as parent_input:
-                component = registration_component(parent_input)
-                agent = WitAgent(metadata={'application': 'personal-avatar-manager', 'entry': 'ontology-read'})
-                agent.install(component, required=True)
-                async with agent:
-                    status = await agent.context.get(TRUSTED_REGISTRATION).refresh_certificate_status()
-                    if str(status.phase) != 'active' or component.final_acs is None:
-                        raise RegistrationPending('等待本体审核及证书就绪', settings.system_atr_poll_interval)
-                    ontology = plain_json(component.final_acs)
-        except RegistrationPending:
-            raise
-        except FileNotFoundError:
-            raise RegistrationFailure('个人分身本体注册材料缺失，请恢复原 ACS 和 ATR 状态；不要重新申请本体') from None
-        except (OSError, RuntimeError, ValueError, LookupError):
-            raise RegistrationPending('等待本体审核、证书和 CA 状态核验就绪；不会重新申请本体', settings.system_atr_poll_interval) from None
+        return parent_paths,paths,parent
+
+    def _freeze(self,user_id,profile,parent_paths,paths,parent,ontology):
+        settings=self.settings
         expected=json.loads(parent_paths.registration.read_text()).get('expected_aic')
         if expected and ontology.get('aic')!=expected:raise RegistrationFailure('个人本体 AIC 与明确指定的本体不一致，拒绝派生')
         if ontology.get('endPoints'):
@@ -174,12 +192,9 @@ class EntityRegistrationRunner:
             raise RegistrationFailure('个人分身本体用途或技能不符，拒绝使用管理系统模板注册个人分身') from None
         for directory in (paths.root.parent, paths.root, paths.certificates):
             private_directory(directory)
-        from avatar.core.execution import run_blocking
-        def allocate():
-            with self.database.connect(write=True) as db:
-                endpoint = entity_endpoint(settings, user_id, db=db)
-                return endpoint, entity_oidc_identity(settings, user_id, db=db) if endpoint else None
-        endpoint, oidc_identity = await run_blocking(allocate)
+        with self.database.connect(write=True) as db:
+            endpoint=entity_endpoint(settings,user_id,db=db)
+            oidc_identity=entity_oidc_identity(settings,user_id,db=db) if endpoint else None
         create_identity_json(paths.acs, build_entity_candidate(ontology, user_id, profile, endpoint, oidc_identity))
         create_identity_json(paths.registration, {
             'registry_url': parent.endpoints.registry_url,
@@ -206,8 +221,8 @@ class EntityRegistrationRunner:
     async def advance(self, user_id, profile):
         async with asyncio.timeout(self.settings.system_atr_call_timeout):
             paths, config, ontology = await self.configuration(user_id, profile)
-            with wit_candidate_config(config) as input_config:
-                component = registration_component(input_config, registry=EntityRegistry(config))
+            async with blocking_context(wit_candidate_config(config)) as input_config:
+                component = await run_blocking(_entity_component,input_config,config)
                 agent = WitAgent(metadata={'application': 'personal-avatar-manager', 'entry': 'entity-registration'})
                 agent.install(component, required=True)
                 try:
@@ -227,10 +242,11 @@ class EntityRegistrationRunner:
                             raise RegistrationFailure('框架未返回正式实体 ACS，不能标记注册成功')
                         document = plain_json(component.final_acs)
                 finally:
-                    sync_component_acs(config, component)
-            publish_identity_document(paths.acs, document, result.aic, user_id)
-            with wit_candidate_config(config) as input_config:
-                material, generation, _ = await registration_component(input_config).read_active_snapshot()
+                    await run_blocking(sync_component_acs,config,component)
+            await run_blocking(publish_identity_document,paths.acs,document,result.aic,user_id)
+            async with blocking_context(wit_candidate_config(config)) as input_config:
+                component=await run_blocking(registration_component,input_config)
+                material,generation,_=await component.read_active_snapshot()
             if material.aic != document['aic']:
                 raise RegistrationFailure('实体证书与已确认 ACS 的 AIC 不一致，禁止发布身份')
             return {'aic': material.aic, 'certificate': certificate_projection(material, generation, ontology['aic']),

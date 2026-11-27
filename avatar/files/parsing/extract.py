@@ -7,6 +7,8 @@ from html.parser import HTMLParser
 from pathlib import Path
 from avatar.files.parsing import PLAIN_TEXT_EXTENSIONS
 from xml.etree import ElementTree
+from avatar.files.parsing.ocr import pdf_page_text, image_text
+from avatar.files.word_pdfs import read_word_pdf
 
 MAX_TEXT = 30000
 PDF_MAX_TEXT = 1000000
@@ -131,7 +133,6 @@ def extract(path, extension):
         if len(source) > 1024 * 1024:
             return text[:MAX_TEXT], 'truncated'
     elif extension in ('.doc','.docx'):
-        from avatar.files.word_pdfs import read_word_pdf
         pdf, _ = read_word_pdf(path)
         return extract(pdf, '.pdf')
     elif extension == '.xlsx':
@@ -144,7 +145,6 @@ def extract(path, extension):
         if reader.is_encrypted:
             return '', 'needs_description'
         parts=[];ocr_pages=0;unread=0;index=-1
-        from avatar.files.parsing.ocr import pdf_page_text
         size=0
         for index in range(min(len(reader.pages),PDF_MAX_PAGES)):
             try:text=reader.pages[index].extract_text() or ''
@@ -168,7 +168,6 @@ def extract(path, extension):
         if unread:text+='\n[部分页面未提取到文字，请补充说明或用视觉模型查看原件。]'
         return text, 'ocr_partial' if unread else 'truncated' if truncated else 'ocr' if ocr_pages else 'extracted'
     elif extension in ('.png','.jpg','.jpeg','.webp','.gif','.bmp'):
-        from avatar.files.parsing.ocr import image_text
         text=image_text(path)
         return text[:MAX_TEXT], 'ocr' if text else 'needs_description'
     else:

@@ -4,7 +4,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 from avatar.core.db import event
 from avatar.core.revisions import ModifiedAt
-from avatar.files.library.folders import validate_path, MaterialFolders
+from avatar.files.library.folders import MaterialFolders, folder_visibility, inherited, refresh_inherited, validate_path
 
 
 class BatchRequest(BaseModel):
@@ -29,30 +29,11 @@ def select(db,user_id,body,*,knowledge=False):
     return [r for r in rows if r['id'] in ids or any(r['relative_path'].startswith(p+'/') for p in paths)],folders
 
 
-def inherited(db,user_id,path):
-    settings={r['path']:r['visibility'] for r in db.execute('SELECT path,visibility FROM material_folders WHERE user_id=?',(user_id,))}
-    return folder_visibility(settings,path)
-
-
-def folder_visibility(settings,path):
-    while path:
-        if settings.get(path) is not None:return settings[path]
-        path=path.rpartition('/')[0]
-    return 'private'
-
-
-def refresh_inherited(db,files,user_id,stamp):
-    settings={r['path']:r['visibility'] for r in db.execute('SELECT path,visibility FROM material_folders WHERE user_id=?',(user_id,))}
-    rows=db.execute('SELECT id,relative_path,visibility FROM attachments WHERE user_id=? AND visibility_override=0',(user_id,)).fetchall()
-    db.executemany('UPDATE attachments SET visibility=?,updated_at=? WHERE id=? AND user_id=?',
-        [(folder_visibility(settings,r['relative_path'].rpartition('/')[0]),stamp,r['id'],user_id) for r in rows if r['visibility']!=folder_visibility(settings,r['relative_path'].rpartition('/')[0])])
-
-
 def apply(files,user,body):
     if body.action=='delete':
         result=files.remove(user,last_modified_at=body.last_modified_at,selection=body)
     else:
-        with files.database.connect(write=True) as db:
+        with files.database.connect(write=True, account_scope=user['id']) as db:
             files.editable(db,user['id'],body.last_modified_at)
             rows,_=select(db,user['id'],body)
             stamp=files.touch(db,user['id'])

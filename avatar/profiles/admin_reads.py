@@ -7,6 +7,9 @@ from avatar.core.platform_settings import PlatformSettings
 from avatar.profiles.pending_reviews import pending_count
 from avatar.protocols.registration.entity import staged_entity_metadata
 from avatar.protocols.transport.endpoints import entity_port_pool, preview_entity_urls
+from avatar.models.artifact_cache import fingerprint
+from avatar.models.capabilities import apply_capabilities, target
+from avatar.models.model_config import public_config
 
 
 def counts(db):
@@ -35,9 +38,6 @@ def agent_detail(state, row):
 
 def agent_details(state, db, rows):
     """批量读取旧管理记录页展示的完整分身详情，保持单项详情的权限和字段。"""
-    from avatar.models.artifact_cache import fingerprint
-    from avatar.models.capabilities import apply_capabilities, target
-    from avatar.models.model_config import public_config
     owners = [row['user_id'] for row in rows]
     if not owners:
         return []

@@ -10,6 +10,7 @@ from starlette.formparsers import MultiPartException
 
 from avatar.core.text_budget import TEXT_BYTES
 from avatar.files.library.attachments import MAX_STORED_SIZE
+from avatar.files.uploads import validation
 from avatar.knowledge.media import MAX_ASSET
 from avatar.skills.policy import MAX_UPLOAD
 
@@ -54,12 +55,21 @@ async def invalid_request(request, exc):
     )
 
 
+def streaming_upload_limit(method, path):
+    if method == 'POST':
+        if path == '/api/me/attachments':
+            return MAX_STORED_SIZE
+        if path == '/api/me/knowledge/assets':
+            return MAX_ASSET + 65536
+        if re.fullmatch(r'/api/conversations/[^/]+/files', path):
+            return validation.MAX_CHAT_UPLOAD + 65536
+    return None
+
+
 def body_limit(method, path):
     limit = (
         MAX_UPLOAD + 65536
         if method == "POST" and path == "/api/me/skills"
-        else MAX_STORED_SIZE
-        if method == "POST" and path == "/api/me/attachments"
         else 256 * 1024
         if path == "/api/me/profile"
         else 65536
@@ -74,8 +84,6 @@ def body_limit(method, path):
         limit = 256 * 1024
     if path == "/api/admin/soul-question-bank/import":
         limit = 8 * 1024 * 1024
-    if method == "POST" and path == "/api/me/knowledge/assets":
-        limit = MAX_ASSET + 65536
     if re.fullmatch(r"/api/conversations/[^/]+/diagrams/promote", path):
         limit = 7 * 1024 * 1024
     if re.fullmatch(r"/api/(?:chat/(?:stream|generations)|agent-dialogues(?:/[^/]+/(?:resume|confirm|accept))?|"
@@ -85,9 +93,6 @@ def body_limit(method, path):
         limit = 7 * TEXT_BYTES
         if path.startswith("/api/agent-intents/"):
             limit += 12 * 60000  # Optional shared_content, up to 60k Unicode characters.
-    if method == "POST" and re.fullmatch(r"/api/conversations/[^/]+/files", path):
-        # The multipart endpoint spools originals and validates each file type.
-        limit = None
     return limit
 
 
@@ -108,7 +113,7 @@ def response_headers(path, headers):
     if path in ("/", "/admin", "/platform-entry"):
         headers["Referrer-Policy"] = "no-referrer"
         headers["Content-Security-Policy"] = SHELL_CSP
-    if path in {"/static/preview/mermaid.html", "/static/preview/animation.html"}:
+    if path == "/static/preview/mermaid.html":
         # 仅受信静态渲染页允许同源嵌入；iframe 自身不带 allow-same-origin，拥有不透明 origin。
         headers["X-Frame-Options"] = "SAMEORIGIN"
         headers["Referrer-Policy"] = "no-referrer"
@@ -156,9 +161,8 @@ class SecurityMiddleware:
         lengths = headers.getlist('content-length')
         if lengths and (len(lengths) != 1 or not re.fullmatch(r'[0-9]{1,20}', lengths[0])):
             return await reject(400, '请求长度无效')
-        limit = body_limit(method, path)
-        if limit is None:
-            return await self.app(scope, receive, secure_send)
+        upload_limit = streaming_upload_limit(method, path)
+        limit = upload_limit if upload_limit is not None else body_limit(method, path)
         if lengths and int(lengths[0]) > limit:
             return await reject(413, '请求内容过大')
 
@@ -172,8 +176,8 @@ class SecurityMiddleware:
                 raise MultiPartException('请求内容过大')
             return message
 
-        if method == 'POST' and path in ('/api/me/attachments', '/api/me/knowledge/assets'):
-            # Both upload routes authorize first and consume the entire stream before storing.
+        if upload_limit is not None:
+            # Uploads authorize first and consume the entire stream before storing.
             try:
                 return await self.app(scope, limited_receive, secure_send)
             except MultiPartException:

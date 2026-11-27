@@ -18,7 +18,7 @@ export DATABASE_URL='postgresql:///avatar?user=avatar_app'
 
 源码部署的 `./service.sh start` 先启动自管 PostgreSQL 16（`data/pgsql`），再启动应用。`./service.sh restart` 保留数据库和项目独立运行的消息依赖。`./service.sh stop` 仅停止应用。PostgreSQL、Redis 和 Kafka 可继续供其他进程使用。外部 PostgreSQL 由其管理员维护。可选读缓存使用服务器项目根目录的 `redis/`，套接字示例为 `AVATAR_REDIS_SOCKET=redis/redis.sock`。Redis 不可用时管理员待审计数回源 PostgreSQL。
 
-任务和通知继续在 PostgreSQL 提交后生效。应用启动时在当前 schema 安装事务内事件表和变更触发器。触发器同时发送当前 schema 专用的空载荷 NOTIFY。事务回滚会撤销事件与通知。单进程转发器先 LISTEN 再扫描，每批最多处理 128 行；空闲 8 秒复查一次，重连时继续读取已提交的积压。Kafka 不可用时仍在本进程唤醒任务，Redis 不可用时客户端按原接口读取快照。认证的会话和 OIDC 查询复用一次连接池借用。已核对的单账户写入使用账户锁。同一账户仍串行，跨账户事务继续使用 Schema 写入屏障。
+任务和通知继续在 PostgreSQL 提交后生效。数据库初始化时在当前 schema 安装事务内事件表和变更触发器。HTTP 应用运行转发器期间开启事务事件写入。独立 WIT 和 CLI 的写事务首次触发事件时，通过当前 schema 的建议锁检查转发器。监听在线时同样在提交后唤醒任务和订阅者，无监听时不积压事件。触发器同时发送当前 schema 专用的空载荷 NOTIFY。事务回滚会撤销事件与通知。单进程转发器先 LISTEN 再扫描，每批最多处理 128 行；空闲 8 秒复查一次，重连时继续读取已提交的积压。只配置 PostgreSQL 即可在本进程唤醒任务、通知订阅者并使待审缓存失效。Kafka 断线时任务仍走本地唤醒；Redis 缺失或发布失败时订阅者接收本地提示。认证的会话和 OIDC 查询复用一次连接池借用。已核对的单账户写入使用账户锁。同一账户仍串行，跨账户事务继续使用 Schema 写入屏障。
 
 连接池按进程配置。 `AVATAR_PG_POOL_MIN` 默认 1，`AVATAR_PG_POOL_MAX` 默认 10，`AVATAR_PG_POOL_TIMEOUT` 默认 30 秒。通过运行监控的连接申请等待和写锁等待指标判断瓶颈。
 

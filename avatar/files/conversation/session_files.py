@@ -13,6 +13,8 @@ from fastapi import HTTPException
 from avatar.core.execution import authorization
 from avatar.files.parsing import PLAIN_TEXT_EXTENSIONS
 from avatar.core.artifact_limits import MAX_SOURCE_BYTES
+from avatar.files.parsing.images import jpeg_bytes
+from avatar.files.parsing.text_worker import read_original
 
 
 _CONTROL = re.compile(r'[\x00-\x08\x0e-\x1f\x7f-\x9f]')
@@ -196,7 +198,6 @@ class SessionFiles:
                 chunk = stream.read(limit if limit is not None else 8192)
             result.update(self._text_page(chunk,offset,row['size']))
         elif extension in ('.pdf','.doc','.docx','.ppt','.pptx','.xlsx'):
-            from avatar.files.parsing.text_worker import read_original
             try:
                 parsed = read_original(path,extension,start=page,end=None if explicit else page,offset=offset,
                                        limit=max(1,limit//4) if limit is not None and not explicit else limit or 2000)
@@ -233,7 +234,6 @@ class SessionFiles:
                                      '如需处理原始二进制，请先开启本会话 Python 沙箱。')
         if vision and row['content_type'].startswith('image/'):
             from base64 import b64encode
-            from avatar.files.parsing.images import jpeg_bytes
             try:
                 image = jpeg_bytes(path)
             except HTTPException as exc:

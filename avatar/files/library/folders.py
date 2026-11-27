@@ -25,6 +25,25 @@ def ensure_folders(db,user_id,path,*,table='material_folders'):
     db.executemany('INSERT INTO '+table+'(user_id,path) VALUES(?,?)',[(user_id,item) for item in sorted(needed)])
 
 
+def inherited(db,user_id,path):
+    settings={r['path']:r['visibility'] for r in db.execute('SELECT path,visibility FROM material_folders WHERE user_id=?',(user_id,))}
+    return folder_visibility(settings,path)
+
+
+def folder_visibility(settings,path):
+    while path:
+        if settings.get(path) is not None:return settings[path]
+        path=path.rpartition('/')[0]
+    return 'private'
+
+
+def refresh_inherited(db,files,user_id,stamp):
+    settings={r['path']:r['visibility'] for r in db.execute('SELECT path,visibility FROM material_folders WHERE user_id=?',(user_id,))}
+    rows=db.execute('SELECT id,relative_path,visibility FROM attachments WHERE user_id=? AND visibility_override=0',(user_id,)).fetchall()
+    db.executemany('UPDATE attachments SET visibility=?,updated_at=? WHERE id=? AND user_id=?',
+        [(folder_visibility(settings,r['relative_path'].rpartition('/')[0]),stamp,r['id'],user_id) for r in rows if r['visibility']!=folder_visibility(settings,r['relative_path'].rpartition('/')[0])])
+
+
 class FolderRequest(BaseModel):
     model_config=ConfigDict(extra='forbid')
     path:str=Field(min_length=1,max_length=1024)
@@ -37,7 +56,6 @@ class MaterialFolders:
     def __init__(self,attachments):self.files=attachments;self.database=attachments.database
 
     def list(self,user_id):
-        from avatar.files.library.batch import folder_visibility
         with self.database.connect() as db:
             rows=db.execute('SELECT path,caption,visibility FROM material_folders WHERE user_id=? ORDER BY path',(user_id,)).fetchall()
             settings={r['path']:r['visibility'] for r in rows}
@@ -47,7 +65,7 @@ class MaterialFolders:
 
     def create(self,user,body):
         path=validate_path(body.path)
-        with self.database.connect(write=True) as db:
+        with self.database.connect(write=True, account_scope=user['id']) as db:
             self.files.editable(db,user['id'],body.last_modified_at)
             if db.execute('SELECT 1 FROM material_folders WHERE user_id=? AND path=?',(user['id'],path)).fetchone():raise HTTPException(409,'该文件夹已存在')
             ensure_folders(db,user['id'],path)
@@ -81,7 +99,7 @@ def rename_folder(files,user,body):
     if body.new_name is None:
         if body.caption is None:raise HTTPException(422,'请提供名称或目录说明')
         path=validate_path(body.path)
-        with files.database.connect(write=True) as db:
+        with files.database.connect(write=True, account_scope=user['id']) as db:
             files.editable(db,user['id'],body.last_modified_at)
             if not db.execute('UPDATE material_folders SET caption=? WHERE user_id=? AND path=?',(body.caption.strip(),user['id'],path)).rowcount:raise HTTPException(404,'文件夹不存在')
             modified=files.touch(db,user['id']);prefix=path+'/'
@@ -91,7 +109,7 @@ def rename_folder(files,user,body):
     if body.caption is not None:raise HTTPException(422,'重命名和修改说明请分别保存')
     path=validate_path(body.path);name=validate_name(body.new_name)
     target=(path.rpartition('/')[0]+'/' if '/' in path else '')+name
-    with files.database.connect(write=True) as db:
+    with files.database.connect(write=True, account_scope=user['id']) as db:
         files.editable(db,user['id'],body.last_modified_at)
         folders=[row[0] for row in db.execute('SELECT path FROM material_folders WHERE user_id=?',(user['id'],))]
         if path not in folders:raise HTTPException(404,'文件夹不存在')
@@ -106,7 +124,6 @@ def rename_folder(files,user,body):
         for old,new in updates:db.execute('UPDATE material_folders SET path=? WHERE user_id=? AND path=?',(new,user['id'],old))
         modified=files.touch(db,user['id'])
         db.executemany('UPDATE attachments SET relative_path=?,updated_at=? WHERE user_id=? AND id=?',[(new,modified,user['id'],identifier) for new,identifier in file_updates])
-        from avatar.files.library.batch import refresh_inherited
         refresh_inherited(db,files,user['id'],modified)
         event(db,user['id'],user['username'],'重命名资料文件夹',path+' → '+target,actor_id=user['id'])
     return {**MaterialFolders(files).list(user['id']),'last_modified_at':modified,'path':target,'files':files.inventory(user['id'])}
@@ -129,7 +146,7 @@ def ensure_filename_available(db,user_id,target,exclude_id=''):
 
 
 def rename_file(files,user,identifier,body):
-    with files.database.connect(write=True) as db:
+    with files.database.connect(write=True, account_scope=user['id']) as db:
         files.editable(db,user['id'],body.last_modified_at)
         row=db.execute('SELECT * FROM attachments WHERE user_id=? AND id=?',(user['id'],identifier)).fetchone()
         if not row:raise HTTPException(404,'文件不存在')

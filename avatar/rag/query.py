@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Literal
 from pydantic import BaseModel,ConfigDict,Field,model_validator
 from fastapi import HTTPException
+from avatar.files.library.folders import validate_path
 
 
 class FileQuery(BaseModel):
@@ -23,7 +24,6 @@ class FileQuery(BaseModel):
     @model_validator(mode='after')
     def bounds(self):
         if self.folder:
-            from avatar.files.library.folders import validate_path
             try:validate_path(self.folder)
             except HTTPException:raise ValueError('目录过滤路径无效') from None
         if self.page_start and self.page_end and self.page_end<self.page_start:raise ValueError('页码范围无效')

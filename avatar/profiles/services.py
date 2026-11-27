@@ -8,12 +8,16 @@ from avatar.core.db import dump, event, now
 from avatar.core.activity_visibility import event_scope
 from avatar.profiles.schemas import Profile
 from avatar.protocols.identity.acs import resolve_input, build_acs, public_base_url
-from avatar.protocols.registration.base import RegistrationFailure
+from avatar.protocols.errors import RegistrationFailure
 from avatar.files.library.attachments import AttachmentService
 from avatar.contracts.profile_fields import public_profile, FIXED_PUBLIC_FIELDS
 from avatar.core.revisions import next_modified_at
 from avatar.models.model_settings import ModelSettingsService
 from avatar.profiles.identity import save_identity
+from avatar.models.embedding import EmbeddingSettings
+from avatar.protocols.identity.ontology import avatar_ontology_paths
+from avatar.protocols.registration.direct import personal_input, signed_input, active_input, require_profile
+from avatar.protocols.transport.endpoints import entity_endpoint
 
 
 # 职责：协调个人资料、审核、任务、分身和平台设置业务。
@@ -42,26 +46,16 @@ class AvatarService:
 
     def personal_acs(self,stored,profile):
         if getattr(self.provider,'mode','demo')=='acps-direct':
-            from avatar.protocols.registration.direct import personal_input
             return personal_input(stored,profile)
         return resolve_input(stored,profile)
 
-    def deployment_acs(self, document, user_id, db=None, *, allocate=True):
+    def deployment_acs(self, document, user_id, db, *, allocate=True):
         """草稿即保留固定端口；正式监听仍须审核和证书核验。"""
         settings=getattr(getattr(self.provider,'runner',None),'settings',None)
         if getattr(self.provider,'mode','demo')!='acps-direct' or settings is None:
             return document
-        from avatar.protocols.transport.endpoints import entity_endpoint
         try:
-            if db is None and settings.entity_aip_enabled:
-                with self.database.connect() as reader:
-                    endpoint = entity_endpoint(settings, user_id, db=reader, existing_only=True)
-                if endpoint is None:
-                    # 并发首次读取时，在写锁内重查并保留同一端口。
-                    with self.database.connect(write=True) as writer:
-                        endpoint = entity_endpoint(settings, user_id, db=writer)
-            else:
-                endpoint = entity_endpoint(settings, user_id, db=db, allocate=allocate)
+            endpoint = entity_endpoint(settings, user_id, db=db, allocate=allocate)
         except RegistrationFailure as exc:
             raise HTTPException(409, str(exc)) from None
         document={**document,'endPoints':[endpoint] if endpoint else []}
@@ -72,11 +66,28 @@ class AvatarService:
             document['certificate']={**document['certificate'],'altNames':{'dns':[],'ip':[urlsplit(endpoint['url']).hostname]}}
         return document
 
+    def _draft_acs(self, db, user_id, record, agent):
+        profile = dict(record) if record else {}
+        draft = json.loads(profile.get('draft','{}'))
+        # 当前公开策略覆盖历史私密标记，仅规范化返回副本，不篡改旧草稿及审核记录。
+        draft['visibility'] = {**draft.get('visibility',{}), **{key:'public' for key in FIXED_PUBLIC_FIELDS}}
+        content = self.personal_acs(json.loads(profile.get('acs_input','{}')),draft)
+        document = json.loads(profile.get('acs_document','{}'))
+        if not document:
+            document = build_acs(content,user_id,public_base_url(db),agent['aic'] if agent else '',profile.get('updated_at'))
+        errors=content.errors()
+        if record:
+            try:
+                document=self.deployment_acs(document,user_id,db,allocate=False)
+            except HTTPException as exc:
+                errors.append(str(exc.detail))
+        return draft,content,document,{'valid':not errors,'errors':errors}
+
     # 职责：汇总本人资料、分身、申请记录、事件和模型用量。
     # 输入：user_id 必须由已授权调用方提供。
     # 结果与约束：返回前端个人中心数据，隐藏 Key；上次修改时间直接读取资料日期，不受审核状态改变影响。
-    def overview(self, user_id, *, access_scope="full"):
-        with self.database.connect() as db:
+    def overview(self, user_id, *, access_scope="full", db=None):
+        with (nullcontext(db) if db is not None else self.database.connect()) as db:
             p = db.execute("SELECT * FROM profile_records WHERE user_id=?", (user_id,)).fetchone()
             agent = db.execute("SELECT * FROM avatar_records WHERE user_id=?", (user_id,)).fetchone()
             history = db.execute("SELECT s.*,u.username AS reviewer_name FROM profile_submissions s LEFT JOIN users u ON u.id=s.reviewer WHERE s.user_id=? ORDER BY submitted_at DESC", (user_id,)).fetchall()
@@ -85,29 +96,24 @@ class AvatarService:
             events = db.execute("SELECT e.* FROM audit_events e WHERE "+scope+" ORDER BY e.id DESC LIMIT 50",values).fetchall()
             calls = db.execute("SELECT provider,model,usage,created_at,purpose FROM model_calls WHERE user_id=? ORDER BY id DESC LIMIT 20", (user_id,)).fetchall()
             bindings=db.execute('SELECT platform,account_id,created_at FROM platform_bindings WHERE user_id=?',(user_id,)).fetchall()
-            from avatar.models.embedding import EmbeddingSettings
             embedding_configured=EmbeddingSettings.configured(db,user_id)
             model_settings = self.models.get(user_id, db)
             files = self.attachments.inventory(user_id, db=db)
             by_id = {item['id']: item for item in files}
             files_modified_at = self.attachments.collection_date(user_id, db)
-            base = public_base_url(db) if not p or not json.loads(p['acs_document']) else None
+            draft,content,document,validation=self._draft_acs(db,user_id,p,agent)
             job=db.execute('SELECT j.registration_phase,j.error,j.status FROM provision_jobs j JOIN profile_submissions s ON s.id=j.submission_id WHERE s.user_id=? ORDER BY j.updated_at DESC LIMIT 1',(user_id,)).fetchone()
         profile = dict(p) if p else {"draft": "{}", "last_modified_at": "", "status": "draft", "reason": ""}
         profile['registration'] = dict(job) if job else None
-        profile["draft"] = json.loads(profile["draft"])
-        # 当前公开策略覆盖历史私密标记，仅规范化返回副本，不篡改旧草稿及审核记录。
-        profile['draft']['visibility'] = {**profile['draft'].get('visibility', {}), **{key: 'public' for key in FIXED_PUBLIC_FIELDS}}
+        profile["draft"] = draft
         profile["model_config"] = model_settings['model_config']
         stored_input = json.loads(profile.get('acs_input', '{}'))
-        content = self.personal_acs(stored_input, profile['draft'])
         profile['acs_input'] = content.model_dump()
         profile['acs_generated_description']=self.personal_acs({},profile['draft']).description
         profile['acs_online']=bool(agent and agent['identity_status']=='active')
         profile['acs_active_document']=json.loads(agent['acs_document']) if profile['acs_online'] else None
         profile['acs_active_input']=None
         if profile['acs_online']:
-            from avatar.protocols.registration.direct import signed_input
             active = json.loads(agent['acs_input']) or content.model_dump()
             profile['acs_active_input'] = signed_input(active,profile['acs_active_document'] or {})
         profile['acs_editing'] = bool(profile['acs_online'] and profile['status']!='active' and
@@ -123,19 +129,9 @@ class AvatarService:
             profile['acs_active_document'].pop('webAppUrl',None)
             profile['acs_active_document']['entityMeta']={**profile['acs_active_document'].get('entityMeta',{}),'environment':'1.0.0'}
             profile['acs_active_document']['active']=True
-        deployment_errors=[]
-        document = json.loads(profile.get('acs_document', '{}'))
-        if not document:
-            document = build_acs(content, user_id, base, agent['aic'] if agent else '', profile.get('updated_at'))
-        if p:
-            try:
-                document = self.deployment_acs(document, user_id)
-            except HTTPException as exc:
-                deployment_errors.append(str(exc.detail))
         profile['acs_document'] = document
         profile['acs_direct'] = getattr(self.provider,'mode','demo')=='acps-direct'
         if inherited:
-            from avatar.protocols.identity.ontology import avatar_ontology_paths
             paths = avatar_ontology_paths(self.database.data_dir)
             path = paths.acs
             try:
@@ -146,7 +142,7 @@ class AvatarService:
             profile['acs_inheritance'] = {'enabled': True, 'document': formal or template, 'registered': bool(formal)}
         profile['attachments'] = self.attachments.resolve_refs(by_id, profile['draft'].get('attachments', []))
         profile['files'] = files
-        profile['acs_validation'] = {'valid': not (content.errors()+deployment_errors), 'errors': content.errors()+deployment_errors}
+        profile['acs_validation'] = validation
         agent_view = self.decode_agent(agent)
         if agent_view is not None:
             agent_view.update(model_config=model_settings['model_config'], attachments=profile['files'])
@@ -160,16 +156,14 @@ class AvatarService:
     # 职责：按 AIC 查询分身可公开资料。
     # 输入：aic 为目标分身身份。
     # 结果与约束：返回 AIC 与经过逐字段隐私过滤的资料；不存在返回 404，不暴露 Key、私密字段或会话历史。
-    def public_avatar(self, aic):
-        with self.database.connect() as db:
+    def public_avatar(self, aic, *, db=None):
+        with (nullcontext(db) if db is not None else self.database.connect()) as db:
             row = db.execute("SELECT user_id,profile FROM avatar_records WHERE aic=?", (aic,)).fetchone()
-        if not row:
-            raise HTTPException(404, "分身不存在")
-        profile = json.loads(row['profile'])
-        visible = public_profile(profile)
-        visible['attachments'] = [{**item, 'download_url': '/api/avatars/' + aic + '/attachments/' + item['id']}
-                                  for item in self.attachments.public_context(row['user_id'])]
-        return {'aic': aic, 'profile': visible}
+            if not row:raise HTTPException(404, "分身不存在")
+            files=self.attachments.public_context(row['user_id'],db=db,target_aic=aic)
+        visible=public_profile(json.loads(row['profile']))
+        visible['attachments']=[{**item,'download_url':'/api/avatars/'+aic+'/attachments/'+item['id']} for item in files]
+        return {'aic':aic,'profile':visible}
 
     # 职责：解析数据库分身记录，排除旧模型配置副本。
     # 输入：row 为可选 SQLite Row。
@@ -228,7 +222,6 @@ class AvatarService:
             agent = self.decode_agent(db.execute('SELECT * FROM avatar_records WHERE user_id=?',(user['id'],)).fetchone())
             reuse = None
             if agent and agent['identity_status']=='active' and getattr(self.provider,'mode','demo')=='acps-direct':
-                from avatar.protocols.registration.direct import active_input
                 active = active_input(agent)
                 if request.acs_edit and request.acs_input is not None:
                     reuse = int(content == active)
@@ -269,7 +262,6 @@ class AvatarService:
             validated.avatar_name = content.name
             validated.validate_submission()
             if getattr(self.provider,'mode','demo')=='acps-direct':
-                from avatar.protocols.registration.direct import require_profile
                 require_profile(validated.model_dump())
             if content.errors() and not self.inherited_acs(user['id'], db):
                 raise HTTPException(422, '；'.join(content.errors()))
@@ -281,7 +273,6 @@ class AvatarService:
             reuse = p['reuse_signed_acs'] if current and current['identity_status']=='active' else None
             submitted_input=content.model_dump()
             if reuse:
-                from avatar.protocols.registration.direct import signed_input
                 document=json.loads(current['acs_document'])
                 submitted_input=signed_input(json.loads(current['acs_input']),document)
                 validated.avatar_name=submitted_input.get('name') or validated.avatar_name
@@ -391,11 +382,13 @@ class AvatarService:
     # 职责：获取本人已保存草稿或已生效分身的 ACS，供预览和下载。
     # 输入：user 为已认证账户，source 为 draft 或 approved。
     # 结果与约束：不按外部 user_id 获取其他人的内容；旧分身无文档时提示提交更新，不临时公开或改写正式 ACS。
-    def saved_acs(self, user, source):
-        if source == 'draft':
-            profile = self.overview(user['id'], access_scope=user.get("access_scope", "full"))['profile']
-            return {'document': profile['acs_document'], 'validation': profile['acs_validation'], 'mode': getattr(self.provider, 'mode', 'demo'), 'source': source}
-        with self.database.connect() as db:
+    def saved_acs(self, user, source, *, db=None):
+        with (nullcontext(db) if db is not None else self.database.connect()) as db:
+            if source == 'draft':
+                profile=db.execute('SELECT draft,acs_input,acs_document,updated_at FROM profile_records WHERE user_id=?',(user['id'],)).fetchone()
+                agent=db.execute('SELECT aic FROM avatar_records WHERE user_id=?',(user['id'],)).fetchone()
+                _,_,document,validation=self._draft_acs(db,user['id'],profile,agent)
+                return {'document':document,'validation':validation,'mode':getattr(self.provider,'mode','demo'),'source':source}
             row = db.execute('SELECT acs_document FROM avatar_records WHERE user_id=?', (user['id'],)).fetchone()
         if not row or not json.loads(row[0]):
             raise HTTPException(409, '当前分身尚无已审核 ACS，请在个人资料中保存并提交更新')
@@ -407,8 +400,9 @@ class AvatarService:
     def _agent(self, row, admin=False):
         data = self.decode_agent(row)
         if data:
-            data['model_config'] = self.models.get(row['user_id'])['model_config']
-            data['attachments'] = self.attachments.inventory(row['user_id'],admin=admin)
+            with self.database.connect() as db:
+                data['model_config'] = self.models.get(row['user_id'],db)['model_config']
+                data['attachments'] = self.attachments.inventory(row['user_id'],admin=admin,db=db)
         return data
 
     # 职责：把审核快照中的附件引用解析为可查看摘要。

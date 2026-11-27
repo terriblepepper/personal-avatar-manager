@@ -2,7 +2,10 @@
 import json
 import os
 import tempfile
+from collections.abc import Mapping
 from contextlib import contextmanager
+from avatar.core.execution import run_blocking
+from avatar.protocols.errors import RegistrationConfigurationError
 from dataclasses import replace
 from pathlib import Path
 from wit.acps.identity.acs import validate_registration_candidate_acs, validate_registry_acs
@@ -70,8 +73,7 @@ class LocalEntityDirectory:
     def __init__(self,registrations):self.registrations=dict(registrations)
 
     async def select(self,aic):
-        import asyncio
-        return await asyncio.to_thread(self.load,self.registrations[aic],aic)
+        return await run_blocking(self.load, self.registrations[aic], aic)
 
     @staticmethod
     def load(config,aic):
@@ -144,7 +146,6 @@ def migrate_identity_document(config):
                 or (expected and expected != document['aic'])
                 or any(identity_json(p) != document for p in legacy)):
             raise ValueError('缺失 ACS 与原 ATR 身份不一致，拒绝恢复或新建身份')
-        from avatar.protocols.registration.system import publish_identity_document
         publish_identity_document(config.paths.acs_path, document, state['aic'], candidate['entityUserId'])
     if not legacy:
         return
@@ -157,7 +158,6 @@ def migrate_identity_document(config):
         raise ValueError('旧正式 ACS 与 ATR 身份不一致，保留文件待核对')
     if registration_candidate(config) != state.get('candidate'):
         raise ValueError('原 ACS 候选与 ATR 状态不一致，拒绝迁移')
-    from avatar.protocols.registration.system import publish_identity_document
     publish_identity_document(config.paths.acs_path, document, state['aic'], state['candidate']['entityUserId'])
     for path in legacy:
         path.unlink()
@@ -173,6 +173,50 @@ def sync_component_acs(config, component, publisher=None):
         if publisher is not None:
             publisher(document, status.aic)
         else:
-            from avatar.protocols.registration.system import publish_identity_document
             candidate = status.acs_candidate
             publish_identity_document(config.paths.acs_path, document, status.aic, candidate['entityUserId'])
+
+
+# 职责：把框架只读 JSON 映射/元组转换为普通 JSON 容器。
+# 输入：value 是 Registry 已确认的 ACS 数据，不包含凭据或证书材料。
+# 结果与约束：保留字段和值，不经过会补充默认值的模型重建，不改变已确认 ACS 的语义内容。
+def plain_json(value):
+    if isinstance(value, Mapping):
+        return {key: plain_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [plain_json(item) for item in value]
+    return value
+
+
+# 职责：原子写回一个系统、本体或实体已经核验的正式 ACS。
+# 输入：path 是身份专用目录文件，document 为框架 final_acs，aic 与 entity_user_id 为预期稳定身份。
+# 结果与约束：不生成缺失字段；只允许同一用户候选升级或同一 AIC 更新，权限为 0600，相同内容不重复写盘。
+def publish_identity_document(path, document, aic, entity_user_id):
+    document = plain_json(document)
+    validate_registry_acs(document)
+    if document.get('aic') != aic or document.get('entityUserId') != entity_user_id:
+        raise RegistrationConfigurationError('registered_identity_mismatch')
+    if path.is_symlink():
+        raise RegistrationConfigurationError('unsafe_acs_path')
+    if path.exists():
+        previous = json.loads(path.read_text())
+        if previous.get('entityUserId') != entity_user_id or previous.get('aic') not in ('', aic):
+            raise RegistrationConfigurationError('registered_identity_mismatch')
+        if previous == document:
+            return
+    descriptor, name = tempfile.mkstemp(prefix='.acs-', dir=path.parent)
+    try:
+        with os.fdopen(descriptor, 'w') as stream:
+            json.dump(document, stream, ensure_ascii=False, indent=2)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, path)
+        parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)

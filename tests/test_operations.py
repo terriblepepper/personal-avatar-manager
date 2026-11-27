@@ -426,6 +426,82 @@ def test_release_contains_locked_cache_client_and_only_public_files(tmp_path):
 
 # frontend serving
 
+@pytest.mark.parametrize('failure',['cancel','cancel_stop_error','listener_lookup'])
+def test_system_aip_partial_start_releases_agent(tmp_path,monkeypatch,failure):
+    import asyncio
+    from unittest.mock import AsyncMock, Mock
+    from avatar.core.config import Settings
+    from avatar.runtime import system_aip as module
+    from avatar.runtime.system_registration import SystemRegistrationRuntime
+
+    url='https://system.test/aip/rpc'
+    settings=Settings(data_dir=tmp_path,system_aip_enabled=True,system_aip_public_url=url,system_aip_aic='system')
+    acs=tmp_path/'candidate.json'
+    acs.write_text(json.dumps({'entityUserId':module.SYSTEM_ENTITY_ID,'endPoints':[module.system_aip_endpoint(url)]}))
+    config=SimpleNamespace(mode='integrated',paths=SimpleNamespace(acs_path=acs))
+    monkeypatch.setattr(module,'system_registration_config',lambda _:config)
+    monkeypatch.setattr(module,'LocalEntityDirectory',Mock())
+    monkeypatch.setattr(module,'CachedEntityDirectory',Mock(return_value=SimpleNamespace(select=AsyncMock())))
+    monkeypatch.setattr(module,'PassiveTlsListener',Mock())
+    monkeypatch.setattr(module,'SystemPartnerHandler',Mock())
+
+    async def check():
+        started, stopping, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        stop_error=RuntimeError('stop failed')
+        async def start():
+            started.set()
+            if failure!='listener_lookup':
+                await asyncio.Event().wait()
+        async def stop():
+            stopping.set()
+            await release.wait()
+            if failure=='cancel_stop_error':
+                raise stop_error
+        agent=SimpleNamespace(install=Mock(),start=start,stop=AsyncMock(side_effect=stop),
+                              context=SimpleNamespace(get=Mock(side_effect=RuntimeError('missing listener'))))
+        monkeypatch.setattr(module,'WitAgent',Mock(return_value=agent))
+        runtime=module.SystemAipRuntime(settings,None)
+        registration=SystemRegistrationRuntime(settings,runtime)
+        registration.aic='system'
+        task=asyncio.create_task(runtime.start() if failure=='listener_lookup' else registration.activate(None))
+        registration.task=task
+        await started.wait()
+        signal=asyncio.create_task(stopping.wait())
+        closing=None
+        try:
+            if failure=='cancel':
+                closing=asyncio.create_task(registration.stop())
+            elif failure=='cancel_stop_error':
+                task.cancel()
+            await asyncio.wait({task,signal},return_when=asyncio.FIRST_COMPLETED)
+            assert stopping.is_set() and not task.done()
+            assert runtime.agent is None and runtime.listener is None
+            if failure=='cancel':
+                task.cancel()
+                await asyncio.sleep(0)
+                assert not task.done()
+            release.set()
+            if failure=='listener_lookup':
+                await task
+                assert runtime.reason=='identity_or_configuration_not_ready'
+            else:
+                with pytest.raises(asyncio.CancelledError) as cancelled:
+                    await task
+                if failure=='cancel_stop_error':
+                    assert cancelled.value.__cause__ is stop_error
+                if closing:
+                    await closing
+                    assert registration.task is None
+            agent.stop.assert_awaited_once()
+        finally:
+            release.set()
+            signal.cancel()
+            await asyncio.gather(task,signal,return_exceptions=True)
+            if closing:
+                await closing
+    asyncio.run(check())
+
+
 def test_database_is_closed_when_runtime_start_fails(context, monkeypatch):
     app, _, _ = context
     closed = []
@@ -460,6 +536,9 @@ def test_spa_refresh_keeps_api_static_and_unknown_paths_distinct(tmp_path):
     for path in ('/', '/chat', '/admin'):
         assert "worker-src 'self' blob:" in client.get(path).headers['content-security-policy']
     assert "worker-src 'none'" in client.get('/static/preview/html.html').headers['content-security-policy']
+    assert client.get('/static/preview/mermaid.html').headers['x-frame-options'] == 'SAMEORIGIN'
+    removed = client.get('/static/preview/animation.html')
+    assert removed.status_code == 404 and removed.headers['x-frame-options'] == 'DENY'
     assert 'Vue' in client.get('/chat').text
     assert 'Vue' in client.get('/admin/reviews').text
     assert 'Vue' in client.get('/admin/custom-section').text
@@ -802,3 +881,36 @@ def test_town_guest_cookie_uses_deployment_tls_setting(monkeypatch):
     assert result.status_code == 200
     cookie = result.headers['set-cookie']
     assert 'avatar_visitor=' in cookie and 'Secure' in cookie and 'HttpOnly' in cookie
+
+
+def test_conversation_upload_limits_declared_and_streamed_wire_bytes(monkeypatch):
+    import asyncio
+    import httpx
+    from starlette.requests import Request
+    from avatar.api.middleware import SecurityMiddleware
+    from avatar.files.uploads import validation
+    monkeypatch.setattr(validation, 'MAX_CHAT_UPLOAD', 32)
+    wire_limit = 32 + 65536
+    stored = []
+    calls = []
+
+    async def upload(scope, receive, send):
+        calls.append(scope['path'])
+        size = sum([len(chunk) async for chunk in Request(scope, receive).stream()])
+        stored.append(size)
+        await send({'type':'http.response.start','status':201,'headers':[]})
+        await send({'type':'http.response.body','body':b''})
+    async def pieces(extra, expected_calls):
+        assert len(calls) == expected_calls  # The upload handler authorizes before reading the first chunk.
+        yield b'x' * (wire_limit - 1)
+        yield extra
+    async def check():
+        app = SecurityMiddleware(upload, public_url='http://unit.invalid')
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://unit.invalid') as client:
+            path = '/api/conversations/chat/files'
+            assert (await client.post(path, content=b'x'*(wire_limit+1))).status_code == 413
+            assert calls == []
+            assert (await client.post(path, content=pieces(b'xx', 1))).status_code == 413
+            assert (await client.post(path, content=pieces(b'x', 2))).status_code == 201
+            assert stored == [wire_limit]
+    asyncio.run(check())

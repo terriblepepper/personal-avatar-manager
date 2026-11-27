@@ -9,7 +9,7 @@ from avatar.api.dependencies import PageOffset, ShortPageSearch
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, TypeAdapter, ValidationError
 from starlette.formparsers import MultiPartException
 from avatar.api.multipart import FileTooLarge, UploadParser
-from avatar.files.uploads.validation import html_file_limit
+from avatar.files.uploads import validation
 from avatar.files.uploads.buffer import upload_buffer, upload_work
 from avatar.models.effort import Effort
 from avatar.accounts.auth import current_user
@@ -116,11 +116,12 @@ async def upload(conversation_id: str, request: Request, user=Depends(current_us
 
     await asyncio.to_thread(require_editable)
     try:
-        form = await UploadParser(request.headers, request.stream(), max_fields=1, file_limit=html_file_limit).parse()
+        form = await UploadParser(request.headers, request.stream(), max_fields=1,
+                                  file_limit=lambda _: validation.MAX_CHAT_UPLOAD).parse()
     except FileTooLarge:
-        raise HTTPException(413, 'HTML 文件不能超过 100 MiB') from None
+        raise HTTPException(413, validation.CHAT_UPLOAD_ERROR) from None
     except MultiPartException:
-        raise HTTPException(413,'上传超过字段或文件数量限制') from None
+        raise HTTPException(413,'上传超过表单大小、字段或文件数量限制') from None
     try:
         file = form.get('file')
         if not hasattr(file,'file') or not file.filename:
@@ -169,8 +170,7 @@ def download(conversation_id: str, file_id: str, request: Request, user=Depends(
 def remove(conversation_id: str, file_id: str, request: Request, user=Depends(current_user)):
     service=request.app.state.chat.chat_files
     with ExitStack() as stack:
-        with service.database.connect(write=True) as db:
-            service.session(db,user['id'],conversation_id,editable=True)
+        with service.edit_session(user['id'],conversation_id) as db:
             row=service.owned(db,user['id'],conversation_id,file_id)
             stack.enter_context(service.deleting(db,[row]))
     return {'items':service.list(user['id'],conversation_id)}

@@ -11,6 +11,9 @@ from avatar.files.uploads.validation import TYPES, chat_file_limit
 from avatar.core.artifact_limits import MAX_SOURCE_BYTES
 from avatar.files.uploads.buffer import upload_buffer, upload_work
 from avatar.files.word_pdfs import WORD_SUFFIXES, link_word_pdf, prepare_word_pdf
+from avatar.files.library.folders import validate_path, with_folder_caption
+from avatar.files.library.public import PublicMaterials
+from avatar.files.parsing.images import jpeg_bytes
 
 OUTPUT_TYPES = {**TYPES, '.zip': 'application/zip'}
 
@@ -57,7 +60,6 @@ def validate_output(filename,data):
 class ConversationResources:
     # 引用目录只包含长期资料；会话临时文件须先转存为独立资料。
     def library(self,user_id,conversation_id,search='',offset=0,folder='',recursive=False):
-        from avatar.files.library.folders import validate_path
         validate_path(folder,root=True)
         with self.database.connect() as db:
             self.session(db,user_id,conversation_id)
@@ -87,7 +89,6 @@ class ConversationResources:
                 elif source=='chat':raise HTTPException(422,'会话临时文件不属于资料库，请先转存为独立资料文件')
                 else:raise HTTPException(422,'文件来源无效')
                 if row:
-                    from avatar.files.library.folders import with_folder_caption
                     row=with_folder_caption(db,row)
             if not row:raise HTTPException(404,'文件不存在')
             return row,directory
@@ -111,7 +112,6 @@ class ConversationResources:
         paths=[]
         try:
             storage_owner=self.session(db,user_id,conversation_id)['user_id']
-            from avatar.files.library.public import PublicMaterials
             generated=[item for item in outputs if not item.get('public_material_id')]
             ordinary=sum(len(item['data']) for item in generated if OUTPUT_TYPES.get(Path(item['filename']).suffix.lower()) != 'text/html')
             total=sum(len(item['data']) for item in generated)
@@ -158,7 +158,6 @@ class ConversationResources:
                     if pdf is not None:
                         paths.append(pdf)
                 if mime.startswith('image/'):
-                    from avatar.files.parsing.images import jpeg_bytes
                     encoded=jpeg_bytes(path);preview=path.with_suffix('.jpg')
                     with os.fdopen(os.open(preview,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),'wb') as stream:
                         paths.append(preview);stream.write(encoded)

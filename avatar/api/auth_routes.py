@@ -30,7 +30,7 @@ def register(body: RegistrationRequest, request: Request, response: Response):
         raise HTTPException(403, '请通过 Keycloak 注册并登录')
     user_id=auth.create_user(request.app.state.database, body)
     if body.platform_entry_token:
-        with request.app.state.database.connect(write=True) as db:
+        with request.app.state.database.connect(write=True, account_scope=user_id) as db:
             token,csrf,user=auth.issue_session(db,user_id,1800,'profile')
         response.set_cookie('avatar_session',token,httponly=True,samesite='strict',secure=request.app.state.settings.secure_cookie,max_age=1800)
         return {'message':'注册并绑定成功','user':user,'csrf':csrf}
@@ -103,7 +103,7 @@ def me(request: Request, user=Depends(auth.current_user)):
 
 @router.post("/me/onboarding/{stage}")
 def advance_onboarding(stage: Literal['tour', 'done'], request: Request, user=Depends(auth.current_user)):
-    with request.app.state.database.connect(write=True) as db:
+    with request.app.state.database.connect(write=True, account_scope=user['id']) as db:
         db.execute("""UPDATE users SET onboarding_stage=? WHERE id=? AND role='user'
                       AND (onboarding_stage='welcome' OR (onboarding_stage='tour' AND ?='done'))""",
                    (stage, user['id'], stage))
@@ -117,8 +117,8 @@ def advance_onboarding(stage: Literal['tour', 'done'], request: Request, user=De
 @router.post("/auth/logout")
 async def logout(request: Request, response: Response, user=Depends(auth.current_user)):
     def revoke_session():
-        with request.app.state.database.connect(write=True) as db:
-            db.execute("DELETE FROM sessions WHERE token=?", (hashlib.sha256(request.cookies["avatar_session"].encode()).hexdigest(),))
+        with request.app.state.database.connect(write=True, account_scope=user['id']) as db:
+            db.execute("DELETE FROM sessions WHERE token=? AND user_id=?", (hashlib.sha256(request.cookies["avatar_session"].encode()).hexdigest(), user["id"]))
     await asyncio.to_thread(revoke_session)
     response.delete_cookie("avatar_session")
     result = {'message': '已退出'}

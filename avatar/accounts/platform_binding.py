@@ -7,6 +7,7 @@ import time
 from urllib.parse import urlsplit
 from fastapi import HTTPException
 from avatar.core.db import event, now
+from avatar.accounts.sessions import issue_session
 
 PLATFORM = 'beiyou-dingdang'
 
@@ -101,10 +102,12 @@ class PlatformBindingService:
     # 输入：token 必须有效、未使用，且绑定关系与签发快照相同。
     # 结果与约束：同一事务内消费令牌并生成 1800 秒 profile 会话；返回令牌、CSRF 和受限用户信息，不改变数据库真实角色。
     def redeem(self,token):
-        from avatar.accounts.auth import issue_session
-        with self.database.connect(write=True) as db:
+        with self.database.connect() as db:
+            owner=self._token(db,token)['issued_for_user_id']
+        if not owner:raise HTTPException(409,'平台账号尚未绑定，请注册或登录已有账户完成绑定')
+        with self.database.connect(write=True, account_scope=owner) as db:
             row=self._token(db,token)
-            if not row['issued_for_user_id']:raise HTTPException(409,'平台账号尚未绑定，请注册或登录已有账户完成绑定')
+            if row['issued_for_user_id']!=owner:raise HTTPException(409,'平台绑定状态已变化，请重新获取临时入口')
             db.execute('UPDATE platform_entry_tokens SET used_at=? WHERE token_hash=?',(now(),row['token_hash']))
             # 消费令牌和创建受限会话同事务完成，避免失败后出现已消费但未登录的半成状态。
             session=issue_session(db,row['issued_for_user_id'],1800,'profile')

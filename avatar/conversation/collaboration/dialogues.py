@@ -342,7 +342,7 @@ class AgentDialogues:
 
     # 删除本方历史游标和记忆，不改写对方记忆、任务账单或对方保留的原文。
     def clear_session(self,user,identifier,hide=False):
-        with ExitStack() as resources, self.database.connect(write=True) as db:
+        with ExitStack() as resources, self.database.connect(write=True, account_scope=None if hide else user['id']) as db:
             self.session_store.member(db,user,identifier,hidden=True)
             if hide:
                 if db.execute("SELECT 1 FROM agent_dialogues WHERE session_id=? AND delivery_mode='message' AND status NOT IN ('ended','failed')",(identifier,)).fetchone():
@@ -512,7 +512,7 @@ class AgentDialogues:
         task_id, member, memory, rows, context, speaker, history = prepared
         result=await self.executor.billed({'user_id':uid},speaker,context[0],self.chat.memory.summarize(context,memory['summary'],history,self.chat.model_client,focus=focus),'agent_dialogue_memory')
         def save():
-            with self.database.connect(write=True) as db:
+            with self.database.connect(write=True, account_scope=uid) as db:
                 current=self.session_store.member(db,user,session_id,hidden=bool(task_id))
                 if not task_id and current['cleared_through']!=member['cleared_through']:raise HTTPException(409,'会话记录已变化，请重试')
                 if task_id:

@@ -1,5 +1,5 @@
 from avatar.core.user_storage import ConversationBlobs, UserBlobs
-from avatar.files.uploads.buffer import clean_removed, staged_removals, upload_work, write_original
+from avatar.files.uploads.buffer import clean_removed, staged_removals, upload_work, write_original, recover_removed
 # 模块说明：独立资料文件存储、归属、说明和隐私；用户保存立即生效，原件不进入公开静态目录。
 import asyncio
 import json
@@ -14,6 +14,10 @@ from avatar.core.revisions import next_modified_at
 from avatar.core.revisions import ModifiedAt
 
 from avatar.files.uploads.validation import TYPES, inspect_file
+from avatar.files.library.batch import select
+from avatar.files.library.folders import ensure_folders, ensure_filename_available, inherited, validate_path
+from avatar.files.uploads.batches import audit_detail
+from avatar.files.word_pdfs import discard_original
 
 MAX_STORED_SIZE = 10 * 1024 ** 3
 
@@ -50,7 +54,6 @@ class AttachmentService:
         self.database = database
         self.directory = UserBlobs(database,'attachments','attachments')
         self.parsing = asyncio.Semaphore(2)
-        from avatar.files.uploads.buffer import recover_removed
         if recover:
             recover_removed(database,self.directory,'attachments')
 
@@ -127,20 +130,16 @@ class AttachmentService:
                 quota = self.quota(db,user['id'])
                 if quota['used_bytes']+len(data)>quota['limit_bytes']:
                     raise HTTPException(413,'资料文件总大小不能超过 10 GiB，请先删除不需要的文件')
-                from avatar.files.library.folders import ensure_folders,ensure_filename_available
                 if check_name:ensure_filename_available(db,user['id'],relative_path or filename)
                 ensure_folders(db,user['id'],'/'.join(relative_path.split('/')[:-1]))
                 modified=self.touch(db,user['id'])
-                from avatar.files.library.batch import inherited
                 effective_visibility=visibility or inherited(db,user['id'],relative_path.rpartition('/')[0])
                 db.execute('INSERT INTO attachments(id,user_id,filename,content_type,size,sha256,extracted_text,extraction_status,created_at,caption,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
                            (identifier,user['id'],filename,'application/zip' if extension=='.zip' else TYPES[extension],len(data),checksum,extracted,status,now(),caption,modified))
                 db.execute('UPDATE attachments SET extraction_version=1,relative_path=?,visibility=?,visibility_override=?,saved_at=? WHERE id=?',
                            (relative_path,effective_visibility,int(visibility is not None),modified if visibility is not None else None,identifier))
-                from avatar.files.uploads.batches import audit_detail
                 event(db, user['id'], user['username'], '上传资料附件', audit_detail(identifier,batch_id), actor_id=user['id'])
         except BaseException:
-            from avatar.files.word_pdfs import discard_original
             discard_original(path)
             raise
         ref = {'id': identifier, 'visibility': effective_visibility, 'caption': caption}
@@ -242,14 +241,12 @@ class AttachmentService:
             with self.database.connect(write=True, account_scope=user['id']) as db:
                 self.editable(db,user['id'],last_modified_at)
                 if selection is not None:
-                    from avatar.files.library.batch import select
                     rows,folders=select(db,user['id'],selection)
                     db.executemany('DELETE FROM material_folders WHERE user_id=? AND path=?',[(user['id'],p) for p in folders])
                 elif folder_path is None:
                     rows=db.execute('SELECT id FROM attachments WHERE id=? AND user_id=?',(identifier,user['id'])).fetchall()
                     if not rows:raise HTTPException(404,'附件不存在')
                 else:
-                    from avatar.files.library.folders import validate_path
                     validate_path(folder_path)
                     if not db.execute('SELECT 1 FROM material_folders WHERE user_id=? AND path=?',(user['id'],folder_path)).fetchone():raise HTTPException(404,'文件夹不存在')
                     prefix=folder_path+'/'

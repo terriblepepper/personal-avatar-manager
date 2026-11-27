@@ -13,6 +13,8 @@ import signal
 import sys
 import tempfile
 from avatar.core.execution import run_blocking
+from avatar.files.conversation.resources import validate_output
+from avatar.sandbox.https_inputs import fetch_inputs
 
 RUNTIME = Path(os.environ.get('AVATAR_SANDBOX_RUNTIME') or Path(sys.prefix) / 'share/avatar-sandbox').resolve()
 ANALYSIS_PACKAGES = {'numpy': 'numpy', 'pandas': 'pandas', 'matplotlib': 'matplotlib', 'PIL': 'pillow'}
@@ -75,7 +77,6 @@ class LocalPythonSandbox:
         self.users[user_id] = (lock,count+1)
         try:
             async with lock, self.slots:
-                from avatar.sandbox.https_inputs import fetch_inputs
                 if authorize:
                     await run_blocking(authorize)
                 library = RUNTIME / 'cache/npm/registry.npmjs.org/pyodide/0.27.8'
@@ -214,7 +215,6 @@ class LocalPythonSandbox:
             raise SandboxExecutionError('沙箱文字输出超过 1 MiB，执行已中止')
         files=value.get('files',[]) if value['success'] else []
         if not isinstance(files,list):raise SandboxExecutionError('沙箱生成文件清单无效')
-        from avatar.files.conversation.resources import validate_output
         decoded=[]
         for item in files:
             if not isinstance(item,dict) or not isinstance(item.get('data'),str) or len(item['data'])>14*1024*1024:

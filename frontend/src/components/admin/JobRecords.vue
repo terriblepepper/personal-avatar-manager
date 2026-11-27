@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { useConfirmation } from '../../composables/useConfirmation'
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import AppDialog from '../AppDialog.vue'
@@ -7,6 +8,7 @@ import { date, statusLabel } from '../../utils/format'
 import RecordPagination from '../RecordPagination.vue'
 
 interface Job {id:string; username:string; status:string; action?:string; registration_phase?:string; error?:string; attempts?:number; updated_at:string}
+const confirmAction = useConfirmation()
 const props=defineProps<{collection:'identity_jobs'|'jobs'}>()
 const identity=props.collection==='identity_jobs', title=identity?'身份维护记录':'创建任务'
 const actions:Record<string,string>={register:'正式注册',renew:'更新证书',unregister:'注销正式身份'}
@@ -40,7 +42,11 @@ function select(ids:string[],checked:boolean) {
 async function remove(ids:string[]|'all') {
   if(busy.value || ids!=='all'&&!ids.length)return
   const target=ids==='all'?'全部分页的'+(identity?'已完成或失败':'已完成')+'记录':ids.length+' 条记录'
-  if(!confirm('确认删除'+target+'？任务执行结果保留。'))return
+  const batch = ids === selected.value
+  await confirmAction('确认删除'+target+'？任务执行结果保留。', '确认删除记录', () => [
+    props.collection, busy.value, batch ? selected.value : null,
+    ids === 'all' ? null : rows.value.filter(row => ids.includes(row.id)).map(row => [row.id, row.status]),
+  ], async () => {
   busy.value=true
   try {
     await request(`/records/${props.collection}/delete`,'POST',ids==='all'?{all:true}:{ids})
@@ -48,6 +54,7 @@ async function remove(ids:string[]|'all') {
     await load()
     ElMessage.success('记录已删除')
   } catch(e){notifyError(e)} finally {busy.value=false}
+  })
 }
 async function retry(job:Job) {
   if(busy.value)return

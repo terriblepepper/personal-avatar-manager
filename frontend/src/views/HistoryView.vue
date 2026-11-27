@@ -1,11 +1,12 @@
 <script setup lang="ts">
+import { useConfirmation } from '../composables/useConfirmation'
 import RecordPagination from '../components/RecordPagination.vue'
 import DocumentFields from '../components/DocumentFields.vue'
 import { computed, onMounted, ref } from 'vue'
-import { ElMessageBox } from 'element-plus'
 import AppDialog from '../components/AppDialog.vue'
 import { request, notifyError } from '../api/client'
 import { date, fileSizeMB, statusLabel } from '../utils/format'
+const confirmAction = useConfirmation()
 interface Row {id:string;status:string;last_modified_at:string;submitted_at:string;reviewer_name?:string;reason?:string;snapshot:Record<string,unknown>;acs_document?:unknown;attachments?:unknown}
 interface Field {key:string;label:string;audience:string;visibility:string;fixed_public:boolean}
 interface Attachment {id:string;filename:string;visibility:string;size:number}
@@ -35,7 +36,17 @@ async function load(next = 0) {
     if (ticket === sequence) loading.value = false
   }
 }
-async function remove(all=false,ids=selected.value){try{await ElMessageBox.confirm(all?'删除所有分页中已完成的记录？待审核申请保留。':'删除选中的已完成记录？','确认删除');await request('/records/history/delete','POST',{all,ids});await load(all?0:offset.value)}catch(e){if(e!=='cancel'&&e!=='close')notifyError(e)}}
+async function remove(all = false, ids = selected.value) {
+  if (loading.value || failed.value || (!all && !ids.length)) return
+  const batch = ids === selected.value
+  await confirmAction(all ? '删除所有分页中已完成的记录？待审核申请保留。' : '删除选中的已完成记录？', '确认删除', () => [
+    loading.value, failed.value, offset.value, batch && !all ? selected.value : null,
+    all ? null : rows.value.filter(row => ids.includes(row.id)).map(row => [row.id, row.status])
+  ], async () => {
+    await request('/records/history/delete', 'POST', { all, ids })
+    await load(all ? 0 : offset.value)
+  })
+}
 function visibleFields(row:Row){return fields.value.filter(f=>f.audience==='both'||f.audience===row.snapshot.person_type)}
 function fileSummary(value:unknown):Attachment[]{return Array.isArray(value)?value.filter((item):item is Attachment=>typeof item==='object'&&item!==null&&typeof item.id==='string'&&typeof item.filename==='string'&&typeof item.size==='number'&&typeof item.visibility==='string'):[]}
 onMounted(()=>{void load();void request<Field[]>('/profile-fields').then(value=>fields.value=value).catch(notifyError)})

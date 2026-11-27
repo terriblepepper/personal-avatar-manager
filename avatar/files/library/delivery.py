@@ -4,6 +4,7 @@ import stat
 from fastapi import HTTPException
 
 from avatar.core.execution import authorization, current_generation
+from avatar.files.library.folders import with_folder_captions
 
 
 class SavedMaterials:
@@ -13,7 +14,6 @@ class SavedMaterials:
         self.owner = owner
 
     def documents(self, *, public_only=False):
-        from avatar.files.library.folders import with_folder_captions
         # saved_at 记录显式保存；上传后继承目录权限的原件已属于本人。
         condition = 'user_id=?'
         if public_only:

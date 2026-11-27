@@ -3,12 +3,12 @@ import json
 import re
 from pathlib import Path
 from avatar.files.parsing import PLAIN_TEXT_EXTENSIONS
+from avatar.files.parsing.extract import extract, text_content
+from avatar.files.word_pdfs import read_word_pdf
 
 
 def read(path,extension,start=1,end=None,offset=0,limit=12000,query='',visual_text=None):
-    from avatar.files.parsing.extract import extract
     if extension in ('.doc', '.docx'):
-        from avatar.files.word_pdfs import read_word_pdf
         pdf, _ = read_word_pdf(Path(path))
         return read(pdf, '.pdf', start, end, offset, limit, query, visual_text)
     if extension=='.pdf':
@@ -20,7 +20,6 @@ def read(path,extension,start=1,end=None,offset=0,limit=12000,query='',visual_te
         pages=((index+1,lambda index=index:(reader.pages[index].extract_text() or '')+((visual_text or {}).get(str(index+1),''))) for index in range(start-1,end))
     else:
         if extension in PLAIN_TEXT_EXTENSIONS:
-            from avatar.files.parsing.extract import text_content
             body=text_content(path)
             status='extracted'
         else:body,status=extract(Path(path),extension)

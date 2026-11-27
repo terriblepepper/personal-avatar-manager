@@ -1,10 +1,12 @@
 <script setup lang="ts">
+import { useConfirmation } from '../composables/useConfirmation'
 import { computed, reactive, watch } from 'vue'
-import { ElButton, ElInput, ElMessage, ElMessageBox } from 'element-plus'
+import { ElButton, ElInput, ElMessage } from 'element-plus'
 import { request, notifyError } from '../api/client'
 import { useSessionStore } from '../stores/session'
 import TownAccessLimits from '../components/TownAccessLimits.vue'
 import { isAdministrator } from '../utils/accountRole'
+const confirmAction = useConfirmation()
 const session = useSessionStore(),
   contacts = reactive({
     email: '',
@@ -29,17 +31,13 @@ async function saveContacts() {
   }
 }
 async function demote() {
-  if (!user.value || user.value.is_root) return;
-  try {
-    await ElMessageBox.confirm('确认将自己降级为普通用户？管理权限会立即撤销。', '确认降级');
-    await request('/admin/accounts/' + encodeURIComponent(user.value.id) + '/role', 'PUT', {
-      role: 'user'
-    });
-    await session.refresh();
+  const account = user.value
+  if (!account || account.is_root || !isAdministrator(account)) return
+  await confirmAction('确认将自己降级为普通用户？管理权限会立即撤销。', '确认降级', () => user.value?.id, async () => {
+    await request('/admin/accounts/' + encodeURIComponent(account.id) + '/role', 'PUT', { role: 'user' })
+    await session.refresh()
     ElMessage.success('已降级为普通用户')
-  } catch (e) {
-    if (e !== 'cancel' && e !== 'close') notifyError(e)
-  }
+  })
 }
 async function savePassword() {
   if (password.new_password !== password.confirm_password) {

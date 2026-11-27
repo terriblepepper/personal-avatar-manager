@@ -150,6 +150,8 @@ def finish_in(db, rowid, result, run, state, message, *, reason=None, delivery=N
     current = json.loads(row['document'])
     if current['status']['state']!='working' or current['id']!=result['id']:
         return public_result(current)
+    if current['_agent_resume'].get('owner') != run['owner']:
+        raise RunConflict('原任务账户已改变')
     document = {**result,'id':uuid.uuid4().hex,'sentAt':now(),'status':{'state':state,'stateChangedAt':now()}}
     lease_release(db,current['_agent_resume'])
     if state=='awaiting-completion':
@@ -173,7 +175,7 @@ def finish_in(db, rowid, result, run, state, message, *, reason=None, delivery=N
 
 
 def finish(database, rowid, result, run, state, message, *, reason=None):
-    with database.connect(write=True) as db:
+    with database.connect(write=True, account_scope=run['owner']) as db:
         if run.get('work_until', float('inf')) <= time.time():
             state, message, reason = 'failed', TIMEOUT_MESSAGE, 'working_timeout'
         return finish_in(db,rowid,result,run,state,message,reason=reason)

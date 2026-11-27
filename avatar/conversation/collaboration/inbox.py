@@ -103,6 +103,7 @@ class AgentInbox:
             if admin is not None:
                 yield db, admin
                 return
+        # The shared audit cursor must not pass an earlier, uncommitted event from another account.
         with self.database.connect(write=True) as db:
             yield db, sync_activity(db, user_id)
 
@@ -148,7 +149,7 @@ class AgentInbox:
         identifiers=list(dict.fromkeys(identifiers))
         if not 1<=len(identifiers)<=100 or any(type(i) is not int or i<=0 for i in identifiers):raise HTTPException(422,'请选择 1～100 条有效消息')
         slots=','.join('?' for _ in identifiers)
-        with self.database.connect(write=True) as db:
+        with self.database.connect(write=True, account_scope=user_id) as db:
             admin=bool(db.execute("SELECT role IN (?,?) FROM users WHERE id=?",(*ADMIN_ROLES,user_id)).fetchone()[0])
             visible,values=visible_notifications(user_id,admin)
             if db.execute(f'SELECT COUNT(*) FROM agent_notifications WHERE {visible} AND id IN ({slots})',(*values,*identifiers)).fetchone()[0]!=len(identifiers):raise HTTPException(404,'消息不存在或无权操作')

@@ -10,7 +10,16 @@ from datetime import datetime
 from avatar.core.db import dump, event, now
 from avatar.profiles.services import AvatarService
 from avatar.protocols.identity.acs import resolve_input, build_acs, public_base_url
-from avatar.protocols.registration.base import RegistrationPending, RegistrationFailure
+from avatar.protocols.errors import RegistrationPending, RegistrationFailure
+from avatar.profiles.entity_lifecycle import remap_identity
+from avatar.protocols.registration.direct import (
+    personal_input,
+    signed_input,
+    active_input,
+    direct_candidate,
+    verify_existing,
+)
+from avatar.protocols.registration.maintenance import remove_retired_identity, maintain_entity
 
 log = logging.getLogger(__name__)
 
@@ -63,7 +72,6 @@ class ProvisionWorker:
             db.execute("UPDATE provision_jobs SET registration_phase='identity_cleanup' WHERE id=?", (job['job_id'],))
 
     def _cleanup(self, job):
-        from avatar.protocols.registration.maintenance import remove_retired_identity
         remove_retired_identity(self.provider.runner.settings.data_dir, job['user_id'])
         # 新注册可写入同一路径；先持久化清理完成，重启时才不会误删新候选。
         with self.database.connect(write=True, account_scope=job['user_id']) as db:
@@ -80,7 +88,6 @@ class ProvisionWorker:
                         or doc.get('entityUserId') != job['user_id'] or not cert.get('public_pem') or not cert.get('server_public_pem')):
                     raise RegistrationFailure('新注册的 AIC、正式 ACS 或双证书未核验完整',phase='identity_verification')
             if direct:
-                from avatar.protocols.registration.direct import personal_input
                 content = personal_input(json.loads(job['acs_input']), profile)
             else:
                 content = resolve_input(json.loads(job['acs_input']), profile)
@@ -97,7 +104,6 @@ class ProvisionWorker:
             if keep_input:
                 saved_input = old.get('acs_input', {})
             elif direct:
-                from avatar.protocols.registration.direct import signed_input
                 saved_input = signed_input(saved_input, document)
                 if document.get('skills') and not document['skills'][0]['description'].startswith(content.template_owner+'能够'):
                     saved_input.pop('template_owner', None)
@@ -110,7 +116,6 @@ class ProvisionWorker:
                        (job["user_id"], identity["aic"], dump(identity["certificate"]), dump(profile), job["last_modified_at"], now(), now(), dump(saved_input), dump(document)))
             # 先写入该用户当前 AIC，再迁移会话引用；参与者触发器会核验账户归属。
             if retired and old['aic']!=identity['aic']:
-                from avatar.profiles.entity_lifecycle import remap_identity
                 remap_identity(db,job['user_id'],old['aic'],identity['aic'])
             completed_phase = 'certificate_reused' if direct and old and not retired and not old['aic'].startswith('DEMO-') else 'active'
             db.execute("UPDATE provision_jobs SET status='done',registration_phase=?,error='',updated_at=? WHERE id=?", (completed_phase, now(), job["job_id"]))
@@ -154,7 +159,6 @@ class ProvisionWorker:
             direct=getattr(self.provider,'mode','')=='acps-direct'
             cleanup_pending = job['registration_phase'] == 'identity_cleanup'
             if old and direct and old.get('identity_status') in ('active','unregistering'):
-                from avatar.protocols.registration.direct import active_input, direct_candidate, personal_input
                 incoming=personal_input(json.loads(job['acs_input']),profile)
                 existing=active_input(old)
                 reuse = job['reuse_signed_acs']
@@ -165,7 +169,6 @@ class ProvisionWorker:
                     await run_blocking(direct_candidate, self.provider.runner.settings, job['user_id'],
                                        profile, json.loads(job['acs_input']), database=self.database)
                     await run_blocking(self._drain, job)
-                    from avatar.protocols.registration.maintenance import maintain_entity
                     settings=self.provider.runner.settings
                     phase = 'certificate_revocation'
                     await maintain_entity(settings,job['user_id'],old['aic'],'unregister')
@@ -174,7 +177,6 @@ class ProvisionWorker:
                     old={**old,'identity_status':'retired','certificate':{},'acs_document':{}}
                 elif not old['aic'].startswith('DEMO-'):
                     phase = 'identity_verification'
-                    from avatar.protocols.registration.direct import verify_existing
                     await verify_existing(self.provider.runner.settings,job['user_id'],old)
             retired=bool(old and old.get("identity_status")=="retired" and direct)
             if cleanup_pending:

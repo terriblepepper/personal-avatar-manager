@@ -1,5 +1,6 @@
 """个人 ACS 独立注册：本平台批准后提交 Registry，审核通过再签证上线。"""
 import asyncio
+from avatar.core.execution import blocking_context, run_blocking
 import json
 import re
 
@@ -11,13 +12,14 @@ from avatar.protocols.transport.ready import RegistryReadyTransport
 from wit.acps.identity.acs import REGISTRATION_CANDIDATE_LAST_MODIFIED_TIME,validate_registration_candidate_acs
 from avatar.protocols.identity.acs import resolve_input,build_acs,public_base_url,default_input
 from avatar.protocols.registration.entity import EntityRegistrationRunner,entity_identity_paths,certificate_projection
-from avatar.protocols.registration.base import RegistrationPending,RegistrationFailure
+from avatar.protocols.errors import RegistrationPending,RegistrationFailure
 from avatar.protocols.identity.atr_config import read_atr_config
 from avatar.protocols.identity.system import private_directory,create_identity_json,system_identity_paths
-from avatar.protocols.identity.document import wit_candidate_config,sync_component_acs
-from avatar.protocols.registration.system import plain_json,publish_identity_document
+from avatar.protocols.identity import document as identity_document
+from avatar.protocols.identity.document import wit_candidate_config, sync_component_acs, plain_json, publish_identity_document
 from avatar.protocols.transport.endpoints import entity_endpoint,entity_oidc_identity
 from avatar.contracts.profile_fields import public_profile
+from avatar.protocols.registration.demo import DemoRegistrationProvider
 
 
 def legacy_description(public):
@@ -70,15 +72,18 @@ def active_input(record):
 
 
 async def verify_existing(settings,user_id,record):
-    from avatar.protocols.identity.document import LocalEntityDirectory, identity_json
+    await run_blocking(_verify_existing,settings,user_id,record)
+
+
+def _verify_existing(settings,user_id,record):
     paths=entity_identity_paths(settings.data_dir,user_id)
     try:
         config=read_atr_config(paths.registration)
-        identity=await LocalEntityDirectory({record['aic']:config}).select(record['aic'])
+        identity=identity_document.LocalEntityDirectory.load(config,record['aic'])
         cert=record['certificate']
         if (cert.get('public_pem')!=identity.material.certificate
                 or cert.get('server_public_pem')!=identity.material.server_certificate
-                or record['acs_document']!=identity_json(paths.acs)):
+                or record['acs_document']!=identity_document.identity_json(paths.acs)):
             raise ValueError('identity mismatch')
     except (OSError,ValueError,LookupError) as exc:
         raise RegistrationFailure('复用核验失败：原 ACS、AIC 或双证书与当前身份材料不一致，请核对后重试',phase='identity_verification') from exc
@@ -115,8 +120,16 @@ def direct_candidate(settings,user_id,profile,stored,*,database):
     return doc
 
 
+def _direct_component(config):
+    registry=RegistryClient(config,transport=RegistryReadyTransport(config))
+    return registration_component(config,registry=registry)
+
+
 class DirectRegistrationRunner(EntityRegistrationRunner):
     async def configuration(self,user_id,profile,stored=None):
+        return await run_blocking(self._configuration,user_id,profile,stored)
+
+    def _configuration(self,user_id,profile,stored):
         settings=self.settings;paths=entity_identity_paths(settings.data_dir,user_id)
         if not settings.registry_username or not settings.registry_password:
             raise RegistrationPending('等待配置 Registry 注册凭据',phase='configuration')
@@ -124,11 +137,9 @@ class DirectRegistrationRunner(EntityRegistrationRunner):
         if not source.is_file():raise RegistrationFailure('缺少 Registry 和 CA 连接配置')
         infrastructure=read_atr_config(source,settings.registry_username,settings.registry_password)
         for directory in (paths.root.parent,paths.root,paths.certificates):private_directory(directory)
-        from avatar.core.execution import run_blocking
-        candidate=await run_blocking(direct_candidate,settings,user_id,profile,stored or {},database=self.database)
+        candidate=direct_candidate(settings,user_id,profile,stored or {},database=self.database)
         if paths.acs.is_file() and not (stored or {}).get('template_owner'):
-            from avatar.protocols.identity.document import identity_json
-            saved = identity_json(paths.acs)
+            saved = identity_document.identity_json(paths.acs)
             if saved != candidate:
                 public = public_profile(profile)
                 descriptions = {s['id']: s['description'] for s in (stored or {}).get('skills', [])}
@@ -156,8 +167,7 @@ class DirectRegistrationRunner(EntityRegistrationRunner):
         config=read_atr_config(paths.registration,settings.registry_username,settings.registry_password)
         if config.mode!='integrated' or config.paths.parent_state_dir:
             raise RegistrationFailure('该账户仍有旧派生注册状态，需完成身份迁移后再提交独立实体')
-        from avatar.protocols.identity.document import registration_candidate
-        original=registration_candidate(config)
+        original=identity_document.registration_candidate(config)
         # 旧申请继续按原冻结 ACS 核验；仅兼容本次移除的可选网页字段。
         if original.get('webAppUrl') and 'webAppUrl' not in candidate:
             original={key:value for key,value in original.items() if key!='webAppUrl'}
@@ -170,8 +180,8 @@ class DirectRegistrationRunner(EntityRegistrationRunner):
     async def advance(self,user_id,profile,stored=None):
         async with asyncio.timeout(self.settings.system_atr_call_timeout):
             paths,config=await self.configuration(user_id,profile,stored)
-            with wit_candidate_config(config) as input_config:
-                component=registration_component(input_config,registry=RegistryClient(input_config,transport=RegistryReadyTransport(input_config)))
+            async with blocking_context(wit_candidate_config(config)) as input_config:
+                component=await run_blocking(_direct_component,input_config)
                 agent=WitAgent(metadata={'application':'personal-avatar-manager','entry':'direct-personal-registration'})
                 agent.install(component,required=True)
                 try:
@@ -185,10 +195,11 @@ class DirectRegistrationRunner(EntityRegistrationRunner):
                             raise RegistrationPending({'registry_review':'等待 Registry 管理员审核','certificate_issuing':'Registry 已通过，正在申请并核验证书','registry_submitting':'正在向 Registry 提交实体申请'}[stage],self.settings.system_atr_poll_interval,phase=stage)
                         if not result.aic or component.final_acs is None:raise RegistrationFailure('未取得正式 ACS，不能标记上线')
                         document=plain_json(component.final_acs)
-                finally:sync_component_acs(config,component)
-            publish_identity_document(paths.acs,document,result.aic,user_id)
-            with wit_candidate_config(config) as input_config:
-                material,generation,_=await registration_component(input_config).read_active_snapshot()
+                finally:await run_blocking(sync_component_acs,config,component)
+            await run_blocking(publish_identity_document,paths.acs,document,result.aic,user_id)
+            async with blocking_context(wit_candidate_config(config)) as input_config:
+                component=await run_blocking(registration_component,input_config)
+                material,generation,_=await component.read_active_snapshot()
             if (material.aic!=document['aic'] or document.get('entityUserId')!=user_id or document.get('active') is not True):raise RegistrationFailure('证书与正式 ACS 不一致，拒绝上线')
             certificate=certificate_projection(material,generation,'');certificate.update(mode='acps-direct');certificate.pop('ontology_aic',None)
             return {'aic':material.aic,'certificate':certificate,'acs_document':document}
@@ -231,7 +242,6 @@ class DirectRegistrationProvider:
     # 结果与约束：正式续期需使用该账户 registration.json 的 wit 工具，不在 数据库写事务内进行远端签发。
     def renew(self, certificate):
         if certificate.get('mode') == 'demo':
-            from avatar.protocols.registration.base import DemoRegistrationProvider
             return DemoRegistrationProvider().renew(certificate)
         from fastapi import HTTPException
         raise HTTPException(409, '请使用该实体 registration.json 运行 wit 证书续期工具')

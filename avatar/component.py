@@ -26,6 +26,7 @@ class AvatarPlatformComponent(WitComponent[None]):
         self.app = self.server = None
 
     async def setup(self, ctx):
+        # Hosts can discover the component before activating the full Web application.
         from avatar.api.app import create_app
         self.app = create_app(self.settings or Settings.from_env(), self.provider,
                               self.run_worker, self.model_client)

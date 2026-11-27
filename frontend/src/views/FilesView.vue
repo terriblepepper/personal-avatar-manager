@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { useConfirmation } from '../composables/useConfirmation'
 import { usePolling } from '../composables/usePolling'
 import { fileSizeMB, quotaSummary, type StorageQuota } from '../utils/format'
 import { droppedFiles, type UploadFile } from '../utils/droppedFiles'
@@ -13,6 +14,7 @@ import MaterialFileDialog from '../components/MaterialFileDialog.vue'
 import type { AnimationMetadata, FilePromotion } from '../types'
 import { request, notifyError } from '../api/client'
 import { useSessionStore } from '../stores/session'
+const confirmAction = useConfirmation()
 const FilePreview = defineAsyncComponent(() => import('../components/FilePreview.vue'))
 interface FileItem extends AnimationMetadata {
   id: string;filename: string;relative_path: string;content_type: string;size: number;caption: string;visibility: 'public' |
@@ -240,20 +242,18 @@ async function save() {
   } catch (e) { notifyError(e) } finally { busy.value = false }
 }
 async function batch(actionName: 'public' | 'private' | 'delete') {
-  if (!selected.value.length) return;
-  if (actionName === 'delete') {
-    try {
-      await ElMessageBox.confirm('删除所选文件及文件夹？', '确认删除')
-    } catch {
-      return
-    }
-  }
-  await action('/me/attachments/batch', 'POST', {
+  if (busy.value || !selected.value.length) return
+  const apply = () => action('/me/attachments/batch', 'POST', {
     action: actionName,
     ids: selected.value.filter(x => x.startsWith('f:')).map(x => x.slice(2)),
     folders: selected.value.filter(x => x.startsWith('d:')).map(x => x.slice(2)),
     last_modified_at: modified.value
   })
+  if (actionName === 'delete') {
+    await confirmAction('删除所选文件及文件夹？', '确认删除', () => [busy.value, folder.value, selected.value, modified.value], apply)
+  } else {
+    await apply()
+  }
 }
 const allowed=/\.(txt|md|mmd|html?|csv|tsv|xlsx|json|log|png|jpe?g|webp|gif|bmp|pdf|docx?|pptx?|wav|mp3|m4a|ogg|flac|mp4|mov|webm)$/i
 async function uploadFiles(list:UploadFile[], directory:boolean, emptyFolders:string[]=[]){

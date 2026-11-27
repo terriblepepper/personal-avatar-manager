@@ -15,7 +15,7 @@ class LexicalStore:
         self.database=database
 
     def stage(self,user_id,collection,records):
-        with self.database.connect(write=True) as db:
+        with self.database.connect(write=True, account_scope=user_id) as db:
             self.stage_in(db,user_id,collection,records)
 
     @staticmethod

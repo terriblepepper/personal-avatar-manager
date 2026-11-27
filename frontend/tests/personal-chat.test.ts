@@ -124,8 +124,22 @@ it('blocks sending while uploading and releases the state on conversation switch
 it('uploads multipart data and emits the returned persistent references',async()=>{
   request.mockImplementation(async (_path:string,method?:string)=>method==='POST'?{items:[item('uploaded')]}:[])
   const wrapper=mount(ChatFilesManager,{props:{conversationId:'a',busy:false}});await flushPromises()
-  const input=wrapper.get<HTMLInputElement>('input[type=file]');Object.defineProperty(input.element,'files',{configurable:true,value:[new File(['x'],'file.txt')]})
-  await input.trigger('change');await flushPromises()
+  expect(wrapper.text()).toContain('本地上传每个文件最多 100 MiB')
+  const input = wrapper.get<HTMLInputElement>('input[type=file]')
+  const choose = async (name: string, size: number) => {
+    const file = new File(['x'], name)
+    Object.defineProperty(file, 'size', {value: size})
+    Object.defineProperty(input.element, 'files', {configurable: true, value: [file]})
+    await input.trigger('change')
+    await flushPromises()
+  }
+  const limit = 100 * 1024 * 1024
+  for (const name of ['video.mp4', 'page.html']) {
+    await choose(name, limit + 1)
+    expect(wrapper.get('[role=status]').text()).toContain(name)
+    expect(request.mock.calls.some(call => call[1] === 'POST')).toBe(false)
+  }
+  await choose('file.txt', limit)
   const call=request.mock.calls.find(c=>c[1]==='POST');expect(call?.[0]).toBe('/conversations/a/files');expect(call?.[2]).toBeInstanceOf(FormData)
   expect(wrapper.emitted('selected')?.at(-1)).toEqual([['uploaded']]);expect(wrapper.emitted('uploading')?.at(-1)).toEqual([false]);wrapper.unmount()
 })

@@ -51,7 +51,6 @@ class ApplicationServices:
     @classmethod
     def create(cls, settings: Settings, provider=None, model_client=None):
         database = Database(settings.data_dir, settings.database_url, schema=install_schema)
-        database.dispatch_enabled = bool(settings.redis_socket or settings.kafka_bootstrap)
         database.initialize()
         try:
             bootstrap(database, settings.data_dir)

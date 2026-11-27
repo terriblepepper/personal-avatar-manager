@@ -3,12 +3,12 @@ import asyncio
 import hashlib
 
 from fastapi import HTTPException
+from avatar.files.library.folders import renamed_filename
 
 SOURCE_FILENAME = 'Mermaid绘图.mmd'
 
 
 async def save_mermaid(sessions,user,conversation_id,source,caption,visibility,new_name=None):
-    from avatar.files.library.folders import renamed_filename
     filename=SOURCE_FILENAME if new_name is None else renamed_filename(SOURCE_FILENAME,new_name)
     if not source.strip():raise HTTPException(422,'Mermaid 源码不能为空')
     data=source.encode('utf-8')

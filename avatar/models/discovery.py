@@ -4,7 +4,7 @@ import json
 import httpx
 from avatar.models.model_network import pinned_request_url
 from fastapi import HTTPException
-from avatar.models.diagnostics import check_response, provider_error
+from avatar.models.diagnostics import check_response, provider_error, connection_error
 
 from avatar.models.metadata import LABELS, describe, dimension, enrich
 
@@ -50,7 +50,6 @@ async def discover(client,config,key):
             else:truncated=True
     except (TimeoutError,httpx.TimeoutException):raise HTTPException(504,'获取模型目录超时，请稍后刷新；未发起回答生成') from None
     except httpx.ConnectError as error:
-        from avatar.models.diagnostics import connection_error
         raise connection_error(error,'模型目录') from None
     except httpx.HTTPError:raise HTTPException(502,'无法连接模型目录，请检查 Base URL 和服务器出网网络') from None
     except (ValueError,TypeError,AttributeError):raise HTTPException(502,'模型目录格式无法识别，可手动填写模型 ID') from None

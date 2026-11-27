@@ -77,7 +77,7 @@ class DialogueIntent:
             raise
         finally:
             def record_usage():
-                with self.dialogues.database.connect(write=True) as db:
+                with self.dialogues.database.connect(write=True, account_scope=uid) as db:
                     db.execute('INSERT INTO model_calls(user_id,provider,model,usage,created_at,purpose,caller_id,conversation_id) VALUES(?,?,?,?,?,?,?,?)',
                                (uid,config['provider'],config['model'],dump(usage),now(),'agent_intent',uid,conversation_id))
             await run_blocking(record_usage)
@@ -224,7 +224,7 @@ class DialogueIntent:
     async def choose(self, user, identifier, mode):
         """第一步用户显式选消息或任务；选择后才允许打开内容编辑表单。"""
         def begin():
-            with self.dialogues.database.connect(write=True) as db:
+            with self.dialogues.database.connect(write=True, account_scope=user['id']) as db:
                 row=self.load(db,user,identifier);self.check_pending(row)
                 document=json.loads(row['document'])
                 if row['status']=='editing' and document.get('delivery_mode')!=mode:
@@ -251,7 +251,7 @@ class DialogueIntent:
                     match=(resource['file_id'],)
                 if match[0] not in selected:selected.append(match[0])
             def save():
-                with self.dialogues.database.connect(write=True) as db:
+                with self.dialogues.database.connect(write=True, account_scope=user['id']) as db:
                     fresh=self.load(db,user,identifier);self.check_pending(fresh,'editing');document=json.loads(fresh['document']);document.update(file_ids=selected,files_prepared=True)
                     db.execute('UPDATE agent_intents SET document=? WHERE id=?',(dump(document),identifier))
             await run_blocking(save)
@@ -267,7 +267,7 @@ class DialogueIntent:
 
     def cancel(self, user, identifier):
         """两个确认阶段都能取消；重复取消不重复记忆，也不创建通信任务。"""
-        with self.dialogues.database.connect(write=True) as db:
+        with self.dialogues.database.connect(write=True, account_scope=user['id']) as db:
             row=self.load(db,user,identifier)
             if row['status']=='confirmed':raise HTTPException(409,'请求已提交，请到分身会话中暂停或结束')
             if row['status']!='cancelled':

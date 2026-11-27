@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { useConfirmation } from '../composables/useConfirmation'
 import { defineAsyncComponent, computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElButton, ElOption, ElSelect, ElMessage, ElMessageBox } from 'element-plus'
@@ -27,6 +28,7 @@ import { requestId } from '../utils/requestId'
 import ChatFilesManager from '../components/chat/ChatFilesManager.vue'
 import HistoryMessage from '../components/chat/HistoryMessage.vue'
 
+const confirmAction = useConfirmation()
 const FilePreview = defineAsyncComponent(() => import('../components/FilePreview.vue'))
 interface Conversation {id:string;title:string;created_at:string;message_count:number;memory_active:boolean;compression_count:number}
 const route=useRoute(),router=useRouter(),conversations=ref<Conversation[]>([]),conversationId=ref('')
@@ -203,16 +205,15 @@ async function rename() {
 }
 async function remove(clear: boolean) {
   if (busy.value || uploading.value) return
-  if (!confirm(clear ? '清空当前会话聊天记录、记忆及附件？已转存资料与已学到的风格仍保留。' : '删除当前会话、聊天、记忆及附件？已转存资料与已学到的风格仍保留。')) return
-  try {
-    await request(selectedURL(conversationId.value) + (clear ? '/clear' : '') + '?personal=true&channel=assistant',
-      clear ? 'POST' : 'DELETE');
-    selectedFiles.value = [];
-    if (!clear) conversationId.value = '';
+  const target = conversationId.value
+  await confirmAction(clear ? '清空当前会话聊天记录、记忆及附件？已转存资料与已学到的风格仍保留。' : '删除当前会话、聊天、记忆及附件？已转存资料与已学到的风格仍保留。', clear ? '确认清空会话' : '确认删除会话',
+    () => [conversationId.value, current.value?.id, busy.value, uploading.value], async () => {
+    await request(selectedURL(target) + (clear ? '/clear' : '') + '?personal=true&channel=assistant', clear ? 'POST' : 'DELETE')
+    if (conversationId.value !== target) return
+    selectedFiles.value = []
+    if (!clear) conversationId.value = ''
     await load()
-  } catch (e) {
-    notifyError(e)
-  }
+  })
 }
 async function send(control: NonNullable<GenerationRequest['agent_control']> = 'continue', answer?: QuestionReply) {
   const pause = pauseId.value ? pending.value : null

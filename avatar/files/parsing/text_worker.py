@@ -11,7 +11,14 @@ import subprocess
 import sys
 import threading
 import time
+if __name__ == '__main__':
+    # Isolated mode launches this file directly and omits the checkout from sys.path.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
+from avatar.core import config
+from avatar.files.parsing import PLAIN_TEXT_EXTENSIONS
+from avatar.files.parsing.extract import native_plain
+from avatar.files.parsing.reader import read
 from avatar.core.performance import measure
 
 MAX_REPLY_BYTES = 6_000_256  # One million characters, including JSON control escapes.
@@ -23,7 +30,6 @@ LINUX_FDS = sys.platform == 'linux' and Path('/proc/self/fd').is_dir()
 
 
 def supports(extension):
-    from avatar.files.parsing import PLAIN_TEXT_EXTENSIONS
     return LINUX_FDS and extension in PLAIN_TEXT_EXTENSIONS
 
 
@@ -31,8 +37,7 @@ def supports(extension):
 def read_original(path,extension,**options):
     if supports(extension):
         return parse(path, extension, 'read', **options)
-    from avatar.core.config import ROOT
-    result=subprocess.run([sys.executable,'-m','avatar.files.parsing.reader',str(path),extension],input=json.dumps(options).encode(),cwd=ROOT,capture_output=True,timeout=45,check=True)
+    result=subprocess.run([sys.executable,'-m','avatar.files.parsing.reader',str(path),extension],input=json.dumps(options).encode(),cwd=config.ROOT,capture_output=True,timeout=45,check=True)
     return json.loads(result.stdout)
 
 
@@ -150,12 +155,11 @@ def parse(path, extension, operation, **options):
             raise ValueError('文本原件必须是普通文件')
         if info.st_size > MAX_POOLED_BYTES:
             # Large concurrent replies saturate the two slots; preserve one-shot parsing on the same inode.
-            from avatar.core.config import ROOT
             module = 'avatar.files.parsing.reader' if operation == 'read' else 'avatar.files.parsing.extract'
             args = [sys.executable, '-B', '-m', module, f'/proc/self/fd/{descriptor}', extension]
             if operation == 'native':
                 args.append('--native-only')
-            result = subprocess.run(args, input=json.dumps(options).encode(), cwd=ROOT,
+            result = subprocess.run(args, input=json.dumps(options).encode(), cwd=config.ROOT,
                                     capture_output=True, check=True, timeout=TIMEOUT_SECONDS,
                                     pass_fds=(descriptor,), env={'LANG':'C.UTF-8'})
             return json.loads(result.stdout)
@@ -176,8 +180,6 @@ def parse(path, extension, operation, **options):
 def serve(sock):
     import resource
     import re
-    from avatar.files.parsing.extract import native_plain
-    from avatar.files.parsing.reader import read
     for kind, maximum in ((resource.RLIMIT_AS, 512 * 1024**2), (resource.RLIMIT_NOFILE, 64),
                           (resource.RLIMIT_CPU, 30 * MAX_TASKS)):
         inherited = resource.getrlimit(kind)
@@ -212,6 +214,5 @@ def serve(sock):
 
 
 if __name__ == '__main__':
-    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
     with socket.socket(fileno=int(sys.argv[1])) as channel:
         serve(channel)

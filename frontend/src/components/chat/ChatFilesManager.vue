@@ -1,8 +1,9 @@
 <script setup lang="ts">
+import { useConfirmation } from '../../composables/useConfirmation'
 import { date, fileSizeMB } from '../../utils/format'
 import RecordPagination from '../RecordPagination.vue'
 import { defineAsyncComponent, computed, onBeforeUnmount, ref, shallowRef, watch } from 'vue'
-import { ElButton, ElInput, ElMessageBox } from 'element-plus'
+import { ElButton, ElInput } from 'element-plus'
 import AppDialog from '../AppDialog.vue'
 import MaterialFileDialog from '../MaterialFileDialog.vue'
 import type { AnimationMetadata, FilePromotion } from '../../types'
@@ -10,9 +11,10 @@ import { request, notifyError } from '../../api/client'
 import AppIcon from '../AppIcon.vue'
 import MaterialEntry from '../MaterialEntry.vue'
 import MaterialTypeIcon from '../MaterialTypeIcon.vue'
-import { htmlUploadError } from '../../utils/htmlFile'
 
+const confirmAction = useConfirmation()
 const FilePreview = defineAsyncComponent(() => import('../FilePreview.vue'))
+const MAX_CHAT_UPLOAD_BYTES = 100 * 1024 * 1024
 const props=defineProps<{conversationId:string;busy?:boolean;readOnly?:boolean;temporary?:boolean;includeConversationFiles?:boolean;selectedIds?:string[];label?:string;sharedRevision?:string}>()
 const emit=defineEmits<{selected:[ids:string[]];uploading:[value:boolean]}>()
 interface ChatFile {id:string;filename:string;content_type:string;size:number;description:string;referenced:boolean;download_url:string;origin?:string;source_label?:string;expires_at?:string|null;shared_attachment?:boolean;promoted_id?:string|null}
@@ -82,8 +84,11 @@ async function upload(event:Event) {
     status.value = '一次最多发送五份附件'
     return
   }
-  const sizeError = htmlUploadError(list)
-  if (sizeError) { status.value = sizeError; return }
+  const oversized = list.find(file => file.size > MAX_CHAT_UPLOAD_BYTES)
+  if (oversized) {
+    status.value = `文件「${oversized.name}」超过 100 MiB`
+    return
+  }
   await operation(async (id, sessionSignal, ticket) => {
     const transfer = new AbortController()
     uploadController.value = transfer
@@ -159,7 +164,15 @@ async function reference() {
 }
 function openDetail(file:ChatFile){detail.value=file;description.value=file.description||''}
 async function saveDescription(){const file=detail.value;if(!file)return;await operation(async(id,signal,ticket)=>{const result=await request<Result>(endpoint(id)+'/'+encodeURIComponent(file.id),'PATCH',{description:description.value},signal);update(result.items,ticket);if(ticket===generation)detail.value=null})}
-async function remove(file:ChatFile){try{await ElMessageBox.confirm('删除会话原件及索引？已转存的资料副本保留。','确认删除')}catch{return}await operation(async(id,signal,ticket)=>{const result=await request<Result>(endpoint(id)+'/'+encodeURIComponent(file.id),'DELETE',undefined,signal);update(result.items,ticket)})}
+async function remove(file: ChatFile) {
+  if (props.readOnly || props.busy || working.value) return
+  await confirmAction('删除会话原件及索引？已转存的资料副本保留。', '确认删除', () => [
+    generation, props.conversationId, working.value, props.busy, props.readOnly, files.value.some(item => item.id === file.id)
+  ], () => operation(async (id, signal, ticket) => {
+    const result = await request<Result>(endpoint(id) + '/' + encodeURIComponent(file.id), 'DELETE', undefined, signal)
+    update(result.items, ticket)
+  }))
+}
 async function openPromotion(file:ChatFile){if(props.busy||working.value||file.promoted_id)return;status.value='';const ticket=generation;try{const result=await request<{items:string[]}>('/me/material-folders','GET',undefined,controller.signal);if(ticket!==generation)return;folders.value=result.items;promoting.value=file}catch(e){if(ticket===generation)notifyError(e)}}
 async function promote(value:FilePromotion) {
   const file = promoting.value
@@ -177,7 +190,7 @@ async function promote(value:FilePromotion) {
   <button v-if="uploadController" type="button" class="button small" @click="uploadController.abort()">取消上传</button>
   <input ref="uploadInput" hidden type="file" multiple accept=".png,.jpg,.jpeg,.webp,.gif,.bmp,.txt,.md,.mmd,.html,.htm,.csv,.tsv,.xlsx,.json,.log,.pdf,.docx,.pptx,.mp3,.wav,.m4a,.ogg,.flac,.webm,.mp4,.mov" :disabled="busy||working||!conversationId" @change="upload">
 </div>
-<p v-if="!readOnly" class="sub">{{ temporary?'发送选中的原件副本，最多五份。':'后续提问最多同时引用五份，超过时可继续上传。其他会话临时文件需先转存为资料；索引与检索使用模型额度。' }} HTML 单件最多 100 MiB。</p>
+<p v-if="!readOnly" class="sub">{{ temporary?'发送选中的原件副本，最多五份。':'后续提问最多同时引用五份，超过时可继续上传。其他会话临时文件需先转存为资料；索引与检索使用模型额度。' }} 本地上传每个文件最多 100 MiB。</p>
 <p v-if="status" class="sub" role="status">{{ status }}</p>
 <article v-for="file in page" :key="file.id" class="chat-file compact-chat-file"><label><input v-if="!temporary && !readOnly && file.origin!=='attachment'" type="checkbox" :checked="included(file)" :disabled="busy||working" @change="toggle(file,$event)"><MaterialTypeIcon :filename="file.filename"/> {{ file.filename }}</label>
     <div v-if="sharedRevision !== undefined" class="sub">

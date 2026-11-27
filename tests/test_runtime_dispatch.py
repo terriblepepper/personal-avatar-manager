@@ -19,8 +19,8 @@ def test_dispatch_listens_for_commit_and_drains_preexisting_work(pg_database, mo
     unavailable = socket.socket()
     unavailable.bind(('127.0.0.1', 0))
     bootstrap = f'127.0.0.1:{unavailable.getsockname()[1]}'
-    changes = Changes(pg_database, str(tmp_path / 'absent.sock'), bootstrap, lambda: None)
-    pg_database.dispatch_enabled = True
+    invalidated = threading.Event()
+    changes = Changes(pg_database, str(tmp_path / 'absent.sock'), bootstrap, invalidated.set)
 
     def pending():
         with pg_database.connect() as db:
@@ -30,8 +30,12 @@ def test_dispatch_listens_for_commit_and_drains_preexisting_work(pg_database, mo
         with pg_database.connect(write=True) as db:
             db.execute("SELECT avatar_emit('work',?)", (queue,))
 
+    def seed_backlog(queue):
+        with pg_database.connect(write=True) as db:
+            db.execute('INSERT INTO avatar_dispatch_events(payload) VALUES(?)', (f'["work","{queue}"]',))
+
     async def check():
-        emit('chat')
+        seed_backlog('chat')
         listener = asyncio.create_task(changes.run())
         try:
             await asyncio.wait_for(changes.work['chat'].wait(), 2)
@@ -43,6 +47,7 @@ def test_dispatch_listens_for_commit_and_drains_preexisting_work(pg_database, mo
             baseline = len(scans)
             await asyncio.sleep(.65)
             assert len(scans) == baseline
+            assert changes.can_push and not changes.can_dispatch
             changes.work['soul'].clear()
             with pg_database.connect(write=True) as db:
                 db.execute("SELECT avatar_emit('work','soul')")
@@ -50,12 +55,19 @@ def test_dispatch_listens_for_commit_and_drains_preexisting_work(pg_database, mo
                 assert not changes.work['soul'].is_set()
 
             await asyncio.wait_for(changes.work['soul'].wait(), 1)
+            with changes.watch(('reviews',)) as event:
+                with pg_database.connect(write=True) as db:
+                    db.execute("SELECT avatar_emit('reviews')")
+                await asyncio.wait_for(event.wait(), 1)
+                assert event.take() == {'reviews'} and invalidated.is_set()
         finally:
             listener.cancel()
             await asyncio.wait_for(asyncio.gather(listener, return_exceptions=True), 2)
         assert changes.loop is None and not any(changes.health.values())
         await asyncio.to_thread(emit, 'index')
-        assert await asyncio.to_thread(pending)
+        assert not await asyncio.to_thread(pending)
+        # Simulate an event committed by the previous process before it could acknowledge it.
+        seed_backlog('index')
         restarted = Changes(pg_database, '', '', lambda: None)
         forward = restarted._forward
         batches = []
@@ -79,6 +91,97 @@ def test_dispatch_listens_for_commit_and_drains_preexisting_work(pg_database, mo
 
     with unavailable:
         asyncio.run(check())
+
+
+def test_pure_postgres_http_lifespan_delivers_commits_and_stops(tmp_path, postgres_url, pg_database):
+    from avatar.api.app import create_app
+    from avatar.core.config import Settings
+
+    app = create_app(Settings(data_dir=tmp_path, database_url=postgres_url, redis_socket='', kafka_bootstrap=''),
+                     run_worker=False)
+    changes, database = app.state.changes, app.state.database
+    reviews = threading.Event()
+    changes.invalidate_reviews = reviews.set
+
+    async def check():
+        assert not database.dispatch_enabled
+        async with app.router.lifespan_context(app):
+            await asyncio.sleep(0)
+            assert changes.loop is asyncio.get_running_loop()
+            async with asyncio.timeout(3):
+                while not changes.can_push:
+                    await asyncio.sleep(.01)
+            assert changes.can_dispatch
+            changes.work['provision'].clear()
+            with changes.watch(('reviews',), ('overview', 'owner')) as owner, changes.watch(('overview', 'other')) as other:
+                with database.connect(write=True) as db:
+                    db.execute("INSERT INTO users(id,username,password,role,created_at) VALUES('owner','owner','hash','user','2026')")
+                    db.execute("""INSERT INTO profile_submissions(id,user_id,last_modified_at,snapshot,status,submitted_at)
+                                  VALUES('submission','owner','2026','{}','pending','2026')""")
+                    db.execute("UPDATE profile_submissions SET status='approved' WHERE id='submission'")
+                    db.execute("""INSERT INTO provision_jobs(id,submission_id,status,updated_at)
+                                  VALUES('job','submission','queued','2026')""")
+                    await asyncio.sleep(.05)
+                    assert not reviews.is_set() and not owner.is_set() and not changes.work['provision'].is_set()
+                await asyncio.wait_for(changes.work['provision'].wait(), 1)
+                received = set()
+                async with asyncio.timeout(1):
+                    while received != {'reviews', 'overview'}:
+                        await owner.wait()
+                        received.update(owner.take())
+                assert reviews.is_set() and not other.is_set()
+                # A separately opened WIT/CLI pool discovers this schema's listener.
+                changes.work['provision'].clear()
+                with pg_database.connect(write=True) as db:
+                    db.execute("UPDATE provision_jobs SET status='waiting' WHERE id='job'")
+                    await asyncio.sleep(.05)
+                    assert not changes.work['provision'].is_set() and not owner.is_set()
+                async with asyncio.timeout(1):
+                    await changes.work['provision'].wait()
+                    await owner.wait()
+                assert owner.take() == {'overview'} and not other.is_set()
+
+        assert changes.loop is None and not database.dispatch_enabled
+
+    asyncio.run(check())
+
+
+def test_standalone_wit_writes_no_outbox_and_relay_start_observes_commit(tmp_path, postgres_url, pg_database):
+    from avatar.core.config import Settings
+    from avatar.runtime.wit_components import ApplicationServices
+
+    services = ApplicationServices.create(
+        Settings(data_dir=tmp_path, database_url=postgres_url, kafka_bootstrap='127.0.0.1:1'))
+    relay = Changes(pg_database, '', '', lambda: None)
+
+    async def check():
+        listener = None
+        try:
+            with services.database.connect(write=True) as db:
+                db.execute("SELECT avatar_emit('work','soul')")
+                assert db.execute('SELECT count(*) FROM avatar_dispatch_events').fetchone()[0] == 0
+                # The first ledger scan must see writes that started without a listener.
+                listener = asyncio.create_task(relay.run())
+                async with asyncio.timeout(2):
+                    while not db.execute("""SELECT EXISTS(
+                        SELECT 1 FROM pg_locks mine JOIN pg_locks waiting
+                        USING (locktype,database,classid,objid,objsubid)
+                        WHERE mine.locktype='advisory' AND mine.pid=pg_backend_pid()
+                        AND mine.mode='ShareLock' AND NOT waiting.granted)""").fetchone()[0]:
+                        await asyncio.sleep(.01)
+                assert not relay.can_push
+            await asyncio.wait_for(relay.work['soul'].wait(), 1)
+            assert relay.can_push
+        finally:
+            if listener is not None:
+                listener.cancel()
+                await asyncio.gather(listener, return_exceptions=True)
+
+    try:
+        asyncio.run(check())
+    finally:
+        services.chat.rag.store.close()
+        services.database.close()
 
 
 def test_monitor_restored_minute_is_counted_once(pg_database, monkeypatch):

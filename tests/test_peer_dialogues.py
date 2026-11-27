@@ -408,6 +408,44 @@ def peers(context, monkeypatch):
     return app, actor, peer
 
 
+def test_member_settings_and_shared_file_lock_their_respective_owners(peers, monkeypatch):
+    from avatar.api.chat_file_routes import remove
+    from avatar.core import postgres
+
+    app, actor, peer = peers
+    db = app.state.database
+    sessions = app.state.dialogues.session_store
+    files = app.state.chat.chat_files
+    first = actor.get('/api/auth/me').json()['user']
+    second = peer.get('/api/auth/me').json()['user']
+    task = actor.post('/api/agent-dialogues',json={'target_aic':'admin','objective':'scope','request_id':'scope'}).json()['id']
+    with db.connect(write=True) as tx:
+        sid = tx.execute('SELECT session_id FROM agent_dialogues WHERE id=?',(task,)).fetchone()[0]
+        shared = app.state.dialogues.resources.workspace(tx,first['id'],sid)
+        tx.execute("""INSERT INTO chat_files(id,user_id,conversation_id,filename,content_type,size,extraction_status,created_at)
+            VALUES('scoped-file',?,?,'test.txt','text/plain',1,'ready',?)""",(first['id'],shared,now()))
+    path = files.directory.path(first['id'],shared,'scoped-file.blob',create=True)
+    path.write_bytes(b'x')
+    original = postgres.lock_schema_transaction
+    def bounded(raw, *args, **kwargs):
+        raw.execute("SET LOCAL lock_timeout='500ms'")
+        original(raw,*args,**kwargs)
+    monkeypatch.setattr(postgres,'lock_schema_transaction',bounded)
+    with db.connect(write=True, account_scope=first['id']):
+        assert sessions.auto_accept(second,sid,True)['auto_accept']
+        sessions.session(second,sid)
+    with db.connect() as tx:
+        private = tx.execute("""SELECT c.user_id FROM agent_session_members m JOIN chat_conversations c
+            ON c.id=m.resource_conversation_id WHERE m.session_id=? AND m.user_id=?""",(sid,second['id'])).fetchone()
+        assert private[0] == second['id']
+    with pytest.raises(HTTPException) as denied:
+        remove(shared,'scoped-file',SimpleNamespace(app=app),{'id':'not-a-member'})
+    assert denied.value.status_code == 404 and path.exists()
+    with db.connect(write=True, account_scope=second['id']):
+        remove(shared,'scoped-file',SimpleNamespace(app=app),second)
+    assert not path.exists()
+
+
 def test_contact_tool_requires_confirmation_and_rejects_foreign_files(peers, monkeypatch):
     from tests.support import MODEL, saved_file
 

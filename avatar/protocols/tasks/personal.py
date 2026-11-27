@@ -429,11 +429,11 @@ class PersonalTaskService:
         except asyncio.CancelledError:
             # Fence the writer before draining an interrupted provider or a blocking tool.
             def interrupt():
-                with self.database.connect(write=True) as db:
+                with self.database.connect(write=True, account_scope=owner) as db:
                     row = self.task_row(db,scope)
                     if row:
                         doc = json.loads(row['document'])
-                        if doc['id']==writer and doc['status']['state']=='working':
+                        if doc['id']==writer and doc['status']['state']=='working' and doc.get('_agent_resume',{}).get('owner')==owner:
                             turns.interrupt_in(db,row,doc)
             await run_blocking(interrupt)
             raise

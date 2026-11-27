@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { useConfirmation } from '../composables/useConfirmation'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElButton } from 'element-plus'
@@ -10,6 +11,7 @@ import { useNotificationInbox } from '../composables/useNotificationInbox'
 import { useLivePolling } from '../composables/usePlatformUpdates'
 import { date } from '../utils/format'
 interface Notice { id:number; title:string; content:string; kind:string; read_at:string|null; created_at:string; session_id?:string; task_id?:string; task_request_state?:'pending'|'accepted'|'rejected'; target_page?:string; admin_only?:boolean }
+const confirmAction = useConfirmation()
 const props = withDefaults(defineProps<{ management?: boolean }>(), { management: true })
 const emit = defineEmits<{ opened: [] }>()
 const router = useRouter(), items = ref<Notice[]>([]), total = ref(0), offset = ref(0), status = ref('all'), category = ref('all'), search = ref(''), selected = ref<number[]>([]), detail = ref<Notice | null>(null), busy = ref(false), failure = ref('')
@@ -38,7 +40,15 @@ onMounted(() => { inbox.lists.add(poll.restart) })
 onBeforeUnmount(() => { controller.abort(); inbox.lists.delete(poll.restart) })
 async function change(action:'read'|'unread'|'delete', ids = selected.value) {
   if (busy.value) return
-  if (action === 'delete' && !confirm('删除所选消息条目？聊天和任务仍会保留。')) return
+  if (action === 'delete') {
+    const batch = ids === selected.value
+    return confirmAction('删除所选消息条目？聊天和任务仍会保留。', '确认删除消息', () => [
+      busy.value, batch ? selected.value : null, items.value.filter(row => ids.includes(row.id)).map(row => row.id),
+    ], () => applyChange(action, ids))
+  }
+  return applyChange(action, ids)
+}
+async function applyChange(action:'read'|'unread'|'delete', ids:number[]) {
   busy.value = true
   try {
     await request('/notifications/batch', 'POST', {ids,action}, controller.signal)
@@ -48,7 +58,8 @@ async function change(action:'read'|'unread'|'delete', ids = selected.value) {
   } catch (error) { notifyError(error) } finally { busy.value = false }
 }
 async function deleteAll() {
-  if (busy.value || !confirm('删除全部分类、所有分页的消息记录？聊天和任务仍会保留。')) return
+  if (busy.value) return
+  await confirmAction('删除全部分类、所有分页的消息记录？聊天和任务仍会保留。', '确认删除消息', () => busy.value, async () => {
   busy.value = true
   try {
     await request('/notifications/delete-all', 'POST', {}, controller.signal)
@@ -57,6 +68,7 @@ async function deleteAll() {
     offset.value = 0
     await inbox.refreshLists()
   } catch (error) { notifyError(error) } finally { busy.value = false }
+  })
 }
 async function resolveTaskRequest(item:Notice, decision:'accept'|'reject') {
   if (busy.value || item.task_request_state !== 'pending' || !item.task_id) return
