@@ -8,7 +8,7 @@ from fastapi import HTTPException
 
 from avatar.conversation.jobs.pipeline import current_generation, validate_authorization
 from avatar.conversation.jobs.store import GenerationStore
-from avatar.conversation.pause_state import available_outputs, checked, pending, settle_run_usage
+from avatar.conversation.pause_state import available_outputs, checked, pending, settle_run_usage, settlement_write
 from avatar.core.db import dump, now
 from avatar.conversation.loop.personal import validate_sources_in, run_id_for
 from avatar.conversation.loop.store import RunStore
@@ -149,7 +149,7 @@ def pause(chat, user, request, work, parent, session, overview, error, previous,
 
 
 def end_task(chat, user, parent, request):
-    with chat.service.database.connect(write=True) as db:
+    with settlement_write(chat.service.database, user['id'], parent['id']) as db:
         job=current_generation.get()
         validate_authorization(db,job,lock=True)
         result=end_paused_in(chat,db,user,parent,request.agent_pause_id)

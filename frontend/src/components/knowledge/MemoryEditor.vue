@@ -54,4 +54,41 @@ async function save() {
   } catch (error) { if (!disposed) notifyError(error) } finally { loading.value = false }
 }
 </script>
-<template><details class="soul-memory-tree" @toggle="opened = ($event.currentTarget as HTMLDetailsElement).open"><summary class="button small">管理记忆树</summary><p class="sub">修改随 Soul 修订审核后生效。</p><details v-for="node in filtered.slice(offset,offset+10)" :key="node.id" class="soul-memory-node"><summary>{{ node.group }} · {{ node.title }}</summary><label>标题<ElInput placeholder=" " v-model="node.title" maxlength="200" /></label><label>摘要<ElInput placeholder=" " v-model="node.summary" type="textarea" maxlength="2000" /></label><label>内容<ElInput placeholder=" " v-model="node.content" type="textarea" maxlength="8000" /></label><ElCheckbox v-model="node.deleted">删除此记忆</ElCheckbox><ElButton @click="reset(node.id)">撤销本项修改</ElButton></details><RecordPagination v-if="tree" v-model:offset="offset" :total="filtered.length" :search="search" label="记忆分页" @update:search="search=$event;offset=0"/><p v-if="stale" role="status">构建已更新。请保留需要的修改，再重新载入。</p><ElButton v-if="stale" @click="reload">重新载入记忆树</ElButton><ElButton v-if="tree" :disabled="stale" :loading="loading" @click="save">保存记忆修订</ElButton></details></template>
+<template>
+  <details
+    class="soul-memory-tree"
+    @toggle="opened = ($event.currentTarget as HTMLDetailsElement).open"
+  >
+    <summary class="button small">管理记忆树</summary>
+    <p class="sub">修改随 Soul 修订审核后生效。</p>
+    <details
+      v-for="node in filtered.slice(offset, offset + 10)"
+      :key="node.id"
+      class="soul-memory-node"
+    >
+      <summary>{{ node.group }} · {{ node.title }}</summary>
+      <label>标题<ElInput placeholder=" " v-model="node.title" maxlength="200" />
+      </label>
+      <label>摘要<ElInput placeholder=" " v-model="node.summary" type="textarea" maxlength="2000" />
+      </label>
+      <label>内容<ElInput placeholder=" " v-model="node.content" type="textarea" maxlength="8000" />
+      </label>
+      <ElCheckbox v-model="node.deleted">删除此记忆</ElCheckbox>
+      <ElButton @click="reset(node.id)">撤销本项修改</ElButton>
+    </details>
+    <RecordPagination
+      v-if="tree"
+      v-model:offset="offset"
+      :total="filtered.length"
+      :search="search"
+      label="记忆分页"
+      @update:search="
+        search = $event;
+        offset = 0;
+      "
+    />
+    <p v-if="stale" role="status">构建已更新。请保留需要的修改，再重新载入。</p>
+    <ElButton v-if="stale" @click="reload">重新载入记忆树</ElButton>
+    <ElButton v-if="tree" :disabled="stale" :loading="loading" @click="save">保存记忆修订</ElButton>
+  </details>
+</template>

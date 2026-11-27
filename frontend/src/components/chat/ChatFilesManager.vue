@@ -50,13 +50,59 @@ function update(items:ChatFile[],ticket:number,addedId?:string){
   emitSelection()
 }
 async function refresh(id:string,ticket:number){working.value=true;emit('uploading',true);try{const rows=await request<ChatFile[]>(endpoint(id),'GET',undefined,controller.signal);update(rows,ticket)}catch(e){if(ticket===generation){status.value='读取会话文件失败，请重新进入会话';notifyError(e)}}finally{if(ticket===generation){working.value=false;emit('uploading',false)}}}
-watch(()=>props.conversationId,id=>{generation++;controller.abort();uploadController.value=undefined;controller=new AbortController();librarySequence++;selectedInDraft.value=[...(props.selectedIds || [])];files.value=[];selectedLibrary.value=[];libraryOpen.value=false;preview.value=null;detail.value=null;promoting.value=null;status.value='';working.value=false;listOffset.value=0;emit('selected',[...selectedInDraft.value]);emit('uploading',false);if(id)void refresh(id,generation)},{immediate:true})
+watch(
+  () => props.conversationId,
+  (id) => {
+    generation++
+    controller.abort()
+    uploadController.value = undefined
+    controller = new AbortController()
+    librarySequence++
+    selectedInDraft.value = [...(props.selectedIds || [])]
+    files.value = []
+    selectedLibrary.value = []
+    libraryOpen.value = false
+    preview.value = null
+    detail.value = null
+    promoting.value = null
+    status.value = ''
+    working.value = false
+    listOffset.value = 0
+    emit('selected', [...selectedInDraft.value])
+    emit('uploading', false)
+    if (id) void refresh(id, generation)
+  },
+  { immediate: true }
+)
 function refreshShared() {
   if(props.sharedRevision!==undefined && props.conversationId && !working.value) void refresh(props.conversationId,generation)
 }
 watch(()=>props.sharedRevision,refreshShared)
 onBeforeUnmount(()=>{generation++;controller.abort();emit('uploading',false)})
-async function operation(fn:(id:string,signal:AbortSignal,ticket:number)=>Promise<void>){if(props.busy||working.value||!props.conversationId){status.value='请等待当前操作完成';return}const ticket=generation,id=props.conversationId,signal=controller.signal;working.value=true;emit('uploading',true);try{await fn(id,signal,ticket)}catch(e){if(ticket===generation){status.value=e instanceof Error?e.message:'操作失败';notifyError(e)}}finally{if(ticket===generation){working.value=false;emit('uploading',false)}}}
+async function operation(fn: (id: string, signal: AbortSignal, ticket: number) => Promise<void>) {
+  if (props.busy || working.value || !props.conversationId) {
+    status.value = '请等待当前操作完成'
+    return
+  }
+  const ticket = generation,
+    id = props.conversationId,
+    signal = controller.signal
+  working.value = true
+  emit('uploading', true)
+  try {
+    await fn(id, signal, ticket)
+  } catch (e) {
+    if (ticket === generation) {
+      status.value = e instanceof Error ? e.message : '操作失败'
+      notifyError(e)
+    }
+  } finally {
+    if (ticket === generation) {
+      working.value = false
+      emit('uploading', false)
+    }
+  }
+}
 async function toggle(file:ChatFile,event:Event){
   const target=event.target
   if(!(target instanceof HTMLInputElement))return
@@ -139,7 +185,35 @@ async function loadLibrary(next:number) {
   }
 }
 function navigate(path:string){folder.value=path;search.value='';void loadLibrary(0)}
-async function chooseFolder(item:LibraryFile){if(!item.path)return;await operation(async(id,signal,ticket)=>{const all:LibraryFile[]=[];let start=0;while(true){const query=new URLSearchParams({folder:item.path||'',recursive:'true',offset:String(start)});const result=await request<LibraryPage>('/conversations/'+encodeURIComponent(id)+'/file-library?'+query,'GET',undefined,signal);all.push(...result.items.filter(file=>file.source==='profile'&&!file.already_referenced));start+=result.items.length;if(start>=result.total||!result.items.length)break}if(ticket!==generation)return;const unique=new Map<string,LibraryFile>();for(const file of [...selectedLibrary.value,...all])unique.set(file.sha256||file.id,file);selectedLibrary.value=[...unique.values()];})}
+async function chooseFolder(item: LibraryFile) {
+  if (!item.path) return
+  await operation(async (id, signal, ticket) => {
+    const all: LibraryFile[] = []
+    let start = 0
+    while (true) {
+      const query = new URLSearchParams({
+        folder: item.path || '',
+        recursive: 'true',
+        offset: String(start)
+      })
+      const result = await request<LibraryPage>(
+        '/conversations/' + encodeURIComponent(id) + '/file-library?' + query,
+        'GET',
+        undefined,
+        signal
+      )
+      all.push(
+        ...result.items.filter((file) => file.source === 'profile' && !file.already_referenced)
+      )
+      start += result.items.length
+      if (start >= result.total || !result.items.length) break
+    }
+    if (ticket !== generation) return
+    const unique = new Map<string, LibraryFile>()
+    for (const file of [...selectedLibrary.value, ...all]) unique.set(file.sha256 || file.id, file)
+    selectedLibrary.value = [...unique.values()]
+  })
+}
 function choose(file:LibraryFile,checked:boolean){selectedLibrary.value=checked?[...selectedLibrary.value.filter(x=>x.id!==file.id),file]:selectedLibrary.value.filter(x=>x.id!==file.id)}
 async function reference() {
   const selected = uniqueSelection.value
@@ -184,7 +258,19 @@ async function promote(value:FilePromotion) {
   })
 }
 </script>
-<template><details class="composer-menu composer-tool" @toggle="($event.target as HTMLDetailsElement).open && refreshShared()"><summary :title="label || (temporary ? '添加和预览发送附件' : '上传、引用和管理会话文件')"><AppIcon name="folder" :size="14"/><span>{{ label || '文件' }}</span><small>{{ sharedRevision === undefined ? active.length : visible.length }}</small></summary><div class="composer-popover chat-file-menu"><h3>{{ label || (temporary ? '本次发送附件' : '会话文件') }}</h3><div class="actions">
+<template>
+  <details
+    class="composer-menu composer-tool"
+    @toggle="($event.target as HTMLDetailsElement).open && refreshShared()"
+  >
+    <summary :title="label || (temporary ? '添加和预览发送附件' : '上传、引用和管理会话文件')">
+      <AppIcon name="folder" :size="14" />
+      <span>{{ label || '文件' }}</span>
+      <small>{{ sharedRevision === undefined ? active.length : visible.length }}</small>
+    </summary>
+    <div class="composer-popover chat-file-menu">
+      <h3>{{ label || (temporary ? '本次发送附件' : '会话文件') }}</h3>
+      <div class="actions">
   <button v-if="!readOnly" type="button" class="button small" :disabled="busy||working||!conversationId" @click="uploadInput?.click()">上传本地文件</button>
   <button v-if="!readOnly" type="button" class="button small" :disabled="busy||working||!conversationId" @click="openLibrary">{{ temporary ? '从资料库添加' : '从资料库引用' }}</button>
   <button v-if="uploadController" type="button" class="button small" @click="uploadController.abort()">取消上传</button>
@@ -199,7 +285,22 @@ async function promote(value:FilePromotion) {
     </div>
     <div class="actions"><el-button @click="preview=file">{{ /\.mmd$/i.test(file.filename) ? '预览与下载' : '预览' }}</el-button>
     <el-button v-if="temporary" :disabled="busy||working" @click="toggleAttachment(file)">{{ included(file) ? '移除附件' : '添加为附件' }}</el-button>
-    <template v-else><el-button v-if="!readOnly" @click="openDetail(file)">详情与说明</el-button><el-button v-if="!/\.mmd$/i.test(file.filename)" tag="a" :href="file.download_url" :download="file.filename">下载</el-button><el-button :disabled="busy||working||!!file.promoted_id" @click="openPromotion(file)">{{ file.promoted_id?'已转存':'转存资料' }}</el-button><el-button v-if="!readOnly" :disabled="busy||working" @click="remove(file)">删除</el-button></template></div></article>
+    <template v-else>
+      <el-button v-if="!readOnly" @click="openDetail(file)">详情与说明</el-button>
+      <el-button
+        v-if="!/\.mmd$/i.test(file.filename)"
+        tag="a"
+        :href="file.download_url"
+        :download="file.filename"
+      >下载</el-button>
+      <el-button
+        :disabled="busy || working || !!file.promoted_id"
+        @click="openPromotion(file)"
+      >{{ file.promoted_id ? '已转存' : '转存资料' }}</el-button>
+      <el-button v-if="!readOnly" :disabled="busy || working" @click="remove(file)">删除</el-button>
+    </template>
+  </div>
+</article>
 <p v-if="!visible.length" class="sub">{{ temporary ? '暂无发送附件。' : '本会话暂无文件。' }}</p>
 <RecordPagination v-model:offset="listOffset" :total="visible.length" :label="temporary ? '附件分页' : '会话文件分页'" unit="项"/></div></details><FilePreview v-if="preview" :file="preview" :url="preview.download_url" @close="preview=null"/>
 <AppDialog v-model="libraryOpen" :title="temporary ? '从资料库添加附件' : '从资料库引用'" class="library-picker" width="min(52rem, calc(100vw - 1rem))" align-center>
@@ -247,6 +348,18 @@ async function promote(value:FilePromotion) {
     </div>
   </template>
 </AppDialog>
-<AppDialog :model-value="!!detail" title="会话文件详情" @close="detail=null"><template v-if="detail"><p>{{ detail.filename }} · {{ fileSizeMB(detail.size) }} · {{ detail.source_label || '会话文件' }} {{ detail.expires_at }}</p><label class="field">内容说明<el-input placeholder=" " v-model="description" type="textarea" maxlength="2000"/></label><el-button :disabled="busy||working" @click="saveDescription">保存说明</el-button></template></AppDialog><MaterialFileDialog v-if="promoting" :filename="promoting.filename" :caption="promoting.description"
+<AppDialog :model-value="!!detail" title="会话文件详情" @close="detail = null">
+  <template v-if="detail">
+    <p>{{ detail.filename }} · {{ fileSizeMB(detail.size) }} ·
+      {{ detail.source_label || '会话文件' }} {{ detail.expires_at }}</p>
+    <label class="field">内容说明<el-input placeholder=" " v-model="description" type="textarea" maxlength="2000" />
+    </label>
+    <el-button :disabled="busy || working" @click="saveDescription">保存说明</el-button>
+  </template>
+</AppDialog>
+<MaterialFileDialog
+  v-if="promoting"
+  :filename="promoting.filename"
+  :caption="promoting.description"
   :folders="folders" :disabled="busy || working" :save="promote" @close="promoting=null"/>
 </template>

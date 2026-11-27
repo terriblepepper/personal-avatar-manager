@@ -1,4 +1,5 @@
 """Read and validate durable pause records, saved files and unsettled usage."""
+from contextlib import contextmanager
 import json
 
 from fastapi import HTTPException
@@ -49,6 +50,23 @@ def available_outputs(chat, db, user_id, parent_id, ids):
             raise HTTPException(409,'已保存作品的原件校验失败')
         available.append({**item,'origin':'generated','download_url':f"/api/conversations/{parent_id}/files/{item['id']}"})
     return available
+
+
+@contextmanager
+def settlement_write(database, user_id, parent_id, run_id=None):
+    with database.connect(write=True, account_scope=user_id) as db:
+        other_payer = db.execute("""SELECT 1 FROM agent_loop_runs
+            WHERE owner=? AND scope='chat' AND scope_id=?
+              AND run_id=COALESCE(?::text, (SELECT document::jsonb->>'run_id'
+                  FROM chat_agent_pauses WHERE conversation_id=?))
+              AND state #>> '{binding,owner}' <> ?""",
+            (user_id, parent_id, run_id, parent_id, user_id)).fetchone()
+        if not other_payer:
+            yield db
+            return
+    # Release the account lock before taking the cross-account write barrier.
+    with database.connect(write=True) as db:
+        yield db
 
 
 def settle_run_usage(db,user_id,parent_id,run_id):

@@ -9,7 +9,7 @@ from avatar.conversation.loop.runtime import prepare_checkpoint, resume_safe
 from avatar.conversation.loop.store import RunStore
 from avatar.knowledge.learning import auto_style_advance
 from avatar.skills.policy import require_skills_enabled
-from avatar.conversation.pause_state import pending, settle_run_usage
+from avatar.conversation.pause_state import pending, settle_run_usage, settlement_write
 from avatar.knowledge.soul_document import approved_style
 
 
@@ -183,7 +183,7 @@ def attach(chat, user, original, parent, session, overview, context, job, held, 
 
 
 def discard_unpaused(store, lease):
-    with store.database.connect(write=True) as db:
+    with settlement_write(store.database, store.owner, store.scope_id, store.run_id) as db:
         row=db.execute('SELECT lease_until FROM chat_conversations WHERE id=? AND user_id=?',
                        (store.scope_id,store.owner)).fetchone()
         task=pending(db,store.owner,store.scope_id)
