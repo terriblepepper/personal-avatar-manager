@@ -1,17 +1,18 @@
 """Generation scope crosses WIT adapters without adding client-controlled fields."""
+from fastapi import HTTPException
+from pathlib import Path
 import json
 import hashlib
-import re
 from contextlib import contextmanager
-from avatar.core.execution import current_generation, authorization
-from avatar.skills.policy import SKILLS_PAUSED, require_skills_enabled
+from avatar.core.execution import current_generation, authorization, execution_guard
+from avatar.skills.policy import require_skills_enabled
+from avatar.conversation.pause_state import pending, available_outputs
 
 
 @contextmanager
 def generation_scope(job,database=None):
     token = current_generation.set(job)
     try:
-        from avatar.core.execution import execution_guard
         def validate():
             with database.connect() as db:validate_authorization(db,job)
         with execution_guard(validate if database else None):yield
@@ -20,9 +21,6 @@ def generation_scope(job,database=None):
 
 
 def capture_authorization(db,user_id,body):
-    skills={}
-    if not SKILLS_PAUSED:
-        skills=capture_skills(db,user_id,body)
     files=[row['id'] for row in db.execute('SELECT id FROM chat_files WHERE user_id=? AND conversation_id=? AND referenced=1',(user_id,body.conversation_id))]
     materials=[row['id'] for row in db.execute("SELECT id FROM attachments WHERE visibility='public' OR user_id=?",(user_id,))]
     versions={}
@@ -32,19 +30,10 @@ def capture_authorization(db,user_id,body):
     conversation = db.execute('SELECT tools_config FROM chat_conversations WHERE id=? AND user_id=?',
                               (body.conversation_id,user_id)).fetchone()
     effort = json.loads(conversation[0]).get('reasoning_effort') if conversation else None
-    return dict(skills=skills,files=files,materials=materials,versions=versions,reasoning_effort=effort)
-
-
-def capture_skills(db,user_id,body):
-    from avatar.skills.service import UserSkills
-    rows=db.execute('SELECT id,name,updated_at FROM agent_skills WHERE user_id=? AND enabled=1',(user_id,)).fetchall()
-    active={row['skill_id'] for row in db.execute('SELECT skill_id FROM chat_session_skills WHERE conversation_id=? AND enabled=1 AND authorized=1',(body.conversation_id,))}
-    names={name.casefold() for name in UserSkills.command_names([dict(row) for row in rows],body.message)}
-    return {row['id']:row['updated_at'] for row in rows if row['id'] in active or row['name'].casefold() in names or re.search(r'(?<![\w-])/'+re.escape(row['name'])+r'(?![\w-])',body.message)}
+    return dict(skills={},files=files,materials=materials,versions=versions,reasoning_effort=effort)
 
 
 def validate_versions(db,user_id,scope):
-    from fastapi import HTTPException
     for table,column in (('model_settings','model_config'),('embedding_settings','config')):
         row=db.execute(f'SELECT {column} FROM {table} WHERE user_id=?',(user_id,)).fetchone()
         expected=scope.get('versions',{}).get(table)
@@ -53,7 +42,6 @@ def validate_versions(db,user_id,scope):
 
 
 def validate_authorization(db,job=None,*,lock=False):
-    from fastapi import HTTPException
     job=job or current_generation.get()
     if not job:return
     if not isinstance(job,dict):job=dict(job)
@@ -68,17 +56,11 @@ def validate_authorization(db,job=None,*,lock=False):
     validate_versions(db,uid,scope)
     if job.get('_source_guard'):
         job['_source_guard'](db,full=lock)
-    for identifier,version in scope.get('skills',{}).items():
+    if scope.get('skills'):
         require_skills_enabled()
-        row=db.execute('SELECT enabled,updated_at FROM agent_skills WHERE id=? AND user_id=?',(identifier,uid)).fetchone()
-        session=db.execute('SELECT enabled,authorized FROM chat_session_skills WHERE conversation_id=? AND skill_id=?',(job['conversation_id'],identifier)).fetchone()
-        if not row or not row['enabled'] or row['updated_at']!=version or session and not(session['enabled'] and session['authorized']):
-            raise HTTPException(409,'技能授权或内容已变化，未继续执行或保存回答')
 
 
 def sandbox_inputs(chat,user_id,parent_id,files,saved=(),pause_id=None):
-    from pathlib import Path
-    from fastapi import HTTPException
     database=chat.service.database;scope=authorization();job=current_generation.get()
     with database.connect() as db:
         profile=[dict(row) for row in db.execute('SELECT id,filename FROM attachments WHERE user_id=?',(user_id,))]
@@ -86,14 +68,13 @@ def sandbox_inputs(chat,user_id,parent_id,files,saved=(),pause_id=None):
         with database.connect() as db:
             validate_authorization(db,job)
             if source=='generated':
-                from avatar.conversation.pauses import pending, available_outputs
                 task=pending(db,user_id,parent_id)
                 row=bool(task and task['snapshot']['agent_pause_id']==pause_id and identifier in task['outputs']
                          and available_outputs(chat,db,user_id,parent_id,[identifier]))
             elif source=='profile':
                 row=db.execute('SELECT 1 FROM attachments WHERE id=? AND user_id=?',(identifier,user_id)).fetchone()
             else:
-                row=db.execute("SELECT 1 FROM chat_files WHERE id=? AND user_id=? AND conversation_id=? AND referenced=1 AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))",(identifier,user_id,parent_id)).fetchone()
+                row=db.execute("SELECT 1 FROM chat_files WHERE id=? AND user_id=? AND conversation_id=? AND referenced=1 AND (expires_at IS NULL OR avatar_utc_time(expires_at)>CURRENT_TIMESTAMP)",(identifier,user_id,parent_id)).fetchone()
             if not row:raise HTTPException(409,'文件已删除或引用授权已撤销，未读取原件')
             try:
                 path=(directory.new(user_id,identifier+'.blob') if source=='profile'

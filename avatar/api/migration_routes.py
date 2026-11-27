@@ -1,8 +1,9 @@
 # 模块说明：根管理员旧账号迁移接口；输入指定业务账号及真实 User ID 或已登录用户名，先预览再确认，不提供普通用户自助接管。
 from typing import Literal
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from avatar.accounts.auth import current_user
+from avatar.api.dependencies import PageOffset, ShortPageSearch
 
 router = APIRouter(prefix='/api/admin/identity-migration')
 
@@ -41,7 +42,7 @@ class MigrationCommitRequest(BaseModel):
 # 输入：搜索和分页，user 经会话与 CSRF 依赖检查。
 # 结果与约束：服务再次读取数据库确认根权限；不返回用户凭据，不调用 Keycloak 管理接口。
 @router.get('')
-def migration_inventory(request: Request, search: str = Query(default='', max_length=100), offset: int = Query(default=0, ge=0), user=Depends(current_user)):
+def migration_inventory(request: Request, search: ShortPageSearch = '', offset: PageOffset = 0, user=Depends(current_user)):
     return request.app.state.identity_migration.inventory(user, search, offset)
 
 

@@ -8,7 +8,9 @@ from avatar.conversation.jobs.pipeline import validate_authorization
 from avatar.conversation.loop.runtime import prepare_checkpoint, resume_safe
 from avatar.conversation.loop.store import RunStore
 from avatar.knowledge.learning import auto_style_advance
-from avatar.skills.policy import SKILLS_PAUSED, require_skills_enabled
+from avatar.skills.policy import require_skills_enabled
+from avatar.conversation.pause_state import pending, settle_run_usage
+from avatar.knowledge.soul_document import approved_style
 
 
 STYLE_FIELDS = ('soul', 'soul_version')
@@ -29,18 +31,15 @@ def source_snapshot(db, user_id, parent_id, owner, aic):
         raise HTTPException(409,'原分身或会话已变更，无法继续此任务')
     files = db.execute("""SELECT id,sha256,md5(description) AS description,filename FROM chat_files
         WHERE user_id=? AND conversation_id=? AND referenced=1 AND origin!='attachment'
-        AND (expires_at IS NULL OR julianday(expires_at)>julianday('now'))""",(user_id,parent_id))
+        AND (expires_at IS NULL OR avatar_utc_time(expires_at)>CURRENT_TIMESTAMP)""",(user_id,parent_id))
     materials = db.execute("""SELECT id,md5(jsonb_build_array(sha256,visibility,filename,relative_path,
         caption,updated_at,extraction_version,animation_digest)::text) AS version
         FROM attachments WHERE user_id=? AND (user_id=? OR visibility='public')""",(owner,user_id))
     folders = db.execute("""SELECT path,md5(jsonb_build_array(caption,visibility)::text) AS version
         FROM material_folders WHERE user_id=? AND (user_id=? OR visibility='public')""",(owner,user_id))
-    skills = [] if SKILLS_PAUSED else db.execute("""SELECT s.id,s.updated_at FROM agent_skills s LEFT JOIN chat_session_skills c
-        ON c.skill_id=s.id AND c.conversation_id=? WHERE s.user_id=? AND s.enabled=1
-        AND (c.skill_id IS NULL OR (c.enabled=1 AND c.authorized=1))""",(parent_id,owner))
     return {'identity':dict(row),'files':{r['id']:[r['sha256'],r['description'],r['filename']] for r in files},
             'materials':{r['id']:r['version'] for r in materials},'folders':{r['path']:r['version'] for r in folders},
-            'skills':{r['id']:r['updated_at'] for r in skills},
+            'skills':{},
             'tools':sorted(k for k,v in json.loads(parent['tools_config']).items() if v is True)}
 
 
@@ -80,7 +79,7 @@ def source_guard(user_id,parent_id,binding,sources):
             (SELECT bit_xor(hashtextextended(skill_id||':'||xmin::text,0)) FROM chat_session_skills WHERE conversation_id=p.id),
             (SELECT bit_xor(hashtextextended(id||':'||xmin::text,0)) FROM chat_files WHERE user_id=p.user_id AND
                 conversation_id=p.id AND referenced=1 AND origin!='attachment'
-                AND (expires_at IS NULL OR julianday(expires_at)>julianday('now')))
+                AND (expires_at IS NULL OR avatar_utc_time(expires_at)>CURRENT_TIMESTAMP))
             FROM chat_conversations p JOIN users u ON u.id=p.user_id
             JOIN chat_conversations child ON child.id=? AND child.user_id=u.id AND (child.id=p.id OR child.parent_id=p.id)
             JOIN avatar_records a ON a.user_id=? AND a.aic=? JOIN users t ON t.id=a.user_id
@@ -155,7 +154,6 @@ def attach(chat, user, original, parent, session, overview, context, job, held, 
                 prefix, raw = context[2].split('\n',1)
                 background = json.loads(raw)
                 if 'approved_soul_style' in background:
-                    from avatar.knowledge.soul_document import approved_style
                     if old_style:
                         background['approved_soul_style'] = approved_style(db,binding['owner'],build_id=old_style)
                     else:
@@ -185,7 +183,6 @@ def attach(chat, user, original, parent, session, overview, context, job, held, 
 
 
 def discard_unpaused(store, lease):
-    from avatar.conversation.pauses import pending, settle_run_usage
     with store.database.connect(write=True) as db:
         row=db.execute('SELECT lease_until FROM chat_conversations WHERE id=? AND user_id=?',
                        (store.scope_id,store.owner)).fetchone()

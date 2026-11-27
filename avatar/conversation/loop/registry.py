@@ -31,22 +31,27 @@ class ToolRegistry:
         self.tools[schema['name']] = ToolSpec(schema, execute, parameters, control, checkpoint,
                                              disclosure, summary, when)
 
+    def available(self, name: str) -> bool:
+        tool = self.tools.get(name)
+        return bool(tool and (tool.disclosure != 'state' or tool.when and tool.when()))
+
     def sync_state(self, unlocked: list[str]) -> list[str]:
+        unlocked[:] = [name for name in unlocked if self.available(name)]
         for name, tool in self.tools.items():
-            if tool.disclosure == 'state' and name not in unlocked and (tool.when is None or tool.when()):
+            if tool.disclosure == 'state' and name not in unlocked and self.available(name):
                 unlocked.append(name)
         return unlocked
 
     def active_names(self, unlocked: list[str]) -> list[str]:
         core = [name for name, tool in self.tools.items() if tool.disclosure == 'core']
-        return list(dict.fromkeys([*core, *(name for name in unlocked if name in self.tools)]))
+        return list(dict.fromkeys([*core, *(name for name in unlocked if self.available(name))]))
 
     def active_schemas(self, unlocked: list[str]) -> list[dict]:
         return [self.tools[name].schema for name in self.active_names(unlocked)]
 
     def activatable(self, name: str) -> bool:
         tool = self.tools.get(name)
-        return bool(tool and (tool.disclosure == 'deferred' or (tool.disclosure == 'state' and tool.summary)))
+        return bool(tool and tool.disclosure == 'deferred')
 
     def catalog_prompt(self, active: set[str]) -> str:
         entries = [f'{name}({tool.summary})' for name, tool in self.tools.items()
@@ -90,9 +95,11 @@ class ToolRegistry:
     async def dispatch(self, call, seen, step, *, active=None):
         name, args = call['name'], call['arguments']
         await check_execution_async(self.validate)
-        if name not in self.tools:
+        if not self.available(name):
             return ToolOutcome.error('当前会话未授权此工具。请选择已声明的工具。'), None
         if active is not None and name not in active:
+            if not self.activatable(name):
+                return ToolOutcome.error('此工具未在当前步骤声明。请选择已声明的工具。'), None
             return ToolOutcome.error(f'已加载 {name} 的完整参数定义，请在下一步重新调用。', activated=(name,)), None
         if call.get('argument_error'):
             return ToolOutcome.error(call['argument_error']), None

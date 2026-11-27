@@ -5,6 +5,12 @@ import time
 import uuid
 from fastapi import HTTPException
 from avatar.files.library.delivery import material_card, visible_delivery_reply
+from avatar.conversation.jobs.pipeline import capture_authorization, validate_authorization
+from avatar.conversation.loop.runtime import resume_safe
+from avatar.conversation.loop.store import RunStore
+from avatar.conversation.pause_state import pending, checked, settle_terminal_usage
+from avatar.conversation.tools.activity import public_event
+from avatar.core.execution import current_generation
 
 ACTIVE=('queued','running')
 TERMINAL=('succeeded','failed','cancelled','indeterminate','awaiting_input')
@@ -17,7 +23,6 @@ def run_key(row):
 
 
 def current_claim(row,active=None):
-    from avatar.core.execution import current_generation
     active = active or current_generation.get()
     return (not active or (active['task_id']==row['task_id'] and
             json.loads(active['authorization']).get('claim_token')==json.loads(row['authorization']).get('claim_token')))
@@ -44,7 +49,6 @@ class GenerationStore:
         if row is None:return None
         value=snapshot_value(row['snapshot']);value.pop('_request',None)
         if value.get('tool_events'):
-            from avatar.conversation.pauses import public_event
             value['tool_events'] = [public_event(event) for event in value['tool_events']]
         value.update(task_id=row['task_id'],request_id=row['request_id'],state=row['state'],conversation_id=row['conversation_id'])
         result=value.get('result')
@@ -67,9 +71,8 @@ class GenerationStore:
 
     def latest(self,user_id,conversation_id):
         with self.database.connect() as db:
-            latest=self.view(db.execute('SELECT * FROM chat_generation_jobs WHERE user_id=? AND conversation_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1',(user_id,conversation_id)).fetchone(),db)
+            latest=self.view(db.execute('SELECT * FROM chat_generation_jobs WHERE user_id=? AND conversation_id=? ORDER BY created_at DESC,queue_number DESC LIMIT 1',(user_id,conversation_id)).fetchone(),db)
             if latest and latest['state'] in ACTIVE:return latest
-            from avatar.conversation.pauses import pending
             paused=pending(db,user_id,conversation_id)
             if paused:
                 if latest and latest.get('agent_pause_id')==paused['snapshot']['agent_pause_id']:return latest
@@ -92,10 +95,8 @@ class GenerationStore:
                 if previous['fingerprint']!=fingerprint:raise HTTPException(409,'同一请求标识不能更改内容')
                 return {'accepted':True,'request_id':body.request_id,'task_id':previous['task_id']}
             if db.execute("SELECT 1 FROM chat_generation_jobs WHERE conversation_id=? AND state IN ('queued','running')",(body.conversation_id,)).fetchone():raise HTTPException(409,'上一条消息仍在生成，请等待完成')
-            from avatar.conversation.pauses import checked
             held = checked(db,user['id'],body)
             task_id=uuid.uuid4().hex;timestamp=time.time()
-            from avatar.conversation.jobs.pipeline import capture_authorization
             scope=capture_authorization(db,user['id'],body)
             if owner['platform']=='web' or held:
                 previous = (held or {}).get('snapshot', {})
@@ -109,7 +110,7 @@ class GenerationStore:
     def claim(self,limit=1,*,leased=False,busy=()):
         claimed = []
         with self.database.connect(write=True) as db:
-            rows=db.execute("SELECT * FROM chat_generation_jobs WHERE state='queued' AND NOT (conversation_id=ANY(?::text[])) ORDER BY created_at,rowid LIMIT ? FOR UPDATE SKIP LOCKED",(list(busy),max(0,limit))).fetchall()
+            rows=db.execute("SELECT * FROM chat_generation_jobs WHERE state='queued' AND NOT (conversation_id=ANY(?::text[])) ORDER BY created_at,queue_number LIMIT ? FOR UPDATE SKIP LOCKED",(list(busy),max(0,limit))).fetchall()
             for row in rows:
                 scope = json.loads(row['authorization'])
                 if leased:
@@ -138,7 +139,6 @@ class GenerationStore:
                     (time.time(),job['task_id'],json.loads(job['authorization'])['claim_token']))
 
     def record(self,user_id,request_id,snapshot):
-        from avatar.core.execution import current_generation
         job=current_generation.get()
         if job and (job['user_id'],job['request_id'])!=(user_id,request_id):return False
         claim=json.loads(job['authorization']).get('claim_token') if job else None
@@ -149,7 +149,6 @@ class GenerationStore:
                 (canonical(snapshot),time.time(),user_id,request_id,claim)).rowcount
             if not row:return False
             if job and job.get('_source_guard'):
-                from avatar.conversation.jobs.pipeline import validate_authorization
                 validate_authorization(db,job)
         if changes := getattr(self.database, 'changes', None):
             changes.generation_committed(user_id, request_id)
@@ -157,7 +156,7 @@ class GenerationStore:
 
     def finish(self,user_id,request_id,state,result=None,error=''):
         if state not in TERMINAL:raise ValueError('Invalid generation terminal state')
-        with self.database.connect(write=True) as db:
+        with self.database.connect(write=True, account_scope=user_id) as db:
             return self.finish_in(db,user_id,request_id,state,result,error)
 
     @staticmethod
@@ -180,10 +179,8 @@ class GenerationStore:
         db.execute('UPDATE chat_generation_jobs SET state=?,snapshot=?,updated_at=? WHERE task_id=?',(state,canonical(snapshot),time.time(),row['task_id']))
         if row['conversation_id']:
             if state!='awaiting_input' and json.loads(row['authorization']).get('run_id'):
-                from avatar.conversation.loop.store import RunStore
                 key=run_key(row)
                 if state in ('failed','cancelled','indeterminate'):
-                    from avatar.conversation.pauses import settle_terminal_usage
                     settle_terminal_usage(db,row,key[-1])
                 retained=state in ('failed','indeterminate') and db.execute("""SELECT 1 FROM chat_agent_pauses
                     WHERE conversation_id=? AND COALESCE(document::jsonb->>'run_id',
@@ -195,8 +192,6 @@ class GenerationStore:
 
     def interrupted_in(self,db,row):
         """Only restart a confirmed checkpoint. A queued transition also fences the old writer."""
-        from avatar.conversation.loop.runtime import resume_safe
-        from avatar.conversation.loop.store import RunStore
         scope=json.loads(row['authorization'])
         state=RunStore.inspect_in(db,*run_key(row)) if scope.get('run_id') else None
         safe = state and state.get('binding') and resume_safe(state,automatic=True)
@@ -213,8 +208,8 @@ class GenerationStore:
         return bool(safe)
 
     def interrupted(self,job):
-        with self.database.connect(write=True) as db:
-            row=db.execute("SELECT * FROM chat_generation_jobs WHERE task_id=? AND state='running' FOR UPDATE",(job['task_id'],)).fetchone()
+        with self.database.connect(write=True, account_scope=job['user_id']) as db:
+            row=db.execute("SELECT * FROM chat_generation_jobs WHERE task_id=? AND user_id=? AND state='running' FOR UPDATE",(job['task_id'],job['user_id'])).fetchone()
             if row and current_claim(row,job):
                 return self.interrupted_in(db,row)
         return False
@@ -223,15 +218,15 @@ class GenerationStore:
         """Poll without a write lock until a running claim expires."""
         cutoff=time.time()-LEASE_SECONDS
         with self.database.connect() as db:
-            rows=db.execute("""SELECT state,task_id FROM chat_generation_jobs WHERE state='running'
+            rows=db.execute("""SELECT state,task_id,user_id FROM chat_generation_jobs WHERE state='running'
                 AND (updated_at<? OR authorization::jsonb->>'claim_token' IS NULL)
-                UNION ALL (SELECT state,task_id FROM chat_generation_jobs WHERE state='queued' LIMIT 1)""",(cutoff,)).fetchall()
+                UNION ALL (SELECT state,task_id,user_id FROM chat_generation_jobs WHERE state='queued' LIMIT 1)""",(cutoff,)).fetchall()
         queued=False
         for row in rows:
             if row['state']=='queued':
                 queued=True
             elif row['task_id'] not in active_ids:
-                with self.database.connect(write=True) as db:
+                with self.database.connect(write=True, account_scope=row['user_id']) as db:
                     job=db.execute("""SELECT * FROM chat_generation_jobs WHERE task_id=? AND state='running'
                         AND (updated_at<? OR authorization::jsonb->>'claim_token' IS NULL) FOR UPDATE""",(row['task_id'],cutoff)).fetchone()
                     if job and self.interrupted_in(db,job):queued=True

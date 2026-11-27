@@ -12,7 +12,7 @@ PEER_NOTIFICATION_VISIBILITY="NOT (kind IN ('message','paused') AND EXISTS (SELE
 
 
 SOUL_COMPLETIONS=('soul 构建完成','soul 草案等待本人确认','soul 构建完成，等待审核')
-SOUL_NOTIFICATION_VISIBILITY="(kind!='activity' OR (instr(lower(title),'soul')=0 AND instr(title,'知识库')=0) OR title IN ('开始构建 soul','提交 soul 构建','soul 构建完成','soul 草案等待本人确认','soul 构建完成，等待审核'))"
+SOUL_NOTIFICATION_VISIBILITY="(kind!='activity' OR (strpos(lower(title),'soul')=0 AND strpos(title,'知识库')=0) OR title IN ('开始构建 soul','提交 soul 构建','soul 构建完成','soul 草案等待本人确认','soul 构建完成，等待审核'))"
 
 
 # 页面标识来自固定业务映射，不允许审计文本提供外部链接或任意导航目标。
@@ -119,7 +119,7 @@ class AgentInbox:
             condition=' AND read_at IS NULL' if unread or status=='unread' else ' AND read_at IS NOT NULL' if status=='read' else ''
             values=list(base_values)
             if category!='all':condition+=' AND category=?';values.append(category)
-            if search:condition+=" AND instr(lower(title||' '||content),lower(?))>0";values.append(search)
+            if search:condition+=" AND strpos(lower(title||' '||content),lower(?))>0";values.append(search)
             if condition:
                 count=count_unread(db,base,base_values)
                 total=count if condition==' AND read_at IS NULL' else db.execute('SELECT COUNT(*) FROM agent_notifications WHERE '+base+condition,values).fetchone()[0]
@@ -135,7 +135,7 @@ class AgentInbox:
                       AND d.delivery_mode<>'message' AND m.hidden=0
                 ) END AS task_request_state
                 FROM agent_notifications WHERE """+base+condition+
-                ' ORDER BY julianday(created_at) DESC,id DESC LIMIT 10 OFFSET ?',(*values,offset)).fetchall()
+                ' ORDER BY avatar_utc_time(created_at) DESC,id DESC LIMIT 10 OFFSET ?',(*values,offset)).fetchall()
         return {'items':[dict(r) for r in rows],'total':total,'unread':count,'offset':offset,'limit':10}
 
     def change(self,user_id,identifier,action):

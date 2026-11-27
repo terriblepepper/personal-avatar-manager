@@ -5,9 +5,12 @@ from typing import Literal
 from fastapi import APIRouter, Depends, Request, Query, HTTPException
 from fastapi.responses import FileResponse
 from avatar.api.file_previews import word_pdf
+from avatar.api.dependencies import PageOffset, ShortPageSearch
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, TypeAdapter, ValidationError
-from starlette.formparsers import MultiPartParser, MultiPartException
-from avatar.files.uploads.buffer import upload_buffer
+from starlette.formparsers import MultiPartException
+from avatar.api.multipart import FileTooLarge, UploadParser
+from avatar.files.uploads.validation import html_file_limit
+from avatar.files.uploads.buffer import upload_buffer, upload_work
 from avatar.models.effort import Effort
 from avatar.accounts.auth import current_user
 
@@ -49,7 +52,7 @@ def set_chat_effort(conversation_id: str, body: EffortSetting, request: Request,
 
 # 职责：分页浏览本人文件库，供输入区选择引用，文件正文不在目录接口返回。
 @router.get('/{conversation_id}/file-library')
-def file_library(conversation_id: str,request: Request,offset: int=Query(default=0,ge=0),search: str=Query(default='',max_length=100),folder:str=Query(default='',max_length=1024),recursive:bool=False,user=Depends(current_user)):
+def file_library(conversation_id: str,request: Request,offset: PageOffset = 0,search: ShortPageSearch = '',folder:str=Query(default='',max_length=1024),recursive:bool=False,user=Depends(current_user)):
     return request.app.state.chat.chat_files.library(user['id'],conversation_id,search,offset,folder,recursive)
 
 
@@ -113,7 +116,9 @@ async def upload(conversation_id: str, request: Request, user=Depends(current_us
 
     await asyncio.to_thread(require_editable)
     try:
-        form = await MultiPartParser(request.headers,request.stream(),max_files=1,max_fields=1,max_part_size=65536).parse()
+        form = await UploadParser(request.headers, request.stream(), max_fields=1, file_limit=html_file_limit).parse()
+    except FileTooLarge:
+        raise HTTPException(413, 'HTML 文件不能超过 100 MiB') from None
     except MultiPartException:
         raise HTTPException(413,'上传超过字段或文件数量限制') from None
     try:
@@ -177,7 +182,6 @@ def remove(conversation_id: str, file_id: str, request: Request, user=Depends(cu
 @router.post('/{conversation_id}/files/{file_id}/promote')
 async def promote(conversation_id: str, file_id: str, body: PromoteFile, request: Request, user=Depends(current_user)):
     chat=request.app.state.chat
-    from avatar.files.uploads.buffer import upload_work
     lease = None
     def acquire():
         nonlocal lease

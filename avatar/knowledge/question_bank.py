@@ -75,10 +75,10 @@ class QuestionBank:
         clauses=[];args=[]
         if category:clauses.append('q.category_id=?');args.append(category)
         if status!='all':clauses.append('q.active=?');args.append(int(status=='active'))
-        if search:clauses.append("instr(lower(q.prompt||' '||q.id),lower(?))>0");args.append(search)
+        if search:clauses.append("strpos(lower(q.prompt||' '||q.id),lower(?))>0");args.append(search)
         where=' WHERE '+' AND '.join(clauses) if clauses else ''
         with self.database.connect() as db:
-            db.execute('BEGIN')
+            db.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY')
             total=db.execute('SELECT COUNT(*) FROM soul_questions q'+where,args).fetchone()[0]
             offset=min(offset,((max(total,1)-1)//10)*10)
             rows=db.execute('SELECT q.*,c.name AS category_name FROM soul_questions q JOIN soul_question_categories c ON c.id=q.category_id'+where+' ORDER BY q.created_at DESC,q.id LIMIT 10 OFFSET ?',(*args,offset)).fetchall()

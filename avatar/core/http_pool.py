@@ -1,5 +1,6 @@
 """Short-lived, loop-local transport leases. Request clients own headers and cookies."""
 import asyncio
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
@@ -16,7 +17,7 @@ class BorrowedTransport(httpx.AsyncBaseTransport):
 
 @dataclass
 class Endpoint:
-    key: tuple
+    addresses: tuple | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     transport: httpx.AsyncBaseTransport | None = None
     expires: float = float('inf')
@@ -30,8 +31,7 @@ class HttpTransportPool:
     def __init__(self):
         self.loop = None
         self._stop = None
-        self.entries = {}
-        self.validated = {}
+        self.entries = OrderedDict()
 
     @asynccontextmanager
     async def lifespan(self):
@@ -51,7 +51,6 @@ class HttpTransportPool:
             idle = [entry.transport for entry in self.entries.values()
                     if entry.transport is not None and not entry.users]
             self.entries.clear()
-            self.validated.clear()
             try:
                 await sweeper
                 for transport in idle:
@@ -67,31 +66,34 @@ class HttpTransportPool:
                 return
             except TimeoutError:
                 pass
-            for key, entry in tuple(self.entries.items()):
-                if self.entries.get(key) is entry and entry.expires <= asyncio.get_running_loop().time():
-                    await self._discard(key)
+            for origin, entry in tuple(self.entries.items()):
+                if (self.entries.get(origin) is entry and not entry.users
+                        and entry.expires <= asyncio.get_running_loop().time()):
+                    await self._discard(origin)
 
-    async def _discard(self, key):
-        entry = self.entries.pop(key, None)
-        if entry is not None:
-            self.validated.pop(key[0], None)
-            if entry.transport is not None and not entry.users:
-                await entry.transport.aclose()
+    async def _discard(self, origin):
+        entry = self.entries.pop(origin)
+        if entry.transport is not None:
+            await entry.transport.aclose()
 
     async def _reserve(self, origin, stop):
         loop = asyncio.get_running_loop()
-        # A request waiting on eviction may resume after a different lifespan has started.
         while not stop.is_set():
-            entry = self.entries.get((origin, self.validated.get(origin)))
+            entry = self.entries.get(origin)
             if entry is not None:
                 if entry.expires > loop.time():
+                    self.entries.move_to_end(origin)
                     return entry
-                await self._discard(entry.key)
+                if entry.users:
+                    return None  # A fresh validation gets a request-local transport.
+                await self._discard(origin)
             elif len(self.entries) >= self.capacity:
-                await self._discard(next(iter(self.entries)))
+                idle = next((key for key, item in self.entries.items() if not item.users), None)
+                if idle is None:
+                    return None
+                await self._discard(idle)
             else:
-                key = (origin, None)
-                entry = self.entries[key] = Endpoint(key)
+                entry = self.entries[origin] = Endpoint()
                 return entry
         return None
 
@@ -114,21 +116,15 @@ class HttpTransportPool:
         try:
             async with entry.lock:
                 if entry.transport is None:
-                    addresses, entry.transport = await connect(url)
-                    key = (origin, addresses)
-                    if self.entries.get(entry.key) is entry:
-                        del self.entries[entry.key]
-                        self.validated[origin] = addresses
-                        self.entries[key] = entry
-                    entry.key = key
+                    entry.addresses, entry.transport = await connect(url)
                     entry.expires = loop.time() + self.ttl
             async with httpx.AsyncClient(transport=BorrowedTransport(entry.transport), **options) as client:
-                yield entry.key[1], client
+                yield entry.addresses, client
         finally:
             entry.users -= 1
             if not entry.users:
-                if self.entries.get(entry.key) is not entry:
+                if self.entries.get(origin) is not entry:
                     if entry.transport is not None:
                         await entry.transport.aclose()
                 elif entry.transport is None:
-                    self.entries.pop(entry.key)
+                    self.entries.pop(origin)

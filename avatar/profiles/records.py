@@ -20,8 +20,7 @@ def record_page(state,user,collection,scope='user',offset=0,search='',status='al
         if not admin:where.append('s.user_id=?');values.append(user['id'])
         if status=='reviewed':where.append("s.status!='pending'")
         elif status!='all':where.append('s.status=?');values.append(status)
-        if search:where.append("instr(lower(u.username||' '||COALESCE(json_extract(s.snapshot,'$.name'),'')||' '||COALESCE(json_extract(s.snapshot,'$.avatar_name'),'')),lower(?))>0");values.append(search)
-        decode=lambda row:service._submission(row,admin=admin)
+        if search:where.append("strpos(lower(u.username||' '||COALESCE((s.snapshot::jsonb->>'name'),'')||' '||COALESCE((s.snapshot::jsonb->>'avatar_name'),'')),lower(?))>0");values.append(search)
     elif collection=='events':
         source='audit_events e';fields='e.*';order='e.id DESC'
         current_admin=user['role'] in ADMIN_ROLES
@@ -34,7 +33,6 @@ def record_page(state,user,collection,scope='user',offset=0,search='',status='al
     elif collection=='dialogues' and not admin:
         source='agent_dialogues d JOIN agent_session_members visible ON visible.session_id=d.session_id';fields='d.*';order='d.created_at DESC,d.id DESC'
         where.append("visible.user_id=? AND visible.hidden=0 AND (d.status!='ended' OR EXISTS(SELECT 1 FROM agent_dialogue_messages WHERE dialogue_id=d.id AND id>visible.cleared_through))");values.append(user['id'])
-        decode=lambda row:state.dialogues.session_store.view(dict(row),user)
     elif admin:
         definitions={
             'agents':('avatar_records a JOIN users u ON u.id=a.user_id','a.*,u.username','a.updated_at DESC,a.user_id'),
@@ -47,10 +45,6 @@ def record_page(state,user,collection,scope='user',offset=0,search='',status='al
         if collection=='registrations':
             where.append("u.person_type='teacher'")
             decode=lambda row:{**dict(row),'draft':json.loads(row['draft'] or '{}')}
-        elif collection=='agents':
-            # 复用脱敏分身投影，并附加与原管理列表一致的协议和暂存身份状态。
-            from avatar.profiles.admin_reads import agent_detail
-            decode=lambda row:agent_detail(state,row)
     else:raise HTTPException(403,'无权读取此类记录')
     if search and collection not in ('history','submissions'):
         fields_by_collection={
@@ -62,17 +56,26 @@ def record_page(state,user,collection,scope='user',offset=0,search='',status='al
             'identity_jobs':"u.username||' '||j.status||' '||j.action",
             'registrations':"u.username||' '||COALESCE(u.teacher_id,'')||' '||COALESCE(p.draft,'')",
             'account_reviews':"u.username||' '||a.username||' '||r.reason"}
-        where.append('instr(lower('+fields_by_collection[collection]+'),lower(?))>0');values.append(search)
+        where.append('strpos(lower('+fields_by_collection[collection]+'),lower(?))>0');values.append(search)
     if collection in ('model_calls','identity_jobs','jobs','history','events'):
         alias={'model_calls':'c','identity_jobs':'j','jobs':'j','history':'s','events':'e'}[collection]
         where.append(f'NOT EXISTS(SELECT 1 FROM record_dismissals hidden WHERE hidden.user_id=? AND hidden.collection=? AND hidden.record_id=CAST({alias}.id AS TEXT))');values.extend((user['id'],collection))
     clause=' WHERE '+' AND '.join(where) if where else ''
     with service.database.connect() as db:
-        db.execute('BEGIN')
+        db.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY')
         total=db.execute('SELECT COUNT(*) FROM '+source+clause,values).fetchone()[0]
         offset=min(offset,((max(total,1)-1)//10)*10)
         rows=db.execute('SELECT '+fields+' FROM '+source+clause+' ORDER BY '+order+' LIMIT 10 OFFSET ?',[*values,offset]).fetchall()
-    return {'items':[decode(row) for row in rows],'total':total,'offset':offset,'limit':10}
+        if collection in ('history','submissions'):
+            items = service.submission_page(db, rows, admin)
+        elif collection == 'agents':
+            from avatar.profiles.admin_reads import agent_details
+            items = agent_details(state, db, rows)
+        elif collection == 'dialogues':
+            items = state.dialogues.session_store.views(db, rows, user)
+        else:
+            items = None
+    return {'items':items if items is not None else [decode(row) for row in rows],'total':total,'offset':offset,'limit':10}
 
 
 def dismiss_records(state,user,collection,ids):
@@ -83,7 +86,7 @@ def dismiss_records(state,user,collection,ids):
     if collection in ('identity_jobs','jobs'):require_admin(user)
     elif collection not in ('model_calls','history'):raise HTTPException(404,'不支持删除此类记录')
     table={'model_calls':'model_calls','identity_jobs':'avatar_identity_jobs','jobs':'provision_jobs','history':'profile_submissions'}[collection]
-    with state.service.database.connect(write=True) as db:
+    with state.service.database.connect(write=True, account_scope=user['id']) as db:
         clause='id IN ('+','.join('?' for _ in ids)+')';values=list(ids)
         if collection in ('model_calls','history'):clause+=' AND user_id=?';values.append(user['id'])
         if collection=='jobs':clause+=" AND status='done'"
@@ -109,6 +112,6 @@ def dismiss_all_records(state,user,collection):
     if collection=='events':
         clause,args=event_scope(user['id'],user['role'] in ADMIN_ROLES);where.append(clause);values.extend(args)
     where.append('NOT EXISTS(SELECT 1 FROM record_dismissals h WHERE h.user_id=? AND h.collection=? AND h.record_id=CAST('+('e' if collection=='events' else tables[collection])+'.id AS TEXT))');values.extend((user['id'],collection))
-    with state.service.database.connect(write=True) as db:
+    with state.service.database.connect(write=True, account_scope=user['id']) as db:
         changed=db.execute('INSERT INTO record_dismissals(user_id,collection,record_id,created_at) SELECT ?,?,CAST(id AS TEXT),? FROM '+tables[collection]+(' e' if collection=='events' else '')+' WHERE '+' AND '.join(where),(user['id'],collection,now(),*values)).rowcount
     return {'deleted':changed}

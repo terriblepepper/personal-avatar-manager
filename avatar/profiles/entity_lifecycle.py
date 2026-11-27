@@ -42,8 +42,8 @@ class EntityLifecycleService:
         self.database, self.settings = database, settings
         if runner is None and settings.provider=='acps-direct':
             from avatar.protocols.registration.direct import DirectRegistrationRunner
-            runner=DirectRegistrationRunner(settings)
-        self.runner = runner or EntityRegistrationRunner(settings)
+            runner=DirectRegistrationRunner(settings, database)
+        self.runner = runner or EntityRegistrationRunner(settings, database)
         self.maintainer = maintainer or maintain_entity
 
     # 职责：校验目标并排入一个身份维护任务。
@@ -93,10 +93,10 @@ class EntityLifecycleService:
             return
         timestamp = now()
         with self.database.connect(write=True) as db:
-            due = db.execute("""SELECT a.user_id,a.aic,json_extract(a.certificate,'$.id') AS fingerprint
+            due = db.execute("""SELECT a.user_id,a.aic,(a.certificate::jsonb->>'id') AS fingerprint
                 FROM avatar_records a JOIN users u ON u.id=a.user_id
                 WHERE a.identity_status='active' AND u.account_status='active' AND a.aic NOT LIKE 'DEMO-%'
-                AND julianday(json_extract(a.certificate,'$.expires_at')) <= julianday(?, '+1 day')
+                AND avatar_utc_time((a.certificate::jsonb->>'expires_at')) <= (avatar_utc_time(?) + interval '1 day')
                 AND NOT EXISTS (SELECT 1 FROM avatar_identity_jobs j WHERE j.user_id=a.user_id
                     AND (j.status IN ('queued','waiting','running') OR (j.action='renew' AND j.status='failed'
                          AND j.expected_aic=a.aic AND j.updated_at>=a.updated_at)))

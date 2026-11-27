@@ -35,14 +35,22 @@ class IdentityMigrationService:
     # 结果与约束：复用账号分页，返回身份关联状态和固定 issuer，根账号保留展示但不可迁移，不返回凭据。
     def inventory(self, actor, search='', offset=0):
         with self.database.connect() as db:
+            db.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY')
             self.require_root(db, actor)
-        result = AccountManagement(self.database).list(actor, search, 'all', offset)
-        with self.database.connect() as db:
-            self.require_root(db, actor)
+            result = AccountManagement(self.database).list(actor, search, 'all', offset, db=db)
+            owners = [user['id'] for user in result['items']]
+            primary = {}
+            linked = {}
+            for row in db.execute("""SELECT user_id,issuer,subject,username,verified_at,0 AS linked
+                    FROM oidc_identities WHERE user_id=ANY(?::text[])
+                    UNION ALL SELECT user_id,issuer,subject,username,verified_at,1 AS linked
+                    FROM oidc_identity_links WHERE user_id=ANY(?::text[]) AND issuer=?""", (owners, owners, self.issuer)):
+                data = dict(row)
+                identities = linked if data.pop('linked') else primary
+                identities[data.pop('user_id')] = data
             for user in result['items']:
-                identity = db.execute('SELECT issuer,subject,username,verified_at FROM oidc_identities WHERE user_id=?', (user['id'],)).fetchone()
-                previous = identity
-                current = db.execute('SELECT issuer,subject,username,verified_at FROM oidc_identity_links WHERE user_id=? AND issuer=?',(user['id'],self.issuer)).fetchone()
+                previous = identity = primary.get(user['id'])
+                current = linked.get(user['id'])
                 identity = current or (identity if identity and identity['issuer']==self.issuer else None)
                 user['previous_identity'] = dict(previous) if previous and previous['issuer']!=self.issuer else None
                 user['identity'] = dict(identity) if identity else None
@@ -93,6 +101,8 @@ class IdentityMigrationService:
                     or conversation['caller_id'] != user_id or conversation['parent_id'] or conversation['selected_aic']
                     or conversation['summary'] or conversation['summary_through'] or conversation['compression_count']
                     or conversation['summary_profile_modified_at'] or conversation['lease_until']
+                    or json.loads(conversation['tools_config']) or conversation['tools_updated_at']
+                    or conversation['skills_updated_at'] or conversation['title_source'] == 'manual'
                     or db.execute('SELECT 1 FROM chat_messages WHERE conversation_id=?', (conversation['id'],)).fetchone()
                     or db.execute('SELECT 1 FROM chat_conversations WHERE parent_id=?', (conversation['id'],)).fetchone()):
                 raise HTTPException(409, '占位账号已有有效或自建会话，不能清理')
@@ -104,9 +114,27 @@ class IdentityMigrationService:
             raise HTTPException(409, '占位账号已有资料变更，不能清理')
         if db.execute("SELECT 1 FROM audit_events WHERE user_id=? AND action NOT IN ('统一认证首次建立业务账户','统一认证登录')", (user_id,)).fetchone():
             raise HTTPException(409, '占位账号有其他操作历史，不能清理')
-        for sql in ('SELECT 1 FROM account_reviews WHERE reviewer=?', 'SELECT 1 FROM profile_submissions WHERE reviewer=?', 'SELECT 1 FROM platform_entry_tokens WHERE issued_for_user_id=?', 'SELECT 1 FROM chat_conversations WHERE caller_id=? AND user_id<>caller_id'):
-            if db.execute(sql, (user_id,)).fetchone():
-                raise HTTPException(409, '占位账号存在其他业务引用，不能清理')
+        if db.execute('SELECT 1 FROM chat_conversations WHERE caller_id=? AND user_id<>caller_id', (user_id,)).fetchone():
+            raise HTTPException(409, '占位账号存在其他业务引用，不能清理')
+        # 首登可产生这些记录。提交时显式迁移或撤销，其余外键引用包括级联删除项一律阻止。
+        transferable = {
+            ('oidc_identities','user_id'), ('sessions','user_id'), ('login_devices','user_id'),
+            ('profile_records','user_id'), ('chat_conversations','user_id'), ('attachment_collections','user_id'),
+            ('audit_events','user_id'), ('audit_events','actor_id'), ('identity_migration_previews','user_id'),
+        }
+        checks = []
+        for ref in db.execute("""SELECT t.relname AS tab,a.attname AS col,
+                    format('SELECT 1 FROM %I.%I WHERE %I=', n.nspname,t.relname,a.attname) AS query
+                FROM pg_class t JOIN pg_namespace n ON n.oid=t.relnamespace
+                JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum>0 AND NOT a.attisdropped
+                WHERE t.relkind IN ('r','p') AND n.nspname=current_schema() AND (
+                    a.attname IN ('user_id','owner_id') OR EXISTS (
+                        SELECT 1 FROM pg_constraint c WHERE c.conrelid=t.oid AND c.contype='f'
+                        AND c.confrelid='users'::regclass AND a.attnum=ANY(c.conkey)))"""):
+            if (ref['tab'], ref['col']) not in transferable:
+                checks.append('EXISTS (' + ref['query'] + '?)')
+        if checks and db.execute('SELECT ' + ' OR '.join(checks), [user_id] * len(checks)).fetchone()[0]:
+            raise HTTPException(409, '占位账号存在其他业务引用，不能清理')
 
     # 职责：生成当前关联计划，不写业务身份。
     # 输入：目标账号、稳定 Keycloak User ID，以及是否显式允许转移空占位身份。

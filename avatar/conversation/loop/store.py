@@ -19,7 +19,7 @@ _SCOPE_ACCESS = {
     'chat': 'SELECT 1 FROM chat_conversations WHERE id=? AND user_id=?',
     'dialogue': 'SELECT 1 FROM agent_dialogues WHERE id=? AND ? IN (user_id,target_user_id)',
     'protocol': '''SELECT 1 FROM avatar_aip_tasks t JOIN avatar_records a ON a.aic=t.local_aic
-                   WHERE t._rowid=?::bigint AND a.user_id=?''',
+                   WHERE t.task_number=?::bigint AND a.user_id=?''',
 }
 _UNSEEN = object()
 BATCH_PREFIX = 'react-batch-'
@@ -83,7 +83,7 @@ class RunStore:
                     AND j.state IN ('running','queued'))
                  AND NOT EXISTS (SELECT 1 FROM chat_agent_pauses p WHERE p.conversation_id=r.chat_id))
                 OR EXISTS (SELECT 1 FROM agent_dialogues d WHERE d.id=r.dialogue_id AND d.status='ended')
-                OR EXISTS (SELECT 1 FROM avatar_aip_tasks t WHERE t._rowid=r.protocol_id AND
+                OR EXISTS (SELECT 1 FROM avatar_aip_tasks t WHERE t.task_number=r.protocol_id AND
                     t.document::jsonb #>> '{status,state}' IN ('failed','canceled','completed')))
             ORDER BY r.updated_at LIMIT 10 FOR UPDATE OF r SKIP LOCKED)
             DELETE FROM agent_loop_runs r USING expired WHERE r.id=expired.id""").rowcount

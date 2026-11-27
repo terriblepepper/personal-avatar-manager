@@ -1,7 +1,6 @@
 from fastapi import APIRouter
 from fastapi import Depends
 from fastapi import Request
-from fastapi import Query
 from fastapi import HTTPException
 from typing import Literal
 from pydantic import BaseModel
@@ -11,7 +10,9 @@ import avatar.accounts.auth as auth
 from avatar.profiles.schemas import ReviewRequest
 from avatar.core.platform_settings import PlatformSettings
 from avatar.accounts.schemas import AccountRoleRequest
-from avatar.api.dependencies import admin
+from avatar.api.dependencies import PageOffset, ShortPageSearch, admin
+from avatar.profiles.admin_reads import agent_detail, counts, operations, settings_view
+from avatar.profiles.records import dismiss_all_records, dismiss_records, record_page
 
 
 router = APIRouter()
@@ -24,27 +25,23 @@ def pending_review_count(request: Request, user=Depends(admin)):
 
 @router.get('/admin/overview')
 def admin_overview(request: Request, user=Depends(admin)):
-    from avatar.profiles.admin_reads import counts
     with request.app.state.database.connect() as db:
         return {'counts': counts(db)}
 
 
 @router.get('/admin/settings')
 def admin_settings(request: Request, user=Depends(admin)):
-    from avatar.profiles.admin_reads import settings_view
     return settings_view(request.app.state)
 
 
 @router.get('/admin/agents/operations')
-def agent_operations(request: Request, offset: int=Query(default=0,ge=0,le=2147483647),
-                     search: str=Query(default='',max_length=100), user=Depends(admin)):
-    from avatar.profiles.admin_reads import operations
+def agent_operations(request: Request, offset: PageOffset = 0,
+                     search: ShortPageSearch = '', user=Depends(admin)):
     return operations(request.app.state, search, offset)
 
 
 @router.get('/admin/agents/{user_id}/detail')
 def admin_agent_detail(user_id: str, request: Request, user=Depends(admin)):
-    from avatar.profiles.admin_reads import agent_detail
     with request.app.state.database.connect() as db:
         row = db.execute('SELECT a.*,u.username FROM avatar_records a JOIN users u ON u.id=a.user_id WHERE a.user_id=?',
                          (user_id,)).fetchone()
@@ -60,7 +57,7 @@ async def agent_health(user_id:str,request:Request,user=Depends(admin)):
 # 输入：search 最多 100 字符，role 限 all/user/admin，offset 非负，user 必须管理员。
 # 结果与约束：委托账户管理服务分页检索，返回 items 与 total，不返回密码哈希。
 @router.get('/admin/accounts')
-def account_list(request: Request, search: str = Query(default='',max_length=100), role: Literal['all','user','admin','super_admin'] = 'all', offset: int = Query(default=0,ge=0), user=Depends(admin)):
+def account_list(request: Request, search: ShortPageSearch = '', role: Literal['all','user','admin','super_admin'] = 'all', offset: PageOffset = 0, user=Depends(admin)):
     return request.app.state.runtime.services.accounts.list(user,search,role,offset)
 
 
@@ -122,7 +119,6 @@ class RecordSelection(BaseModel):
 
 @router.post('/records/{collection}/delete')
 def delete_records(collection:Literal['model_calls','identity_jobs','jobs','history','events'],body:RecordSelection,request:Request,user=Depends(auth.current_user)):
-    from avatar.profiles.records import dismiss_records,dismiss_all_records
     if body.all:
         if body.ids:raise HTTPException(422,'全部删除不能同时指定记录 ID')
         return dismiss_all_records(request.app.state,user,collection)
@@ -131,7 +127,6 @@ def delete_records(collection:Literal['model_calls','identity_jobs','jobs','hist
 
 @router.get('/records/{collection}')
 def records(collection: Literal['history','submissions','events','model_calls','dialogues','agents','jobs','identity_jobs','registrations','account_reviews'],request: Request,
-            scope: Literal['user','admin']='user',offset: int=Query(default=0,ge=0,le=2147483647),
-            search: str=Query(default='',max_length=100),status: Literal['all','pending','approved','rejected','reviewed']='all',user=Depends(auth.current_user)):
-    from avatar.profiles.records import record_page
+            scope: Literal['user','admin']='user',offset: PageOffset = 0,
+            search: ShortPageSearch = '',status: Literal['all','pending','approved','rejected','reviewed']='all',user=Depends(auth.current_user)):
     return record_page(request.app.state,user,collection,scope,offset,search,status)

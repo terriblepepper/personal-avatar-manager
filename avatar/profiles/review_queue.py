@@ -7,19 +7,19 @@ from avatar.core.db import now
 
 # 分类依据提交前已通过的申请，不用当前是否存在分身反推历史创建申请。
 SOURCE="""SELECT 'profile' AS kind,s.id,s.user_id,u.username,
- COALESCE(json_extract(s.snapshot,'$.name'),'') AS name,
- COALESCE(json_extract(s.snapshot,'$.avatar_name'),'') AS avatar_name,
+ COALESCE((s.snapshot::jsonb->>'name'),'') AS name,
+ COALESCE((s.snapshot::jsonb->>'avatar_name'),'') AS avatar_name,
  s.submitted_at AS created_at,s.status,s.reason,s.reviewed_at,
- CASE WHEN EXISTS(SELECT 1 FROM avatar_records a WHERE a.user_id=s.user_id AND julianday(a.created_at)<julianday(s.submitted_at)) OR EXISTS(SELECT 1 FROM profile_submissions p WHERE p.user_id=s.user_id
+ CASE WHEN EXISTS(SELECT 1 FROM avatar_records a WHERE a.user_id=s.user_id AND avatar_utc_time(a.created_at)<avatar_utc_time(s.submitted_at)) OR EXISTS(SELECT 1 FROM profile_submissions p WHERE p.user_id=s.user_id
  AND p.status='approved' AND p.submitted_at<s.submitted_at) THEN 'update' ELSE 'create' END AS category,s.last_modified_at
  FROM profile_submissions s JOIN users u ON u.id=s.user_id
 
  UNION ALL SELECT 'teacher_history',CAST(r.id AS TEXT),u.id,u.username,
- COALESCE(json_extract(p.draft,'$.name'),''),'',r.created_at,
+ COALESCE((p.draft::jsonb->>'name'),''),'',r.created_at,
  CASE WHEN r.approved=1 THEN 'approved' ELSE 'rejected' END,r.reason,r.created_at,'teacher',COALESCE(p.last_modified_at,'')
  FROM account_reviews r JOIN users u ON u.id=r.user_id LEFT JOIN profile_records p ON p.user_id=u.id
  UNION ALL SELECT 'soul',b.id,b.user_id,u.username,
- COALESCE(json_extract(b.profile_snapshot,'$.name'),''),COALESCE(json_extract(b.profile_snapshot,'$.avatar_name'),''),
+ COALESCE((b.profile_snapshot::jsonb->>'name'),''),COALESCE((b.profile_snapshot::jsonb->>'avatar_name'),''),
  b.created_at,b.status,b.reason,b.reviewed_at,'soul',b.profile_revision
  FROM soul_builds b JOIN users u ON u.id=b.user_id WHERE b.status IN ('pending','approved','rejected')"""
 
@@ -34,10 +34,10 @@ class ReviewQueue:
         where=["NOT EXISTS(SELECT 1 FROM record_dismissals hidden WHERE hidden.user_id=? AND hidden.collection='review_queue' AND hidden.record_id=(kind||':'||id))"];values=[user['id']]
         for field,value in [('category',category),('status',status)]:
             if value!='all':where.append(field+'=?');values.append(value)
-        if search:where.append("instr(lower(username||' '||name||' '||avatar_name||' '||reason),lower(?))>0");values.append(search)
+        if search:where.append("strpos(lower(username||' '||name||' '||avatar_name||' '||reason),lower(?))>0");values.append(search)
         clause=' WHERE '+' AND '.join(where)
         with self.database.connect() as db:
-            db.execute('BEGIN')
+            db.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY')
             total=db.execute('SELECT COUNT(*) FROM ('+SOURCE+')'+clause,values).fetchone()[0]
             offset=min(offset,((max(total,1)-1)//10)*10)
             rows=db.execute('SELECT * FROM ('+SOURCE+')'+clause+' ORDER BY created_at DESC,kind,id LIMIT 10 OFFSET ?',(*values,offset)).fetchall()
@@ -87,7 +87,7 @@ class ReviewQueue:
         require_admin(user)
         identifiers=list(dict.fromkeys((item.kind,item.id) for item in items))
         if not 1<=len(identifiers)<=100:raise HTTPException(422,'请选择 1～100 项已处理审核记录')
-        with self.database.connect(write=True) as db:
+        with self.database.connect(write=True, account_scope=user['id']) as db:
             current=db.execute('SELECT role FROM users WHERE id=?',(user['id'],)).fetchone()
             require_admin(current if current else {'role':'user'})
             for kind,identifier in identifiers:
@@ -100,7 +100,7 @@ class ReviewQueue:
 
     def dismiss_all(self,user):
         require_admin(user)
-        with self.database.connect(write=True) as db:
+        with self.database.connect(write=True, account_scope=user['id']) as db:
             current=db.execute('SELECT role FROM users WHERE id=?',(user['id'],)).fetchone()
             require_admin(current if current else {'role':'user'})
             count=db.execute("INSERT INTO record_dismissals(user_id,collection,record_id,created_at) SELECT ?,'review_queue',kind||':'||id,? FROM ("+SOURCE+") WHERE status IN ('approved','rejected') AND NOT EXISTS(SELECT 1 FROM record_dismissals h WHERE h.user_id=? AND h.collection='review_queue' AND h.record_id=kind||':'||id)",(user['id'],now(),user['id'])).rowcount

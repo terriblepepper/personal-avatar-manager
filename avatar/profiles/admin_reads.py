@@ -33,11 +33,51 @@ def agent_detail(state, row):
     return agent
 
 
+def agent_details(state, db, rows):
+    """批量读取旧管理记录页展示的完整分身详情，保持单项详情的权限和字段。"""
+    from avatar.models.artifact_cache import fingerprint
+    from avatar.models.capabilities import apply_capabilities, target
+    from avatar.models.model_config import public_config
+    owners = [row['user_id'] for row in rows]
+    if not owners:
+        return []
+    configs = {row['user_id']: json.loads(row['model_config']) for row in db.execute(
+        'SELECT user_id,model_config FROM model_settings WHERE user_id=ANY(?::text[])', (owners,))}
+    keys = [(owner,target(config),fingerprint(config.get('model',''))) for owner,config in configs.items() if config]
+    evidence = {}
+    if keys:
+        evidence = {r['user_id']: json.loads(r['value']) for r in db.execute(
+            """SELECT c.user_id,c.value FROM model_artifact_cache c
+               JOIN unnest(?::text[],?::text[],?::text[]) k(user_id,signature,digest)
+               USING(user_id,signature,digest) WHERE c.kind='capabilities'""",
+            tuple(map(list, zip(*keys))))}
+    attachments = state.service.attachments
+    files = {}
+    for row in db.execute('SELECT user_id,'+attachments.summary_fields+' FROM attachments '
+                          'WHERE user_id=ANY(?::text[]) ORDER BY created_at DESC,id', (owners,)):
+        item = attachments._summary(row, admin=True)
+        files.setdefault(item.pop('user_id'), []).append(item)
+    pool = entity_port_pool(state.settings, db=db) if state.settings.entity_aip_enabled else {}
+    errors = {}
+    urls = preview_entity_urls(state.settings, db, owners, pool, errors=errors)
+    items = []
+    for row in rows:
+        uid = row['user_id']
+        config = configs.get(uid)
+        agent = state.service.decode_agent(row)
+        agent.update(model_config=public_config(apply_capabilities(config,evidence.get(uid,{})) if config else {}),
+                     attachments=files.get(uid,[]), protocol=state.personal_aip.status(uid,
+                         endpoint_result=(urls.get(uid), errors.get(uid) or pool.get('error'))),
+                     staged_identity=staged_entity_metadata(state.settings.data_dir,uid))
+        items.append(agent)
+    return items
+
+
 def operations(state, search, offset):
     source = ' FROM avatar_records a JOIN users u ON u.id=a.user_id'
     params = []
     if search:
-        source += " WHERE instr(lower(u.username||' '||a.aic||' '||a.profile),lower(?))>0"
+        source += " WHERE strpos(lower(u.username||' '||a.aic||' '||a.profile),lower(?))>0"
         params.append(search)
     with state.database.connect() as db:
         db.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY')
@@ -45,12 +85,12 @@ def operations(state, search, offset):
         offset = min(offset, (max(total, 1)-1)//10*10)
         rows = db.execute(f"""WITH page AS (
           SELECT a.user_id, u.username, a.aic, a.identity_status, a.updated_at, a.last_modified_at,
-            json_extract(a.profile,'$.avatar_name') AS avatar_name,
-            json_extract(a.certificate,'$.id') AS certificate_id,
-            json_extract(a.certificate,'$.expires_at') AS expires_at,
-            json_extract(a.certificate,'$.mode') AS certificate_mode,
-            json_extract(a.acs_document,'$.version') AS acs_version,
-            json_extract(a.acs_document,'$.entityMeta.environment') AS environment
+            (a.profile::jsonb->>'avatar_name') AS avatar_name,
+            (a.certificate::jsonb->>'id') AS certificate_id,
+            (a.certificate::jsonb->>'expires_at') AS expires_at,
+            (a.certificate::jsonb->>'mode') AS certificate_mode,
+            (a.acs_document::jsonb->>'version') AS acs_version,
+            (a.acs_document::jsonb->'entityMeta'->>'environment') AS environment
           {source} ORDER BY a.updated_at DESC,a.user_id LIMIT 10 OFFSET ?
         ), jobs AS (
           SELECT j.user_id,j.id,j.action,j.status,j.error,
