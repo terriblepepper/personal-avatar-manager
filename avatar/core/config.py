@@ -1,5 +1,6 @@
 # 模块说明：启动配置：统一读取运行目录、网络、会话 Cookie 及记忆预算的环境参数。
 import os
+import ipaddress
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -106,6 +107,11 @@ class Settings:
     redis_socket: str = ""
     town_oidc_client_id: str = ""
     kafka_bootstrap: str = ""
+    enable_api_docs: bool = field(default_factory=lambda: os.getenv("AVATAR_ENABLE_API_DOCS") == "1")
+    trusted_proxies: tuple = field(default_factory=lambda: tuple(
+        ipaddress.ip_network(item.strip(), strict=False)
+        for item in os.getenv("AVATAR_TRUSTED_PROXIES", "").split(",") if item.strip()))
+
 
     # 职责：从环境变量构建启动配置。
     # 输入：cls 为配置类型；读取 AVATAR_DATA_DIR、模型、记忆、OIDC 和 AVATAR_SYSTEM_AIP_* 环境变量。

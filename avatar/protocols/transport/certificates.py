@@ -38,8 +38,8 @@ class CertificateTransport(httpx.AsyncBaseTransport):
                     except BlockingIOError:
                         await asyncio.sleep(.05)
                 previous = float(clock.read() or 0)
-                elapsed = time.monotonic() - previous
-                if 0 <= elapsed < .5:
+                elapsed = max(0, time.time() - previous)
+                if elapsed < .5:
                     await asyncio.sleep(.5 - elapsed)
                 try:
                     response = await self.transport.handle_async_request(request)
@@ -47,7 +47,7 @@ class CertificateTransport(httpx.AsyncBaseTransport):
                     return response
                 finally:
                     clock.seek(0)
-                    clock.write(str(time.monotonic()))
+                    clock.write(str(time.time()))
                     clock.truncate()
 
     async def aclose(self):

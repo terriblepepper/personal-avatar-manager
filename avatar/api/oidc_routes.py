@@ -4,9 +4,11 @@ import asyncio
 import re
 import secrets
 from urllib.parse import urlencode
+from avatar.api.middleware import client_address
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field
+from avatar.accounts.login_devices import device_context
 
 router = APIRouter(prefix='/api/auth')
 
@@ -29,11 +31,11 @@ def authentication_config(request: Request):
 
 
 # 职责：发起统一认证并设置只供当前浏览器使用的短期凭据。
-# 输入：经过校验的身份/入口参数，request.client.host 用于限流。
+# 输入：经过校验的身份/入口参数，client_address(request) 用于限流。
 # 结果与约束：返回固定提供者授权 URL；Cookie 为 HttpOnly、Lax、5 分钟且限定认证路径，支持跨站顶层回调。
 @router.post('/oidc/start')
 async def oidc_start(body: OidcStartRequest, request: Request, response: Response):
-    url, browser = await request.app.state.oidc.start(body.return_to, body.platform_entry_token, request.client.host)
+    url, browser = await request.app.state.oidc.start(body.return_to, body.platform_entry_token, client_address(request))
     response.set_cookie('avatar_oidc_browser', browser, max_age=300, httponly=True, samesite='lax',
                         secure=request.app.state.settings.secure_cookie, path='/api/auth/oidc')
     return {'authorization_url': url}
@@ -54,7 +56,6 @@ async def oidc_callback(request: Request, state: str = Query(default='', max_len
         if error or not code:
             await asyncio.to_thread(request.app.state.oidc.consume,state,browser)
             raise HTTPException(400, '统一认证已取消或未返回授权码，请重新登录')
-        from avatar.accounts.login_devices import device_context
         identifier=request.cookies.get('avatar_device','')
         if not re.fullmatch(r'[A-Za-z0-9_-]{43}',identifier):identifier=secrets.token_urlsafe(32)
         (token, _, _, duration), target = await request.app.state.oidc.finish(state, code, browser, iss, device_context(request,identifier))

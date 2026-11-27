@@ -32,11 +32,15 @@ def verify_password(password, hashed):
 # 输入：database 为数据库，data_dir 用于保存首次随机密码文件。
 # 结果与约束：仅在不存在根管理员时创建 admin，初始密码文件设为 0600；重启不覆盖已有根账户。
 def bootstrap(database, data_dir):
+    with database.connect() as db:
+        if db.execute("SELECT 1 FROM users WHERE is_root=1").fetchone():
+            return
+    password = secrets.token_urlsafe(18)
+    password_hash = hash_password(password)
     with database.connect(write=True) as db:
         if not db.execute("SELECT 1 FROM users WHERE is_root=1").fetchone():
-            password = secrets.token_urlsafe(18)
             user_id = str(uuid.uuid4())
-            db.execute("INSERT INTO users(id,username,password,role,created_at,is_root) VALUES(?,?,?,?,?,1)", (user_id, "admin", hash_password(password), "admin", now()))
+            db.execute("INSERT INTO users(id,username,password,role,created_at,is_root) VALUES(?,?,?,?,?,1)", (user_id, "admin", password_hash, "admin", now()))
             modified = now()
             db.execute('INSERT INTO profile_records(user_id,draft,last_modified_at,updated_at) VALUES(?,?,?,?)', (user_id,dump({'person_type':'student','student_id':''}),modified,modified))
             path = data_dir / "initial-admin.txt"
@@ -91,6 +95,28 @@ def issue_session(db,user_id,duration=43200,access_scope='full',auth_method='loc
     return token,csrf,result
 
 
+def _login_user(db, username, identifier, *, lock=False):
+    suffix = ' FOR UPDATE' if lock else ''
+    return (db.execute("SELECT * FROM users WHERE username=?" + suffix, (username,)).fetchone()
+            or db.execute("SELECT * FROM users WHERE email=? OR phone=?" + suffix, (identifier, identifier)).fetchone())
+
+
+def _login_limit(db, key, current):
+    row = db.execute("SELECT attempts,reset_at FROM login_limits WHERE key=? AND reset_at>?", (key, current)).fetchone()
+    if row and row["attempts"] >= 10:
+        raise HTTPException(429, "登录尝试过多，请 15 分钟后重试")
+    return row
+
+
+def prune_auth_limits(database):
+    current = time.time()
+    with database.connect(write=True) as db:
+        db.execute("DELETE FROM login_limits WHERE reset_at<=?", (current,))
+        db.execute("DELETE FROM recovery_limits WHERE reset_at<=?", (current,))
+        db.execute("DELETE FROM sessions WHERE expires<=?", (current,))
+        db.execute("DELETE FROM oidc_login_states WHERE expires<=?", (current,))
+
+
 # 职责：按用户名、邮箱或手机号验证密码并签发完整会话。
 # 输入：credentials 为登录请求，ip 用于限流，root_only 表示仅根账户可用本地密码；登录标识按联系方式规范化。
 # 结果与约束：成功返回会话三元组；失败计入 15 分钟限流，用户名优先匹配，错误统一返回 401，未知账户仍计算虚拟密码哈希；统一认证启用后仅根账号可使用本地密码；关闭时预关联的旧账号仍可本地登录。
@@ -100,31 +126,31 @@ def login(database, credentials, ip, root_only=False, *, ops_only=False):
         identifier = normalize_email(identifier) if '@' in identifier else normalize_phone(identifier)
     except ValueError:
         identifier = credentials.username.strip()
-    key = ip + ":" + identifier
-    current = time.time()
-    with database.connect(write=True) as db:
-        limit = db.execute("SELECT * FROM login_limits WHERE key=?", (key,)).fetchone()
-        if limit and limit["reset_at"] > current and limit["attempts"] >= 10:
-            raise HTTPException(429, "登录尝试过多，请 15 分钟后重试")
-        # 优先匹配原用户名，再匹配规范化邮箱或手机号；注册时已防止别名归属冲突。
-        user = db.execute("SELECT * FROM users WHERE username=?", (credentials.username.strip(),)).fetchone()
-        if not user:
-            user = db.execute("SELECT * FROM users WHERE email=? OR phone=?", (identifier, identifier)).fetchone()
-        key = ip + ":" + (user["id"] if user else identifier)
-        limit = db.execute("SELECT * FROM login_limits WHERE key=?", (key,)).fetchone()
-        if limit and limit["reset_at"] > current and limit["attempts"] >= 10:
-            raise HTTPException(429, "登录尝试过多，请 15 分钟后重试")
-        managed = bool(user and not user['is_root'] and db.execute('SELECT 1 FROM oidc_identities WHERE user_id=?', (user['id'],)).fetchone())
-        valid = verify_password(credentials.password, user["password"] if user else hash_password("dummy-password", "00"*16))
-        if (not user or not valid or (managed and root_only) or (root_only and not user['is_root'])
-                or (ops_only and not can_view_ops(user))):
-            attempts = limit["attempts"] + 1 if limit and limit["reset_at"] > current else 1
-            reset = limit["reset_at"] if limit and limit["reset_at"] > current else current + 900
-            db.execute("INSERT OR REPLACE INTO login_limits VALUES(?,?,?)", (key, attempts, reset))
-        else:
+    username = credentials.username.strip()
+    alias_key = ip + ":" + identifier
+    with database.connect() as db:
+        snapshot = _login_user(db, username, identifier)
+        key = ip + ":" + (snapshot['id'] if snapshot else identifier)
+        _login_limit(db, alias_key, time.time())
+        if key != alias_key:
+            _login_limit(db, key, time.time())
+    # 未知账号同样执行一次 PBKDF2；虚拟盐和摘要不对应任何可登录账户。
+    stored = snapshot['password'] if snapshot else '00' * 16 + '$' + '00' * 32
+    valid = verify_password(credentials.password, stored)
+    with database.connect(write=True, account_scope=snapshot['id'] if snapshot else 'login:' + key) as db:
+        current = time.time()
+        if key != alias_key:
+            _login_limit(db, alias_key, current)
+        limit = _login_limit(db, key, current)
+        user = _login_user(db, username, identifier, lock=True)
+        if (valid and snapshot and user and user['id'] == snapshot['id'] and user['password'] == stored
+                and user['account_status'] == 'active' and (not root_only or user['is_root'])
+                and (not ops_only or can_view_ops(user))):
             db.execute("DELETE FROM login_limits WHERE key=?", (key,))
-            db.execute("DELETE FROM sessions WHERE expires < ?", (current,))
-            return issue_session(db,user['id'])
+            return issue_session(db, user['id'])
+        attempts = limit["attempts"] + 1 if limit else 1
+        reset = limit["reset_at"] if limit else current + 900
+        db.execute("INSERT OR REPLACE INTO login_limits VALUES(?,?,?)", (key, attempts, reset))
     raise HTTPException(401, "登录账号或密码不正确")
 
 
@@ -172,28 +198,41 @@ def require_admin(user):
         raise HTTPException(403, "需要管理员权限")
 
 
+def _verified_hash(database, user_id, password):
+    with database.connect() as db:
+        row = db.execute("SELECT password FROM users WHERE id=?", (user_id,)).fetchone()
+    if not row or not verify_password(password, row['password']):
+        raise HTTPException(400, "当前密码不正确")
+    return row['password']
+
+
+def _check_credential(db, user_id, stored):
+    if not db.execute("SELECT 1 FROM users WHERE id=? AND password=? AND account_status='active' FOR UPDATE", (user_id, stored)).fetchone():
+        raise HTTPException(400, "当前密码不正确")
+
+
 # 职责：验证当前密码后修改本人密码。
 # 输入：user 为已登录账户，body 含当前密码与新密码。
 # 结果与约束：拒绝错误旧密码及相同新密码；事务内撤销全部会话和未使用入口并记事件，返回重新登录提示。
 def change_password(database, user, body):
     if user.get('auth_source') == 'oidc':
         raise HTTPException(403, '登录凭据由 Keycloak 管理，请前往统一账户中心修改')
-    with database.connect(write=True) as db:
-        row = db.execute("SELECT password FROM users WHERE id=?", (user["id"],)).fetchone()
-        if not verify_password(body.current_password, row["password"]):
-            raise HTTPException(400, "当前密码不正确")
-        if body.current_password == body.new_password:
-            raise HTTPException(422, "新密码不能与当前密码相同")
-        _replace_password(db, user["id"], body.new_password)
+    stored = _verified_hash(database, user['id'], body.current_password)
+    if body.current_password == body.new_password:
+        raise HTTPException(422, "新密码不能与当前密码相同")
+    password_hash = hash_password(body.new_password)
+    with database.connect(write=True, account_scope=user['id']) as db:
+        _check_credential(db, user['id'], stored)
+        _replace_password(db, user["id"], password_hash)
         event(db, user["id"], user["username"], "修改账户密码", actor_id=user['id'])
     return {"message": "密码已修改，请使用新密码重新登录"}
 
 
 # 职责：在调用方事务内更新密码并撤销旧认证凭据。
-# 输入：db 为写事务连接，user_id 为目标账户，password 为新明文密码。
+# 输入：db 为写事务连接，user_id 为目标账户，password_hash 为事务外计算的新密码哈希。
 # 结果与约束：存入新哈希，删除该用户全部会话，消费未使用的已绑定入口，并清理按账户限流记录；不单独提交事务。
-def _replace_password(db, user_id, password):
-    db.execute("UPDATE users SET password=? WHERE id=?", (hash_password(password), user_id))
+def _replace_password(db, user_id, password_hash):
+    db.execute("UPDATE users SET password=? WHERE id=?", (password_hash, user_id))
     db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
     db.execute('UPDATE platform_entry_tokens SET used_at=? WHERE issued_for_user_id=? AND used_at IS NULL',(now(),user_id))
     # 找回后清理按账户累计的登录限制，使持有人可使用新密码重新登录。
@@ -209,23 +248,28 @@ def recover_password(database, body, ip):
     Not possession verification; replace this boundary with platform recovery when
     deploying beyond the demo. No profile contact or arbitrary username can reset.
     """
-    current = time.time()
     key = "recover:" + ip
-    limited = False
-    with database.connect(write=True) as db:
-        limit = db.execute("SELECT * FROM recovery_limits WHERE key=?", (key,)).fetchone()
-        attempts = limit["attempts"] + 1 if limit and limit["reset_at"] > current else 1
-        reset = limit["reset_at"] if limit and limit["reset_at"] > current else current+900
-        db.execute("INSERT OR REPLACE INTO recovery_limits VALUES(?,?,?)", (key, attempts, reset))
-        limited = attempts > 5
-        if not limited:
-            column = "email" if '@' in body.contact else "phone"
-            row = db.execute(f"SELECT id,username FROM users WHERE {column}=? AND is_root=0 AND NOT EXISTS (SELECT 1 FROM oidc_identities o WHERE o.user_id=users.id)", (body.contact,)).fetchone()
-            if row:
-                _replace_password(db, row["id"], body.new_password)
-                event(db, row["id"], "demo-recovery", "通过注册联系方式重置密码")
-    if limited:
-        raise HTTPException(429, "找回尝试过多，请 15 分钟后重试")
+    column = "email" if '@' in body.contact else "phone"
+    lookup = (f"SELECT id,password FROM users WHERE {column}=? AND is_root=0 AND account_status='active' "
+              "AND NOT EXISTS (SELECT 1 FROM oidc_identities o WHERE o.user_id=users.id) "
+              "AND NOT EXISTS (SELECT 1 FROM oidc_identity_links o WHERE o.user_id=users.id)")
+    with database.connect(write=True, account_scope=key) as db:
+        current = time.time()
+        snapshot = db.execute(lookup, (body.contact,)).fetchone()
+        target = snapshot['id'] if snapshot else hashlib.sha256(body.contact.encode()).hexdigest()
+        for bucket, maximum in ((key, 50), (key + ':' + target, 5)):
+            limit = db.execute("SELECT * FROM recovery_limits WHERE key=? AND reset_at>?", (bucket, current)).fetchone()
+            if limit and limit['attempts'] >= maximum:
+                raise HTTPException(429, "找回尝试过多，请 15 分钟后重试")
+            db.execute("INSERT OR REPLACE INTO recovery_limits VALUES(?,?,?)",
+                       (bucket, limit['attempts'] + 1 if limit else 1, limit['reset_at'] if limit else current + 900))
+    if snapshot:
+        password_hash = hash_password(body.new_password)
+        with database.connect(write=True, account_scope=snapshot['id']) as db:
+            row = db.execute(lookup + ' FOR UPDATE', (body.contact,)).fetchone()
+            if row and row['id'] == snapshot['id'] and row['password'] == snapshot['password']:
+                _replace_password(db, row['id'], password_hash)
+                event(db, row['id'], "demo-recovery", "通过注册联系方式重置密码")
     # 联系方式未匹配也返回相同提示，避免通过找回响应公开枚举账户。
     return {"message": "如联系方式与注册账户匹配，密码已重置，请使用新密码登录"}
 
@@ -257,11 +301,10 @@ def change_contacts(database, user, body):
         raise HTTPException(403, '登录手机号由 Keycloak 管理，请前往统一账户中心换绑')
     if user.get('is_root') and body.phone:
         raise HTTPException(403, '根管理员使用本地账号，不绑定手机号')
+    stored = _verified_hash(database, user["id"], body.current_password)
     try:
         with database.connect(write=True) as db:
-            row = db.execute("SELECT password FROM users WHERE id=?", (user["id"],)).fetchone()
-            if not verify_password(body.current_password, row["password"]):
-                raise HTTPException(400, "当前密码不正确")
+            _check_credential(db, user["id"], stored)
             _check_contact_conflicts(db, body.email, body.phone, user["id"])
             db.execute("UPDATE users SET email=?,phone=? WHERE id=?", (body.email, body.phone or None, user["id"]))
             event(db, user["id"], user["username"], "修改登录联系方式", actor_id=user['id'])

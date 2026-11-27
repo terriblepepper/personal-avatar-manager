@@ -152,7 +152,7 @@ async def public_task(target: str, body: PublicTaskRequest, request: Request, re
     visitor=request.cookies.get('avatar_visitor','')
     if not visitor or len(visitor)>128:
         visitor=secrets.token_urlsafe(32)
-        response.set_cookie('avatar_visitor',visitor,httponly=True,samesite='lax',secure=request.url.scheme=='https')
+        response.set_cookie('avatar_visitor',visitor,httponly=True,samesite='lax',secure=request.app.state.settings.secure_cookie)
     wire = {'type': 'task-command', 'id': body.command_id, 'sentAt': now(), 'senderRole': 'leader',
             'senderId': 'town-http', 'mentions': [row['aic']], 'command': body.operation,
             'taskId': body.task_id, 'sessionId': body.session_id,

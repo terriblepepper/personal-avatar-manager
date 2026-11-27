@@ -9,7 +9,7 @@ from wit.acps.aip.base import AipContext
 from wit.acps.aip.direct import DIRECT_LEADER
 from wit.acps.identity import use_local_entity
 from avatar.core.db import now
-from avatar.core.execution import AgentNeedsInput
+from avatar.core.execution import AgentNeedsInput, run_blocking
 from avatar.protocols.transport.endpoints import entity_oidc_identity
 
 
@@ -22,11 +22,11 @@ class PeerAcpsTransport:
 
     def ready(self,left,right):
         """只检查真实共享入口是否已装载双方身份；不以 Demo AIC 或磁盘文件冒充上线。"""
-        return all(uid in self.runtime.instances and self.runtime.status(uid)['serving'] for uid in (left,right))
+        return all((instance := self.runtime.instances.get(uid)) and instance[2] and instance[2].serving for uid in (left,right))
 
     async def send(self,job,leader_id,partner_id,operation,command_id):
         local=self.runtime.instances.get(leader_id);remote=self.runtime.instances.get(partner_id)
-        if not local or not remote or not self.runtime.status(leader_id)['serving'] or not self.runtime.status(partner_id)['serving']:
+        if not self.ready(leader_id,partner_id):
             raise PeerEndpointUnavailable('分身 ACPS 证书或共享入口尚未就绪，尚未发出本轮调用')
         try:
             entity=await self.runtime.directories[leader_id].select(local[0])
@@ -40,7 +40,10 @@ class PeerAcpsTransport:
         command={'type':'task-command','id':command_id,'sentAt':now(),'senderRole':'leader','senderId':local[0],
                  'mentions':[remote[0]],'command':operation,'taskId':job['id'],'sessionId':job['session_id'],
                  'dataItems':[{'type':'data','data':{'peerDialogueTask':job['id']}}] if operation in ('start','continue') else []}
-        owner=entity_oidc_identity(self.runtime.settings,leader_id)
+        def requester():
+            with self.runtime.database.connect() as db:
+                return entity_oidc_identity(self.runtime.settings, leader_id, db=db)
+        owner = await run_blocking(requester)
         command['commandParams']={'requester':{'id':owner['keycloakSubject'],'issuer':owner['keycloakIssuer']}}
         context=AipContext(local_aic=local[0],peer_aic=remote[0])
         with use_local_entity(entity):
@@ -48,14 +51,17 @@ class PeerAcpsTransport:
             return await method(command,context=context,endpoint=remote[3])
 
     async def exchange(self,job,leader_id,partner_id):
-        with self.runtime.database.connect() as db:
-            from avatar.conversation.loop.peer import wire_id
-            command_id=wire_id(db,job,partner_id)
-            first = db.execute('SELECT command_id FROM agent_wire_results WHERE task_id=? AND session_id=? '
-                               'AND local_aic=(SELECT aic FROM avatar_records WHERE user_id=?) '
-                               'AND peer_aic=(SELECT aic FROM avatar_records WHERE user_id=?) ORDER BY rowid LIMIT 1',
-                               (job['id'], job['session_id'], partner_id, leader_id)).fetchone()
-        operation = 'start' if not first or first[0] == command_id else 'continue'
+        def command_scope():
+            with self.runtime.database.connect() as db:
+                from avatar.conversation.loop.peer import wire_id
+                command_id=wire_id(db,job,partner_id)
+                first = db.execute('SELECT command_id FROM agent_wire_results WHERE task_id=? AND session_id=? '
+                                   'AND local_aic=(SELECT aic FROM avatar_records WHERE user_id=?) '
+                                   'AND peer_aic=(SELECT aic FROM avatar_records WHERE user_id=?) ORDER BY result_number LIMIT 1',
+                                   (job['id'], job['session_id'], partner_id, leader_id)).fetchone()
+            operation = 'start' if not first or first[0] == command_id else 'continue'
+            return command_id, operation
+        command_id, operation = await run_blocking(command_scope)
         checkpoint=json.loads(job.get('agent_checkpoint') or '{}')
         if checkpoint.get('resume_wire') == command_id:
             result=await self.send(job,leader_id,partner_id,'get',uuid.uuid4().hex)
@@ -84,11 +90,13 @@ class PeerAcpsTransport:
                 'task_action':next((i['data']['peerTaskAction'] for i in data if i.get('type')=='data' and isinstance(i.get('data'),dict) and 'peerTaskAction' in i['data']),None)}
 
     async def _control(self,job,left,right,operation):
-        with self.runtime.database.connect() as db:
-            rows = db.execute('SELECT DISTINCT ON (local_aic,peer_aic) local_aic,peer_aic,state FROM agent_wire_results '
-                              'WHERE task_id=? AND session_id=? ORDER BY local_aic,peer_aic,rowid DESC',
-                              (job['id'],job['session_id'])).fetchall()
-        started = {(r['local_aic'], r['peer_aic']):r['state'] for r in rows}
+        def started_directions():
+            with self.runtime.database.connect() as db:
+                rows = db.execute('SELECT DISTINCT ON (local_aic,peer_aic) local_aic,peer_aic,state FROM agent_wire_results '
+                                  'WHERE task_id=? AND session_id=? ORDER BY local_aic,peer_aic,result_number DESC',
+                                  (job['id'],job['session_id'])).fetchall()
+            return {(r['local_aic'], r['peer_aic']):r['state'] for r in rows}
+        started = await run_blocking(started_directions)
         directions = {
             (job['target_aic'],job['own_aic']): (left,right),
             (job['own_aic'],job['target_aic']): (right,left),
@@ -128,20 +136,23 @@ class PeerTransport:
             raise PeerEndpointUnavailable('正在等待原 ACPS 入口确认已接收命令')
         if mode=='internal' and job.get('transport_mode')=='acps' and job.get('status')=='awaiting_identity':
             raise PeerEndpointUnavailable('ACPS 入口尚未恢复，继续等待原通道，不改走内部传输')
-        with self.database.connect(write=True) as db:
-            row=db.execute('SELECT * FROM agent_dialogues WHERE id=? AND session_id=?',(job['id'],job['session_id'])).fetchone()
-            pair=db.execute('SELECT * FROM agent_peer_sessions WHERE id=?',(job['session_id'],)).fetchone()
-            if not row or not pair or row['status']!='running' or row['revision']!=job['revision']:
-                raise HTTPException(409,'分身任务状态已变化，本次未发送')
-            own,target=self.dialogues.session_store.participants(db,row['user_id'],row['target_aic'])
-            mode='internal' if checkpoint.get('resume_internal') else current_protocol(own['aic'],target['aic'],ready=mode=='acps')
-            speaker=row['user_id'] if row['next_speaker']==0 else row['target_user_id']
-            if {leader_id,partner_id}!={own['user_id'],target['user_id']} or partner_id!=speaker or {pair['left_user_id'],pair['right_user_id']}!={leader_id,partner_id}:
-                raise HTTPException(403,'分身通信参与者不匹配')
-            if row['delivery_mode']!='message' and not row['accepted']:
-                raise HTTPException(409,'协商需等待目标本人同意')
-            db.execute("UPDATE agent_dialogues SET transport_mode=?,error='' WHERE id=?",(mode,job['id']))
-            current=dict(row)
+        def prepare(mode):
+            with self.database.connect(write=True) as db:
+                row=db.execute('SELECT * FROM agent_dialogues WHERE id=? AND session_id=?',(job['id'],job['session_id'])).fetchone()
+                pair=db.execute('SELECT * FROM agent_peer_sessions WHERE id=?',(job['session_id'],)).fetchone()
+                if not row or not pair or row['status']!='running' or row['revision']!=job['revision']:
+                    raise HTTPException(409,'分身任务状态已变化，本次未发送')
+                own,target=self.dialogues.session_store.participants(db,row['user_id'],row['target_aic'])
+                mode='internal' if checkpoint.get('resume_internal') else current_protocol(own['aic'],target['aic'],ready=mode=='acps')
+                speaker=row['user_id'] if row['next_speaker']==0 else row['target_user_id']
+                if {leader_id,partner_id}!={own['user_id'],target['user_id']} or partner_id!=speaker or {pair['left_user_id'],pair['right_user_id']}!={leader_id,partner_id}:
+                    raise HTTPException(403,'分身通信参与者不匹配')
+                if row['delivery_mode']!='message' and not row['accepted']:
+                    raise HTTPException(409,'协商需等待目标本人同意')
+                db.execute("UPDATE agent_dialogues SET transport_mode=?,error='' WHERE id=?",(mode,job['id']))
+                current=dict(row)
+            return mode, current
+        mode, current = await run_blocking(prepare, mode)
         if mode=='acps':
             result=await self.acps.exchange(job,leader_id,partner_id)
         else:

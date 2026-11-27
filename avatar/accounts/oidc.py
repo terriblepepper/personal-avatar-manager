@@ -14,7 +14,7 @@ import httpx
 import jwt
 from fastapi import HTTPException
 from avatar.core.http_pool import HttpTransportPool
-from avatar.accounts.auth import hash_password, issue_session
+from avatar.accounts.auth import issue_session
 from avatar.core.db import dump, event, now
 
 
@@ -99,20 +99,19 @@ class OidcService:
 
     # 职责：建立短期、绑定当前浏览器的授权码事务。
     # 输入：受限返回入口、可选平台绑定令牌及请求 IP；身份在本人资料页选择，不属于认证参数。
-    # 结果与约束：返回授权地址和 HttpOnly Cookie 原值；状态 5 分钟一次使用，携带 S256/nonce，按 IP 限流并清除过期状态。
+    # 结果与约束：返回授权地址和 HttpOnly Cookie 原值；状态 5 分钟一次使用，携带 S256/nonce，按 IP 限流，过期状态由后台清理。
     async def start(self, return_to, platform_token, ip):
         state, browser, verifier, nonce = (secrets.token_urlsafe(32) for _ in range(4))
         current = time.time()
         def admit():
-            with self.database.connect(write=True) as db:
-                key = 'oidc:' + digest(ip)
+            key = 'oidc:' + digest(ip)
+            with self.database.connect(write=True, account_scope=key) as db:
                 limit = db.execute('SELECT * FROM login_limits WHERE key=?', (key,)).fetchone()
                 if limit and limit['reset_at'] > current and limit['attempts'] >= 20:
                     raise HTTPException(429, '统一认证请求过多，请稍后重试')
                 attempts = limit['attempts'] + 1 if limit and limit['reset_at'] > current else 1
                 reset = limit['reset_at'] if limit and limit['reset_at'] > current else current + 300
                 db.execute('INSERT OR REPLACE INTO login_limits VALUES(?,?,?)', (key, attempts, reset))
-                db.execute('DELETE FROM oidc_login_states WHERE expires<?', (current,))
         await asyncio.to_thread(admit)
         configuration = await self.discovery()
         if platform_token:
@@ -120,7 +119,7 @@ class OidcService:
             from avatar.accounts.platform_binding import PlatformBindingService
             await asyncio.to_thread(PlatformBindingService(self.database).preview,platform_token)
         def save_state():
-            with self.database.connect(write=True) as db:
+            with self.database.connect(write=True, account_scope='oidc-state:' + digest(state)) as db:
                 db.execute('INSERT INTO oidc_login_states VALUES(?,?,?,?,?,?,?,?)',
                            (digest(state), digest(browser), verifier, nonce, 'student', return_to, platform_token, current + 300))
         await asyncio.to_thread(save_state)
@@ -134,7 +133,7 @@ class OidcService:
     # 输入：state 来自 OIDC 回调，browser 来自 HttpOnly 短期 Cookie。
     # 结果与约束：过期、缺失、错误浏览器和重放均拒绝；正确状态先消费再进行远程请求，失败须重新发起登录。
     def consume(self, state, browser):
-        with self.database.connect(write=True) as db:
+        with self.database.connect(write=True, account_scope='oidc-state:' + digest(state)) as db:
             row = db.execute('SELECT * FROM oidc_login_states WHERE state_hash=?', (digest(state),)).fetchone()
             if not row or row['expires'] <= time.time() or not browser or not hmac.compare_digest(row['browser_hash'], digest(browser)):
                 raise HTTPException(400, '登录状态失效或浏览器不匹配，请重新发起登录')
@@ -175,26 +174,39 @@ class OidcService:
     def identify(self, claims, transaction, device=None):
         identity_username = claims.get('preferred_username', '')
         identity_username = identity_username[:160] if isinstance(identity_username, str) else ''
+        def lookup(db):
+            params = (self.issuer, claims['sub'])
+            primary = db.execute('SELECT user_id FROM oidc_identities WHERE issuer=? AND subject=?', params).fetchone()
+            if primary:
+                return primary, 'oidc_identities'
+            linked = db.execute('SELECT user_id FROM oidc_identity_links WHERE issuer=? AND subject=?', params).fetchone()
+            return linked, 'oidc_identity_links' if linked else 'oidc_identities'
+
+        scope = None
+        if not transaction.get('platform_token'):
+            with self.database.connect() as reader:
+                previous, _ = lookup(reader)
+                scope = previous['user_id'] if previous else None
         try:
-            with self.database.connect(write=True) as db:
-                identity = db.execute('SELECT * FROM oidc_identities WHERE issuer=? AND subject=?', (self.issuer, claims['sub'])).fetchone()
-                linked = False
-                if not identity:
-                    identity = db.execute('SELECT * FROM oidc_identity_links WHERE issuer=? AND subject=?', (self.issuer, claims['sub'])).fetchone()
-                    linked = identity is not None
+            with self.database.connect(write=True, account_scope=scope) as db:
+                identity, table = lookup(db)
+                if scope is not None and (not identity or scope != identity['user_id']):
+                    raise HTTPException(409, '统一身份关联已变化，请重新登录')
                 if identity:
                     user_id = identity['user_id']
-                    user = db.execute('SELECT * FROM users WHERE id=?', (user_id,)).fetchone()
+                    user = db.execute('SELECT * FROM users WHERE id=? FOR UPDATE', (user_id,)).fetchone()
                     if not user or user['is_root']:
                         raise HTTPException(403, '根管理员仅允许本地登录')
+                    if user['account_status'] != 'active':
+                        raise HTTPException(403, '当前账户无法登录')
                 else:
                     user_id = str(uuid.uuid4())
                     # 新账号仅建立业务草稿；学生/教师身份由本人在个人资料页选择，旧账号身份不改变。
                     person_type = 'student'
                     username = 'kc_' + uuid.uuid4().hex
-                    # 本地不可知随机密码仅兼容旧表 NOT NULL，不接受该账户本地密码登录。
+                    # 随机盐和随机摘要只占用不可用的本地凭据字段，不生成可用密码。
                     db.execute("INSERT INTO users(id,username,password,role,created_at,person_type,onboarding_stage) VALUES(?,?,?,?,?,?,'welcome')",
-                               (user_id, username, hash_password(secrets.token_urlsafe(48)), 'user', now(), person_type))
+                               (user_id, username, secrets.token_hex(16) + '$' + secrets.token_hex(32), 'user', now(), person_type))
                     modified = now()
                     name = claims.get('name', '')
                     name = name[:80] if isinstance(name, str) else ''
@@ -203,7 +215,6 @@ class OidcService:
                     db.execute('INSERT INTO oidc_identities(issuer,subject,user_id) VALUES(?,?,?)', (self.issuer, claims['sub'], user_id))
                     event(db, user_id, username, '统一认证首次建立业务账户', actor_id=user_id)
                 # verified_at 兼容历史字段名，现在记录统一账号验签登录时间；不表示手机号已验证。
-                table = 'oidc_identity_links' if linked else 'oidc_identities'
                 db.execute('UPDATE '+table+' SET username=?,verified_at=? WHERE issuer=? AND subject=?',
                            (identity_username, now(), self.issuer, claims['sub']))
                 if transaction.get('platform_token'):
