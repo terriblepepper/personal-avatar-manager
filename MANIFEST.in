@@ -10,9 +10,10 @@ include frontend/vitest.config.ts frontend/playwright.config.ts
 recursive-include frontend/src *.vue *.ts *.css
 recursive-include frontend/tests *.ts
 recursive-include frontend/dist *
-include admin-frontend/index.html admin-frontend/package.json admin-frontend/vite.config.ts admin-frontend/tsconfig.json
+include admin-frontend/index.html admin-frontend/package.json admin-frontend/package-lock.json admin-frontend/vite.config.ts admin-frontend/tsconfig.json
 recursive-include admin-frontend/src *.vue *.ts *.css
 recursive-include admin-frontend/dist *
+prune admin-frontend/node_modules
 prune frontend/node_modules
 prune frontend/test-results
 prune frontend/playwright-report

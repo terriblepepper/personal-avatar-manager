@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "typecheck": "vue-tsc --noEmit",
-    "build": "vue-tsc --noEmit && vite build && npm --prefix ../admin-frontend run build",
+    "build": "vue-tsc --noEmit && vite build && npm --prefix ../admin-frontend ci --offline --no-audit --no-fund && npm --prefix ../admin-frontend run build",
     "test": "vitest run",
     "test:browser": "playwright test",
     "preview": "vite preview --host 127.0.0.1"

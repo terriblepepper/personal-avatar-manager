@@ -1,10 +1,7 @@
-import { createRequire } from 'node:module'
+import { defineConfig } from 'vite'
+import vue from '@vitejs/plugin-vue'
 
-const frontend = createRequire(new URL('../frontend/package.json', import.meta.url))
-const vue = frontend('@vitejs/plugin-vue').default
-
-export default {
+export default defineConfig({
   base: '/ops/',
   plugins: [vue()],
-  resolve: { alias: { vue: frontend.resolve('vue/dist/vue.esm-bundler.js') } },
-}
+})

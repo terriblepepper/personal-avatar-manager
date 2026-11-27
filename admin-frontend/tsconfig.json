@@ -1,5 +1,14 @@
 {
-  "extends": "../frontend/tsconfig.json",
-  "compilerOptions": { "types": ["node"], "typeRoots": ["../frontend/node_modules/@types"] },
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "types": ["vite/client", "node"]
+  },
   "include": ["src/**/*.vue", "src/**/*.ts", "vite.config.ts"]
 }
